@@ -11,7 +11,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@1.96.0
+    - uses: dtolnay/rust-toolchain@1.97.1
       id: toolchain
       with:
         components: clippy, rustfmt

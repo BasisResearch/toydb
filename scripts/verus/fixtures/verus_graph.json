@@ -1,0 +1,20 @@
+{
+  "functions": [
+    {
+      "id": "src/math.rs::math::add",
+      "file": "src/math.rs", "module": "math", "function": "add",
+      "kind": "fn", "status": "verified", "deps": []
+    },
+    {
+      "id": "src/math.rs::math::mul",
+      "file": "src/math.rs", "module": "math", "function": "mul",
+      "kind": "fn", "status": "verified", "deps": []
+    },
+    {
+      "id": "src/lib.rs::crate::run",
+      "file": "src/lib.rs", "module": "crate", "function": "run",
+      "kind": "fn", "status": "unverified",
+      "deps": ["src/math.rs::math::add"]
+    }
+  ]
+}

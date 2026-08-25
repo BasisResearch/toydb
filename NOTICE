@@ -1,0 +1,23 @@
+toyDB — mixed-license notice
+============================
+
+Upstream toyDB (github.com/erikgrinaker/toydb) is licensed under the
+Apache License, Version 2.0. That base license is retained verbatim in
+`LICENSE` and continues to govern all upstream source.
+
+Files added by Basis Research for the Verus verification-telemetry work are
+licensed under the MIT License (see `LICENSE-MIT`) and each carries an
+`SPDX-License-Identifier: MIT` header. These additions are:
+
+  - `.claude/`            Claude Code capture (Stop) + gate (SessionStart) hooks,
+                          the shared `verus_trace` envelope package, and tests.
+  - `.codex/`             Codex Stop-hook capture adapter + committed MCP config.
+  - `.opencode/`          opencode session-end capture plugin + gate probe.
+  - `.mcp.json`           committed Verus MCP server registration.
+  - `.github/workflows/verus-verify.yml`  verification-progress CI.
+  - `scripts/verus/`      metrics + blueprint-graph extraction.
+
+The two licenses are compatible: Apache-2.0 permits redistribution of the work
+with added MIT-licensed files, provided this NOTICE and the Apache `LICENSE` are
+preserved. MIT imposes no additional restriction on the combined distribution.
+Each file's own SPDX header is authoritative for that file.

@@ -1,0 +1,9 @@
+{
+  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). Registers the Verus MCP server for Claude Code so a fresh clone of toyDB loads it by default; the SessionStart gate hook (.claude/hooks/verus_gate.py) refuses to run without it. Invocation matches verus-tools-mcp README: stdio transport.",
+  "mcpServers": {
+    "verus": {
+      "command": "verus-tools-mcp",
+      "args": ["stdio"]
+    }
+  }
+}
