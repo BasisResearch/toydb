@@ -28,6 +28,7 @@ from verus_trace import envelope as env  # noqa: E402
 from verus_trace import claude_adapter  # noqa: E402
 from verus_trace import codex_adapter  # noqa: E402
 from verus_trace import opencode_adapter  # noqa: E402
+from verus_trace import mcp_probe  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -218,6 +219,54 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertTrue(call["is_mcp"])
         self.assertEqual(call["name"], "verify")   # bare name after prefix strip
         self.assertEqual(call["duration_ms"], 4200)
+
+
+class McpVersionThreadingTest(unittest.TestCase):
+    """The whole experiment keys on the precise mcp_version. A dirty (dev-build)
+    mcp_version probed from the `version` tool must land on the envelope's
+    mcp_version field so the dashboard buckets dev sessions apart. We inject the
+    probed version rather than requiring a live server."""
+
+    DIRTY = {
+        "server_name": "verus-tools-mcp",
+        "server_version": "0.1.0",
+        "git_commit": "1b40a7d",
+        "git_dirty": True,
+        "mcp_version": "0.1.0+g1b40a7d.dirty",
+        "verus_version": "0.2026.08.23",
+        "rust_toolchain": "1.97.1",
+        "protocol": "mcp",
+    }
+
+    def test_dirty_mcp_version_flows_into_envelope(self):
+        path = os.path.join(FIXTURES, "claude_transcript.jsonl")
+        # Mirror what the Stop hooks do: prefer the precise mcp_version.
+        mcp_version = self.DIRTY.get("mcp_version") or self.DIRTY.get("server_version")
+        verus_version = self.DIRTY.get("verus_version")
+        with tempfile.TemporaryDirectory() as empty:
+            os.environ["VERUS_MCP_LOG_DIR"] = empty
+            try:
+                envelope = claude_adapter.build_from_transcript(
+                    path, mcp_version=mcp_version, verus_version=verus_version
+                )
+            finally:
+                os.environ.pop("VERUS_MCP_LOG_DIR", None)
+        assert_envelope_shape(self, envelope)
+        self.assertEqual(envelope["mcp_version"], "0.1.0+g1b40a7d.dirty")
+        self.assertIn(".dirty", envelope["mcp_version"])
+        self.assertEqual(envelope["verus_version"], "0.2026.08.23")
+
+    def test_is_dirty_version_classifier(self):
+        self.assertTrue(mcp_probe.is_dirty_version(self.DIRTY))
+        self.assertTrue(
+            mcp_probe.is_dirty_version({"mcp_version": "0.1.0+unknown"})
+        )
+        self.assertFalse(
+            mcp_probe.is_dirty_version(
+                {"mcp_version": "0.1.0+g1b40a7d", "git_dirty": False}
+            )
+        )
+        self.assertFalse(mcp_probe.is_dirty_version({}))
 
 
 class PostDryRunTest(unittest.TestCase):

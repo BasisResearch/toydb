@@ -91,12 +91,19 @@ def main():
     try:
         from verus_trace import codex_adapter, envelope, mcp_probe
 
+        # Codex has no session-start event, so we probe at Stop time to stamp the
+        # PRECISE mcp_version (e.g. 0.1.0+g1b40a7d.dirty) onto the envelope; this
+        # is what the dashboard keys on and how dev builds are bucketed apart.
         mcp_version = ""
         verus_version = ""
         try:
             res = mcp_probe.probe_version()
             if res.healthy:
-                mcp_version = res.version.get("server_version", "")
+                mcp_version = (
+                    res.version.get("mcp_version")
+                    or res.version.get("server_version")
+                    or ""
+                )
                 verus_version = res.version.get("verus_version", "")
         except Exception:
             pass

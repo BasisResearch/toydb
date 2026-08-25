@@ -58,12 +58,19 @@ def cmd_capture(argv):
             sys.stderr.write("[verus-trace] no opencode session found\n")
             return 0
 
+        # Stamp the PRECISE mcp_version (e.g. 0.1.0+g1b40a7d.dirty) from the
+        # server's `version` tool; this is what the dashboard keys on and how it
+        # buckets dev builds apart from releases.
         mcp_version = ""
         verus_version = ""
         try:
             res = mcp_probe.probe_version()
             if res.healthy:
-                mcp_version = res.version.get("server_version", "")
+                mcp_version = (
+                    res.version.get("mcp_version")
+                    or res.version.get("server_version")
+                    or ""
+                )
                 verus_version = res.version.get("verus_version", "")
         except Exception:
             pass
