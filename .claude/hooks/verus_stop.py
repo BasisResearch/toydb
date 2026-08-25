@@ -37,13 +37,20 @@ def main():
     try:
         from verus_trace import claude_adapter, envelope, mcp_probe
 
-        # Record mcp/verus versions on the trace if the server answers quickly.
+        # Stamp the PRECISE mcp_version (and verus_version) onto the trace from
+        # the server's `version` tool. `mcp_version` is the canonical id (e.g.
+        # 0.1.0+g1b40a7d.dirty); it is what the whole experiment keys on and how
+        # the dashboard buckets dev builds separately from releases.
         mcp_version = ""
         verus_version = ""
         try:
             res = mcp_probe.probe_version()
             if res.healthy:
-                mcp_version = res.version.get("server_version", "")
+                mcp_version = (
+                    res.version.get("mcp_version")
+                    or res.version.get("server_version")
+                    or ""
+                )
                 verus_version = res.version.get("verus_version", "")
         except Exception:
             pass

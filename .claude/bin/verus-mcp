@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Basis Research
+#
+# Self-provisioning launcher for the Verus MCP server (verus-tools-mcp).
+#
+# This is the PINNED, reproducible way to run the server for the box / CI /
+# colleagues who do not hack on the server itself. It is referenced by
+# .mcp.prod.json. Unlike the dev-default .mcp.json (a running hot-reload HTTP
+# server), this ensures a specific git ref of verus-tools-mcp is installed into
+# a per-ref cache dir, then execs it over stdio.
+#
+# Behaviour:
+#   * If `verus-tools-mcp` is already on PATH, use it (assume the operator pinned
+#     it deliberately) and exec it with `stdio` plus any passed args.
+#   * Otherwise install the pinned ref with `cargo install --git ... --root
+#     <per-ref cache>` (idempotent: skipped if the cached binary already exists),
+#     then exec that binary.
+#   * Fail with a clear message if `cargo` is absent.
+#
+# All output except the exec'd server's own stdio protocol goes to stderr so it
+# never corrupts the MCP stdio stream.
+
+set -euo pipefail
+
+# --- Pin -------------------------------------------------------------------
+# Git ref / tag of BasisResearch/verus-tools-mcp to install. Pinned to a
+# released tag so the box/CI/non-dev clones run a frozen, comparable build.
+# Bump this when a new server release is cut.
+VERUS_MCP_REF="${VERUS_MCP_REF:-v0.1.0}"
+
+VERUS_MCP_REPO="https://github.com/BasisResearch/verus-tools-mcp"
+CACHE_ROOT="${VERUS_MCP_CACHE_ROOT:-$HOME/.cache/verus-mcp}"
+CACHE_DIR="$CACHE_ROOT/$VERUS_MCP_REF"
+CACHED_BIN="$CACHE_DIR/bin/verus-tools-mcp"
+
+log() { printf '[verus-mcp] %s\n' "$*" >&2; }
+
+# --- 1. Already on PATH? ---------------------------------------------------
+if command -v verus-tools-mcp >/dev/null 2>&1; then
+  log "using verus-tools-mcp from PATH"
+  exec verus-tools-mcp stdio "$@"
+fi
+
+# --- 2. Already installed in the per-ref cache? ----------------------------
+if [ -x "$CACHED_BIN" ]; then
+  log "using cached pinned build ($VERUS_MCP_REF): $CACHED_BIN"
+  exec "$CACHED_BIN" stdio "$@"
+fi
+
+# --- 3. Install the pinned ref ---------------------------------------------
+if ! command -v cargo >/dev/null 2>&1; then
+  log "ERROR: cargo not found on PATH; cannot install verus-tools-mcp."
+  log "Install the Rust toolchain (rustup) or put verus-tools-mcp on PATH, then retry."
+  exit 127
+fi
+
+log "installing verus-tools-mcp @ $VERUS_MCP_REF into $CACHE_DIR (one-time) ..."
+mkdir -p "$CACHE_DIR"
+
+# A tag and a branch/sha are passed to cargo differently: --tag vs --rev. We do
+# not know which the pin is, so try --tag first (works for release tags) and
+# fall back to --rev (works for branches and commit shas like `main`/`1b40a7d`).
+if cargo install --git "$VERUS_MCP_REPO" --tag "$VERUS_MCP_REF" \
+      --root "$CACHE_DIR" verus-tools-mcp >&2 2>/dev/null; then
+  :
+else
+  log "--tag $VERUS_MCP_REF failed or is not a tag; retrying as --rev ..."
+  cargo install --git "$VERUS_MCP_REPO" --rev "$VERUS_MCP_REF" \
+      --root "$CACHE_DIR" verus-tools-mcp >&2
+fi
+
+if [ ! -x "$CACHED_BIN" ]; then
+  log "ERROR: install completed but $CACHED_BIN is missing or not executable."
+  exit 1
+fi
+
+log "installed; launching pinned build"
+exec "$CACHED_BIN" stdio "$@"
