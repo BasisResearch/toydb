@@ -196,7 +196,7 @@ def build_metrics(
             )
         else:
             files_clean, lines_verified = _rollup_whole_repo(
-                functions_with_errors, files_total, lines_total
+                functions_verified, functions_with_errors, files_total, lines_total
             )
     else:
         human = parse_human_summary(verus_output) if verus_output else None
@@ -207,7 +207,7 @@ def build_metrics(
                 f"{functions_verified} verified, {functions_with_errors} errors"
             )
             files_clean, lines_verified = _rollup_whole_repo(
-                functions_with_errors, files_total, lines_total
+                functions_verified, functions_with_errors, files_total, lines_total
             )
         elif verus_ran:
             log(
@@ -261,18 +261,22 @@ def _rollup_from_files(
 
 
 def _rollup_whole_repo(
+    functions_verified: int,
     functions_with_errors: int,
     files_total: int,
     lines_total: int,
 ) -> Tuple[int, int]:
     """Whole-repo roll-up when Verus gives no per-file breakdown.
 
-    Verus was run over the repo as a unit, so we cannot attribute errors to
-    individual files. Conservative rule: if there are zero errors the whole
-    repo is clean (all files, all lines); otherwise zero clean. This keeps the
-    roll-up coherent with the outcome counts without inventing per-file data.
+    Verus was run over the repo as a unit, so we cannot attribute outcomes to
+    individual files. A file/line only counts as *clean* once something was
+    actually proven: we require at least one verified function AND zero errors.
+    Absent any proof outcome (the initial state, before specs exist) nothing is
+    clean, so the metrics read 0 rather than a misleading 100%. Only when the
+    whole repo verifies with real proven functions do we roll every file/line up
+    as clean; any error drops it back to zero.
     """
-    if functions_with_errors == 0:
+    if functions_verified > 0 and functions_with_errors == 0:
         return files_total, lines_total
     return 0, 0
 
