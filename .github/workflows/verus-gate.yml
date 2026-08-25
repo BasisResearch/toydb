@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Basis Research. MIT header over toyDB's Apache-2.0 base;
+# see LICENSE-MIT / NOTICE.
+#
+# Verus verification GATE. Runs `scripts/verus/verify.sh` (i.e. `cargo verus
+# focus --lib` over the opted-in modules) and FAILS the PR if any verified
+# module stops verifying. This is the enforcement counterpart to the
+# non-blocking telemetry workflow in verus-verify.yml: that one measures
+# progress and never fails; this one holds the line on what is already proven.
+#
+# Re-pinning: keep RUST_TOOLCHAIN / VERUS_VERSION equal to verus-verify.yml and
+# the vstd pin in Cargo.toml.
+
+name: verus-gate
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+  VERUS_VERSION: "release/0.2026.08.23.fbbbbcf"
+
+jobs:
+  verus-gate:
+    name: Verus gate (verify opted-in modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          # cargo-verus links rustc internals; it needs rustc-dev + llvm-tools.
+          components: rustc-dev, llvm-tools
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: verus-gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install pinned Verus (verus + cargo-verus)
+        run: |
+          set -euo pipefail
+          VERUS_TAG="${VERUS_VERSION}"
+          VER_STEM="${VERUS_TAG##*/}"
+          ASSET="verus-${VER_STEM}-x86-linux.zip"
+          URL="https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${ASSET}"
+          echo "Installing Verus ${VERUS_TAG}"
+          mkdir -p "$HOME/verus"
+          curl -fsSL "$URL" -o /tmp/verus.zip
+          unzip -q /tmp/verus.zip -d "$HOME/verus"
+          # The zip ships `verus` and `cargo-verus` in the same dir; put it on PATH.
+          VERUS_BIN_DIR="$(dirname "$(find "$HOME/verus" -name cargo-verus -type f | head -1)")"
+          test -n "$VERUS_BIN_DIR"
+          echo "$VERUS_BIN_DIR" >> "$GITHUB_PATH"
+          "$VERUS_BIN_DIR/verus" --version
+
+      - name: Raise ulimit (Verus spawns many Z3 processes)
+        run: ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
+
+      - name: Verify opted-in modules (gating)
+        run: |
+          ulimit -u 65535 || true
+          ./scripts/verus/verify.sh
