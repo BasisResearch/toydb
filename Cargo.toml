@@ -13,7 +13,19 @@ publish = false
 [lib]
 doctest = false
 
+# Verus progressive verification. `cargo verus focus --lib` verifies the modules
+# opted in via `verus!` blocks; everything else is external-by-default and
+# untouched. `scripts/verus/verify.sh` and the verus-gate CI job drive it. A
+# normal `cargo build` ignores this table and erases all spec/proof code.
+[package.metadata.verus]
+verify = true
+
 [dependencies]
+# vstd is Verus's verified std. Published on crates.io; it compiles under a
+# normal `cargo build` (the `verus!` macro erases ghost code), so keeping it a
+# plain dependency lets verified code live inline in real modules. Pin tracks
+# the Verus release in .github/workflows/verus-verify.yml.
+vstd = "=0.0.0-2026-08-23-0033"
 bincode = { version = "2.0", features = ["serde"] }
 clap = { version = "4.5", features = ["cargo", "derive"] }
 config = "0.15"

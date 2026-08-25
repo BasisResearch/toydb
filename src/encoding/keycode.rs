@@ -49,6 +49,61 @@ use serde::ser::{Impossible, Serialize, SerializeSeq, SerializeTuple, SerializeT
 use crate::errdata;
 use crate::error::{Error, Result};
 
+// --- Verus-verified core of the i64 key encoding ---------------------------
+//
+// An i64 is stored as its big-endian bytes with the sign bit flipped, so that
+// the unsigned lexicographic byte order of encoded keys matches the signed
+// order of the values (see `serialize_i64` below). Flipping the sign bit of the
+// big-endian bytes is exactly `x ^ (1 << 63)` on the u64 view of those bytes.
+//
+// The functions below are the executable encoder/decoder that
+// `serialize_i64` / `deserialize_i64` call. Verus proves they are mutual
+// inverses (`i64_key_roundtrip`) and order-preserving (`i64_key_order`), which
+// are the two correctness properties keycode relies on. Everything else in this
+// file is external-by-default and unverified. `verus!` erases all of this to
+// the two plain `fn` bodies under a normal `cargo build`.
+use vstd::prelude::*;
+
+verus! {
+
+/// The order-preserving u64 key for an i64 value: flip the sign bit.
+pub open spec fn i64_key(v: i64) -> u64 {
+    (v as u64) ^ (1u64 << 63)
+}
+
+/// The encoding is reversible: flipping the sign bit twice is the identity.
+pub proof fn i64_key_roundtrip(v: i64)
+    ensures (i64_key(v) ^ (1u64 << 63)) as i64 == v,
+{
+    assert((((v as u64) ^ (1u64 << 63)) ^ (1u64 << 63)) as i64 == v) by (bit_vector);
+}
+
+/// The encoding is order-preserving: signed `<=` on values matches unsigned
+/// `<=` on keys, which is what makes lexicographic key scans correct.
+pub proof fn i64_key_order(a: i64, b: i64)
+    ensures a <= b <==> i64_key(a) <= i64_key(b),
+{
+    assert(a <= b <==> ((a as u64) ^ (1u64 << 63)) <= ((b as u64) ^ (1u64 << 63)))
+        by (bit_vector);
+}
+
+/// Executable encoder, proven to compute `i64_key`.
+pub fn encode_i64_key(v: i64) -> (r: u64)
+    ensures r == i64_key(v),
+{
+    (v as u64) ^ (1u64 << 63)
+}
+
+/// Executable decoder, proven to invert the encoding: `i64_key(decode(k)) == k`.
+pub fn decode_i64_key(k: u64) -> (r: i64)
+    ensures i64_key(r) == k,
+{
+    assert(((((k ^ (1u64 << 63)) as i64) as u64) ^ (1u64 << 63)) == k) by (bit_vector);
+    (k ^ (1u64 << 63)) as i64
+}
+
+} // verus!
+
 /// Serializes a key to a binary Keycode representation.
 ///
 /// In the common case, the encoded key is borrowed for a storage engine call
@@ -136,9 +191,8 @@ impl serde::ser::Serializer for &mut Serializer {
     /// largest negative integer, is encoded as 01111111...11111111, ordered
     /// after all other negative integers but before positive integers.
     fn serialize_i64(self, v: i64) -> Result<()> {
-        let mut bytes = v.to_be_bytes();
-        bytes[0] ^= 1 << 7; // flip sign bit
-        self.output.extend(bytes);
+        // Verified encoder: big-endian bytes with the sign bit flipped.
+        self.output.extend(encode_i64_key(v).to_be_bytes());
         Ok(())
     }
 
@@ -407,9 +461,9 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let mut bytes = self.take_bytes(8)?.to_vec();
-        bytes[0] ^= 1 << 7; // flip sign bit
-        visitor.visit_i64(i64::from_be_bytes(bytes.as_slice().try_into()?))
+        // Verified decoder, the inverse of `serialize_i64`.
+        let key = u64::from_be_bytes(self.take_bytes(8)?.try_into()?);
+        visitor.visit_i64(decode_i64_key(key))
     }
 
     fn deserialize_u8<V: Visitor<'de>>(self, _: V) -> Result<V::Value> {
