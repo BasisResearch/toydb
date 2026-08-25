@@ -303,11 +303,23 @@ def _bare_tool_name(name):
 
 
 def is_mcp_tool(name, mcp_server_names=("verus",)):
-    """Heuristic: does this tool name denote an MCP (specifically Verus) call?"""
+    """Does this tool name denote a *Verus* MCP call?
+
+    Only the Verus MCP server counts, not any MCP server that happens to be
+    connected (e.g. `mcp__cove__rename`). Otherwise the `mcp_tool_calls` metric
+    — the independent variable of the whole experiment — would be inflated by
+    unrelated tooling.
+
+    Claude Code:  mcp__<server>__<tool>  -> server must be Verus.
+    opencode:     <server>_<tool>        -> prefix must be Verus.
+    Codex/plain:  <server>__<tool>       -> prefix must be Verus.
+    """
     if not name:
         return False
     if name.startswith("mcp__"):
-        return True
+        parts = name.split("__")
+        server = parts[1] if len(parts) >= 2 else ""
+        return server in mcp_server_names
     for srv in mcp_server_names:
         if name.startswith(srv + "_") or name.startswith(srv + "__"):
             return True
