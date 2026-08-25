@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Basis Research. MIT header over toyDB's Apache-2.0 base;
+# see LICENSE-MIT / NOTICE.
+#
+# Component 3 of the Verus telemetry project: verification-progress + blueprint
+# graph. Runs on every push and PR, installs a pinned Rust + Verus, runs verus
+# over the repo, extracts the three progress metrics and the blueprint graph,
+# and POSTs both to the dashboard ingest endpoints. Separate from ci.yml, which
+# is left untouched.
+#
+# Re-pinning: bump VERUS_VERSION below (and RUST_TOOLCHAIN only when the Verus
+# release moves its own rust-toolchain). Keep RUST_TOOLCHAIN equal to toyDB's
+# rust-toolchain file and the MCP repo's toolchain.
+
+name: verus-verify
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+env:
+  # Single easy-to-bump pins. Verus is the fixed point; Rust follows it.
+  RUST_TOOLCHAIN: "1.97.1"
+  # Latest Verus stable release as of 2026-08-25. Bump this one line to re-pin.
+  VERUS_VERSION: "release/0.2026.08.23.fbbbbcf"
+  # MCP server semver (verus-tools-mcp); recorded on every datapoint. No MCP is
+  # invoked in CI, so this is the pinned contract value until wired.
+  MCP_VERSION: "0.1.0"
+  INGEST_BASE: "https://dashboard.kirancodes.me/verus/ingest"
+
+jobs:
+  verus-verify:
+    name: Verus verify + graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need history so parent_shas resolve on both push and PR.
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          # Verus links rustc internals; it needs rustc-dev + llvm-tools.
+          components: rustc-dev, llvm-tools
+
+      - name: Raise ulimit and record toolchain versions
+        id: env
+        run: |
+          # Verus spawns many Z3 processes; give the runner generous process
+          # headroom or verification hits posix_spawn EAGAIN (see spec note).
+          ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
+          ulimit -n 65535 || true
+          echo "ulimit -u: $(ulimit -u), -n: $(ulimit -n)"
+          echo "rust_toolchain=${RUST_TOOLCHAIN}" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Verus
+        id: verus
+        run: |
+          set -euo pipefail
+          VERUS_TAG="${VERUS_VERSION}"
+          # Release tags look like "release/0.2026.08.23.fbbbbcf"; the asset
+          # version stem is the part after the slash.
+          VER_STEM="${VERUS_TAG##*/}"
+          echo "Installing Verus ${VERUS_TAG} (stem ${VER_STEM})"
+          ASSET="verus-${VER_STEM}-x86-linux.zip"
+          URL="https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${ASSET}"
+          mkdir -p "$HOME/verus"
+          if curl -fsSL "$URL" -o /tmp/verus.zip; then
+            unzip -q /tmp/verus.zip -d "$HOME/verus"
+            # The zip unpacks to a verus-x86-linux/ dir containing the binary.
+            VERUS_BIN_DIR="$(dirname "$(find "$HOME/verus" -name verus -type f | head -1)")"
+            if [ -n "$VERUS_BIN_DIR" ]; then
+              echo "$VERUS_BIN_DIR" >> "$GITHUB_PATH"
+              echo "verus_available=true" >> "$GITHUB_OUTPUT"
+              RESOLVED="$("$VERUS_BIN_DIR/verus" --version 2>/dev/null | head -1 || echo "$VER_STEM")"
+              echo "verus_version=${RESOLVED:-$VER_STEM}" >> "$GITHUB_OUTPUT"
+              echo "Verus installed at $VERUS_BIN_DIR"
+            else
+              echo "verus binary not found after unzip"
+              echo "verus_available=false" >> "$GITHUB_OUTPUT"
+              echo "verus_version=unavailable" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # Verus not wired over toyDB yet: do not hard-fail the telemetry
+            # path. Metrics/graph steps emit best-effort payloads and still POST.
+            echo "::warning::Verus ${VERUS_TAG} download failed; emitting best-effort telemetry"
+            echo "verus_available=false" >> "$GITHUB_OUTPUT"
+            echo "verus_version=unavailable" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Verus over the repo
+        id: run_verus
+        continue-on-error: true
+        run: |
+          set +e
+          ulimit -u 65535 || true
+          mkdir -p .verus-out
+          if [ "${{ steps.verus.outputs.verus_available }}" = "true" ]; then
+            # Prefer structured JSON summary; fall back to human output if the
+            # release does not support the flag. Verus over a Cargo crate:
+            verus --version
+            verus ./src/lib.rs --output-json > .verus-out/verus.out 2> .verus-out/verus.err
+            RC=$?
+            # If --output-json is unsupported, retry without it (human summary).
+            if grep -qi "unexpected argument\|unrecognized" .verus-out/verus.err; then
+              verus ./src/lib.rs > .verus-out/verus.out 2>> .verus-out/verus.err
+              RC=$?
+            fi
+            echo "verus exit code: $RC"
+            echo "verus_ran=true" >> "$GITHUB_OUTPUT"
+          else
+            : > .verus-out/verus.out
+            echo "verus_ran=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Never fail this step: telemetry must always POST.
+          exit 0
+
+      - name: Resolve branch / commit / parents
+        id: gitmeta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH="${{ github.head_ref }}"
+            SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BRANCH="${GITHUB_REF_NAME}"
+            SHA="${GITHUB_SHA}"
+          fi
+          # parent_shas from git ancestry (first line: <commit> <parent...>).
+          PARENTS="$(git rev-list --parents -n 1 "$SHA" 2>/dev/null | cut -d' ' -f2- || true)"
+          PARENT_JSON="$(python3 - "$PARENTS" <<'PY'
+          import json, sys
+          parts = sys.argv[1].split() if len(sys.argv) > 1 else []
+          print(json.dumps(parts))
+          PY
+          )"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "parent_shas=${PARENT_JSON}" >> "$GITHUB_OUTPUT"
+          echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH sha=$SHA parents=$PARENT_JSON"
+
+      - name: Extract metrics
+        id: metrics
+        run: |
+          python3 scripts/verus/extract_metrics.py \
+            --repo-root . \
+            --verus-output .verus-out/verus.out \
+            --verus-ran "${{ steps.run_verus.outputs.verus_ran }}" \
+            --output .verus-out/metrics.json
+          cat .verus-out/metrics.json
+
+      - name: Build verification payload and POST
+        env:
+          VERUS_INGEST_TOKEN: ${{ secrets.VERUS_INGEST_TOKEN }}
+        run: |
+          python3 - <<'PY' > .verus-out/verification.json
+          import json
+          with open(".verus-out/metrics.json") as f:
+              metrics = json.load(f)
+          payload = {
+              "branch": """${{ steps.gitmeta.outputs.branch }}""",
+              "commit_sha": """${{ steps.gitmeta.outputs.commit_sha }}""",
+              "parent_shas": json.loads('''${{ steps.gitmeta.outputs.parent_shas }}'''),
+              "ts": """${{ steps.gitmeta.outputs.ts }}""",
+              "verus_version": """${{ steps.verus.outputs.verus_version }}""",
+              "mcp_version": """${{ env.MCP_VERSION }}""",
+              "rust_toolchain": """${{ env.RUST_TOOLCHAIN }}""",
+              "metrics": metrics,
+          }
+          print(json.dumps(payload, indent=2))
+          PY
+          cat .verus-out/verification.json
+          # POST; never hard-fail the workflow on a telemetry hiccup.
+          if [ -z "${VERUS_INGEST_TOKEN:-}" ]; then
+            echo "::warning::VERUS_INGEST_TOKEN unset; skipping verification POST"
+          else
+            curl -fsS -X POST "${INGEST_BASE}/verification" \
+              -H "Authorization: Bearer ${VERUS_INGEST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data @.verus-out/verification.json \
+              || echo "::warning::verification POST failed (non-fatal)"
+          fi
+
+      - name: Extract blueprint graph
+        run: |
+          # Pass --verus-graph only if a real dependency graph was produced;
+          # otherwise the script uses its documented static fallback.
+          GRAPH_ARG=""
+          if [ -s .verus-out/verus-graph.json ]; then
+            GRAPH_ARG="--verus-graph .verus-out/verus-graph.json"
+          fi
+          VERUS_BRANCH="${{ steps.gitmeta.outputs.branch }}" \
+          VERUS_COMMIT_SHA="${{ steps.gitmeta.outputs.commit_sha }}" \
+          python3 scripts/verus/extract_graph.py \
+            --repo-root . $GRAPH_ARG \
+            --output .verus-out/graph.json
+          python3 -c "import json;g=json.load(open('.verus-out/graph.json'));print('nodes',len(g['nodes']),'edges',len(g['edges']))"
+
+      - name: POST blueprint graph
+        env:
+          VERUS_INGEST_TOKEN: ${{ secrets.VERUS_INGEST_TOKEN }}
+        run: |
+          if [ -z "${VERUS_INGEST_TOKEN:-}" ]; then
+            echo "::warning::VERUS_INGEST_TOKEN unset; skipping graph POST"
+          else
+            curl -fsS -X POST "${INGEST_BASE}/graph" \
+              -H "Authorization: Bearer ${VERUS_INGEST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data @.verus-out/graph.json \
+              || echo "::warning::graph POST failed (non-fatal)"
+          fi
+
+      - name: Run extraction self-tests
+        run: python3 scripts/verus/test_extract.py

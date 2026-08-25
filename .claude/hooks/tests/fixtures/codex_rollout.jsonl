@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-08-25T11:00:00Z","payload":{"id":"codex-sess-1","cli_version":"0.9.0","cwd":"/repo","git":{"branch":"main"}}}
+{"type":"turn_context","timestamp":"2026-08-25T11:00:00Z","payload":{"cwd":"/repo","model":"o4"}}
+{"type":"event_msg","timestamp":"2026-08-25T11:00:01Z","payload":{"type":"user_message","message":"Verify storage with Verus."}}
+{"type":"response_item","timestamp":"2026-08-25T11:00:05Z","payload":{"type":"function_call","name":"verus__verify","arguments":"{\"path\":\"src/storage.rs\"}","call_id":"fc_1"}}
+{"type":"response_item","timestamp":"2026-08-25T11:00:10Z","payload":{"type":"function_call_output","call_id":"fc_1","output":"{\"success\":true,\"summary\":{\"verified\":3,\"errors\":0}}"}}
+{"type":"event_msg","timestamp":"2026-08-25T11:00:11Z","payload":{"type":"agent_message","message":"All three functions verify."}}
+{"type":"event_msg","timestamp":"2026-08-25T11:00:12Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3200,"output_tokens":140,"cached_input_tokens":800}}}}

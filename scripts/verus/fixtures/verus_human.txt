@@ -1,0 +1,11 @@
+Verifying root module
+Verifying module math
+note: verifying 15 functions across 3 files
+
+error: assertion failed
+  --> src/broken.rs:8:5
+   |
+ 8 |     assert(x > 0);
+   |     ^^^^^^^^^^^^^^ assertion failed
+
+verification results:: 12 verified, 3 errors

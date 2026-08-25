@@ -1,0 +1,13 @@
+{
+  "verification-results": {
+    "encountered-vir-error": false,
+    "success": false,
+    "verified": 12,
+    "errors": 3,
+    "files": [
+      { "path": "src/lib.rs", "errors": 0 },
+      { "path": "src/math.rs", "errors": 0 },
+      { "path": "src/broken.rs", "errors": 3 }
+    ]
+  }
+}
