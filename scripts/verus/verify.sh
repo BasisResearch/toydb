@@ -41,5 +41,7 @@ done
 
 echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}"
 # `--lib` scopes to the library target; the four binaries carry no verified
-# modules and would otherwise fail `--verify-module`. Extra args pass through.
-exec cargo verus focus --lib "$@" -- "${module_args[@]}"
+# modules and would otherwise fail `--verify-module`. Pass-through args ("$@",
+# e.g. --output-json) go AFTER `--` so they reach Verus, not `cargo check`
+# (which rejects unknown flags).
+exec cargo verus focus --lib -- "${module_args[@]}" "$@"

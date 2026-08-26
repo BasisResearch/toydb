@@ -30,7 +30,7 @@ import extract_graph  # noqa: E402
 import extract_metrics  # noqa: E402
 
 METRIC_KEYS = {
-    "functions_verified", "functions_with_errors",
+    "functions_verified", "functions_with_errors", "functions_total",
     "files_clean", "files_total",
     "lines_verified", "lines_total",
 }
@@ -89,6 +89,56 @@ class MetricsTest(unittest.TestCase):
         crate = os.path.join(FIXTURES, "sample_crate")
         m = extract_metrics.build_metrics(crate, "", verus_ran=False)
         self.assertEqual(m["files_total"], 2)  # lib.rs, math.rs
+
+    def test_functions_total_counted(self) -> None:
+        # The coverage denominator counts fn definitions across the crate.
+        crate = os.path.join(FIXTURES, "sample_crate")
+        m = extract_metrics.build_metrics(crate, "", verus_ran=False)
+        self.assertGreater(m["functions_total"], 0)
+
+    def test_crate_local_function_counts_exclude_vstd(self) -> None:
+        # func-details with a vstd axiom must not inflate the numerator.
+        out = json.dumps(
+            {
+                "verification-results": {"verified": 3, "errors": 0},
+                "func-details": {
+                    "toydb::m::a": {"failed_proof_notes": []},
+                    "toydb::m::b": {"failed_proof_notes": []},
+                    "vstd::function::axiom": {"failed_proof_notes": []},
+                },
+            }
+        )
+        m = extract_metrics.build_metrics(
+            os.path.join(FIXTURES, "sample_crate"), out, verus_ran=True
+        )
+        self.assertEqual(m["functions_verified"], 2)  # vstd axiom excluded
+        self.assertEqual(m["functions_with_errors"], 0)
+
+    def test_line_coverage_from_verus_blocks(self) -> None:
+        # A verus! block's lines count as verified; surrounding code does not.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src")
+            os.makedirs(src)
+            with open(os.path.join(src, "lib.rs"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    "fn plain() {}\n"
+                    "verus! {\n"
+                    "proof fn p() {}\n"
+                    "} // verus!\n"
+                    "fn other() {}\n"
+                )
+            out = json.dumps(
+                {
+                    "verification-results": {"verified": 1, "errors": 0},
+                    "func-details": {"crate::p": {"failed_proof_notes": []}},
+                }
+            )
+            m = extract_metrics.build_metrics(d, out, verus_ran=True)
+            self.assertEqual(m["lines_verified"], 3)  # the 3 verus! block lines
+            self.assertEqual(m["files_clean"], 1)
+            self.assertGreater(m["lines_total"], m["lines_verified"])
 
 
 class GraphStructureMixin:
