@@ -26,7 +26,7 @@ env:
   # MCP server semver (verus-tools-mcp); recorded on every datapoint. No MCP is
   # invoked in CI, so this is the pinned contract value until wired.
   MCP_VERSION: "0.1.0"
-  INGEST_BASE: "https://dashboard.kirancodes.me/verus/ingest"
+  INGEST_BASE: "https://verus.kirancodes.me/verus/ingest"
 
 jobs:
   verus-verify:
