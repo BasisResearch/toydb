@@ -99,16 +99,16 @@ jobs:
           ulimit -u 65535 || true
           mkdir -p .verus-out
           if [ "${{ steps.verus.outputs.verus_available }}" = "true" ]; then
-            # Prefer structured JSON summary; fall back to human output if the
-            # release does not support the flag. Verus over a Cargo crate:
-            verus --version
-            verus ./src/lib.rs --output-json > .verus-out/verus.out 2> .verus-out/verus.err
+            # Verus verifies a Cargo crate through cargo-verus, which supplies the
+            # dependency graph. A bare `verus ./src/lib.rs` cannot resolve extern
+            # crates (serde, etc.) and so verifies nothing. verify.sh runs
+            # `cargo verus focus --lib` over the opted-in modules and is the same
+            # script the verus-gate job uses (single source of truth for what is
+            # verified). cargo-verus ships alongside verus on $GITHUB_PATH.
+            command -v cargo-verus || echo "warning: cargo-verus not on PATH"
+            bash scripts/verus/verify.sh --output-json \
+              > .verus-out/verus.out 2> .verus-out/verus.err
             RC=$?
-            # If --output-json is unsupported, retry without it (human summary).
-            if grep -qi "unexpected argument\|unrecognized" .verus-out/verus.err; then
-              verus ./src/lib.rs > .verus-out/verus.out 2>> .verus-out/verus.err
-              RC=$?
-            fi
             echo "verus exit code: $RC"
             echo "verus_ran=true" >> "$GITHUB_OUTPUT"
           else

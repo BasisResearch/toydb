@@ -87,6 +87,79 @@ def count_lines(root: str, rel_paths: List[str]) -> Dict[str, int]:
     return counts
 
 
+# `fn name` definitions, for the function-coverage denominator.
+_FN_RE = re.compile(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*")
+
+
+def count_functions(root: str, rel_paths: List[str]) -> int:
+    """Total function definitions across the walked sources (coverage total)."""
+    total = 0
+    for rel in rel_paths:
+        try:
+            with open(os.path.join(root, rel), "r", encoding="utf-8", errors="replace") as fh:
+                total += len(_FN_RE.findall(fh.read()))
+        except OSError:
+            continue
+    return total
+
+
+def scan_verus_blocks(root: str, rel_paths: List[str]) -> Tuple[int, int]:
+    """Return (files_with_verus_blocks, total_lines_inside_verus_blocks).
+
+    A ``verus! { ... } // verus!`` block is the only *verified* code in toyDB
+    (everything outside is external-by-default). Counting those blocks — rather
+    than whole files — is what keeps line/file coverage honest: keycode.rs is a
+    ~800-line file with a ~40-line proof block, so only ~40 lines are verified.
+    """
+    files = 0
+    lines = 0
+    for rel in rel_paths:
+        try:
+            with open(os.path.join(root, rel), "r", encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        in_block = False
+        block_lines = 0
+        seen = False
+        for ln in src.splitlines():
+            if not in_block and "verus!" in ln and "{" in ln:
+                in_block = True
+                seen = True
+            if in_block:
+                block_lines += 1
+            if in_block and "} // verus!" in ln:
+                in_block = False
+        if seen:
+            files += 1
+            lines += block_lines
+    return files, lines
+
+
+def _crate_function_counts(summary: Dict[str, Any]) -> Tuple[int, int]:
+    """(verified, errors) for CRATE-authored functions.
+
+    Prefers per-function detail so Verus's own vstd/builtin proof obligations
+    are excluded from the numerator; falls back to the raw verified/errors
+    counts when the release gives no per-function breakdown.
+    """
+    fd = summary.get("func_details")
+    if isinstance(fd, dict) and fd:
+        internal = ("vstd::", "builtin::", "core::", "alloc::", "std::")
+        verified = errors = 0
+        for name, det in fd.items():
+            if name.startswith(internal):
+                continue
+            failed = det.get("failed_proof_notes") if isinstance(det, dict) else None
+            if failed:
+                errors += 1
+            else:
+                verified += 1
+        if verified or errors:
+            return verified, errors
+    return int(summary.get("verified") or 0), int(summary.get("errors") or 0)
+
+
 def parse_json_summary(text: str) -> Optional[Dict[str, Any]]:
     """Parse a Verus ``--output-json`` structured summary if present.
 
@@ -150,6 +223,12 @@ def _find_verification_results(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         result["files"] = base["files"]
     if isinstance(base.get("functions"), list):
         result["functions"] = base["functions"]
+    # Per-function detail (top-level sibling of verification-results). Lets us
+    # count crate-authored proven functions, excluding Verus's own vstd/builtin
+    # obligations, for an honest function-coverage numerator.
+    fd = obj.get("func-details")
+    if isinstance(fd, dict):
+        result["func_details"] = fd
     return result
 
 
@@ -170,11 +249,20 @@ def build_metrics(
     verus_output: str,
     verus_ran: bool,
 ) -> Dict[str, int]:
-    """Compute the six-key metrics block, best-effort and never raising."""
+    """Compute the coverage metrics block, best-effort and never raising.
+
+    Coverage is measured against the WHOLE crate, so the dashboard can report
+    what fraction of toyDB is verified:
+      * functions_verified / functions_total  (function coverage)
+      * lines_verified     / lines_total      (line coverage; verus! block lines)
+      * files_clean        / files_total      (file coverage)
+    """
     sources = walk_sources(root)
     line_counts = count_lines(root, sources)
     files_total = len(sources)
     lines_total = sum(line_counts.values())
+    functions_total = count_functions(root, sources)
+    verus_files, verus_lines = scan_verus_blocks(root, sources)
 
     functions_verified = 0
     functions_with_errors = 0
@@ -183,20 +271,21 @@ def build_metrics(
 
     summary = parse_json_summary(verus_output) if verus_output else None
     if summary is not None:
-        functions_verified = summary["verified"]
-        functions_with_errors = summary["errors"]
+        functions_verified, functions_with_errors = _crate_function_counts(summary)
         log(
             "parsed structured JSON summary: "
-            f"{functions_verified} verified, {functions_with_errors} errors"
+            f"{functions_verified} crate functions verified, "
+            f"{functions_with_errors} errors"
         )
         files = summary.get("files")
         if isinstance(files, list) and files:
+            # Release provided per-file outcomes: trust them directly.
             files_clean, lines_verified = _rollup_from_files(
                 files, root, line_counts
             )
         else:
-            files_clean, lines_verified = _rollup_whole_repo(
-                functions_verified, functions_with_errors, files_total, lines_total
+            files_clean, lines_verified = _verus_block_coverage(
+                verus_files, verus_lines, functions_verified, functions_with_errors
             )
     else:
         human = parse_human_summary(verus_output) if verus_output else None
@@ -206,8 +295,8 @@ def build_metrics(
                 "parsed human summary line: "
                 f"{functions_verified} verified, {functions_with_errors} errors"
             )
-            files_clean, lines_verified = _rollup_whole_repo(
-                functions_verified, functions_with_errors, files_total, lines_total
+            files_clean, lines_verified = _verus_block_coverage(
+                verus_files, verus_lines, functions_verified, functions_with_errors
             )
         elif verus_ran:
             log(
@@ -223,11 +312,27 @@ def build_metrics(
     return {
         "functions_verified": int(functions_verified),
         "functions_with_errors": int(functions_with_errors),
+        "functions_total": int(functions_total),
         "files_clean": int(files_clean),
         "files_total": int(files_total),
         "lines_verified": int(lines_verified),
         "lines_total": int(lines_total),
     }
+
+
+def _verus_block_coverage(
+    verus_files: int,
+    verus_lines: int,
+    functions_verified: int,
+    functions_with_errors: int,
+) -> Tuple[int, int]:
+    """Honest file/line coverage from the opted-in verus! blocks.
+
+    Attributes coverage to the verified proof blocks, NEVER the whole repo. A
+    file/line only counts once something actually verified with no errors."""
+    if functions_verified > 0 and functions_with_errors == 0:
+        return verus_files, verus_lines
+    return 0, 0
 
 
 def _rollup_from_files(
