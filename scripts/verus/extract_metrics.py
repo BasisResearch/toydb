@@ -169,31 +169,38 @@ def parse_json_summary(text: str) -> Optional[Dict[str, Any]]:
     ``verified``, ``errors`` and optional ``files`` / ``functions`` lists, or
     None if nothing parseable was found.
     """
-    # Verus prints the JSON as a single object; other lines may be human text.
-    # Try whole-text parse first, then scan for JSON object lines.
-    candidates: List[Any] = []
-    stripped = text.strip()
-    if stripped:
-        try:
-            candidates.append(json.loads(stripped))
-        except json.JSONDecodeError:
-            pass
-    if not candidates:
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    candidates.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-    for obj in candidates:
+    # The --output-json object may be preceded or followed by non-JSON lines (a
+    # "verifying N modules" banner from verify.sh, cargo chatter) and is
+    # pretty-printed across many lines. Scan for every balanced {...} object and
+    # use the first that carries verified/errors counts.
+    for obj in _iter_json_objects(text):
         if not isinstance(obj, dict):
             continue
         vr = _find_verification_results(obj)
         if vr is not None:
             return vr
     return None
+
+
+def _iter_json_objects(text: str):
+    """Yield every top-level JSON object embedded in ``text``.
+
+    Robust to surrounding non-JSON noise and to multi-line pretty-printed
+    objects: ``raw_decode`` from each ``{`` so a leading banner line or trailing
+    cargo output cannot defeat parsing (the failure mode that made every CI
+    datapoint read 0 despite Verus verifying cleanly)."""
+    dec = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "{":
+            try:
+                obj, end = dec.raw_decode(text, i)
+                yield obj
+                i = max(end, i + 1)
+                continue
+            except json.JSONDecodeError:
+                pass
+        i += 1
 
 
 def _find_verification_results(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
