@@ -102,6 +102,74 @@ pub fn decode_i64_key(k: u64) -> (r: i64)
     (k ^ (1u64 << 63)) as i64
 }
 
+// --- Verus-verified core of the f64 key encoding ---------------------------
+//
+// An f64 is stored as its big-endian IEEE-754 bytes, transformed so unsigned
+// lexicographic byte order matches float order: a positive float (sign bit
+// clear) gets its sign bit set, and a negative float (sign bit set) gets all
+// bits flipped (see `serialize_f64` below). On the u64 `to_bits` view that is
+// `bits ^ (1 << 63)` for positives and `!bits` for negatives. Unlike i64 this
+// transform branches on the sign, so encode and decode invert each other via a
+// two-case bit-vector argument (`f64_key_roundtrip`).
+//
+// We verify the round trip (no bit pattern — NaN payloads included — is lost),
+// which is what `serialize_f64` / `deserialize_f64` rely on for correctness.
+// Order preservation is deliberately out of scope here: it is a property of
+// IEEE-754 float ordering, which Verus does not model, so it cannot be stated
+// as an honest `f64 <= f64` spec.
+
+/// The order-preserving u64 key for an f64's raw IEEE-754 bits: a positive
+/// float (sign bit clear) gets its sign bit set; a negative float (sign bit
+/// set) gets all bits flipped.
+pub open spec fn f64_key(bits: u64) -> u64 {
+    if bits & (1u64 << 63) == 0 {
+        bits ^ (1u64 << 63)
+    } else {
+        !bits
+    }
+}
+
+/// The inverse transform: if the key's top bit is set the input was positive
+/// (undo the sign-bit flip), otherwise it was negative (undo the full flip).
+pub open spec fn f64_unkey(key: u64) -> u64 {
+    if key & (1u64 << 63) != 0 {
+        key ^ (1u64 << 63)
+    } else {
+        !key
+    }
+}
+
+/// The encoding is reversible on every bit pattern, so a serialize/deserialize
+/// round trip preserves the exact f64 (including NaN payloads).
+pub proof fn f64_key_roundtrip(bits: u64)
+    ensures f64_unkey(f64_key(bits)) == bits,
+{
+    assert(f64_unkey(f64_key(bits)) == bits) by (bit_vector);
+}
+
+/// Executable encoder, proven to compute `f64_key`.
+pub fn encode_f64_key(bits: u64) -> (r: u64)
+    ensures r == f64_key(bits),
+{
+    if bits & (1u64 << 63) == 0 {
+        bits ^ (1u64 << 63)
+    } else {
+        !bits
+    }
+}
+
+/// Executable decoder, proven to compute `f64_unkey` (the inverse of
+/// `encode_f64_key`, per `f64_key_roundtrip`).
+pub fn decode_f64_key(key: u64) -> (r: u64)
+    ensures r == f64_unkey(key),
+{
+    if key & (1u64 << 63) != 0 {
+        key ^ (1u64 << 63)
+    } else {
+        !key
+    }
+}
+
 } // verus!
 
 /// Serializes a key to a binary Keycode representation.
@@ -223,12 +291,9 @@ impl serde::ser::Serializer for &mut Serializer {
     /// bits for negative numbers to order them from smallest to largest. NaN is
     /// ordered at the end.
     fn serialize_f64(self, v: f64) -> Result<()> {
-        let mut bytes = v.to_be_bytes();
-        match v.is_sign_negative() {
-            false => bytes[0] ^= 1 << 7, // positive, flip sign bit
-            true => bytes.iter_mut().for_each(|b| *b = !*b), // negative, flip all bits
-        }
-        self.output.extend(bytes);
+        // Verified encoder: the sign-dependent bit flip on the IEEE-754 bits,
+        // stored big-endian. `to_bits` gives the same bytes as `to_be_bytes`.
+        self.output.extend(encode_f64_key(v.to_bits()).to_be_bytes());
         Ok(())
     }
 
@@ -487,13 +552,9 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let mut bytes = self.take_bytes(8)?.to_vec();
-        match bytes[0] >> 7 {
-            0 => bytes.iter_mut().for_each(|b| *b = !*b), // negative, flip all bits
-            1 => bytes[0] ^= 1 << 7,                      // positive, flip sign bit
-            _ => panic!("bits can only be 0 or 1"),
-        }
-        visitor.visit_f64(f64::from_be_bytes(bytes.as_slice().try_into()?))
+        // Verified decoder, the inverse of `serialize_f64`.
+        let key = u64::from_be_bytes(self.take_bytes(8)?.try_into()?);
+        visitor.visit_f64(f64::from_bits(decode_f64_key(key)))
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, _: V) -> Result<V::Value> {
