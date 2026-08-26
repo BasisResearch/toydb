@@ -39,7 +39,6 @@
 
 use std::ops::Bound;
 
-use itertools::Either;
 use serde::de::{
     Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer as _, SeqAccess, VariantAccess,
     Visitor,
@@ -167,6 +166,289 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
         key ^ (1u64 << 63)
     } else {
         !key
+    }
+}
+
+// --- Verus-verified core of the bool key encoding --------------------------
+//
+// A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
+// `serialize_bool` / `deserialize_bool`). The round trip is trivial but we
+// state it so the encoder/decoder are pinned to the same byte convention.
+
+/// The single-byte key for a bool: 1 for true, 0 for false.
+pub open spec fn bool_key(b: bool) -> u8 {
+    if b { 1u8 } else { 0u8 }
+}
+
+/// Executable encoder, proven to compute `bool_key`.
+pub fn encode_bool_key(b: bool) -> (r: u8)
+    ensures r == bool_key(b),
+{
+    if b { 1u8 } else { 0u8 }
+}
+
+/// Executable decoder, proven to invert the encoding for the two valid bytes.
+pub fn decode_bool_key(byte: u8) -> (r: bool)
+    requires byte == 0u8 || byte == 1u8,
+    ensures bool_key(r) == byte,
+{
+    byte == 1u8
+}
+
+// --- Verus-verified core of the byte-string key encoding -------------------
+//
+// A byte slice is encoded by escaping each 0x00 as the pair `0x00 0xff` and
+// appending a `0x00 0x00` terminator (see `serialize_bytes` /
+// `decode_next_bytes` below). This makes the encoding self-terminating and,
+// because the terminator `0x00 0x00` is <= any escaped continuation, order-
+// preserving so that a prefix orders before a longer string.
+//
+// `bytes_enc` is the mathematical encoding; `bytes_dec` is its parser, returning
+// the decoded content together with the bytes that follow the terminator.
+// `bytes_roundtrip` proves they are inverse on every input, which is exactly the
+// property keycode relies on to deserialize a key unambiguously.
+
+/// The escaped bytes of `v` *without* the terminator: each `0x00` becomes the
+/// pair `0x00 0xff`, every other byte is copied verbatim.
+pub open spec fn esc_all(v: Seq<u8>) -> Seq<u8>
+    decreases v.len(),
+{
+    if v.len() == 0 {
+        Seq::empty()
+    } else {
+        let esc = if v[0] == 0u8 { seq![0u8, 255u8] } else { seq![v[0]] };
+        esc + esc_all(v.subrange(1, v.len() as int))
+    }
+}
+
+/// The full escaped encoding of a byte string: escaped body then the
+/// `0x00 0x00` terminator.
+pub open spec fn bytes_enc(v: Seq<u8>) -> Seq<u8> {
+    esc_all(v) + seq![0u8, 0u8]
+}
+
+/// The parser: given an encoded stream, returns the decoded byte string and the
+/// bytes remaining after the terminator. On malformed input it returns empty
+/// sequences (never reached for `bytes_enc` output, per `bytes_roundtrip`).
+pub open spec fn bytes_dec(s: Seq<u8>) -> (Seq<u8>, Seq<u8>)
+    decreases s.len(),
+{
+    if s.len() < 2 {
+        (Seq::<u8>::empty(), Seq::<u8>::empty())
+    } else if s[0] == 0u8 {
+        if s[1] == 0u8 {
+            // terminator
+            (Seq::<u8>::empty(), s.subrange(2, s.len() as int))
+        } else if s[1] == 255u8 {
+            // escaped 0x00
+            let rest = bytes_dec(s.subrange(2, s.len() as int));
+            (seq![0u8] + rest.0, rest.1)
+        } else {
+            (Seq::<u8>::empty(), Seq::<u8>::empty())
+        }
+    } else {
+        // literal byte
+        let rest = bytes_dec(s.subrange(1, s.len() as int));
+        (seq![s[0]] + rest.0, rest.1)
+    }
+}
+
+/// Encoding then parsing recovers the original byte string and leaves any
+/// trailing bytes untouched: `bytes_dec(bytes_enc(v) + suffix) == (v, suffix)`.
+/// Taking `suffix == []` gives the plain round trip `bytes_dec(bytes_enc(v)).0
+/// == v`.
+pub proof fn bytes_roundtrip(v: Seq<u8>, suffix: Seq<u8>)
+    ensures bytes_dec(bytes_enc(v) + suffix) == (v, suffix),
+    decreases v.len(),
+{
+    let s = bytes_enc(v) + suffix;
+    if v.len() == 0 {
+        assert(esc_all(v) == Seq::<u8>::empty());
+        assert(bytes_enc(v) =~= seq![0u8, 0u8]);
+        assert(s =~= seq![0u8, 0u8] + suffix);
+        assert(s.len() >= 2);
+        assert(s[0] == 0u8 && s[1] == 0u8);
+        assert(s.subrange(2, s.len() as int) =~= suffix);
+    } else {
+        let tail = v.subrange(1, v.len() as int);
+        bytes_roundtrip(tail, suffix);
+        // enc(v) = esc(v[0]) + esc_all(tail) + [0,0]; regroup so the suffix
+        // rides along with the tail's full encoding.
+        assert(bytes_enc(tail) + suffix =~= esc_all(tail) + seq![0u8, 0u8] + suffix);
+        if v[0] == 0u8 {
+            assert(esc_all(v) =~= seq![0u8, 255u8] + esc_all(tail));
+            assert(s =~= seq![0u8, 255u8] + (bytes_enc(tail) + suffix));
+            assert(s.len() >= 2);
+            assert(s[0] == 0u8 && s[1] == 255u8);
+            assert(s.subrange(2, s.len() as int) =~= bytes_enc(tail) + suffix);
+            assert(v =~= seq![0u8] + tail);
+        } else {
+            assert(esc_all(v) =~= seq![v[0]] + esc_all(tail));
+            assert(s =~= seq![v[0]] + (bytes_enc(tail) + suffix));
+            assert(s.len() >= 2);
+            assert(s[0] == v[0] && s[0] != 0u8);
+            assert(s.subrange(1, s.len() as int) =~= bytes_enc(tail) + suffix);
+            assert(v =~= seq![v[0]] + tail);
+        }
+    }
+}
+
+/// `esc_all` is a homomorphism from concatenation to concatenation: escaping a
+/// concatenation is the concatenation of the escapes. This is what lets the
+/// executable encoder build the result one byte at a time.
+pub proof fn esc_all_concat(a: Seq<u8>, b: Seq<u8>)
+    ensures esc_all(a + b) == esc_all(a) + esc_all(b),
+    decreases a.len(),
+{
+    if a.len() == 0 {
+        assert(a + b =~= b);
+        assert(esc_all(a) =~= Seq::<u8>::empty());
+    } else {
+        let a0 = a.subrange(1, a.len() as int);
+        esc_all_concat(a0, b);
+        assert((a + b).len() > 0);
+        assert((a + b)[0] == a[0]);
+        assert((a + b).subrange(1, (a + b).len() as int) =~= a0 + b);
+    }
+}
+
+/// The escape of a single byte, matching `esc_all` on a one-element sequence.
+pub proof fn esc_all_single(b: u8)
+    ensures
+        esc_all(seq![b]) == (if b == 0u8 { seq![0u8, 255u8] } else { seq![b] }),
+{
+    assert(seq![b].subrange(1, 1) =~= Seq::<u8>::empty());
+    assert(esc_all(Seq::<u8>::empty()) =~= Seq::<u8>::empty());
+}
+
+/// Executable encoder, proven to compute `bytes_enc(v)`: escape each `0x00` as
+/// `0x00 0xff` and append the `0x00 0x00` terminator. This is the verified core
+/// that `serialize_bytes` calls.
+pub fn encode_bytes(v: &[u8]) -> (r: Vec<u8>)
+    ensures r@ == bytes_enc(v@),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < v.len()
+        invariant
+            0 <= i <= v.len(),
+            out@ == esc_all(v@.subrange(0, i as int)),
+        decreases v.len() - i,
+    {
+        let b = v[i];
+        proof {
+            esc_all_concat(v@.subrange(0, i as int), seq![b]);
+            esc_all_single(b);
+            assert(v@.subrange(0, i as int + 1) =~= v@.subrange(0, i as int) + seq![b]);
+        }
+        if b == 0u8 {
+            out.push(0u8);
+            out.push(255u8);
+        } else {
+            out.push(b);
+        }
+        i = i + 1;
+    }
+    proof {
+        assert(v@.subrange(0, v.len() as int) =~= v@);
+    }
+    out.push(0u8);
+    out.push(0u8);
+    assert(out@ =~= esc_all(v@) + seq![0u8, 0u8]);
+    out
+}
+
+/// The outcome of `decode_bytes`: either the decoded byte string with the
+/// number of input bytes consumed, or one of the two malformed-input cases,
+/// mirroring the diagnostics `decode_next_bytes` reports.
+pub enum DecodeBytes {
+    /// `Decoded(bytes, taken)`: the parsed content and the number of input
+    /// bytes consumed (up to and including the `0x00 0x00` terminator).
+    Decoded(Vec<u8>, usize),
+    /// A `0x00` was not followed by `0x00` (terminator) or `0xff` (escape).
+    InvalidEscape,
+    /// The input ran out at an element boundary with no terminator.
+    UnexpectedEnd,
+}
+
+/// Executable decoder, proven to compute `bytes_dec(s)` on success: it returns
+/// `Decoded(decoded, taken)` where `decoded` is the parsed byte string and
+/// `taken` is the number of input bytes consumed (up to and including the
+/// terminator). Malformed input yields `InvalidEscape` or `UnexpectedEnd`,
+/// matching the two cases `decode_next_bytes` distinguishes. This is the
+/// verified core that `decode_next_bytes` calls.
+pub fn decode_bytes(s: &[u8]) -> (r: DecodeBytes)
+    ensures
+        match r {
+            DecodeBytes::Decoded(d, n) => {
+                &&& n <= s@.len()
+                &&& d@ == bytes_dec(s@).0
+                &&& n as int == s@.len() - bytes_dec(s@).1.len()
+                &&& s@.subrange(n as int, s@.len() as int) == bytes_dec(s@).1
+            }
+            _ => true,
+        },
+{
+    let ghost full = s@;
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut pos: usize = 0;
+    assert(full.subrange(0, full.len() as int) =~= full);
+    assert(decoded@ + bytes_dec(full).0 =~= bytes_dec(full).0);
+    loop
+        invariant
+            pos <= s@.len(),
+            s@ == full,
+            bytes_dec(full).0 == decoded@ + bytes_dec(
+                full.subrange(pos as int, full.len() as int),
+            ).0,
+            bytes_dec(full).1 == bytes_dec(full.subrange(pos as int, full.len() as int)).1,
+        decreases s@.len() - pos,
+    {
+        let ghost suf = full.subrange(pos as int, full.len() as int);
+        if s.len() - pos < 2 {
+            // Fewer than two bytes remain: no room for a terminator. A lone
+            // trailing 0x00 is a truncated escape; anything else is a missing
+            // terminator (matching decode_next_bytes' two error paths).
+            if pos < s.len() && s[pos] == 0 {
+                return DecodeBytes::InvalidEscape;
+            } else {
+                return DecodeBytes::UnexpectedEnd;
+            }
+        }
+        let b0 = s[pos];
+        let b1 = s[pos + 1];
+        assert(suf.len() >= 2);
+        assert(suf[0] == b0 && suf[1] == b1);
+        if b0 == 0 {
+            if b1 == 0 {
+                // Terminator: the decoded bytes so far are the full result.
+                assert(bytes_dec(suf).0 =~= Seq::<u8>::empty());
+                assert(bytes_dec(suf).1 =~= full.subrange(pos as int + 2, full.len() as int));
+                assert(decoded@ =~= bytes_dec(full).0);
+                return DecodeBytes::Decoded(decoded, pos + 2);
+            } else if b1 == 255 {
+                // Escaped 0x00.
+                let ghost suf2 = full.subrange(pos as int + 2, full.len() as int);
+                assert(suf.subrange(2, suf.len() as int) =~= suf2);
+                assert(bytes_dec(suf).0 =~= seq![0u8] + bytes_dec(suf2).0);
+                assert(bytes_dec(suf).1 == bytes_dec(suf2).1);
+                decoded.push(0);
+                pos = pos + 2;
+                assert(decoded@ + bytes_dec(suf2).0 =~= bytes_dec(full).0);
+            } else {
+                // Invalid escape sequence.
+                return DecodeBytes::InvalidEscape;
+            }
+        } else {
+            // Literal byte.
+            let ghost suf1 = full.subrange(pos as int + 1, full.len() as int);
+            assert(suf.subrange(1, suf.len() as int) =~= suf1);
+            assert(bytes_dec(suf).0 =~= seq![b0] + bytes_dec(suf1).0);
+            assert(bytes_dec(suf).1 == bytes_dec(suf1).1);
+            decoded.push(b0);
+            pos = pos + 1;
+            assert(decoded@ + bytes_dec(suf1).0 =~= bytes_dec(full).0);
+        }
     }
 }
 
@@ -312,14 +594,10 @@ impl serde::ser::Serializer for &mut Serializer {
     //
     // We can't use e.g. length prefix encoding, since it doesn't sort correctly.
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        let bytes = v
-            .iter()
-            .flat_map(|&byte| match byte {
-                0x00 => Either::Left([0x00, 0xff].into_iter()),
-                byte => Either::Right([byte].into_iter()),
-            })
-            .chain([0x00, 0x00]);
-        self.output.extend(bytes);
+        // `encode_bytes` is the Verus-verified core, proven to compute
+        // `bytes_enc` (escape each 0x00 as 0x00ff, append the 0x0000
+        // terminator). See the `verus!` block above.
+        self.output.extend(encode_bytes(v));
         Ok(())
     }
 
@@ -478,22 +756,20 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Decodes and chops off the next encoded byte slice.
+    ///
+    /// The parse itself is delegated to `decode_bytes`, the Verus-verified core
+    /// proven to compute `bytes_dec` (see the `verus!` block above); this
+    /// wrapper just advances `self.input` and maps the two malformed-input
+    /// cases to the diagnostics this function has always reported.
     fn decode_next_bytes(&mut self) -> Result<Vec<u8>> {
-        let mut decoded = Vec::new();
-        let mut iter = self.input.iter().enumerate();
-        let taken = loop {
-            match iter.next() {
-                Some((_, 0x00)) => match iter.next() {
-                    Some((i, 0x00)) => break i + 1,        // terminator
-                    Some((_, 0xff)) => decoded.push(0x00), // escaped 0x00
-                    _ => return errdata!("invalid escape sequence"),
-                },
-                Some((_, b)) => decoded.push(*b),
-                None => return errdata!("unexpected end of input"),
+        match decode_bytes(self.input) {
+            DecodeBytes::Decoded(decoded, taken) => {
+                self.input = &self.input[taken..];
+                Ok(decoded)
             }
-        };
-        self.input = &self.input[taken..];
-        Ok(decoded)
+            DecodeBytes::InvalidEscape => errdata!("invalid escape sequence"),
+            DecodeBytes::UnexpectedEnd => errdata!("unexpected end of input"),
+        }
     }
 }
 
