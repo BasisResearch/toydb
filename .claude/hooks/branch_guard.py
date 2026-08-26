@@ -10,6 +10,9 @@
 #      branch name once its PR merges, so names must never collide between
 #      collaborators.
 #   2. `main` is never committed to or pushed directly; changes land via PRs.
+#   3. `gh pr create` always carries `--repo <BASE_REPO>`: this clone is a fork,
+#      so without it gh targets the *upstream* repo and the PR fails with a
+#      "no commits between" / "Head sha can't be blank" error.
 #
 # Entry points (one script, four modes):
 #
@@ -44,12 +47,40 @@ import sys
 BRANCH_RE = re.compile(r"^[a-z]{2,3}/[A-Za-z0-9._/-]+$")
 OPERATORS = {"&&", "||", ";", "|", "&"}
 PROTECTED = ("main", "master")
+# This clone is a fork; `gh pr create` must target this repo explicitly or gh
+# defaults the base to the upstream and the PR fails.
+BASE_REPO = "BasisResearch/toydb"
 
 POLICY = (
     "Branch policy: name branches '<initials>/<topic>' (2-3 lowercase letters "
     "+ '/', e.g. yl/fix-stop-hook) so collaborators' branches never collide, "
     "and never commit to or push main directly - open a PR instead."
 )
+
+
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredocs(command):
+    """Drop heredoc *bodies* before tokenizing. A `gh pr create ... --body
+    "$(cat <<'EOF' ... EOF)"` carries example commands (`gh pr create`, `git
+    push origin main`) in its body; those are data, not commands to run, and
+    must not trip the guard. Keep each opening line (the real command lives
+    there) and the delimiter, drop everything in between."""
+    lines = command.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        delims = [m.group(2) for m in HEREDOC_RE.finditer(line)]
+        i += 1
+        for delim in delims:
+            while i < len(lines) and lines[i].strip() != delim:
+                i += 1
+            if i < len(lines):
+                i += 1  # skip the closing delimiter line itself
+    return "\n".join(out)
 
 
 def _tokens(line):
@@ -63,19 +94,38 @@ def _tokens(line):
         return line.split()
 
 
+def _is_redirect(tok):
+    """A redirection operator token: `>`, `>>`, `<`, `>&`, `&>`, ... (made of
+    `<>&` and containing an angle bracket). `&` alone is the background/join
+    operator, not a redirect."""
+    return bool(tok) and all(c in "<>&" for c in tok) and (">" in tok or "<" in tok)
+
+
 def _segments(command):
     """Split a (possibly multi-line) command into simple-command segments:
     per line, then on shell operators. Backslash continuations are joined
-    first so a wrapped command stays one segment."""
+    first so a wrapped command stays one segment. Redirections are dropped, not
+    treated as command boundaries: `git push origin br 2>&1` is one command, so
+    the fd number (`2`) and target (`&1`, `/dev/null`) must not leak in as a
+    bogus positional (which read as a branch named `2`)."""
     for line in command.replace("\\\n", " ").splitlines():
         cur = []
-        for tok in _tokens(line):
-            if tok in OPERATORS or all(c in "|&;()<>" for c in tok):
+        toks = _tokens(line)
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            if _is_redirect(tok):
+                if cur and cur[-1].isdigit():
+                    cur.pop()  # drop the leading fd, e.g. the 2 in `2>foo`
+                i += 2  # skip the operator and its target token
+                continue
+            if tok in OPERATORS or all(c in "|&;()" for c in tok):
                 if cur:
                     yield cur
                 cur = []
             else:
                 cur.append(tok)
+            i += 1
         if cur:
             yield cur
 
@@ -151,6 +201,19 @@ def _new_branch_from_branch(rest):
     return pos[0]
 
 
+def _gh_pr_create_missing_repo(args):
+    """True if `args` (tokens after `gh`) is a `pr create` that omits `--repo`
+    / `-R`. This clone is a fork, so gh otherwise picks the upstream as the base
+    repo and the PR fails. Only the create subcommand is guarded; `pr view`,
+    `pr list`, etc. are unaffected."""
+    if len(args) < 2 or args[0] != "pr" or args[1] != "create":
+        return False
+    for a in args[2:]:
+        if a in ("-R", "--repo") or a.startswith("--repo="):
+            return False
+    return True
+
+
 def _push_dsts(rest):
     """Destination ref names of a `git push`, resolving `HEAD`/bare pushes to
     the current branch. Deletions are exempt (cleanup of legacy names)."""
@@ -223,8 +286,19 @@ def ensure_hooks_path():
 
 def violations(command):
     probs = []
-    for seg in _segments(command):
-        if not seg or os.path.basename(seg[0]) != "git":
+    for seg in _segments(_strip_heredocs(command)):
+        if not seg:
+            continue
+        prog = os.path.basename(seg[0])
+        if prog == "gh":
+            if _gh_pr_create_missing_repo(seg[1:]):
+                probs.append(
+                    "gh pr create without --repo: this clone is a fork, so gh "
+                    "targets the upstream repo and the PR fails. Re-run with: "
+                    "gh pr create --repo %s --base main" % BASE_REPO
+                )
+            continue
+        if prog != "git":
             continue
         args = _strip_git_globals(seg[1:])
         if not args:

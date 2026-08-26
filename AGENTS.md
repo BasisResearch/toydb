@@ -14,11 +14,23 @@
   `main` view once its PR merges. Colliding or reused branch names would
   attribute one person's sessions to another's work.
 
+## Creating the PR (this repo is a fork)
+
+`BasisResearch/toydb` is a **fork** of upstream toyDB, so `gh pr create`
+defaults its base to the *parent* repo and a bare `gh pr create --base main`
+fails (`No commits between main and <branch>` / `Head sha can't be blank`).
+Always target this repo explicitly:
+
+```
+gh pr create --repo BasisResearch/toydb --base main --title "..." --body "..."
+```
+
 Enforcement (`.claude/hooks/branch_guard.py`, one shared guard):
 
-- **Claude Code**: `PreToolUse` hook on Bash blocks violating git commands.
+- **Claude Code**: `PreToolUse` hook on Bash blocks violating git commands and
+  a `gh pr create` that omits `--repo`.
 - **opencode**: the `verus-telemetry` plugin's `tool.execute.before` handler
-  blocks violating bash commands the same way.
+  blocks the same commands.
 - **Codex / everyone**: committed git hooks (`.githooks/pre-commit`,
   `.githooks/pre-push`) block commits on `main` and pushes of `main` or
   non-prefixed branches. They are activated per clone via
