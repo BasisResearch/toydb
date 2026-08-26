@@ -63,6 +63,30 @@ class MetricsTest(unittest.TestCase):
         # per-file detail: 2 of 3 files clean.
         self.assertEqual(m["files_clean"], 2)
 
+    def test_parses_pretty_json_after_banner(self) -> None:
+        # Regression: verify.sh printed a banner to stdout ahead of the
+        # pretty-printed --output-json object; the old line-based parser saw no
+        # single-line {...} and reported 0 despite Verus verifying cleanly.
+        payload = {
+            "verification-results": {"verified": 3, "errors": 0},
+            "func-details": {
+                "toydb::encoding::keycode::i64_key": {"failed_proof_notes": []},
+                "toydb::encoding::keycode::encode_i64_key": {"failed_proof_notes": []},
+                "toydb::encoding::keycode::decode_i64_key": {"failed_proof_notes": []},
+                "vstd::function::axiom": {"failed_proof_notes": []},
+            },
+        }
+        out = (
+            "verus: verifying 1 module(s): encoding::keycode\n"
+            + json.dumps(payload, indent=2)
+            + "\n"
+        )
+        m = extract_metrics.build_metrics(
+            os.path.join(FIXTURES, "sample_crate"), out, verus_ran=True
+        )
+        self.assertEqual(m["functions_verified"], 3)  # crate-local, vstd excluded
+        self.assertEqual(m["functions_with_errors"], 0)
+
     def test_human_summary(self) -> None:
         out = read(os.path.join(FIXTURES, "verus_human.txt"))
         m = extract_metrics.build_metrics(

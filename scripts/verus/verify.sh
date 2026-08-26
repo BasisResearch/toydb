@@ -39,7 +39,9 @@ for m in "${VERIFY_MODULES[@]}"; do
   module_args+=(--verify-module "$m")
 done
 
-echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}"
+# To stderr: stdout carries the --output-json payload that the telemetry
+# pipeline parses, so it must stay pure JSON.
+echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}" >&2
 # `--lib` scopes to the library target; the four binaries carry no verified
 # modules and would otherwise fail `--verify-module`. Pass-through args ("$@",
 # e.g. --output-json) go AFTER `--` so they reach Verus, not `cargo check`
