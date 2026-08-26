@@ -23,6 +23,7 @@ set -euo pipefail
 # (crate-relative, `::`-separated). Grows one line at a time.
 VERIFY_MODULES=(
   encoding::keycode
+  sql::types::value
 )
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
