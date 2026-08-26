@@ -24,6 +24,15 @@ if os.path.isdir(os.path.join(_PKG, "verus_trace")):
 
 
 def cmd_gate():
+    # Self-provision the branch-discipline git hooks (core.hooksPath ->
+    # .githooks); fail-soft, never blocks the session.
+    try:
+        import branch_guard
+
+        branch_guard.ensure_hooks_path()
+    except Exception:
+        pass
+
     from verus_trace import mcp_probe
 
     res = mcp_probe.probe_version()
