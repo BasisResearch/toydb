@@ -480,6 +480,400 @@ pub fn deserialize<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
     Ok(t)
 }
 
+// --- Verus-verified core of prefix range scans -----------------------------
+//
+// `prefix_range` turns a key prefix into a `[start, end)` byte range such that
+// scanning that range visits exactly the keys that begin with the prefix. This
+// is what makes prefix scans correct — e.g. scanning one SQL table (whose rows
+// share a key prefix) or the tail of the Raft log. The verified core
+// `prefix_end` computes the exclusive upper bound (a `None` result means the
+// scan runs to the end of the keyspace), proven against the lexicographic byte
+// order that the storage engine maintains.
+verus! {
+
+/// Strict lexicographic order on byte strings: compare byte by byte, and a
+/// proper prefix orders before its extensions. This is the order the storage
+/// engine keeps keys in.
+pub open spec fn lex_lt(a: Seq<u8>, b: Seq<u8>) -> bool
+    decreases a.len(),
+{
+    if a.len() == 0 {
+        b.len() > 0
+    } else if b.len() == 0 {
+        false
+    } else if a[0] != b[0] {
+        a[0] < b[0]
+    } else {
+        lex_lt(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int))
+    }
+}
+
+/// Non-strict lexicographic order.
+pub open spec fn lex_le(a: Seq<u8>, b: Seq<u8>) -> bool {
+    a == b || lex_lt(a, b)
+}
+
+/// `p` is a prefix of `k`: `k` starts with all of `p`'s bytes.
+pub open spec fn is_prefix(p: Seq<u8>, k: Seq<u8>) -> bool {
+    p.len() <= k.len() && k.subrange(0, p.len() as int) == p
+}
+
+/// A prefix orders at-or-before any key it prefixes.
+pub proof fn lemma_prefix_implies_le(p: Seq<u8>, k: Seq<u8>)
+    requires is_prefix(p, k),
+    ensures lex_le(p, k),
+    decreases p.len(),
+{
+    if p.len() == 0 {
+        // Empty prefix: p == k (k has length >= 0 and k[0..0] == p == []) or p < k.
+        if k.len() == 0 {
+            assert(p =~= k);
+        } else {
+            assert(lex_lt(p, k));
+        }
+    } else {
+        // p[0] == k[0]; the tails are still in the prefix relation.
+        assert(k[0] == p[0]) by {
+            assert(k.subrange(0, p.len() as int)[0] == p[0]);
+        }
+        assert(k.len() > 0);
+        let p1 = p.subrange(1, p.len() as int);
+        let k1 = k.subrange(1, k.len() as int);
+        assert(is_prefix(p1, k1)) by {
+            assert(k1.subrange(0, p1.len() as int) =~= p1);
+        }
+        lemma_prefix_implies_le(p1, k1);
+        // Fold the tail comparison back up to the full strings.
+        if p == k {
+            assert(lex_le(p, k));
+        } else {
+            // p != k with equal heads forces the tails to differ, so the IH
+            // gives a strict order on the tails, which lifts to p < k.
+            assert(p1 != k1) by {
+                if p1 =~= k1 {
+                    assert(p =~= k);
+                }
+            }
+            assert(lex_lt(p1, k1));
+            assert(lex_lt(p, k));
+        }
+    }
+}
+
+/// Build `lex_lt(a, b)` from a first point of difference: `a` and `b` agree on
+/// `[0, m)` and `a[m] < b[m]`.
+pub proof fn lemma_lex_lt_at(a: Seq<u8>, b: Seq<u8>, m: int)
+    requires
+        0 <= m < a.len(),
+        m < b.len(),
+        forall|j: int| 0 <= j < m ==> a[j] == b[j],
+        a[m] < b[m],
+    ensures
+        lex_lt(a, b),
+    decreases m,
+{
+    if m == 0 {
+        // a[0] != b[0] with a[0] < b[0]: lex_lt reduces to the head comparison.
+    } else {
+        assert(a[0] == b[0]);
+        let a1 = a.subrange(1, a.len() as int);
+        let b1 = b.subrange(1, b.len() as int);
+        assert forall|j: int| 0 <= j < m - 1 implies a1[j] == b1[j] by {
+            assert(a1[j] == a[j + 1]);
+            assert(b1[j] == b[j + 1]);
+        }
+        assert(a1[m - 1] == a[m] && b1[m - 1] == b[m]);
+        lemma_lex_lt_at(a1, b1, m - 1);
+    }
+}
+
+/// From strict order, the heads are ordered `<=`.
+pub proof fn lemma_head_le_from_lt(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_lt(a, b),
+        a.len() > 0,
+        b.len() > 0,
+    ensures
+        a[0] <= b[0],
+{
+}
+
+/// From strict order with equal heads, the tails are strictly ordered.
+pub proof fn lemma_tail_lt_from_lt(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_lt(a, b),
+        a.len() > 0,
+        b.len() > 0,
+        a[0] == b[0],
+    ensures
+        lex_lt(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int)),
+{
+}
+
+/// From non-strict order with equal heads, the tails are non-strictly ordered.
+pub proof fn lemma_le_tail(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_le(a, b),
+        a.len() > 0,
+        b.len() > 0,
+        a[0] == b[0],
+    ensures
+        lex_le(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int)),
+{
+    if a =~= b {
+        assert(a.subrange(1, a.len() as int) =~= b.subrange(1, b.len() as int));
+    } else {
+        lemma_tail_lt_from_lt(a, b);
+    }
+}
+
+/// Lift `is_prefix` over a shared head byte.
+pub proof fn lemma_prefix_lift(p: Seq<u8>, k: Seq<u8>)
+    requires
+        p.len() > 0,
+        k.len() > 0,
+        p[0] == k[0],
+        is_prefix(p.subrange(1, p.len() as int), k.subrange(1, k.len() as int)),
+    ensures
+        is_prefix(p, k),
+{
+    let p1 = p.subrange(1, p.len() as int);
+    let k1 = k.subrange(1, k.len() as int);
+    assert(k1.subrange(0, p1.len() as int) =~= p1);
+    assert(k.subrange(0, p.len() as int) =~= p) by {
+        assert forall|j: int| #![auto] 0 <= j < p.len() implies k.subrange(0, p.len() as int)[j] == p[j] by {
+            if j >= 1 {
+                assert(k1[j - 1] == k[j]);
+                assert(p1[j - 1] == p[j]);
+                assert(k1.subrange(0, p1.len() as int)[j - 1] == p1[j - 1]);
+            }
+        }
+    }
+}
+
+/// When the prefix is all `0xff`, being `>=` the prefix already implies being
+/// prefixed by it: no byte can exceed `0xff`, so a key can only be `>=` an
+/// all-`0xff` prefix by extending it.
+pub proof fn lemma_allff(p: Seq<u8>, k: Seq<u8>)
+    requires
+        forall|j: int| 0 <= j < p.len() ==> p[j] == 255,
+        lex_le(p, k),
+    ensures
+        is_prefix(p, k),
+    decreases p.len(),
+{
+    if p.len() == 0 {
+        assert(k.subrange(0, 0) =~= p);
+    } else if p =~= k {
+        assert(k.subrange(0, p.len() as int) =~= p);
+    } else {
+        assert(lex_lt(p, k));
+        assert(k.len() > 0);
+        lemma_head_le_from_lt(p, k);
+        assert(p[0] == 255);
+        assert(k[0] == 255);
+        let p1 = p.subrange(1, p.len() as int);
+        let k1 = k.subrange(1, k.len() as int);
+        lemma_le_tail(p, k);
+        assert forall|j: int| 0 <= j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_allff(p1, k1);
+        lemma_prefix_lift(p, k);
+    }
+}
+
+/// From non-strict order, the heads are ordered `<=`.
+pub proof fn lemma_head_le_from_le(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_le(a, b),
+        a.len() > 0,
+        b.len() > 0,
+    ensures
+        a[0] <= b[0],
+{
+    if a =~= b {
+    } else {
+        lemma_head_le_from_lt(a, b);
+    }
+}
+
+/// Forward direction of prefix-range correctness: every key prefixed by `p`
+/// lies in `[p, end)`, where `end` is `p` truncated after its last non-`0xff`
+/// byte `i`, with that byte incremented.
+pub proof fn lemma_prefix_end_fwd(p: Seq<u8>, i: int, e: Seq<u8>, k: Seq<u8>)
+    requires
+        0 <= i < p.len(),
+        p[i] != 255,
+        e == p.subrange(0, i) + seq![((p[i] + 1) as u8)],
+        is_prefix(p, k),
+    ensures
+        lex_le(p, k),
+        lex_lt(k, e),
+{
+    lemma_prefix_implies_le(p, k);
+    assert(e.len() == i + 1);
+    assert(i < k.len());
+    assert forall|j: int| 0 <= j < i implies k[j] == e[j] by {
+        assert(k.subrange(0, p.len() as int)[j] == p[j]);
+        assert(e[j] == p[j]);
+    }
+    assert(k[i] == p[i]) by {
+        assert(k.subrange(0, p.len() as int)[i] == p[i]);
+    }
+    assert(e[i] == (p[i] + 1) as u8);
+    assert(k[i] < e[i]);
+    lemma_lex_lt_at(k, e, i);
+}
+
+/// Backward direction of prefix-range correctness: every key in `[p, end)` is
+/// prefixed by `p`. Together with the forward direction this makes the range
+/// exact. Proved by induction on `i`, peeling one shared head byte at a time.
+pub proof fn lemma_prefix_end_bwd(p: Seq<u8>, i: int, e: Seq<u8>, k: Seq<u8>)
+    requires
+        0 <= i < p.len(),
+        p[i] != 255,
+        forall|j: int| i < j < p.len() ==> p[j] == 255,
+        e == p.subrange(0, i) + seq![((p[i] + 1) as u8)],
+        lex_le(p, k),
+        lex_lt(k, e),
+    ensures
+        is_prefix(p, k),
+    decreases i,
+{
+    assert(e.len() == i + 1);
+    assert(k.len() > 0);
+    lemma_head_le_from_le(p, k);
+    lemma_head_le_from_lt(k, e);
+    let p1 = p.subrange(1, p.len() as int);
+    let k1 = k.subrange(1, k.len() as int);
+    if i == 0 {
+        // end == [p[0]+1]. k[0] can only be p[0] (p[0]+1 would force k >= end).
+        assert(e[0] == (p[0] + 1) as u8);
+        if k[0] == e[0] {
+            lemma_tail_lt_from_lt(k, e);
+            assert(e.subrange(1, e.len() as int).len() == 0);
+            assert(false);
+        }
+        assert(k[0] == p[0]);
+        lemma_le_tail(p, k);
+        assert forall|j: int| 0 <= j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_allff(p1, k1);
+        lemma_prefix_lift(p, k);
+    } else {
+        // e[0] == p[0]; the head must match and we recurse on the tails.
+        assert(e[0] == p[0]);
+        assert(k[0] == p[0]);
+        lemma_le_tail(p, k);
+        lemma_tail_lt_from_lt(k, e);
+        let e1 = e.subrange(1, e.len() as int);
+        assert(e1 == p1.subrange(0, i - 1) + seq![((p1[i - 1] + 1) as u8)]) by {
+            assert(p1[i - 1] == p[i]);
+            assert forall|m: int| 0 <= m < i implies e1[m] == (p1.subrange(0, i - 1) + seq![
+                ((p1[i - 1] + 1) as u8),
+            ])[m] by {
+                assert(e1[m] == e[m + 1]);
+                if m < i - 1 {
+                    assert(p1.subrange(0, i - 1)[m] == p1[m]);
+                    assert(p1[m] == p[m + 1]);
+                    assert(e[m + 1] == p[m + 1]);
+                }
+            }
+        }
+        assert forall|j: int| i - 1 < j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_prefix_end_bwd(p1, i - 1, e1, k1);
+        lemma_prefix_lift(p, k);
+    }
+}
+
+/// Executable core of `prefix_range`: computes the exclusive upper bound key for
+/// a prefix scan, or `None` (scan to the end of the keyspace) when the prefix is
+/// empty or all `0xff`. Proven correct: the returned bound makes the range
+/// `[prefix, end)` contain *exactly* the keys prefixed by `prefix`.
+pub fn prefix_end(prefix: &[u8]) -> (r: Option<Vec<u8>>)
+    ensures
+        match r {
+            Option::None => forall|k: Seq<u8>|
+                #![trigger is_prefix(prefix@, k)]
+                is_prefix(prefix@, k) <==> lex_le(prefix@, k),
+            Option::Some(e) => forall|k: Seq<u8>|
+                #![trigger is_prefix(prefix@, k)]
+                is_prefix(prefix@, k) <==> (lex_le(prefix@, k) && lex_lt(k, e@)),
+        },
+{
+    let n = prefix.len();
+    let mut i = n;
+    while i > 0
+        invariant
+            i <= n,
+            n == prefix.len(),
+            forall|j: int| i <= j < n ==> prefix@[j] == 255,
+        decreases i,
+    {
+        if prefix[i - 1] != 255 {
+            let idx = i - 1;
+            assert(prefix@[idx as int] != 255);
+            assert(forall|j: int| idx < j < n ==> prefix@[j] == 255);
+            // Build e = prefix[0..idx] ++ [prefix[idx] + 1].
+            let mut e: Vec<u8> = Vec::new();
+            let mut m: usize = 0;
+            while m < idx
+                invariant
+                    m <= idx,
+                    idx < n,
+                    n == prefix.len(),
+                    e@ == prefix@.subrange(0, m as int),
+                decreases idx - m,
+            {
+                e.push(prefix[m]);
+                assert(prefix@.subrange(0, m as int + 1) =~= prefix@.subrange(0, m as int)
+                    + seq![prefix@[m as int]]);
+                m = m + 1;
+            }
+            assert(prefix@[idx as int] < 255);
+            let last = prefix[idx] + 1;
+            e.push(last);
+            assert(e@ =~= prefix@.subrange(0, idx as int) + seq![((prefix@[idx as int] + 1) as u8)]);
+            proof {
+                assert forall|k: Seq<u8>|
+                    #![trigger is_prefix(prefix@, k)]
+                    is_prefix(prefix@, k) <==> (lex_le(prefix@, k) && lex_lt(k, e@)) by {
+                    if is_prefix(prefix@, k) {
+                        lemma_prefix_end_fwd(prefix@, idx as int, e@, k);
+                    }
+                    if lex_le(prefix@, k) && lex_lt(k, e@) {
+                        lemma_prefix_end_bwd(prefix@, idx as int, e@, k);
+                    }
+                }
+            }
+            return Some(e);
+        }
+        i = i - 1;
+    }
+    // i == 0: every byte is 0xff (or the prefix is empty), so the scan has no
+    // upper bound.
+    assert(forall|j: int| 0 <= j < n ==> prefix@[j] == 255);
+    proof {
+        assert forall|k: Seq<u8>|
+            #![trigger is_prefix(prefix@, k)]
+            is_prefix(prefix@, k) <==> lex_le(prefix@, k) by {
+            if is_prefix(prefix@, k) {
+                lemma_prefix_implies_le(prefix@, k);
+            }
+            if lex_le(prefix@, k) {
+                lemma_allff(prefix@, k);
+            }
+        }
+    }
+    None
+}
+
+} // verus!
+
 /// Generates a key range for a key prefix, used e.g. for prefix scans.
 ///
 /// The exclusive end bound is generated by adding 1 to the value of the last
@@ -489,10 +883,12 @@ pub fn deserialize<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
 /// prefixes after it.
 pub fn prefix_range(prefix: &[u8]) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let start = Bound::Included(prefix.to_vec());
-    let end = match prefix.iter().rposition(|&b| b != 0xff) {
-        Some(i) => Bound::Excluded(
-            prefix.iter().take(i).copied().chain(std::iter::once(prefix[i] + 1)).collect(),
-        ),
+    // `prefix_end` is the Verus-verified core: it computes the exclusive upper
+    // bound (`Some`) or signals an unbounded scan (`None`), proven to make
+    // `[prefix, end)` cover exactly the keys prefixed by `prefix`. See the
+    // `verus!` block above.
+    let end = match prefix_end(prefix) {
+        Some(e) => Bound::Excluded(e),
         None => Bound::Unbounded,
     };
     (start, end)
