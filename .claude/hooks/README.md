@@ -15,9 +15,12 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
 
 ```
 .claude/
-  settings.json              committed hook wiring (SessionStart gate, Stop capture)
+  settings.json              committed hook wiring (PreToolUse guard,
+                             SessionStart gate, Stop capture)
   bin/verus-mcp              self-provisioning pinned stdio launcher (prod/CI)
   hooks/
+    branch_guard.py          PreToolUse (Bash): branch discipline — initials-
+                             prefixed branch names, no commits/pushes to main
     verus_gate.py            SessionStart: fail-closed MCP probe + drift warning
     verus_stop.py            Stop: fail-soft transcript capture + upload
     verus_trace/             shared, agent-agnostic Python package (stdlib only)
@@ -100,6 +103,21 @@ Each Stop path (Claude `verus_stop.py`, Codex `verus_stop.py`, opencode
 `mcp_version`** field over the coarse `server_version`. So a dev session uploads
 `mcp_version="0.1.0+g<sha>.dirty"` and the dashboard buckets it separately from
 released builds automatically — no dashboard change needed.
+
+## Branch discipline (branch_guard.py)
+
+`PreToolUse` hook on the Bash tool, enforcing the workflow described in the
+repo-root `CLAUDE.md`: branch names must be `<initials>/<topic>` (2-3 lowercase
+letters + `/`, e.g. `yl/fix-stop-hook`), and `main` is never committed to or
+pushed directly. The hook parses each Bash command for `git
+checkout/switch/branch` creations and renames, `git commit` while on `main`,
+and `git push` destinations (including bare `git push` and `HEAD` refspecs,
+which resolve to the current branch; `--delete` pushes are exempt so legacy
+names can be cleaned up). Violations exit 2 with the reason on stderr, which
+Claude Code feeds back to the agent. FAIL-OPEN on unparseable input — the guard
+never bricks the Bash tool. The dashboard keys the `main` telemetry rollup on
+branch names (a branch's data folds into `main` when its PR merges), so unique
+prefixes keep collaborators' data from colliding.
 
 ## The two invariants
 
