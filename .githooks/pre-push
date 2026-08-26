@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Branch-discipline backstop, agent-agnostic (covers Codex and humans; Claude
+# and opencode also guard at the tool layer). Blocks pushes to main and pushes
+# of non-initials-prefixed branch names (deletions exempt). Git feeds the
+# refspecs on stdin; the guard reads them there. Activated per clone via
+# `git config core.hooksPath .githooks` (self-provisioned by the telemetry
+# session hooks; see .claude/hooks/branch_guard.py and CLAUDE.md / AGENTS.md).
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+guard="$root/.claude/hooks/branch_guard.py"
+[ -f "$guard" ] || exit 0
+exec python3 "$guard" pre-push

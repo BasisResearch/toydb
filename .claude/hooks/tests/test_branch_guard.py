@@ -103,6 +103,21 @@ class ViolationsTest(unittest.TestCase):
         self.assertTrue(self.v("cargo test && git checkout -b bad-name"))
         self.assertFalse(self.v("cargo test && git checkout -b yl/good"))
 
+    def test_semicolons_attached_to_words(self):
+        self.assertTrue(self.v("git checkout -b bad-name; echo done"))
+        self.assertFalse(self.v("git checkout -b yl/good; echo done"))
+        # The word after `;` starts a new segment, not extra push refspecs.
+        self.assertEqual(len(self.v("git push origin bad; echo x")), 1)
+
+    def test_multiline_commands_split_per_line(self):
+        self.assertTrue(self.v("cargo test\ngit checkout -b bad-name"))
+        self.assertFalse(self.v("git checkout -b yl/a\ngit push origin yl/a"))
+        # A following line never bleeds into the previous push's refspecs.
+        self.assertEqual(len(self.v("git push origin bad\necho x\ngit status")), 1)
+
+    def test_backslash_continuation_joined(self):
+        self.assertTrue(self.v("git push origin \\\n  main"))
+
     def test_git_global_flags_stripped(self):
         self.assertTrue(self.v("git -C /tmp/x checkout -b bad"))
 
@@ -111,6 +126,48 @@ class ViolationsTest(unittest.TestCase):
 
     def test_unparseable_fails_open(self):
         self.assertFalse(self.v('echo "unclosed'))
+
+
+class GitHookModesTest(unittest.TestCase):
+    """The agent-agnostic backstop modes used by .githooks/ (Codex, humans)."""
+
+    def test_precommit_blocks_protected(self):
+        self.assertTrue(branch_guard.precommit_violations("main"))
+        self.assertTrue(branch_guard.precommit_violations("master"))
+        self.assertFalse(branch_guard.precommit_violations("yl/feature"))
+        # Non-conforming branch: warn-only at commit time, not a block.
+        self.assertFalse(branch_guard.precommit_violations("legacy-name"))
+
+    def test_prepush_blocks_main_and_nonconforming(self):
+        sha = "a" * 40
+        lines = [
+            "refs/heads/yl/x %s refs/heads/main %s" % (sha, sha),
+            "refs/heads/yl/ok %s refs/heads/yl/ok %s" % (sha, sha),
+            "refs/heads/legacy %s refs/heads/legacy %s" % (sha, sha),
+        ]
+        probs = branch_guard.prepush_violations(lines)
+        self.assertEqual(len(probs), 2)
+        self.assertIn("main", probs[0])
+        self.assertIn("legacy", probs[1])
+
+    def test_prepush_exempts_deletes_and_tags(self):
+        sha = "a" * 40
+        lines = [
+            "(delete) %s refs/heads/legacy-name %s" % ("0" * 40, sha),
+            "refs/tags/v1.0 %s refs/tags/v1.0 %s" % (sha, "0" * 40),
+        ]
+        self.assertFalse(branch_guard.prepush_violations(lines))
+
+    def test_prepush_garbage_lines_ignored(self):
+        self.assertFalse(branch_guard.prepush_violations(["", "not a refspec"]))
+
+    def test_check_mode_exit_codes(self):
+        self.assertEqual(branch_guard.cmd_check(["--command", "git checkout -b bad"]), 2)
+        self.assertEqual(branch_guard.cmd_check(["--command", "git checkout -b yl/ok"]), 0)
+        self.assertEqual(branch_guard.cmd_check([]), 0)
+
+    def test_unknown_mode_fails_open(self):
+        self.assertEqual(branch_guard.main(["no-such-mode"]), 0)
 
 
 if __name__ == "__main__":

@@ -76,6 +76,16 @@ def _emit_warn_context(mcp_version):
 
 
 def main():
+    # Self-provision the branch-discipline git hooks (core.hooksPath ->
+    # .githooks) so the agent-agnostic backstop is active in this clone.
+    # Fail-soft: never blocks the session.
+    try:
+        import branch_guard
+
+        branch_guard.ensure_hooks_path()
+    except Exception:
+        pass
+
     if str(os.environ.get("VERUS_GATE_DISABLE", "")).lower() in ("1", "true", "yes"):
         sys.stderr.write("[verus-gate] gate disabled via VERUS_GATE_DISABLE\n")
         return 0

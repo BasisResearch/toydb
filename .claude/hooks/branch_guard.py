@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Basis Research
 #
-# Claude Code `PreToolUse` hook (Bash): enforce the repo's branch discipline.
+# Branch-discipline guard, shared across agents (like verus_trace):
 #
 #   1. Every branch name is prefixed with the author's unique initials:
 #      `<initials>/<topic>` (2-3 lowercase letters + "/"), e.g. `yl/fix-gate`.
@@ -10,6 +10,25 @@
 #      branch name once its PR merges, so names must never collide between
 #      collaborators.
 #   2. `main` is never committed to or pushed directly; changes land via PRs.
+#
+# Entry points (one script, four modes):
+#
+#   branch_guard.py                    Claude Code PreToolUse hook: reads the
+#                                      hook JSON on stdin, inspects Bash
+#                                      commands.
+#   branch_guard.py check --command C  Agent-agnostic: check one shell command
+#                                      (used by the opencode plugin's
+#                                      tool.execute.before handler).
+#   branch_guard.py pre-commit         Git pre-commit hook body: block commits
+#                                      on main (warn on a non-prefixed branch).
+#   branch_guard.py pre-push           Git pre-push hook body: reads refspec
+#                                      lines on stdin, blocks pushes to main
+#                                      and of non-prefixed branches.
+#
+# The git-hook modes are the agent-agnostic backstop (they cover Codex, which
+# has no pre-tool event, and humans). The committed shims live in .githooks/;
+# ensure_hooks_path() self-provisions `core.hooksPath .githooks` and is called
+# fail-soft from the session-start/stop paths of all three agents.
 #
 # Blocks by exiting 2 with the reason on stderr (fed back to the agent so it
 # can correct itself). FAIL-OPEN: unparseable input exits 0 — the guard must
@@ -33,25 +52,32 @@ POLICY = (
 )
 
 
-def _tokens(command):
+def _tokens(line):
+    """Tokenize one line. punctuation_chars makes shlex split operators off
+    words (`bad-name;` -> `bad-name`, `;`) instead of leaving them attached."""
     try:
-        return shlex.split(command, posix=True)
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
     except ValueError:
-        return command.split()
+        return line.split()
 
 
-def _segments(tokens):
-    """Split a token stream on shell operators into simple-command segments."""
-    cur = []
-    for tok in tokens:
-        if tok in OPERATORS:
-            if cur:
-                yield cur
-            cur = []
-        else:
-            cur.append(tok)
-    if cur:
-        yield cur
+def _segments(command):
+    """Split a (possibly multi-line) command into simple-command segments:
+    per line, then on shell operators. Backslash continuations are joined
+    first so a wrapped command stays one segment."""
+    for line in command.replace("\\\n", " ").splitlines():
+        cur = []
+        for tok in _tokens(line):
+            if tok in OPERATORS or all(c in "|&;()<>" for c in tok):
+                if cur:
+                    yield cur
+                cur = []
+            else:
+                cur.append(tok)
+        if cur:
+            yield cur
 
 
 def _strip_git_globals(args):
@@ -152,9 +178,52 @@ def _push_dsts(rest):
     return dsts
 
 
+def _repo_root():
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+def ensure_hooks_path():
+    """Self-provision the committed git hooks: point the clone's local
+    core.hooksPath at .githooks so the pre-commit/pre-push backstop is active
+    regardless of which agent (or human) runs git. Idempotent and fail-soft;
+    never overrides a hooksPath the user set to something else."""
+    root = _repo_root()
+    if not root or not os.path.isdir(os.path.join(root, ".githooks")):
+        return
+    try:
+        cur = subprocess.run(
+            ["git", "config", "--local", "core.hooksPath"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if cur.stdout.strip():
+            return  # already set (ours or the user's own choice)
+        subprocess.run(
+            ["git", "config", "--local", "core.hooksPath", ".githooks"],
+            cwd=root,
+            capture_output=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
 def violations(command):
     probs = []
-    for seg in _segments(_tokens(command)):
+    for seg in _segments(command):
         if not seg or os.path.basename(seg[0]) != "git":
             continue
         args = _strip_git_globals(seg[1:])
@@ -188,7 +257,53 @@ def violations(command):
     return probs
 
 
-def main():
+def precommit_violations(current):
+    """Blocking problems for a commit on branch `current` (git pre-commit)."""
+    if current in PROTECTED:
+        return [
+            "committing on '%s' is forbidden; create an initials-prefixed "
+            "feature branch first" % current
+        ]
+    return []
+
+
+def prepush_violations(lines):
+    """Blocking problems for a push, from git pre-push refspec stdin lines
+    (`<local_ref> <local_sha> <remote_ref> <remote_sha>`). Deletions are
+    exempt (legacy-name cleanup); tags are ignored."""
+    probs = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local_ref, local_sha, remote_ref = parts[0], parts[1], parts[2]
+        if local_ref == "(delete)" or set(local_sha) == {"0"}:
+            continue
+        if not remote_ref.startswith("refs/heads/"):
+            continue
+        name = remote_ref[len("refs/heads/"):]
+        if name in PROTECTED:
+            probs.append("direct push to '%s' is forbidden; open a PR" % name)
+        elif not _conforms(name):
+            probs.append(
+                "push of branch '%s' blocked: not initials-prefixed "
+                "(rename with: git branch -m <initials>/%s)" % (name, name)
+            )
+    return probs
+
+
+def _block(probs):
+    sys.stderr.write(
+        "[branch-guard] BLOCKED:\n"
+        + "".join("  - %s\n" % p for p in probs)
+        + POLICY
+        + "\n"
+    )
+    return 2
+
+
+def cmd_claude_hook():
+    """Default mode: Claude Code PreToolUse hook (hook JSON on stdin)."""
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
@@ -201,13 +316,67 @@ def main():
         return 0
     probs = violations(command)
     if probs:
+        return _block(probs)
+    return 0
+
+
+def cmd_check(argv):
+    """`check --command <cmd>` (or `check <cmd>`): agent-agnostic single-
+    command check, used by the opencode plugin."""
+    command = ""
+    if len(argv) >= 2 and argv[0] == "--command":
+        command = argv[1]
+    elif argv:
+        command = argv[0]
+    probs = violations(command)
+    if probs:
+        return _block(probs)
+    return 0
+
+
+def cmd_pre_commit():
+    current = _current_branch()
+    probs = precommit_violations(current)
+    if probs:
+        return _block(probs)
+    if current and current != "HEAD" and not _conforms(current):
+        # Warn only: local commits on a legacy branch stay possible; the
+        # pre-push hook is where a non-conforming name becomes a hard stop.
         sys.stderr.write(
-            "[branch-guard] BLOCKED:\n"
-            + "".join("  - %s\n" % p for p in probs)
-            + POLICY
-            + "\n"
+            "[branch-guard] warning: branch '%s' is not initials-prefixed; "
+            "rename before pushing (git branch -m <initials>/%s)\n"
+            % (current, current)
         )
-        return 2
+    return 0
+
+
+def cmd_pre_push():
+    try:
+        lines = sys.stdin.read().splitlines()
+    except Exception:
+        return 0
+    probs = prepush_violations(lines)
+    if probs:
+        return _block(probs)
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return cmd_claude_hook()
+    sub = argv[0]
+    if sub == "check":
+        return cmd_check(argv[1:])
+    if sub == "pre-commit":
+        return cmd_pre_commit()
+    if sub == "pre-push":
+        return cmd_pre_push()
+    if sub == "ensure-hooks-path":
+        ensure_hooks_path()
+        return 0
+    # Unknown mode: fail open — the guard must never brick a hook chain.
+    sys.stderr.write("[branch-guard] unknown mode '%s' (ignored)\n" % sub)
     return 0
 
 

@@ -106,18 +106,36 @@ released builds automatically — no dashboard change needed.
 
 ## Branch discipline (branch_guard.py)
 
-`PreToolUse` hook on the Bash tool, enforcing the workflow described in the
-repo-root `CLAUDE.md`: branch names must be `<initials>/<topic>` (2-3 lowercase
-letters + `/`, e.g. `yl/fix-stop-hook`), and `main` is never committed to or
-pushed directly. The hook parses each Bash command for `git
+One shared guard, enforcing the workflow described in the repo-root
+`CLAUDE.md` / `AGENTS.md` across all three agents: branch names must be
+`<initials>/<topic>` (2-3 lowercase letters + `/`, e.g. `yl/fix-stop-hook`),
+and `main` is never committed to or pushed directly. The dashboard keys the
+`main` telemetry rollup on branch names (a branch's data folds into `main`
+when its PR merges), so unique prefixes keep collaborators' data from
+colliding.
+
+The command-level check parses each shell command for `git
 checkout/switch/branch` creations and renames, `git commit` while on `main`,
 and `git push` destinations (including bare `git push` and `HEAD` refspecs,
 which resolve to the current branch; `--delete` pushes are exempt so legacy
-names can be cleaned up). Violations exit 2 with the reason on stderr, which
-Claude Code feeds back to the agent. FAIL-OPEN on unparseable input — the guard
-never bricks the Bash tool. The dashboard keys the `main` telemetry rollup on
-branch names (a branch's data folds into `main` when its PR merges), so unique
-prefixes keep collaborators' data from colliding.
+names can be cleaned up). Violations exit 2 with the reason on stderr, fed
+back to the agent. FAIL-OPEN on unparseable input — the guard never bricks the
+bash tool.
+
+| Agent   | Enforcement                                                      |
+|---------|------------------------------------------------------------------|
+| Claude  | `PreToolUse` hook on Bash (`branch_guard.py`, default stdin mode) |
+| opencode| plugin `tool.execute.before` shells to `branch_guard.py check`   |
+| Codex   | no pre-tool event → git-hook backstop only                        |
+
+The agent-agnostic backstop (covers Codex and humans): committed git hooks in
+`.githooks/` (`pre-commit` blocks commits on `main` and warns on non-prefixed
+branches; `pre-push` blocks pushes to `main` and of non-prefixed branch
+names). They run via `branch_guard.py pre-commit` / `pre-push` and are
+activated per clone by `git config core.hooksPath .githooks`, which
+`ensure_hooks_path()` self-provisions fail-soft from each agent's session
+hooks (Claude `SessionStart` gate, opencode gate, Codex Stop). It never
+overrides a hooksPath the user set to something else.
 
 ## The two invariants
 

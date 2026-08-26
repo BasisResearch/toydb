@@ -77,6 +77,16 @@ def _find_rollout(hook_input):
 
 
 def main():
+    # Codex has no pre-tool event, so its branch-discipline enforcement is the
+    # committed git hooks (.githooks). Self-provision core.hooksPath here —
+    # the only per-session Codex entry point we have. Fail-soft.
+    try:
+        import branch_guard
+
+        branch_guard.ensure_hooks_path()
+    except Exception:
+        pass
+
     try:
         raw = sys.stdin.read()
         hook_input = json.loads(raw) if raw.strip() else {}

@@ -17,6 +17,10 @@
 These rules are enforced by `.claude/hooks/branch_guard.py`, a `PreToolUse`
 hook on the Bash tool: it blocks `git checkout -b`/`git switch -c`/`git
 branch` with non-conforming names, `git commit` while on `main`, and any
-`git push` to `main` or of a non-prefixed branch. If it blocks you, rename
-the branch (`git branch -m <initials>/<topic>`) and retry — do not try to
-bypass the hook.
+`git push` to `main` or of a non-prefixed branch. The same guard also backs
+the opencode plugin (`tool.execute.before`) and the committed git hooks in
+`.githooks/` (pre-commit / pre-push, self-provisioned via `core.hooksPath`),
+which cover Codex and humans — the same rules apply to every agent (see
+`AGENTS.md`). If it blocks you, rename the branch
+(`git branch -m <initials>/<topic>`) and retry — do not try to bypass the
+hook.

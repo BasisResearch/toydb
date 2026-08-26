@@ -24,5 +24,11 @@ args = ["stdio"]
 # Point the command at the committed script inside your toyDB checkout. Replace
 # /ABSOLUTE/PATH/TO/toydb with your clone location. VERUS_INGEST_TOKEN must be in
 # the hook's environment for a live upload; set VERUS_INGEST_DRY_RUN=1 to test.
+#
+# Branch discipline (see AGENTS.md): Codex has no pre-tool event, so its
+# enforcement is the committed git hooks (.githooks/ pre-commit + pre-push).
+# The Stop hook self-provisions `core.hooksPath .githooks` in the clone; to
+# activate them before the first session ends, run once:
+#     git config core.hooksPath .githooks
 [[hooks.Stop]]
 command = ["python3", "/ABSOLUTE/PATH/TO/toydb/.codex/hooks/verus_stop.py"]
