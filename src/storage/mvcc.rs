@@ -142,9 +142,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::{Bound, RangeBounds};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 
 use super::engine::{self, Engine};
@@ -366,25 +365,13 @@ impl<E: Engine> Transaction<E> {
     /// Begins a new transaction in read-write mode. This will allocate a new
     /// version that the transaction can write at, add it to the active set, and
     /// record its active snapshot for time-travel queries.
+    ///
+    /// Delegates to the verified `vbegin`, which is proven to refine the
+    /// model `begin` transition and preserve the refinement invariant.
     fn begin(engine: Arc<Mutex<E>>) -> Result<Self> {
         let mut session = engine.lock()?;
-
-        // Allocate a new version to write at.
-        let version = match session.get(&Key::NextVersion.encode())? {
-            Some(ref v) => Version::decode(v)?,
-            None => 1,
-        };
-        session.set(&Key::NextVersion.encode(), (version + 1).encode())?;
-
-        // Fetch the current set of active transactions, persist it for
-        // time-travel queries if non-empty, then add this txn to it.
-        let active = Self::scan_active(&mut session)?;
-        if !active.is_empty() {
-            session.set(&Key::TxnActiveSnapshot(version).encode(), active.encode())?
-        }
-        session.set(&Key::TxnActive(version).encode(), vec![])?;
+        let (version, active) = vbegin(&mut EngineHandle::new(&mut *session))?;
         drop(session);
-
         Ok(Self { engine, state: TransactionState { version, read_only: false, active } })
     }
 
@@ -392,33 +379,15 @@ impl<E: Engine> Transaction<E> {
     /// state as of the beginning of that version (ignoring writes at that
     /// version). In other words, it sees the same state as the read-write
     /// transaction at that version saw when it began.
+    ///
+    /// Delegates to the verified `vbegin_read_only`, which is proven to
+    /// produce a well-formed observer (`wf_observer`) of the current state,
+    /// so the verified read-path theorems (no dirty reads, snapshot
+    /// stability) apply to the resulting transaction.
     fn begin_read_only(engine: Arc<Mutex<E>>, as_of: Option<Version>) -> Result<Self> {
         let mut session = engine.lock()?;
-
-        // Fetch the latest version.
-        let mut version = match session.get(&Key::NextVersion.encode())? {
-            Some(ref v) => Version::decode(v)?,
-            None => 1,
-        };
-
-        // If requested, create the transaction as of a past version, restoring
-        // the active snapshot as of the beginning of that version. Otherwise,
-        // use the latest version and get the current, real-time snapshot.
-        let mut active = BTreeSet::new();
-        if let Some(as_of) = as_of {
-            if as_of >= version {
-                return errinput!("version {as_of} does not exist");
-            }
-            version = as_of;
-            if let Some(value) = session.get(&Key::TxnActiveSnapshot(version).encode())? {
-                active = BTreeSet::<Version>::decode(&value)?;
-            }
-        } else {
-            active = Self::scan_active(&mut session)?;
-        }
-
+        let (version, active) = vbegin_read_only(&mut EngineHandle::new(&mut *session), as_of)?;
         drop(session);
-
         Ok(Self { engine, state: TransactionState { version, read_only: true, active } })
     }
 
@@ -430,19 +399,6 @@ impl<E: Engine> Transaction<E> {
             return errinput!("no active transaction at version {}", s.version);
         }
         Ok(Self { engine, state: s })
-    }
-
-    /// Fetches the set of currently active transactions.
-    fn scan_active(session: &mut MutexGuard<E>) -> Result<BTreeSet<Version>> {
-        let mut active = BTreeSet::new();
-        let mut scan = session.scan_prefix(&KeyPrefix::TxnActive.encode());
-        while let Some((key, _)) = scan.next().transpose()? {
-            match Key::decode(&key)? {
-                Key::TxnActive(version) => active.insert(version),
-                key => return errdata!("expected TxnActive key, got {key:?}"),
-            };
-        }
-        Ok(active)
     }
 
     /// Returns the version the transaction is running at.
@@ -467,46 +423,29 @@ impl<E: Engine> Transaction<E> {
     ///
     /// NB: commit does not flush writes to durable storage, since we rely on
     /// the Raft log for persistence.
+    ///
+    /// Delegates to the verified `vcommit`, proven to refine the model
+    /// `commit` transition.
     pub fn commit(self) -> Result<()> {
         if self.state.read_only {
             return Ok(());
         }
         let mut engine = self.engine.lock()?;
-        let remove: Vec<_> = engine
-            .scan_prefix(&KeyPrefix::TxnWrite(self.state.version).encode())
-            .map_ok(|(k, _)| k)
-            .try_collect()?;
-        for key in remove {
-            engine.delete(&key)?
-        }
-        engine.delete(&Key::TxnActive(self.state.version).encode())
+        vcommit(&mut EngineHandle::new(&mut *engine), self.state.version)
     }
 
     /// Rolls back the transaction, by undoing all written versions and removing
     /// it from the active set. The active set snapshot is left behind, since
     /// this is needed for time travel queries at this version.
+    ///
+    /// Delegates to the verified `vrollback`, proven to refine the model
+    /// `rollback` transition: it erases exactly the transaction's own writes.
     pub fn rollback(self) -> Result<()> {
         if self.state.read_only {
             return Ok(());
         }
         let mut engine = self.engine.lock()?;
-        let mut rollback = Vec::new();
-        let mut scan = engine.scan_prefix(&KeyPrefix::TxnWrite(self.state.version).encode());
-        while let Some((key, _)) = scan.next().transpose()? {
-            match Key::decode(&key)? {
-                Key::TxnWrite(_, key) => {
-                    rollback.push(Key::Version(key, self.state.version).encode())
-                    // the version
-                }
-                key => return errdata!("expected TxnWrite, got {key:?}"),
-            };
-            rollback.push(key); // the TxnWrite record
-        }
-        drop(scan);
-        for key in rollback.into_iter() {
-            engine.delete(&key)?;
-        }
-        engine.delete(&Key::TxnActive(self.state.version).encode()) // remove from active set
+        vrollback(&mut EngineHandle::new(&mut *engine), self.state.version)
     }
 
     /// Deletes a key.
@@ -529,59 +468,44 @@ impl<E: Engine> Transaction<E> {
         }
         let mut engine = self.engine.lock()?;
 
-        // Check for write conflicts, i.e. if the latest key is invisible to us
-        // (either a newer version, or an uncommitted version in our past). We
-        // can only conflict with the latest key, since all transactions enforce
-        // the same invariant.
+        // Delegates to the verified `vwrite`: check for write conflicts, i.e.
+        // if the latest key is invisible to us (either a newer version, or an
+        // uncommitted version in our past). We can only conflict with the
+        // latest key, since all transactions enforce the same invariant.
         //
-        // That invariant is machine-checked: the verified model at the bottom
-        // of this file proves (`thm_conflict_check_exact`) that under the
-        // system invariant `inv`, this latest-version-only check accepts
-        // exactly when *no* version of the key is invisible, and that the
-        // invariant is preserved by every transaction operation.
-        let from = Key::Version(
-            key.into(),
-            self.state.active.first().copied().unwrap_or(self.state.version + 1),
-        )
-        .encode();
-        let to = Key::Version(key.into(), u64::MAX).encode();
-        if let Some((key, _)) = engine.scan(from..=to).last().transpose()? {
-            match Key::decode(&key)? {
-                Key::Version(_, version) => {
-                    if !self.state.is_visible(version) {
-                        return Err(Error::Serialization);
-                    }
-                }
-                key => return errdata!("expected Key::Version got {key:?}"),
-            }
+        // That invariant is machine-checked: `thm_conflict_check_exact`
+        // proves that under the system invariant `inv`, this
+        // latest-version-only check accepts exactly when *no* version of the
+        // key is invisible, `thm_inv_preserved` proves every transaction
+        // operation preserves the invariant, and `vwrite` is proven to
+        // perform exactly this check against the real engine and to refine
+        // the model `write` transition.
+        match vwrite(
+            &mut EngineHandle::new(&mut *engine),
+            self.state.version,
+            &self.state.active,
+            key,
+            &value,
+        ) {
+            VWriteOutcome::Done => Ok(()),
+            VWriteOutcome::Conflict => Err(Error::Serialization),
+            VWriteOutcome::Fail(e) => Err(e),
         }
-
-        // Write the new version and its write record.
-        //
-        // NB: TxnWrite contains the provided user key, not the encoded engine
-        // key, since we can construct the engine key using the version.
-        engine.set(&Key::TxnWrite(self.state.version, key.into()).encode(), vec![])?;
-        engine
-            .set(&Key::Version(key.into(), self.state.version).encode(), bincode::serialize(&value))
     }
 
     /// Fetches a key's value, or None if it does not exist.
+    ///
+    /// Delegates to the verified `vget`, proven to return the model read:
+    /// the value at the greatest visible version of the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut engine = self.engine.lock()?;
-        let from = Key::Version(key.into(), 0).encode();
-        let to = Key::Version(key.into(), self.state.version).encode();
-        let mut scan = engine.scan(from..=to).rev();
-        while let Some((key, value)) = scan.next().transpose()? {
-            match Key::decode(&key)? {
-                Key::Version(_, version) => {
-                    if self.state.is_visible(version) {
-                        return bincode::deserialize(&value);
-                    }
-                }
-                key => return errdata!("expected Key::Version got {key:?}"),
-            };
-        }
-        Ok(None)
+        vget(
+            &mut EngineHandle::new(&mut *engine),
+            self.state.version,
+            self.state.read_only,
+            &self.state.active,
+            key,
+        )
     }
 
     /// Returns an iterator over the latest visible key/value pairs at the
@@ -769,11 +693,13 @@ impl<I: engine::ScanIterator> Iterator for VersionIterator<'_, I> {
 //   ModelState.store   <->  Key::Version(key, version) => value records,
 //                           as a map (key, version) -> Option<value>,
 //                           None modeling a deletion tombstone
-//   ModelState.aborted <->  ghost only: versions that rolled back, so that
-//                           "committed" is definable (allocated, not active,
-//                           not aborted). The engine needs no such record
-//                           because a rolled-back txn erases all its writes —
-//                           which is exactly invariant clause `inv_no_aborted_writes`.
+//
+// There is deliberately no record of *rolled-back* transactions: rollback
+// erases all the transaction's writes (thm_rollback_erases), so a rolled-back
+// version is observationally identical to a committed one that wrote nothing,
+// and the engine keeps no such record either. `ended` (allocated, no longer
+// active) is the model's notion of "this transaction is over"; an ended
+// version that still owns a write in the store necessarily committed.
 //
 // Transitions model Transaction::begin / write_version / commit / rollback.
 // Each transition is one atomic step, matching the engine mutex held across
@@ -822,7 +748,7 @@ impl<I: engine::ScanIterator> Iterator for VersionIterator<'_, I> {
 //   anomaly_write_skew    intentionally NOT prevented: snapshot isolation only
 //                         detects write-write conflicts, and no theorem here
 //                         claims serializability
-//   rollback              thm_rollback_erases, thm_aborted_stays_gone
+//   rollback              thm_rollback_erases, thm_rolled_back_stays_gone
 //
 // `verus!` erases everything below to nothing under a normal `cargo build`,
 // except `is_visible_core`, which erases to the plain function body that
@@ -877,8 +803,6 @@ pub struct ModelState {
     pub snap: Map<u64, Set<u64>>,
     /// Versioned writes: (key, version) -> value, None being a tombstone.
     pub store: Map<(Seq<u8>, u64), Option<Seq<u8>>>,
-    /// Ghost: versions whose transaction rolled back.
-    pub aborted: Set<u64>,
 }
 
 /// Whether version `v` has been allocated to some read-write transaction.
@@ -896,9 +820,14 @@ pub open spec fn txn_visible(s: ModelState, v: u64, w: u64) -> bool {
     spec_is_visible(s.snap[v], v, false, w)
 }
 
-/// A version that has ended without rolling back: its writes are permanent.
-pub open spec fn committed(s: ModelState, v: u64) -> bool {
-    allocated(s, v) && !s.active.contains(v) && !s.aborted.contains(v)
+/// A version whose transaction has ended, by commit or rollback. The two are
+/// deliberately indistinguishable in the state: rollback erases all the
+/// transaction's writes (thm_rollback_erases), making it observationally
+/// identical to a committed transaction that wrote nothing. Consequently, an
+/// ended version that still has a write in the store is necessarily one that
+/// committed.
+pub open spec fn ended(s: ModelState, v: u64) -> bool {
+    allocated(s, v) && !s.active.contains(v)
 }
 
 // ---- The inductive invariant ----------------------------------------------
@@ -911,9 +840,6 @@ pub open spec fn inv(s: ModelState) -> bool {
     &&& 1 <= s.next
     // Active transactions hold allocated versions.
     &&& forall|v: u64| #[trigger] s.active.contains(v) ==> allocated(s, v)
-    // Rolled-back transactions hold allocated versions and have ended.
-    &&& forall|v: u64|
-        #[trigger] s.aborted.contains(v) ==> allocated(s, v) && !s.active.contains(v)
     // Exactly the allocated versions have a begin snapshot.
     &&& forall|v: u64| #[trigger] s.snap.contains_key(v) ==> allocated(s, v)
     &&& forall|v: u64| #[trigger] allocated(s, v) ==> s.snap.contains_key(v)
@@ -930,9 +856,6 @@ pub open spec fn inv(s: ModelState) -> bool {
         s.snap.contains_key(v) && s.active.contains(w) && w < v ==> s.snap[v].contains(w)
     // Versioned writes hold allocated versions.
     &&& forall|k: Seq<u8>, w: u64| #[trigger] s.store.contains_key((k, w)) ==> allocated(s, w)
-    // inv_no_aborted_writes: no writes from rolled-back transactions survive.
-    &&& forall|k: Seq<u8>, w: u64|
-        #[trigger] s.store.contains_key((k, w)) ==> !s.aborted.contains(w)
     // inv_uncommitted_latest: an uncommitted version is the latest version of
     // its key. This is what makes "check only the latest version" complete:
     // an uncommitted-conflict can only sit at the top.
@@ -966,7 +889,6 @@ pub open spec fn init() -> ModelState {
         active: Set::empty(),
         snap: Map::empty(),
         store: Map::empty(),
-        aborted: Set::empty(),
     }
 }
 
@@ -984,7 +906,6 @@ pub open spec fn begin(s: ModelState) -> ModelState {
         active: s.active.insert(s.next),
         snap: s.snap.insert(s.next, s.active),
         store: s.store,
-        aborted: s.aborted,
     }
 }
 
@@ -1000,7 +921,6 @@ pub open spec fn commit(s: ModelState, v: u64) -> ModelState {
         active: s.active.remove(v),
         snap: s.snap,
         store: s.store,
-        aborted: s.aborted,
     }
 }
 
@@ -1017,7 +937,6 @@ pub open spec fn rollback(s: ModelState, v: u64) -> ModelState {
         active: s.active.remove(v),
         snap: s.snap,
         store: s.store.remove_keys(s.store.dom().filter(|p: (Seq<u8>, u64)| p.1 == v)),
-        aborted: s.aborted.insert(v),
     }
 }
 
@@ -1065,7 +984,6 @@ pub open spec fn write(s: ModelState, v: u64, key: Seq<u8>, value: Option<Seq<u8
         active: s.active,
         snap: s.snap,
         store: s.store.insert((key, v), value),
-        aborted: s.aborted,
     }
 }
 
@@ -1252,7 +1170,7 @@ proof fn lemma_inv_begin(s: ModelState)
     assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
         s2,
         w,
-    ) && !s2.aborted.contains(w) by {
+    ) by {
         assert(allocated(s, w));
     }
     assert forall|k: Seq<u8>, w: u64, w2: u64|
@@ -1319,7 +1237,7 @@ proof fn lemma_inv_rollback(s: ModelState, v: u64)
     assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
         s2,
         w,
-    ) && !s2.aborted.contains(w) by {
+    ) by {
         assert(s.store.contains_key((k, w)));
     }
     assert forall|k: Seq<u8>, w: u64, w2: u64|
@@ -1357,7 +1275,7 @@ proof fn lemma_inv_write(s: ModelState, v: u64, key: Seq<u8>, value: Option<Seq<
     assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
         s2,
         w,
-    ) && !s2.aborted.contains(w) by {
+    ) by {
         if k != key || w != v {
             assert(s.store.contains_key((k, w)));
         }
@@ -1519,7 +1437,7 @@ pub proof fn thm_reads_see_only_committed(
         spec_is_visible(a, obs, ro, w),
         ro || w != obs,
     ensures
-        committed(s, w),
+        ended(s, w),
 {
     if s.active.contains(w) {
         thm_uncommitted_invisible(s, obs, a, ro, w);
@@ -1539,7 +1457,7 @@ pub proof fn thm_no_dirty_write(s: ModelState, v: u64, key: Seq<u8>, w: u64)
         has_version(s, key, w),
         w != v,
     ensures
-        committed(s, w),
+        ended(s, w),
         txn_visible(s, v, w),
 {
     let lo = choose|lo: u64|
@@ -1706,7 +1624,7 @@ pub proof fn thm_first_writer_wins(s: ModelState, key: Seq<u8>, w1: u64, w2: u64
         w1 < w2,
     ensures
         !s.snap[w2].contains(w1),
-        committed(s, w1),
+        ended(s, w1),
         txn_visible(s, w2, w1),
 {
     assert(allocated(s, w1));
@@ -1742,20 +1660,22 @@ pub proof fn thm_rollback_erases(s: ModelState, v: u64)
 {
 }
 
-/// A rolled-back version never reappears: it stays aborted and no step can
-/// ever write at it again (writers write only at their own live version).
-pub proof fn thm_aborted_stays_gone(s: ModelState, s2: ModelState, actor: u64, v: u64)
+/// A rolled-back version never reappears. After rollback(v), the version has
+/// ended and holds no writes (thm_rollback_erases); this shows every further
+/// step keeps it that way: versions are never reused (begin allocates fresh
+/// ones) and writers only write at their own live version.
+pub proof fn thm_rolled_back_stays_gone(s: ModelState, s2: ModelState, actor: u64, v: u64)
     requires
         inv(s),
         step(s, s2, actor),
-        s.aborted.contains(v),
+        ended(s, v),
+        forall|key: Seq<u8>| !has_version(s, key, v),
     ensures
-        s2.aborted.contains(v),
+        ended(s2, v),
         forall|key: Seq<u8>| !has_version(s2, key, v),
 {
-    assert(!s.active.contains(v));
     assert forall|key: Seq<u8>| !has_version(s2, key, v) by {
-        assert(!s.store.contains_key((key, v)));
+        assert(!has_version(s, key, v));
         if !(can_begin(s) && actor == s.next && s2 == begin(s)) && !(can_commit(s, actor) && s2
             == commit(s, actor)) && !(can_rollback(s, actor) && s2 == rollback(s, actor)) {
             let (key0, value0) = choose|key0: Seq<u8>, value0: Option<Seq<u8>>|
@@ -1766,7 +1686,1642 @@ pub proof fn thm_aborted_stays_gone(s: ModelState, s2: ModelState, actor: u64, v
     }
 }
 
+// ===========================================================================
+// Refinement: the executable code refines the model
+// ===========================================================================
+//
+// Everything above reasons about `ModelState`. This section closes the gap to
+// the running code: the `Transaction` methods delegate to *verified*
+// executable functions (`vbegin`, `vbegin_read_only`, `vget`, `vwrite`,
+// `vcommit`, `vrollback`) that perform the real engine-call sequences and are
+// proven to transform the engine's decoded contents by exactly the model
+// transitions.
+//
+// The engine is abstracted as a decoded view: a spec-level map `EngView` from
+// decoded MVCC keys (`KeyS`, mirroring `Key`) to decoded values (`ValS`).
+// `abs: EngView -> ModelState` reads the model state off that view, and
+// `view_inv` is the refinement invariant: the model invariant `inv` holds of
+// `abs(view)`, and the `TxnWrite` bookkeeping records cover exactly the
+// writes of live transactions (which is what makes rollback complete).
+//
+// The trusted boundary is the `EngineOps` facade below plus the `h_*` adapter
+// functions marked `#[verifier::external_body]`: their `ensures` clauses
+// axiomatize how each raw engine operation transforms the decoded view. This
+// trusts (a) the storage engine to behave as a lexicographically ordered
+// key/value map, and (b) the keycode/bincode codecs, whose core transforms
+// are themselves verified in `encoding::keycode` (in particular, that encoded
+// `Key::Version(key, version)` keys sort by key then version, which is what
+// makes "last entry of the range scan" mean "greatest version"). Everything
+// else — visibility, the conflict decision, version allocation, snapshot
+// handling, commit/rollback bookkeeping — is verified.
+//
+// TOP-LEVEL GUARANTEE. `lemma_abs_empty` shows a fresh database satisfies
+// `view_inv` and abstracts to `init()`. Every mutation of MVCC state goes
+// through the verified operations, each of which preserves `view_inv` and
+// performs exactly its model transition, while unversioned writes stay off
+// the MVCC key space (`lemma_unversioned_invisible`). By induction over the
+// engine's history, at every operation boundary the engine contents decode
+// to a reachable model state — so every theorem above about reachable model
+// states (conflict-check exactness, no dirty reads or writes, snapshot
+// stability, first-writer-wins, rollback erasure) holds of the running
+// system.
+//
+// Remaining unverified surface: `Transaction::resume` trusts the
+// `TransactionState` handed to it (a documented toyDB design decision for
+// crossing the Raft boundary); `ScanIterator`/`scan_prefix` use the verified
+// `is_visible_core` for visibility but their batching machinery is
+// unverified (`thm_snapshot_stability` covers the visible slice they draw
+// from); `MVCC::status` and the unversioned get/set are direct engine
+// accesses that never touch versioned state. One intentional behavior
+// difference: `vget` decodes each scanned version's value eagerly, so a
+// corrupt value below the visible version now errors where it previously
+// went unread; and `vbegin` returns an error on u64 version-counter
+// overflow where the old code would panic (both unreachable in practice).
+
+// ---- The decoded engine view and abstraction function ---------------------
+
+/// Decoded MVCC engine keys: the spec-level mirror of `Key`.
+pub enum KeyS {
+    NextVersion,
+    TxnActive(u64),
+    TxnActiveSnapshot(u64),
+    TxnWrite(u64, Seq<u8>),
+    Version(Seq<u8>, u64),
+    Unversioned(Seq<u8>),
+}
+
+/// Decoded MVCC engine values, by key type: `Version::encode` for
+/// NextVersion, the empty value of TxnActive/TxnWrite records,
+/// `BTreeSet::encode` for snapshots, bincoded `Option<Vec<u8>>` for versioned
+/// writes (None = tombstone), and raw bytes for unversioned keys.
+pub enum ValS {
+    U64(u64),
+    Unit,
+    VSet(Set<u64>),
+    Bytes(Option<Seq<u8>>),
+    Raw(Seq<u8>),
+}
+
+/// The engine's decoded contents.
+pub type EngView = Map<KeyS, ValS>;
+
+/// The versions `[1, n)`, i.e. all versions allocated when NextVersion is n.
+pub open spec fn version_range(n: u64) -> Set<u64>
+    decreases n,
+{
+    if n <= 1 {
+        Set::empty()
+    } else {
+        version_range((n - 1) as u64).insert((n - 1) as u64)
+    }
+}
+
+pub proof fn lemma_version_range(n: u64)
+    ensures
+        forall|v: u64| #[trigger] version_range(n).contains(v) <==> 1 <= v < n,
+    decreases n,
+{
+    if n > 1 {
+        lemma_version_range((n - 1) as u64);
+        assert forall|v: u64| #[trigger] version_range(n).contains(v) <==> 1 <= v < n by {
+            assert(version_range(n) == version_range((n - 1) as u64).insert((n - 1) as u64));
+        }
+    } else {
+        assert(version_range(n) == Set::<u64>::empty());
+    }
+}
+
+/// The next version: the decoded NextVersion record, or 1 if absent (a fresh
+/// database), exactly as the code defaults.
+pub open spec fn abs_next(view: EngView) -> u64 {
+    if view.contains_key(KeyS::NextVersion) {
+        match view[KeyS::NextVersion] {
+            ValS::U64(n) => n,
+            _ => 1,
+        }
+    } else {
+        1
+    }
+}
+
+/// The active set: the versions with a TxnActive record.
+pub open spec fn abs_active(view: EngView) -> Set<u64> {
+    view.dom().filter(|k: KeyS| k is TxnActive).map(
+        |k: KeyS|
+            match k {
+                KeyS::TxnActive(v) => v,
+                _ => 0u64,
+            },
+    )
+}
+
+pub proof fn lemma_abs_active(view: EngView, v: u64)
+    ensures
+        abs_active(view).contains(v) <==> view.contains_key(KeyS::TxnActive(v)),
+{
+    broadcast use vstd::set::Set::lemma_map_contains;
+
+    if view.contains_key(KeyS::TxnActive(v)) {
+        assert(view.dom().filter(|k: KeyS| k is TxnActive).contains(KeyS::TxnActive(v)));
+    }
+}
+
+/// The begin snapshot recorded for version v: the decoded TxnActiveSnapshot
+/// record, or empty if absent — the record is only written when the set was
+/// non-empty, and the code reads a missing record as empty.
+pub open spec fn abs_snap_at(view: EngView, v: u64) -> Set<u64> {
+    if view.contains_key(KeyS::TxnActiveSnapshot(v)) {
+        match view[KeyS::TxnActiveSnapshot(v)] {
+            ValS::VSet(a) => a,
+            _ => Set::empty(),
+        }
+    } else {
+        Set::empty()
+    }
+}
+
+/// The begin snapshots of all allocated versions.
+pub open spec fn abs_snap(view: EngView) -> Map<u64, Set<u64>> {
+    Map::new(version_range(abs_next(view)), |v: u64| abs_snap_at(view, v))
+}
+
+pub proof fn lemma_abs_snap(view: EngView, v: u64)
+    ensures
+        abs_snap(view).contains_key(v) <==> 1 <= v < abs_next(view),
+        abs_snap(view).contains_key(v) ==> abs_snap(view)[v] == abs_snap_at(view, v),
+{
+    broadcast use vstd::map::lemma_map_new_domain, vstd::map::lemma_map_new_index;
+
+    lemma_version_range(abs_next(view));
+}
+
+/// The (key, version) pairs with a Version record.
+pub open spec fn abs_store_dom(view: EngView) -> Set<(Seq<u8>, u64)> {
+    view.dom().filter(|k: KeyS| k is Version).map(
+        |k: KeyS|
+            match k {
+                KeyS::Version(key, v) => (key, v),
+                _ => (Seq::<u8>::empty(), 0u64),
+            },
+    )
+}
+
+pub proof fn lemma_abs_store_dom(view: EngView, key: Seq<u8>, v: u64)
+    ensures
+        abs_store_dom(view).contains((key, v)) <==> view.contains_key(KeyS::Version(key, v)),
+{
+    broadcast use vstd::set::Set::lemma_map_contains;
+
+    if view.contains_key(KeyS::Version(key, v)) {
+        assert(view.dom().filter(|k: KeyS| k is Version).contains(KeyS::Version(key, v)));
+    }
+}
+
+/// The decoded value of a Version record (None if malformed, which
+/// `view_inv`-reachable views never are for records the code reads).
+pub open spec fn abs_store_at(view: EngView, p: (Seq<u8>, u64)) -> Option<Seq<u8>> {
+    match view[KeyS::Version(p.0, p.1)] {
+        ValS::Bytes(o) => o,
+        _ => None,
+    }
+}
+
+/// The versioned store.
+pub open spec fn abs_store(view: EngView) -> Map<(Seq<u8>, u64), Option<Seq<u8>>> {
+    Map::new(abs_store_dom(view), |p: (Seq<u8>, u64)| abs_store_at(view, p))
+}
+
+pub proof fn lemma_abs_store(view: EngView, key: Seq<u8>, v: u64)
+    ensures
+        abs_store(view).contains_key((key, v)) <==> view.contains_key(KeyS::Version(key, v)),
+        abs_store(view).contains_key((key, v)) ==> abs_store(view)[(key, v)] == abs_store_at(
+            view,
+            (key, v),
+        ),
+{
+    broadcast use vstd::map::lemma_map_new_domain, vstd::map::lemma_map_new_index;
+
+    lemma_abs_store_dom(view, key, v);
+}
+
+/// The abstraction function: the model state an engine's decoded contents
+/// represent.
+pub open spec fn abs(view: EngView) -> ModelState {
+    ModelState {
+        next: abs_next(view),
+        active: abs_active(view),
+        snap: abs_snap(view),
+        store: abs_store(view),
+    }
+}
+
+/// The refinement invariant on engine contents:
+/// * the model invariant holds of the abstracted state;
+/// * TxnActive and TxnActiveSnapshot records only exist for allocated
+///   versions (so scanning TxnActive recovers exactly `abs_active`, and a
+///   fresh begin never finds a stale snapshot record at its new version);
+/// * every write of a live transaction has its TxnWrite bookkeeping record,
+///   which is what makes rollback able to find and erase all of them.
+pub open spec fn view_inv(view: EngView) -> bool {
+    &&& inv(abs(view))
+    &&& forall|v: u64| #[trigger] view.contains_key(KeyS::TxnActive(v)) ==> 1 <= v < abs_next(view)
+    &&& forall|v: u64|
+        #[trigger] view.contains_key(KeyS::TxnActiveSnapshot(v)) ==> 1 <= v < abs_next(view)
+    &&& forall|key: Seq<u8>, v: u64|
+        #![auto]
+        view.contains_key(KeyS::Version(key, v)) && view.contains_key(KeyS::TxnActive(v))
+            ==> view.contains_key(KeyS::TxnWrite(v, key))
+}
+
+/// A fresh (empty) database abstracts to the initial model state and
+/// satisfies the refinement invariant: the induction starts here.
+pub proof fn lemma_abs_empty()
+    ensures
+        abs(Map::empty()) == init(),
+        view_inv(Map::empty()),
+{
+    let view = Map::<KeyS, ValS>::empty();
+    assert forall|v: u64| !(#[trigger] abs_active(view).contains(v)) by {
+        lemma_abs_active(view, v);
+    }
+    assert(abs_active(view) =~= init().active);
+    lemma_version_range(1);
+    assert forall|v: u64| !(#[trigger] abs_snap(view).contains_key(v)) by {
+        lemma_abs_snap(view, v);
+    }
+    assert(abs_snap(view) =~~= init().snap);
+    assert forall|p: (Seq<u8>, u64)| !(#[trigger] abs_store(view).contains_key(p)) by {
+        lemma_abs_store(view, p.0, p.1);
+    }
+    assert(abs_store(view) =~~= init().store);
+    lemma_inv_init();
+}
+
+/// Unversioned keys are invisible to the abstraction: the unversioned
+/// get/set operations (and any other engine traffic that stays off the MVCC
+/// key space) preserve the refinement invariant and the abstract state.
+pub proof fn lemma_unversioned_invisible(view: EngView, key: Seq<u8>, value: Seq<u8>)
+    ensures
+        abs(view.insert(KeyS::Unversioned(key), ValS::Raw(value))) == abs(view),
+        view_inv(view) ==> view_inv(view.insert(KeyS::Unversioned(key), ValS::Raw(value))),
+{
+    let view2 = view.insert(KeyS::Unversioned(key), ValS::Raw(value));
+    assert(abs_next(view2) == abs_next(view));
+    assert forall|v: u64| #[trigger] abs_active(view2).contains(v) <==> abs_active(view).contains(
+        v,
+    ) by {
+        lemma_abs_active(view2, v);
+        lemma_abs_active(view, v);
+    }
+    assert(abs_active(view2) =~= abs_active(view));
+    assert forall|v: u64|
+        #[trigger] abs_snap(view2).contains_key(v) <==> abs_snap(view).contains_key(v) by {
+        lemma_abs_snap(view2, v);
+        lemma_abs_snap(view, v);
+    }
+    assert forall|v: u64| #[trigger] abs_snap(view2).contains_key(v) implies abs_snap(view2)[v]
+        == abs_snap(view)[v] by {
+        lemma_abs_snap(view2, v);
+        lemma_abs_snap(view, v);
+    }
+    assert(abs_snap(view2) =~~= abs_snap(view));
+    assert forall|p: (Seq<u8>, u64)|
+        #[trigger] abs_store(view2).contains_key(p) <==> abs_store(view).contains_key(p) by {
+        lemma_abs_store(view2, p.0, p.1);
+        lemma_abs_store(view, p.0, p.1);
+    }
+    assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view2).contains_key(p) implies abs_store(
+        view2,
+    )[p] == abs_store(view)[p] by {
+        lemma_abs_store(view2, p.0, p.1);
+        lemma_abs_store(view, p.0, p.1);
+    }
+    assert(abs_store(view2) =~~= abs_store(view));
+}
+
+// ---- The trusted engine boundary ------------------------------------------
+//
+// `hview` is the uninterpreted "decoded contents" of the engine behind a
+// handle. The `h_*` functions below are the ONLY way the verified core
+// touches the engine; each is `external_body` with an `ensures` contract
+// axiomatizing (TRUSTED) what the underlying engine operation and codec do
+// to the decoded view. Read operations leave the view unchanged. On `Err`,
+// write operations promise nothing (a failed engine write may leave
+// arbitrary state) and the transaction aborts with the error.
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExError(Error);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExEngineHandle<'a>(EngineHandle<'a>);
+
+/// std Result with toyDB's Error, spelled explicitly because the crate's
+/// single-parameter `Result` alias shadows the std form in this module.
+pub type EResult<T> = core::result::Result<T, Error>;
+
+/// The decoded contents of the engine behind the handle.
+pub uninterp spec fn hview(h: EngineHandle<'_>) -> EngView;
+
+/// TRUSTED: NextVersion holds the next version as a `Version::encode` value,
+/// defaulting to 1 when absent.
+#[verifier::external_body]
+fn h_get_next_version(h: &mut EngineHandle<'_>) -> (r: EResult<u64>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(n) => n == abs_next(hview(*final(h))),
+            Err(_) => true,
+        },
+{
+    match h.inner.get_raw(&Key::NextVersion.encode())? {
+        Some(ref v) => Version::decode(v),
+        None => Ok(1),
+    }
+}
+
+/// TRUSTED: writing NextVersion updates exactly that record.
+#[verifier::external_body]
+fn h_set_next_version(h: &mut EngineHandle<'_>, n: u64) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).insert(KeyS::NextVersion, ValS::U64(n)),
+{
+    h.inner.set_raw(&Key::NextVersion.encode(), n.encode())
+}
+
+/// TRUSTED: scanning the TxnActive prefix yields exactly the versions with a
+/// TxnActive record.
+#[verifier::external_body]
+fn h_scan_active(h: &mut EngineHandle<'_>) -> (r: EResult<Vec<u64>>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(vs) => forall|v: u64|
+                #[trigger] vs@.contains(v) <==> hview(*final(h)).contains_key(KeyS::TxnActive(v)),
+            Err(_) => true,
+        },
+{
+    h.inner.scan_active_versions()
+}
+
+/// TRUSTED: reading a TxnActiveSnapshot record decodes the recorded set.
+#[verifier::external_body]
+fn h_get_txn_active_snapshot(h: &mut EngineHandle<'_>, v: u64) -> (r: EResult<
+    Option<BTreeSet<u64>>,
+>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(Some(b)) => hview(*final(h)).contains_key(KeyS::TxnActiveSnapshot(v)) && hview(*final(h))[
+                KeyS::TxnActiveSnapshot(v)
+            ] == ValS::VSet(b@),
+            Ok(None) => !hview(*final(h)).contains_key(KeyS::TxnActiveSnapshot(v)),
+            Err(_) => true,
+        },
+{
+    match h.inner.get_raw(&Key::TxnActiveSnapshot(v).encode())? {
+        Some(ref value) => Ok(Some(BTreeSet::<Version>::decode(value)?)),
+        None => Ok(None),
+    }
+}
+
+/// TRUSTED: writing a TxnActiveSnapshot record stores the encoded set.
+#[verifier::external_body]
+fn h_set_txn_active_snapshot(h: &mut EngineHandle<'_>, v: u64, set: &BTreeSet<u64>) -> (r: EResult<
+    (),
+>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).insert(
+            KeyS::TxnActiveSnapshot(v),
+            ValS::VSet(set@),
+        ),
+{
+    h.inner.set_raw(&Key::TxnActiveSnapshot(v).encode(), set.encode())
+}
+
+/// TRUSTED: registering a transaction writes its TxnActive record.
+#[verifier::external_body]
+fn h_set_txn_active(h: &mut EngineHandle<'_>, v: u64) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).insert(KeyS::TxnActive(v), ValS::Unit),
+{
+    h.inner.set_raw(&Key::TxnActive(v).encode(), vec![])
+}
+
+/// TRUSTED: unregistering a transaction deletes its TxnActive record.
+#[verifier::external_body]
+fn h_delete_txn_active(h: &mut EngineHandle<'_>, v: u64) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).remove(KeyS::TxnActive(v)),
+{
+    h.inner.delete_raw(&Key::TxnActive(v).encode())
+}
+
+/// TRUSTED: the write-conflict scan. Scanning Version(key, lo)..=Version(key,
+/// u64::MAX) and taking the last entry yields the greatest version of `key`
+/// at or above `lo`, by the keycode ordering of Version keys (key first,
+/// version second — see `encoding::keycode`).
+#[verifier::external_body]
+fn h_scan_last_version_in_range(h: &mut EngineHandle<'_>, key: &[u8], lo: u64) -> (r: EResult<
+    Option<u64>,
+>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(Some(m)) => hview(*final(h)).contains_key(KeyS::Version(key@, m)) && lo <= m && forall|
+                w: u64,
+            |
+                #![auto]
+                hview(*final(h)).contains_key(KeyS::Version(key@, w)) && lo <= w ==> w <= m,
+            Ok(None) => forall|w: u64|
+                #![auto]
+                lo <= w ==> !hview(*final(h)).contains_key(KeyS::Version(key@, w)),
+            Err(_) => true,
+        },
+{
+    h.inner.scan_last_version_in_range(key, lo)
+}
+
+/// TRUSTED: recording a write's TxnWrite bookkeeping record.
+#[verifier::external_body]
+fn h_set_txn_write(h: &mut EngineHandle<'_>, v: u64, key: &[u8]) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).insert(KeyS::TxnWrite(v, key@), ValS::Unit),
+{
+    h.inner.set_raw(&Key::TxnWrite(v, key.into()).encode(), vec![])
+}
+
+/// TRUSTED: writing a versioned value stores its bincoded Option (None being
+/// a deletion tombstone).
+#[verifier::external_body]
+fn h_set_version(h: &mut EngineHandle<'_>, key: &[u8], v: u64, value: &Option<Vec<u8>>) -> (r:
+    EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).insert(
+            KeyS::Version(key@, v),
+            ValS::Bytes(value.deep_view()),
+        ),
+{
+    h.inner.set_raw(&Key::Version(key.into(), v).encode(), bincode::serialize(value))
+}
+
+/// TRUSTED: deleting a TxnWrite record removes exactly it.
+#[verifier::external_body]
+fn h_delete_txn_write(h: &mut EngineHandle<'_>, v: u64, key: &[u8]) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).remove(KeyS::TxnWrite(v, key@)),
+{
+    h.inner.delete_raw(&Key::TxnWrite(v, key.into()).encode())
+}
+
+/// TRUSTED: deleting a versioned record removes exactly it.
+#[verifier::external_body]
+fn h_delete_version(h: &mut EngineHandle<'_>, key: &[u8], v: u64) -> (r: EResult<()>)
+    ensures
+        r is Ok ==> hview(*final(h)) == hview(*old(h)).remove(KeyS::Version(key@, v)),
+{
+    h.inner.delete_raw(&Key::Version(key.into(), v).encode())
+}
+
+/// TRUSTED: scanning the TxnWrite(version) prefix yields exactly the user
+/// keys the transaction has written.
+#[verifier::external_body]
+fn h_scan_txn_write_keys(h: &mut EngineHandle<'_>, v: u64) -> (r: EResult<Vec<Vec<u8>>>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(ks) => (forall|i: int|
+                0 <= i < ks@.len() ==> hview(*final(h)).contains_key(
+                    KeyS::TxnWrite(v, #[trigger] ks@[i]@),
+                )) && (forall|key: Seq<u8>|
+                #[trigger] hview(*final(h)).contains_key(KeyS::TxnWrite(v, key)) ==> exists|i: int| #![auto] 0 <= i < ks@.len() && ks@[i]@ == key),
+            Err(_) => true,
+        },
+{
+    h.inner.scan_txn_write_keys(v)
+}
+
+/// TRUSTED: the read scan. Scanning Version(key, 0)..=Version(key, hi) in
+/// reverse yields all versions of `key` up to `hi`, latest first, with their
+/// decoded values.
+#[verifier::external_body]
+fn h_scan_versions_desc(h: &mut EngineHandle<'_>, key: &[u8], hi: u64) -> (r: EResult<
+    Vec<(u64, Option<Vec<u8>>)>,
+>)
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(es) => (forall|i: int|
+                0 <= i < es@.len() ==> (#[trigger] es@[i]).0 <= hi && hview(*final(h)).contains_key(
+                    KeyS::Version(key@, es@[i].0),
+                ) && hview(*final(h))[KeyS::Version(key@, es@[i].0)] == ValS::Bytes(es@[i].1.deep_view()))
+                && (forall|i: int, j: int| #![auto] 0 <= i < j < es@.len() ==> es@[i].0 > es@[j].0) && (
+            forall|w: u64|
+                w <= hi && #[trigger] hview(*final(h)).contains_key(KeyS::Version(key@, w))
+                    ==> exists|i: int| #![auto] 0 <= i < es@.len() && es@[i].0 == w),
+            Err(_) => true,
+        },
+{
+    h.inner.scan_versions_desc(key, hi)
+}
+
+/// TRUSTED: constructs the version-overflow error (the u64 version counter
+/// would wrap; unreachable in practice).
+#[verifier::external_body]
+fn err_version_overflow() -> Error {
+    Error::InvalidData("version number overflow".to_string())
+}
+
+/// TRUSTED: constructs the begin_as_of error for a nonexistent version, with
+/// the same message the code has always produced.
+#[verifier::external_body]
+fn err_version_does_not_exist(v: u64) -> Error {
+    Error::InvalidInput(format!("version {v} does not exist"))
+}
+
+// ---- Verified transaction operations --------------------------------------
+
+/// The abstraction reads only the NextVersion, TxnActive, TxnActiveSnapshot
+/// and Version records: two views that agree on those abstract identically.
+/// (In particular, TxnWrite bookkeeping and unversioned keys are invisible.)
+proof fn lemma_abs_depends(view: EngView, view2: EngView)
+    requires
+        view2.contains_key(KeyS::NextVersion) == view.contains_key(KeyS::NextVersion),
+        view.contains_key(KeyS::NextVersion) ==> view2[KeyS::NextVersion]
+            == view[KeyS::NextVersion],
+        forall|v: u64|
+            #[trigger] view2.contains_key(KeyS::TxnActive(v)) <==> view.contains_key(
+                KeyS::TxnActive(v),
+            ),
+        forall|v: u64|
+            (#[trigger] view2.contains_key(KeyS::TxnActiveSnapshot(v)) <==> view.contains_key(
+                KeyS::TxnActiveSnapshot(v),
+            )) && (view.contains_key(KeyS::TxnActiveSnapshot(v)) ==> view2[
+                KeyS::TxnActiveSnapshot(v)
+            ] == view[KeyS::TxnActiveSnapshot(v)]),
+        forall|key: Seq<u8>, v: u64|
+            (#[trigger] view2.contains_key(KeyS::Version(key, v)) <==> view.contains_key(
+                KeyS::Version(key, v),
+            )) && (view.contains_key(KeyS::Version(key, v)) ==> view2[KeyS::Version(key, v)]
+                == view[KeyS::Version(key, v)]),
+    ensures
+        abs(view2) == abs(view),
+{
+    assert(abs_next(view2) == abs_next(view));
+    assert forall|v: u64| #[trigger] abs_active(view2).contains(v) <==> abs_active(view).contains(
+        v,
+    ) by {
+        lemma_abs_active(view2, v);
+        lemma_abs_active(view, v);
+    }
+    assert(abs_active(view2) =~= abs_active(view));
+    assert forall|v: u64|
+        #[trigger] abs_snap(view2).contains_key(v) <==> abs_snap(view).contains_key(v) by {
+        lemma_abs_snap(view2, v);
+        lemma_abs_snap(view, v);
+    }
+    assert forall|v: u64| #[trigger] abs_snap(view2).contains_key(v) implies abs_snap(view2)[v]
+        == abs_snap(view)[v] by {
+        lemma_abs_snap(view2, v);
+        lemma_abs_snap(view, v);
+        assert(view2.contains_key(KeyS::TxnActiveSnapshot(v)) == view.contains_key(
+            KeyS::TxnActiveSnapshot(v),
+        ));
+        assert(abs_snap_at(view2, v) == abs_snap_at(view, v));
+    }
+    assert(abs_snap(view2) =~~= abs_snap(view));
+    assert forall|p: (Seq<u8>, u64)|
+        #[trigger] abs_store(view2).contains_key(p) <==> abs_store(view).contains_key(p) by {
+        lemma_abs_store(view2, p.0, p.1);
+        lemma_abs_store(view, p.0, p.1);
+    }
+    assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view2).contains_key(p) implies abs_store(
+        view2,
+    )[p] == abs_store(view)[p] by {
+        lemma_abs_store(view2, p.0, p.1);
+        lemma_abs_store(view, p.0, p.1);
+        assert(view2.contains_key(KeyS::Version(p.0, p.1)) == view.contains_key(
+            KeyS::Version(p.0, p.1),
+        ));
+        assert(abs_store_at(view2, p) == abs_store_at(view, p));
+    }
+    assert(abs_store(view2) =~~= abs_store(view));
+}
+
+/// Verified core of `Transaction::commit` (read-write): delete the
+/// transaction's TxnWrite records (no longer needed once it can no longer
+/// roll back), then delete its TxnActive record — the single step that
+/// atomically publishes its writes. Refines the model `commit` transition.
+#[allow(clippy::question_mark)]
+fn vcommit(h: &mut EngineHandle<'_>, version: u64) -> (r: EResult<()>)
+    requires
+        view_inv(hview(*old(h))),
+        abs(hview(*old(h))).active.contains(version),
+    ensures
+        r is Ok ==> view_inv(hview(*final(h))) && abs(hview(*final(h))) == commit(
+            abs(hview(*old(h))),
+            version,
+        ),
+{
+    let keys = match h_scan_txn_write_keys(h, version) {
+        Ok(ks) => ks,
+        Err(e) => return Err(e),
+    };
+    let ghost view0 = hview(*h);
+    let mut i: usize = 0;
+    while i < keys.len()
+        invariant
+            i <= keys.len(),
+            // Everything the abstraction and the invariant read is untouched,
+            // as are other transactions' TxnWrite records.
+            hview(*h).contains_key(KeyS::NextVersion) == view0.contains_key(KeyS::NextVersion),
+            view0.contains_key(KeyS::NextVersion) ==> hview(*h)[KeyS::NextVersion] == view0[
+                KeyS::NextVersion
+            ],
+            forall|v: u64|
+                #[trigger] hview(*h).contains_key(KeyS::TxnActive(v)) <==> view0.contains_key(
+                    KeyS::TxnActive(v),
+                ),
+            forall|v: u64|
+                (#[trigger] hview(*h).contains_key(KeyS::TxnActiveSnapshot(v))
+                    <==> view0.contains_key(KeyS::TxnActiveSnapshot(v))) && (view0.contains_key(
+                    KeyS::TxnActiveSnapshot(v),
+                ) ==> hview(*h)[KeyS::TxnActiveSnapshot(v)] == view0[KeyS::TxnActiveSnapshot(v)]),
+            forall|key: Seq<u8>, v: u64|
+                (#[trigger] hview(*h).contains_key(KeyS::Version(key, v)) <==> view0.contains_key(
+                    KeyS::Version(key, v),
+                )) && (view0.contains_key(KeyS::Version(key, v)) ==> hview(*h)[
+                    KeyS::Version(key, v)
+                ] == view0[KeyS::Version(key, v)]),
+            forall|v2: u64, key: Seq<u8>|
+                v2 != version ==> (#[trigger] hview(*h).contains_key(KeyS::TxnWrite(v2, key))
+                    <==> view0.contains_key(KeyS::TxnWrite(v2, key))),
+            // Our TxnWrite records only disappear, and the first i are gone.
+            forall|key: Seq<u8>|
+                #[trigger] hview(*h).contains_key(KeyS::TxnWrite(version, key))
+                    ==> view0.contains_key(KeyS::TxnWrite(version, key)),
+            forall|j: int|
+                0 <= j < i ==> !hview(*h).contains_key(KeyS::TxnWrite(version, #[trigger] keys@[j]@)),
+            // The scan listed every TxnWrite record of this transaction.
+            forall|key: Seq<u8>|
+                #[trigger] view0.contains_key(KeyS::TxnWrite(version, key)) ==> exists|j: int| #![auto] 0 <= j < keys@.len() && keys@[j]@ == key,
+        decreases keys.len() - i,
+    {
+        match h_delete_txn_write(h, version, keys[i].as_slice()) {
+            Ok(_) => {},
+            Err(e) => return Err(e),
+        }
+        i += 1;
+    }
+    proof {
+        lemma_abs_depends(view0, hview(*h));
+    }
+    let ghost view_l = hview(*h);
+    match h_delete_txn_active(h, version) {
+        Ok(_) => {},
+        Err(e) => return Err(e),
+    }
+    proof {
+        let s0 = abs(view0);
+        let view_f = hview(*h);
+        // No TxnWrite record of this transaction survived the loop.
+        assert forall|key: Seq<u8>| !(#[trigger] view_f.contains_key(
+            KeyS::TxnWrite(version, key),
+        )) by {
+            if view_l.contains_key(KeyS::TxnWrite(version, key)) {
+                let j = choose|j: int| #![auto] 0 <= j < keys@.len() && keys@[j]@ == key;
+                assert(!view_l.contains_key(KeyS::TxnWrite(version, keys@[j]@)));
+            }
+        }
+        // The abstraction: only the active set changes, dropping version.
+        assert(abs_next(view_f) == abs_next(view_l));
+        assert forall|v: u64|
+            #[trigger] abs_active(view_f).contains(v) <==> abs_active(view_l).remove(
+                version,
+            ).contains(v) by {
+            lemma_abs_active(view_f, v);
+            lemma_abs_active(view_l, v);
+        }
+        assert(abs_active(view_f) =~= abs_active(view_l).remove(version));
+        assert forall|v: u64|
+            #[trigger] abs_snap(view_f).contains_key(v) <==> abs_snap(view_l).contains_key(v) by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view_l, v);
+        }
+        assert forall|v: u64| #[trigger] abs_snap(view_f).contains_key(v) implies abs_snap(view_f)[v]
+            == abs_snap(view_l)[v] by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view_l, v);
+        }
+        assert(abs_snap(view_f) =~~= abs_snap(view_l));
+        assert forall|p: (Seq<u8>, u64)|
+            #[trigger] abs_store(view_f).contains_key(p) <==> abs_store(view_l).contains_key(p) by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view_l, p.0, p.1);
+        }
+        assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view_f).contains_key(p) implies
+            abs_store(view_f)[p] == abs_store(view_l)[p] by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view_l, p.0, p.1);
+        }
+        assert(abs_store(view_f) =~~= abs_store(view_l));
+        assert(abs(view_f) == commit(s0, version));
+        // The refinement invariant.
+        lemma_inv_commit(s0, version);
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActive(v)) implies 1 <= v
+            < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActiveSnapshot(v)) implies 1
+            <= v < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActiveSnapshot(v)));
+        }
+        assert forall|key: Seq<u8>, v: u64|
+            #![auto]
+            view_f.contains_key(KeyS::Version(key, v)) && view_f.contains_key(
+                KeyS::TxnActive(v),
+            ) implies view_f.contains_key(KeyS::TxnWrite(v, key)) by {
+            assert(v != version);
+            assert(view0.contains_key(KeyS::Version(key, v)));
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert(view_inv(view_f));
+    }
+    Ok(())
+}
+
+/// Verified core of `Transaction::rollback` (read-write): use the TxnWrite
+/// records to find and delete every version the transaction wrote (the
+/// refinement invariant guarantees they cover all of them — this is why the
+/// bookkeeping exists), then delete its TxnActive record. The snapshot record
+/// stays behind for time-travel queries. Refines the model `rollback`
+/// transition.
+#[allow(clippy::question_mark)]
+fn vrollback(h: &mut EngineHandle<'_>, version: u64) -> (r: EResult<()>)
+    requires
+        view_inv(hview(*old(h))),
+        abs(hview(*old(h))).active.contains(version),
+    ensures
+        r is Ok ==> view_inv(hview(*final(h))) && abs(hview(*final(h))) == rollback(
+            abs(hview(*old(h))),
+            version,
+        ),
+{
+    let keys = match h_scan_txn_write_keys(h, version) {
+        Ok(ks) => ks,
+        Err(e) => return Err(e),
+    };
+    let ghost view0 = hview(*h);
+    proof {
+        // The transaction is active, so the refinement invariant's TxnWrite
+        // coverage applies to every one of its writes.
+        lemma_abs_active(view0, version);
+        assert(view0.contains_key(KeyS::TxnActive(version)));
+    }
+    let mut i: usize = 0;
+    while i < keys.len()
+        invariant
+            i <= keys.len(),
+            // Records the abstraction reads, other than this transaction's
+            // versioned writes, are untouched; so are other TxnWrites.
+            hview(*h).contains_key(KeyS::NextVersion) == view0.contains_key(KeyS::NextVersion),
+            view0.contains_key(KeyS::NextVersion) ==> hview(*h)[KeyS::NextVersion] == view0[
+                KeyS::NextVersion
+            ],
+            forall|v: u64|
+                #[trigger] hview(*h).contains_key(KeyS::TxnActive(v)) <==> view0.contains_key(
+                    KeyS::TxnActive(v),
+                ),
+            forall|v: u64|
+                (#[trigger] hview(*h).contains_key(KeyS::TxnActiveSnapshot(v))
+                    <==> view0.contains_key(KeyS::TxnActiveSnapshot(v))) && (view0.contains_key(
+                    KeyS::TxnActiveSnapshot(v),
+                ) ==> hview(*h)[KeyS::TxnActiveSnapshot(v)] == view0[KeyS::TxnActiveSnapshot(v)]),
+            forall|v2: u64, key: Seq<u8>|
+                v2 != version ==> (#[trigger] hview(*h).contains_key(KeyS::TxnWrite(v2, key))
+                    <==> view0.contains_key(KeyS::TxnWrite(v2, key))),
+            // Other versions' writes are untouched.
+            forall|key: Seq<u8>, v2: u64|
+                v2 != version ==> (#[trigger] hview(*h).contains_key(KeyS::Version(key, v2))
+                    <==> view0.contains_key(KeyS::Version(key, v2))) && (view0.contains_key(
+                    KeyS::Version(key, v2),
+                ) ==> hview(*h)[KeyS::Version(key, v2)] == view0[KeyS::Version(key, v2)]),
+            // This transaction's writes and TxnWrites only disappear, and the
+            // first i of each are gone.
+            forall|key: Seq<u8>|
+                #[trigger] hview(*h).contains_key(KeyS::Version(key, version))
+                    ==> view0.contains_key(KeyS::Version(key, version)),
+            forall|key: Seq<u8>|
+                #[trigger] hview(*h).contains_key(KeyS::TxnWrite(version, key))
+                    ==> view0.contains_key(KeyS::TxnWrite(version, key)),
+            forall|j: int|
+                0 <= j < i ==> !hview(*h).contains_key(
+                    KeyS::Version(#[trigger] keys@[j]@, version),
+                ) && !hview(*h).contains_key(KeyS::TxnWrite(version, keys@[j]@)),
+            // The scan listed every TxnWrite record of this transaction, and
+            // the refinement invariant made those cover every write.
+            forall|key: Seq<u8>|
+                #[trigger] view0.contains_key(KeyS::TxnWrite(version, key)) ==> exists|j: int| #![auto] 0 <= j < keys@.len() && keys@[j]@ == key,
+            forall|key: Seq<u8>|
+                #[trigger] view0.contains_key(KeyS::Version(key, version)) ==> view0.contains_key(
+                    KeyS::TxnWrite(version, key),
+                ),
+        decreases keys.len() - i,
+    {
+        match h_delete_version(h, keys[i].as_slice(), version) {
+            Ok(_) => {},
+            Err(e) => return Err(e),
+        }
+        match h_delete_txn_write(h, version, keys[i].as_slice()) {
+            Ok(_) => {},
+            Err(e) => return Err(e),
+        }
+        i += 1;
+    }
+    let ghost view_l = hview(*h);
+    match h_delete_txn_active(h, version) {
+        Ok(_) => {},
+        Err(e) => return Err(e),
+    }
+    proof {
+        let s0 = abs(view0);
+        let view_f = hview(*h);
+        // Nothing of the transaction survived: not its writes (coverage +
+        // scan completeness + the loop), not its TxnWrite records.
+        assert forall|key: Seq<u8>|
+            !(#[trigger] view_f.contains_key(KeyS::Version(key, version))) && !(
+            #[trigger] view_f.contains_key(KeyS::TxnWrite(version, key))) by {
+            if view_l.contains_key(KeyS::Version(key, version)) || view_l.contains_key(
+                KeyS::TxnWrite(version, key),
+            ) {
+                assert(view0.contains_key(KeyS::TxnWrite(version, key)));
+                let j = choose|j: int| #![auto] 0 <= j < keys@.len() && keys@[j]@ == key;
+                assert(!view_l.contains_key(KeyS::Version(keys@[j]@, version)));
+                assert(!view_l.contains_key(KeyS::TxnWrite(version, keys@[j]@)));
+            }
+        }
+        // The abstraction: the active set drops version, and the store loses
+        // exactly the pairs at version.
+        let s2 = rollback(s0, version);
+        assert(abs_next(view_f) == abs_next(view0));
+        assert forall|v: u64| #[trigger] abs_active(view_f).contains(v) <==> s2.active.contains(
+            v,
+        ) by {
+            lemma_abs_active(view_f, v);
+            lemma_abs_active(view0, v);
+        }
+        assert(abs_active(view_f) =~= s2.active);
+        assert forall|v: u64|
+            #[trigger] abs_snap(view_f).contains_key(v) <==> s2.snap.contains_key(v) by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+        }
+        assert forall|v: u64| #[trigger] abs_snap(view_f).contains_key(v) implies abs_snap(view_f)[v]
+            == s2.snap[v] by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+            assert(view_f.contains_key(KeyS::TxnActiveSnapshot(v)) == view0.contains_key(
+                KeyS::TxnActiveSnapshot(v),
+            ));
+            assert(abs_snap_at(view_f, v) == abs_snap_at(view0, v));
+        }
+        assert(abs_snap(view_f) =~~= s2.snap);
+        assert forall|p: (Seq<u8>, u64)|
+            #[trigger] abs_store(view_f).contains_key(p) <==> s2.store.contains_key(p) by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+        }
+        assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view_f).contains_key(p) implies
+            abs_store(view_f)[p] == s2.store[p] by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+            assert(p.1 != version);
+            assert(abs_store_at(view_f, p) == abs_store_at(view0, p));
+        }
+        assert(abs_store(view_f) =~~= s2.store);
+        assert(abs(view_f) == s2);
+        // The refinement invariant.
+        lemma_inv_rollback(s0, version);
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActive(v)) implies 1 <= v
+            < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActiveSnapshot(v)) implies 1
+            <= v < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActiveSnapshot(v)));
+        }
+        assert forall|key: Seq<u8>, v: u64|
+            #![auto]
+            view_f.contains_key(KeyS::Version(key, v)) && view_f.contains_key(
+                KeyS::TxnActive(v),
+            ) implies view_f.contains_key(KeyS::TxnWrite(v, key)) by {
+            assert(v != version);
+            assert(view0.contains_key(KeyS::Version(key, v)));
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert(view_inv(view_f));
+    }
+    Ok(())
+}
+
+/// Collects scanned versions into the in-memory active set.
+fn versions_to_set(versions: &[u64]) -> (r: BTreeSet<u64>)
+    ensures
+        forall|v: u64| #[trigger] r@.contains(v) <==> versions@.contains(v),
+{
+    let mut set = BTreeSet::new();
+    let mut i: usize = 0;
+    while i < versions.len()
+        invariant
+            i <= versions.len(),
+            forall|v: u64|
+                #[trigger] set@.contains(v) <==> exists|j: int| 0 <= j < i && versions@[j] == v,
+        decreases versions.len() - i,
+    {
+        set.insert(versions[i]);
+        assert forall|v: u64| #[trigger] set@.contains(v) implies exists|j: int|
+            0 <= j < i + 1 && versions@[j] == v by {
+            if v == versions@[i as int] {
+                assert(0 <= i < i + 1 && versions@[i as int] == v);
+            } else {
+                let j = choose|j: int| 0 <= j < i && versions@[j] == v;
+                assert(0 <= j < i + 1 && versions@[j] == v);
+            }
+        }
+        i += 1;
+    }
+    set
+}
+
+/// Verified core of `Transaction::begin`: allocate the next version, bump
+/// NextVersion, snapshot the active set (persisting it only when non-empty,
+/// exactly as the code always has), and register the transaction as active.
+/// Refines the model `begin` transition and returns the transaction state
+/// (its version and active-set snapshot) that `begin` produces in the model.
+#[allow(clippy::question_mark)]
+fn vbegin(h: &mut EngineHandle<'_>) -> (r: EResult<(u64, BTreeSet<u64>)>)
+    requires
+        view_inv(hview(*old(h))),
+    ensures
+        match r {
+            Ok((version, active)) => {
+                &&& can_begin(abs(hview(*old(h))))
+                &&& version == abs(hview(*old(h))).next
+                &&& active@ == abs(hview(*old(h))).active
+                &&& view_inv(hview(*final(h)))
+                &&& abs(hview(*final(h))) == begin(abs(hview(*old(h))))
+            },
+            Err(_) => true,
+        },
+{
+    let ghost view0 = hview(*h);
+    let ghost s0 = abs(view0);
+    // Allocate a new version to write at.
+    let version = match h_get_next_version(h) {
+        Ok(n) => n,
+        Err(e) => return Err(e),
+    };
+    if version == u64::MAX {
+        // The u64 version counter would wrap: refuse. (Unreachable in
+        // practice; the historical code would panic here instead.)
+        return Err(err_version_overflow());
+    }
+    match h_set_next_version(h, version + 1) {
+        Ok(_) => {},
+        Err(e) => return Err(e),
+    }
+    let ghost view1 = hview(*h);
+    // Fetch the current set of active transactions, persist it for
+    // time-travel queries if non-empty, then add this txn to it.
+    let versions = match h_scan_active(h) {
+        Ok(vs) => vs,
+        Err(e) => return Err(e),
+    };
+    let active = versions_to_set(versions.as_slice());
+    proof {
+        assert forall|v: u64| #[trigger] active@.contains(v) <==> s0.active.contains(v) by {
+            lemma_abs_active(view0, v);
+        }
+        assert(active@ =~= s0.active);
+    }
+    if !active.is_empty() {
+        match h_set_txn_active_snapshot(h, version, &active) {
+            Ok(_) => {},
+            Err(e) => return Err(e),
+        }
+    }
+    let ghost view2 = hview(*h);
+    match h_set_txn_active(h, version) {
+        Ok(_) => {},
+        Err(e) => return Err(e),
+    }
+    proof {
+        let view_f = hview(*h);
+        let s2 = begin(s0);
+        // In the empty case no snapshot record is written; there was no stale
+        // record at the fresh version either (view_inv), so the absent record
+        // reads back as the empty set the active set was.
+        assert(!view0.contains_key(KeyS::TxnActiveSnapshot(version)));
+        assert(abs_next(view_f) == s2.next);
+        assert forall|v: u64| #[trigger] abs_active(view_f).contains(v) <==> s2.active.contains(
+            v,
+        ) by {
+            lemma_abs_active(view_f, v);
+            lemma_abs_active(view0, v);
+        }
+        assert(abs_active(view_f) =~= s2.active);
+        assert forall|v: u64|
+            #[trigger] abs_snap(view_f).contains_key(v) <==> s2.snap.contains_key(v) by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+        }
+        assert forall|v: u64| #[trigger] abs_snap(view_f).contains_key(v) implies abs_snap(view_f)[v]
+            == s2.snap[v] by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+            if v == version {
+                if active@.is_empty() {
+                    assert(!view_f.contains_key(KeyS::TxnActiveSnapshot(version)));
+                    assert(abs_snap_at(view_f, version) =~= s0.active);
+                } else {
+                    assert(view_f[KeyS::TxnActiveSnapshot(version)] == ValS::VSet(active@));
+                    assert(abs_snap_at(view_f, version) == active@);
+                }
+            } else {
+                assert(view_f.contains_key(KeyS::TxnActiveSnapshot(v)) == view0.contains_key(
+                    KeyS::TxnActiveSnapshot(v),
+                ));
+                assert(abs_snap_at(view_f, v) == abs_snap_at(view0, v));
+            }
+        }
+        assert(abs_snap(view_f) =~~= s2.snap);
+        assert forall|p: (Seq<u8>, u64)|
+            #[trigger] abs_store(view_f).contains_key(p) <==> s2.store.contains_key(p) by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+        }
+        assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view_f).contains_key(p) implies
+            abs_store(view_f)[p] == s2.store[p] by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+            assert(abs_store_at(view_f, p) == abs_store_at(view0, p));
+        }
+        assert(abs_store(view_f) =~~= s2.store);
+        assert(abs(view_f) == s2);
+        // The refinement invariant.
+        lemma_inv_begin(s0);
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActive(v)) implies 1 <= v
+            < abs_next(view_f) by {
+            if v != version {
+                assert(view0.contains_key(KeyS::TxnActive(v)));
+            }
+        }
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActiveSnapshot(v)) implies 1
+            <= v < abs_next(view_f) by {
+            if v != version {
+                assert(view0.contains_key(KeyS::TxnActiveSnapshot(v)));
+            }
+        }
+        assert forall|key: Seq<u8>, v: u64|
+            #![auto]
+            view_f.contains_key(KeyS::Version(key, v)) && view_f.contains_key(
+                KeyS::TxnActive(v),
+            ) implies view_f.contains_key(KeyS::TxnWrite(v, key)) by {
+            assert(view0.contains_key(KeyS::Version(key, v)));
+            lemma_abs_store(view0, key, v);
+            assert(s0.store.contains_key((key, v)));
+            assert(allocated(s0, v));
+            assert(v != version);
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert(view_inv(view_f));
+    }
+    Ok((version, active))
+}
+
+/// TRUSTED: `BTreeSet::first` returns the smallest element, if any.
+#[verifier::external_body]
+fn btree_set_first(s: &BTreeSet<u64>) -> (r: Option<u64>)
+    ensures
+        match r {
+            Some(m) => s@.contains(m) && forall|w: u64| #[trigger] s@.contains(w) ==> m <= w,
+            None => forall|w: u64| !(#[trigger] s@.contains(w)),
+        },
+{
+    s.first().copied()
+}
+
+/// The outcome of a versioned write: done, a serialization conflict (the
+/// caller returns `Error::Serialization`), or an engine/decode failure.
+pub enum VWriteOutcome {
+    Done,
+    Conflict,
+    Fail(Error),
+}
+
+/// Verified core of `Transaction::write_version`: the conflict check and
+/// write. Scans the versions of `key` from the smallest version in the begin
+/// snapshot (or version + 1 if none) and errors iff the latest one is
+/// invisible — and by `thm_conflict_check_exact` that latest-only check
+/// conflicts exactly when *any* version of the key is invisible. On success,
+/// writes the TxnWrite bookkeeping record and the new version, refining the
+/// model `write` transition.
+#[allow(clippy::question_mark, clippy::collapsible_if)]
+#[allow(clippy::needless_return)]
+fn vwrite(
+    h: &mut EngineHandle<'_>,
+    version: u64,
+    active: &BTreeSet<u64>,
+    key: &[u8],
+    value: &Option<Vec<u8>>,
+) -> (r: VWriteOutcome)
+    requires
+        view_inv(hview(*old(h))),
+        abs(hview(*old(h))).active.contains(version),
+        active@ == abs(hview(*old(h))).snap[version],
+    ensures
+        match r {
+            VWriteOutcome::Done => {
+                &&& can_write(abs(hview(*old(h))), version, key@)
+                &&& view_inv(hview(*final(h)))
+                &&& abs(hview(*final(h))) == write(
+                    abs(hview(*old(h))),
+                    version,
+                    key@,
+                    value.deep_view(),
+                )
+            },
+            VWriteOutcome::Conflict => !no_write_conflict(abs(hview(*old(h))), version, key@)
+                && hview(*final(h)) == hview(*old(h)),
+            VWriteOutcome::Fail(_) => true,
+        },
+{
+    let ghost view0 = hview(*h);
+    let ghost s0 = abs(view0);
+    proof {
+        assert(allocated(s0, version));  // version is active, so version < next <= u64::MAX
+    }
+    // The scan floor: the smallest version in our begin snapshot, or the
+    // version after ours — everything below is visible to us.
+    let lo = match btree_set_first(active) {
+        Some(m) => m,
+        None => version + 1,
+    };
+    proof {
+        assert(is_scan_floor(s0.snap[version], version, lo));
+    }
+    // Check for write conflicts: find the latest version of the key in the
+    // scanned range and test its visibility.
+    let latest = match h_scan_last_version_in_range(h, key, lo) {
+        Ok(l) => l,
+        Err(e) => return VWriteOutcome::Fail(e),
+    };
+    // Relate the view-level scan result to the model-level range maximum.
+    proof {
+        match latest {
+            Some(m) => {
+                lemma_abs_store(view0, key@, m);
+                assert(has_version(s0, key@, m));
+                assert forall|w: u64| #[trigger] has_version(s0, key@, w) && lo <= w implies w
+                    <= m by {
+                    lemma_abs_store(view0, key@, w);
+                }
+                assert(range_max(s0, key@, lo, m));
+            },
+            None => {
+                assert forall|m2: u64| !(#[trigger] range_max(s0, key@, lo, m2)) by {
+                    if range_max(s0, key@, lo, m2) {
+                        lemma_abs_store(view0, key@, m2);
+                    }
+                }
+            },
+        }
+    }
+    if let Some(m) = latest {
+        if !is_visible_core(active, version, false, m) {
+            proof {
+                // The latest version is invisible: by exactness of the check,
+                // some version of the key genuinely conflicts.
+                assert(!check_passes(s0, version, key@, lo));
+                thm_conflict_check_exact(s0, version, key@, lo);
+            }
+            return VWriteOutcome::Conflict;
+        }
+    }
+    proof {
+        // The check passed: only the range maximum needed testing.
+        assert forall|m2: u64| #[trigger] range_max(s0, key@, lo, m2) implies txn_visible(
+            s0,
+            version,
+            m2,
+        ) by {
+            match latest {
+                Some(m) => {
+                    assert(m2 == m);
+                },
+                None => {},
+            }
+        }
+        assert(check_passes(s0, version, key@, lo));
+        assert(can_write(s0, version, key@));
+    }
+    // Write the new version and its write record.
+    match h_set_txn_write(h, version, key) {
+        Ok(_) => {},
+        Err(e) => return VWriteOutcome::Fail(e),
+    }
+    match h_set_version(h, key, version, value) {
+        Ok(_) => {},
+        Err(e) => return VWriteOutcome::Fail(e),
+    }
+    proof {
+        let view_f = hview(*h);
+        let s2 = write(s0, version, key@, value.deep_view());
+        assert(abs_next(view_f) == s2.next);
+        assert forall|v: u64| #[trigger] abs_active(view_f).contains(v) <==> s2.active.contains(
+            v,
+        ) by {
+            lemma_abs_active(view_f, v);
+            lemma_abs_active(view0, v);
+        }
+        assert(abs_active(view_f) =~= s2.active);
+        assert forall|v: u64|
+            #[trigger] abs_snap(view_f).contains_key(v) <==> s2.snap.contains_key(v) by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+        }
+        assert forall|v: u64| #[trigger] abs_snap(view_f).contains_key(v) implies abs_snap(view_f)[v]
+            == s2.snap[v] by {
+            lemma_abs_snap(view_f, v);
+            lemma_abs_snap(view0, v);
+            assert(view_f.contains_key(KeyS::TxnActiveSnapshot(v)) == view0.contains_key(
+                KeyS::TxnActiveSnapshot(v),
+            ));
+            assert(abs_snap_at(view_f, v) == abs_snap_at(view0, v));
+        }
+        assert(abs_snap(view_f) =~~= s2.snap);
+        assert forall|p: (Seq<u8>, u64)|
+            #[trigger] abs_store(view_f).contains_key(p) <==> s2.store.contains_key(p) by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+        }
+        assert forall|p: (Seq<u8>, u64)| #[trigger] abs_store(view_f).contains_key(p) implies
+            abs_store(view_f)[p] == s2.store[p] by {
+            lemma_abs_store(view_f, p.0, p.1);
+            lemma_abs_store(view0, p.0, p.1);
+            if p == (key@, version) {
+                assert(view_f[KeyS::Version(key@, version)] == ValS::Bytes(value.deep_view()));
+            } else {
+                assert(abs_store_at(view_f, p) == abs_store_at(view0, p));
+            }
+        }
+        assert(abs_store(view_f) =~~= s2.store);
+        assert(abs(view_f) == s2);
+        // The refinement invariant.
+        lemma_inv_write(s0, version, key@, value.deep_view());
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActive(v)) implies 1 <= v
+            < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActive(v)));
+        }
+        assert forall|v: u64| #[trigger] view_f.contains_key(KeyS::TxnActiveSnapshot(v)) implies 1
+            <= v < abs_next(view_f) by {
+            assert(view0.contains_key(KeyS::TxnActiveSnapshot(v)));
+        }
+        assert forall|k2: Seq<u8>, v: u64|
+            #![auto]
+            view_f.contains_key(KeyS::Version(k2, v)) && view_f.contains_key(
+                KeyS::TxnActive(v),
+            ) implies view_f.contains_key(KeyS::TxnWrite(v, k2)) by {
+            if k2 != key@ || v != version {
+                assert(view0.contains_key(KeyS::Version(k2, v)));
+                assert(view0.contains_key(KeyS::TxnActive(v)));
+            }
+        }
+        assert(view_inv(view_f));
+    }
+    VWriteOutcome::Done
+}
+
+/// Verified core of `Transaction::get`: scan the key's versions from the
+/// transaction's version downwards and return the first visible one — proven
+/// to be the model read (`is_read_result`): the value at the greatest visible
+/// version, or None if no version is visible.
+#[allow(clippy::question_mark)]
+fn vget(
+    h: &mut EngineHandle<'_>,
+    version: u64,
+    read_only: bool,
+    active: &BTreeSet<u64>,
+    key: &[u8],
+) -> (r: EResult<Option<Vec<u8>>>)
+    requires
+        view_inv(hview(*old(h))),
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok(res) => ({
+                let s = abs(hview(*old(h)));
+                ||| exists|w: u64|
+                    #[trigger] is_read_result(s, version, active@, read_only, key@, w)
+                        && res.deep_view() == s.store[(key@, w)]
+                ||| ((forall|w: u64|
+                    #[trigger] has_version(s, key@, w) ==> !spec_is_visible(
+                        active@,
+                        version,
+                        read_only,
+                        w,
+                    )) && res is None)
+            }),
+            Err(_) => true,
+        },
+{
+    let ghost view0 = hview(*h);
+    let ghost s0 = abs(view0);
+    let mut entries = match h_scan_versions_desc(h, key, version) {
+        Ok(es) => es,
+        Err(e) => return Err(e),
+    };
+    let ghost es = entries@;
+    proof {
+        // Every version of the key is below NextVersion and, if visible, at
+        // or below the transaction's version — so the scan to `version`
+        // covered every visible version.
+        assert forall|w: u64|
+            #[trigger] has_version(s0, key@, w) && spec_is_visible(active@, version, read_only, w)
+                implies exists|i: int| #![auto] 0 <= i < es.len() && es[i].0 == w by {
+            lemma_abs_store(view0, key@, w);
+        }
+    }
+    let mut i: usize = 0;
+    while i < entries.len()
+        invariant
+            i <= entries.len(),
+            entries@ == es,
+            view0 == hview(*old(h)),
+            hview(*h) == view0,
+            view_inv(view0),
+            s0 == abs(view0),
+            // Scan facts (restated from the adapter contract).
+            forall|j: int|
+                0 <= j < es.len() ==> (#[trigger] es[j]).0 <= version && view0.contains_key(
+                    KeyS::Version(key@, es[j].0),
+                ) && view0[KeyS::Version(key@, es[j].0)] == ValS::Bytes(es[j].1.deep_view()),
+            forall|j: int, j2: int| #![auto] 0 <= j < j2 < es.len() ==> es[j].0 > es[j2].0,
+            forall|w: u64|
+                #[trigger] has_version(s0, key@, w) && spec_is_visible(
+                    active@,
+                    version,
+                    read_only,
+                    w,
+                ) ==> exists|j: int| #![auto] 0 <= j < es.len() && es[j].0 == w,
+            // Everything we have walked past is invisible.
+            forall|j: int|
+                0 <= j < i ==> !spec_is_visible(active@, version, read_only, (#[trigger] es[j]).0),
+        decreases entries.len() - i,
+    {
+        if is_visible_core(active, version, read_only, entries[i].0) {
+            let entry = entries.remove(i);
+            let ghost w = entry.0;
+            let val = entry.1;
+            proof {
+                // w is visible with a version record: it is the model read,
+                // since any visible version appears in the scan, and entries
+                // before ours are invisible while entries after are smaller.
+                lemma_abs_store(view0, key@, w);
+                assert(has_version(s0, key@, w));
+                assert forall|w2: u64|
+                    #[trigger] has_version(s0, key@, w2) && spec_is_visible(
+                        active@,
+                        version,
+                        read_only,
+                        w2,
+                    ) implies w2 <= w by {
+                    let j2 = choose|j2: int| #![auto] 0 <= j2 < es.len() && es[j2].0 == w2;
+                    if j2 < i {
+                        assert(!spec_is_visible(active@, version, read_only, es[j2].0));
+                    } else if j2 > i {
+                        assert(es[i as int].0 > es[j2].0);
+                    }
+                }
+                assert(is_read_result(s0, version, active@, read_only, key@, w));
+                assert(s0.store[(key@, w)] == abs_store_at(view0, (key@, w)));
+                assert(s0.store[(key@, w)] == val.deep_view());
+            }
+            return Ok(val);
+        }
+        i += 1;
+    }
+    proof {
+        // No entry was visible, and every visible version is an entry.
+        assert forall|w: u64| #[trigger] has_version(s0, key@, w) implies !spec_is_visible(
+            active@,
+            version,
+            read_only,
+            w,
+        ) by {
+            if spec_is_visible(active@, version, read_only, w) {
+                let j = choose|j: int| #![auto] 0 <= j < es.len() && es[j].0 == w;
+                assert(!spec_is_visible(active@, version, read_only, es[j].0));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Verified core of `Transaction::begin_read_only`: read the current version
+/// and either take a live snapshot of the active set (as_of None) or restore
+/// the persisted snapshot of a past version (time travel). Either way the
+/// result is a well-formed observer (`wf_observer`) of the current state, so
+/// all the read-path theorems (no dirty reads, snapshot stability) apply to
+/// it. Does not modify the engine.
+#[allow(clippy::question_mark)]
+fn vbegin_read_only(h: &mut EngineHandle<'_>, as_of: Option<u64>) -> (r: EResult<
+    (u64, BTreeSet<u64>),
+>)
+    requires
+        view_inv(hview(*old(h))),
+    ensures
+        hview(*final(h)) == hview(*old(h)),
+        match r {
+            Ok((version, active)) => {
+                &&& wf_observer(abs(hview(*old(h))), version, active@, true)
+                &&& match as_of {
+                    Some(v) => version == v && v < abs(hview(*old(h))).next,
+                    None => version == abs(hview(*old(h))).next && active@ == abs(
+                        hview(*old(h)),
+                    ).active,
+                }
+            },
+            Err(_) => true,
+        },
+{
+    let ghost view0 = hview(*h);
+    let ghost s0 = abs(view0);
+    // Fetch the latest version.
+    let mut version = match h_get_next_version(h) {
+        Ok(n) => n,
+        Err(e) => return Err(e),
+    };
+    let active: BTreeSet<u64>;
+    if let Some(v) = as_of {
+        // Create the transaction as of a past version, restoring the active
+        // snapshot as of the beginning of that version.
+        if v >= version {
+            return Err(err_version_does_not_exist(v));
+        }
+        version = v;
+        active = match h_get_txn_active_snapshot(h, v) {
+            Ok(Some(set)) => set,
+            Ok(None) => BTreeSet::new(),
+            Err(e) => return Err(e),
+        };
+        proof {
+            // The observer property: any still-active transaction below v was
+            // active when v began, hence in the snapshot we restored (which,
+            // if absent, was empty — and then nothing below v is still
+            // active). Mirrors lemma_ro_as_of_is_observer against the view.
+            assert forall|w: u64| s0.active.contains(w) && w < v implies active@.contains(w) by {
+                lemma_abs_active(view0, w);
+                if view0.contains_key(KeyS::TxnActiveSnapshot(v)) {
+                    lemma_abs_snap(view0, v);
+                    assert(s0.snap.contains_key(v));
+                    assert(s0.snap[v].contains(w));
+                    assert(active@ == abs_snap_at(view0, v));
+                } else {
+                    // No snapshot record: the active set at v's begin was
+                    // empty. If w were still active with w < v, the model
+                    // invariant would place it in v's (empty) snapshot.
+                    assert(abs_snap_at(view0, v) =~= Set::<u64>::empty());
+                    if 1 <= v {
+                        lemma_abs_snap(view0, v);
+                        assert(s0.snap.contains_key(v));
+                        assert(s0.snap[v].contains(w));
+                        assert(false);
+                    }
+                }
+            }
+        }
+    } else {
+        // Use the latest version and the current, real-time active set.
+        let versions = match h_scan_active(h) {
+            Ok(vs) => vs,
+            Err(e) => return Err(e),
+        };
+        active = versions_to_set(versions.as_slice());
+        proof {
+            assert forall|w: u64| #[trigger] active@.contains(w) <==> s0.active.contains(w) by {
+                lemma_abs_active(view0, w);
+            }
+            assert(active@ =~= s0.active);
+        }
+    }
+    Ok((version, active))
+}
+
 } // verus!
+
+/// The object-safe engine facade used by the verified MVCC core. TRUSTED:
+/// together with the `h_*` adapter functions in the `verus!` block above,
+/// this forms the trusted boundary between the verified transaction logic
+/// and the raw storage engine. Each method mirrors an engine access pattern
+/// the transaction code historically performed inline; the adapter contracts
+/// state what each is trusted to do in terms of the decoded view `hview`.
+pub trait EngineOps {
+    fn get_raw(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn set_raw(&mut self, key: &[u8], value: Vec<u8>) -> Result<()>;
+    fn delete_raw(&mut self, key: &[u8]) -> Result<()>;
+    /// The versions of all TxnActive records.
+    fn scan_active_versions(&mut self) -> Result<Vec<u64>>;
+    /// The greatest version of `key` in `lo..=u64::MAX`: the write conflict
+    /// scan. Relies on the keycode encoding ordering Version keys by (key,
+    /// version), so the last entry of the range scan is the greatest version.
+    fn scan_last_version_in_range(&mut self, key: &[u8], lo: u64) -> Result<Option<u64>>;
+    /// All (version, value) pairs of `key` with version <= hi, latest first,
+    /// with values decoded: the read scan.
+    fn scan_versions_desc(&mut self, key: &[u8], hi: u64) -> Result<Vec<(u64, Option<Vec<u8>>)>>;
+    /// The user keys of all TxnWrite records of `version`, in key order.
+    fn scan_txn_write_keys(&mut self, version: u64) -> Result<Vec<Vec<u8>>>;
+}
+
+impl<E: Engine> EngineOps for E {
+    fn get_raw(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get(key)
+    }
+
+    fn set_raw(&mut self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        self.set(key, value)
+    }
+
+    fn delete_raw(&mut self, key: &[u8]) -> Result<()> {
+        self.delete(key)
+    }
+
+    fn scan_active_versions(&mut self) -> Result<Vec<u64>> {
+        let mut versions = Vec::new();
+        let mut scan = self.scan_prefix(&KeyPrefix::TxnActive.encode());
+        while let Some((key, _)) = scan.next().transpose()? {
+            match Key::decode(&key)? {
+                Key::TxnActive(version) => versions.push(version),
+                key => return errdata!("expected TxnActive key, got {key:?}"),
+            }
+        }
+        Ok(versions)
+    }
+
+    fn scan_last_version_in_range(&mut self, key: &[u8], lo: u64) -> Result<Option<u64>> {
+        let from = Key::Version(key.into(), lo).encode();
+        let to = Key::Version(key.into(), u64::MAX).encode();
+        match self.scan(from..=to).last().transpose()? {
+            Some((key, _)) => match Key::decode(&key)? {
+                Key::Version(_, version) => Ok(Some(version)),
+                key => errdata!("expected Key::Version got {key:?}"),
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn scan_versions_desc(&mut self, key: &[u8], hi: u64) -> Result<Vec<(u64, Option<Vec<u8>>)>> {
+        let from = Key::Version(key.into(), 0).encode();
+        let to = Key::Version(key.into(), hi).encode();
+        let mut entries = Vec::new();
+        let mut scan = self.scan(from..=to).rev();
+        while let Some((key, value)) = scan.next().transpose()? {
+            match Key::decode(&key)? {
+                Key::Version(_, version) => entries.push((version, bincode::deserialize(&value)?)),
+                key => return errdata!("expected Key::Version got {key:?}"),
+            }
+        }
+        Ok(entries)
+    }
+
+    fn scan_txn_write_keys(&mut self, version: u64) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        let mut scan = self.scan_prefix(&KeyPrefix::TxnWrite(version).encode());
+        while let Some((key, _)) = scan.next().transpose()? {
+            match Key::decode(&key)? {
+                Key::TxnWrite(_, key) => keys.push(key.into_owned()),
+                key => return errdata!("expected TxnWrite, got {key:?}"),
+            }
+        }
+        Ok(keys)
+    }
+}
+
+/// A dyn-erased handle to the engine, passed to the verified core. Erasing
+/// the `Engine` type parameter keeps generic trait bounds out of the
+/// verified functions' signatures.
+pub struct EngineHandle<'a> {
+    inner: &'a mut dyn EngineOps,
+}
+
+impl<'a> EngineHandle<'a> {
+    fn new(inner: &'a mut dyn EngineOps) -> Self {
+        Self { inner }
+    }
+}
 
 /// Most storage tests are Goldenscripts under src/storage/testscripts.
 #[cfg(test)]
@@ -1778,6 +3333,7 @@ pub mod tests {
     use std::result::Result;
 
     use crossbeam::channel::Receiver;
+    use itertools::Itertools as _;
     use tempfile::TempDir;
     use test_case::test_case;
     use test_each_file::test_each_path;
