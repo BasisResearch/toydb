@@ -347,7 +347,7 @@ pub fn encode_bytes(v: &[u8]) -> (r: Vec<u8>)
         } else {
             out.push(b);
         }
-        i = i + 1;
+        i += 1;
     }
     proof {
         assert(v@.subrange(0, v.len() as int) =~= v@);
@@ -433,7 +433,7 @@ pub fn decode_bytes(s: &[u8]) -> (r: DecodeBytes)
                 assert(bytes_dec(suf).0 =~= seq![0u8] + bytes_dec(suf2).0);
                 assert(bytes_dec(suf).1 == bytes_dec(suf2).1);
                 decoded.push(0);
-                pos = pos + 2;
+                pos += 2;
                 assert(decoded@ + bytes_dec(suf2).0 =~= bytes_dec(full).0);
             } else {
                 // Invalid escape sequence.
@@ -446,7 +446,7 @@ pub fn decode_bytes(s: &[u8]) -> (r: DecodeBytes)
             assert(bytes_dec(suf).0 =~= seq![b0] + bytes_dec(suf1).0);
             assert(bytes_dec(suf).1 == bytes_dec(suf1).1);
             decoded.push(b0);
-            pos = pos + 1;
+            pos += 1;
             assert(decoded@ + bytes_dec(suf1).0 =~= bytes_dec(full).0);
         }
     }
@@ -832,7 +832,7 @@ pub fn prefix_end(prefix: &[u8]) -> (r: Option<Vec<u8>>)
                 e.push(prefix[m]);
                 assert(prefix@.subrange(0, m as int + 1) =~= prefix@.subrange(0, m as int)
                     + seq![prefix@[m as int]]);
-                m = m + 1;
+                m += 1;
             }
             assert(prefix@[idx as int] < 255);
             let last = prefix[idx] + 1;
@@ -852,7 +852,7 @@ pub fn prefix_end(prefix: &[u8]) -> (r: Option<Vec<u8>>)
             }
             return Some(e);
         }
-        i = i - 1;
+        i -= 1;
     }
     // i == 0: every byte is 0xff (or the prefix is empty), so the scan has no
     // upper bound.
