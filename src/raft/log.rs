@@ -40,6 +40,401 @@ pub enum Key {
 
 impl encoding::Key<'_> for Key {}
 
+// --- Verus-verified core of the Raft log state machine ----------------------
+//
+// The documented log invariants (see the `Log` doc comment below) are enforced
+// by a small set of precondition checks and in-memory state transitions:
+// append always writes at `last_index + 1` in the current term, the commit
+// index never regresses, and splice rejects batches that are non-contiguous,
+// term-regressing, disconnected from the existing log, or below the commit
+// index. The functions below are that core, extracted into pure, verified
+// code over `LogState` (the mutable in-memory fields of `Log`):
+//
+// * Every checked precondition is proven to hold exactly when the verdict says
+//   so (e.g. `CommitCheck::Regression` is returned iff the index regresses),
+//   so the `Log` methods panic in precisely the documented cases.
+// * Every state transition is proven to compute the new state field-by-field:
+//   `append_state` yields index `last_index + 1` at term `term` (contiguity,
+//   current-term append), `commit_state` yields a strictly larger commit index
+//   (no commit regression), and `splice_state` refuses to touch entries at or
+//   below the commit index.
+// * Each transition preserves the state invariant `wf` — entry terms at or
+//   below the current term, and the commit index at or below the last index —
+//   where `wf` can be preserved. (`Log::new` loads state from disk, which is
+//   unverified: with fsync disabled a crash can legitimately leave the commit
+//   index ahead of the last index, so `wf` is preserved rather than assumed.)
+//
+// What stays unverified (and trusted): the storage engine, serialization, the
+// on-disk log contents, and the splice scan that skips already-present
+// entries. `Log` routes every in-memory state change through these functions,
+// so the bookkeeping the invariants are stated over is verified even though
+// disk I/O is not. `verus!` erases all specs and proofs to the plain `fn`
+// bodies under a normal `cargo build`.
+use vstd::prelude::*;
+
+verus! {
+
+/// The in-memory Raft log state: the mutable fields of `Log`. All `Log` state
+/// changes go through the verified transitions below.
+pub struct LogState {
+    /// The current term.
+    pub term: Term,
+    /// Our leader vote in the current term, if any.
+    pub vote: Option<NodeID>,
+    /// The index of the last stored entry.
+    pub last_index: Index,
+    /// The term of the last stored entry.
+    pub last_term: Term,
+    /// The index of the last committed entry.
+    pub commit_index: Index,
+    /// The term of the last committed entry.
+    pub commit_term: Term,
+}
+
+/// The state invariant: entry terms are at or below the current term, and the
+/// committed prefix is within the log. Every transition preserves this (see
+/// the caveat on `Log::new` in the section comment above).
+pub open spec fn wf(st: LogState) -> bool {
+    &&& st.last_term <= st.term
+    &&& st.commit_index <= st.last_index
+}
+
+/// The verdict of `set_term_vote_state`.
+pub enum TermVoteCheck {
+    /// The term is 0, which is invalid.
+    ZeroTerm,
+    /// The term regresses the current term.
+    TermRegression,
+    /// The vote changes within the current term.
+    VoteChange,
+    /// The term and vote are unchanged; nothing to do.
+    Noop,
+    /// The term/vote change is valid; the new state.
+    Update(LogState),
+}
+
+/// Option<NodeID> equality (Verus has no exec `==` for it out of the box).
+fn vote_eq(a: Option<NodeID>, b: Option<NodeID>) -> (r: bool)
+    ensures r == (a == b),
+{
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Verified term/vote transition: enforces that the term is nonzero and never
+/// regresses, and that the vote can't change within a term.
+pub fn set_term_vote_state(st: &LogState, term: Term, vote: Option<NodeID>) -> (r: TermVoteCheck)
+    ensures match r {
+        TermVoteCheck::ZeroTerm => term == 0,
+        TermVoteCheck::TermRegression => 0 < term < st.term,
+        TermVoteCheck::VoteChange => term == st.term && st.vote is Some && vote != st.vote,
+        TermVoteCheck::Noop => term == st.term && vote == st.vote,
+        TermVoteCheck::Update(new) => {
+            &&& term > 0
+            &&& new.term == term && new.term >= st.term // term monotonicity
+            &&& term == st.term ==> st.vote is None // votes are never changed
+            &&& new.vote == vote
+            &&& new.last_index == st.last_index && new.last_term == st.last_term
+            &&& new.commit_index == st.commit_index && new.commit_term == st.commit_term
+            &&& wf(*st) ==> wf(new)
+        },
+    },
+{
+    if term == 0 {
+        return TermVoteCheck::ZeroTerm;
+    }
+    if term < st.term {
+        return TermVoteCheck::TermRegression;
+    }
+    if term == st.term {
+        let same_vote = vote_eq(vote, st.vote);
+        if st.vote.is_some() && !same_vote {
+            return TermVoteCheck::VoteChange;
+        }
+        if same_vote {
+            return TermVoteCheck::Noop;
+        }
+    }
+    TermVoteCheck::Update(LogState {
+        term,
+        vote,
+        last_index: st.last_index,
+        last_term: st.last_term,
+        commit_index: st.commit_index,
+        commit_term: st.commit_term,
+    })
+}
+
+/// The verdict of `append_state`.
+pub enum AppendCheck {
+    /// Can't append in term 0.
+    ZeroTerm,
+    /// The log is full (`u64::MAX` entries); unreachable in practice.
+    IndexOverflow,
+    /// The append is valid: the new entry's index and the new state.
+    Append(Index, LogState),
+}
+
+/// Verified append transition: the new entry is at `last_index + 1` (index
+/// contiguity) in the current term, and given `wf` its term doesn't regress
+/// the last entry's term (term monotonicity).
+pub fn append_state(st: &LogState) -> (r: AppendCheck)
+    ensures match r {
+        AppendCheck::ZeroTerm => st.term == 0,
+        AppendCheck::IndexOverflow => st.term > 0 && st.last_index == u64::MAX,
+        AppendCheck::Append(index, new) => {
+            &&& st.term > 0
+            &&& index == st.last_index + 1 // index contiguity
+            &&& new.last_index == index && new.last_term == st.term // current-term append
+            &&& wf(*st) ==> new.last_term >= st.last_term // term monotonicity
+            &&& new.term == st.term && new.vote == st.vote
+            &&& new.commit_index == st.commit_index && new.commit_term == st.commit_term
+            &&& wf(*st) ==> wf(new)
+        },
+    },
+{
+    if st.term == 0 {
+        return AppendCheck::ZeroTerm;
+    }
+    if st.last_index == u64::MAX {
+        return AppendCheck::IndexOverflow;
+    }
+    let index = st.last_index + 1;
+    AppendCheck::Append(index, LogState {
+        term: st.term,
+        vote: st.vote,
+        last_index: index,
+        last_term: st.term,
+        commit_index: st.commit_index,
+        commit_term: st.commit_term,
+    })
+}
+
+/// The verdict of `commit_state`.
+pub enum CommitCheck {
+    /// The index regresses the commit index.
+    Regression,
+    /// The index is already committed; nothing to do.
+    Noop,
+    /// The commit is valid; the new state.
+    Commit(LogState),
+}
+
+/// Verified commit transition: the commit index never regresses. `entry_index`
+/// and `entry_term` are the index and term of the log entry being committed
+/// (the caller proves existence by fetching it from the log).
+pub fn commit_state(st: &LogState, entry_index: Index, entry_term: Term) -> (r: CommitCheck)
+    ensures match r {
+        CommitCheck::Regression => entry_index < st.commit_index,
+        CommitCheck::Noop => entry_index == st.commit_index,
+        CommitCheck::Commit(new) => {
+            &&& entry_index > st.commit_index // no commit regression
+            &&& new.commit_index == entry_index && new.commit_term == entry_term
+            &&& new.term == st.term && new.vote == st.vote
+            &&& new.last_index == st.last_index && new.last_term == st.last_term
+            &&& wf(*st) && entry_index <= st.last_index ==> wf(new)
+        },
+    },
+{
+    if entry_index < st.commit_index {
+        CommitCheck::Regression
+    } else if entry_index == st.commit_index {
+        CommitCheck::Noop
+    } else {
+        CommitCheck::Commit(LogState {
+            term: st.term,
+            vote: st.vote,
+            last_index: st.last_index,
+            last_term: st.last_term,
+            commit_index: entry_index,
+            commit_term: entry_term,
+        })
+    }
+}
+
+/// A spliced batch of (index, term) pairs has contiguous indexes.
+pub open spec fn entries_contiguous(pairs: Seq<(Index, Term)>) -> bool {
+    forall|i: int| #![trigger pairs[i]] 0 < i < pairs.len() ==> pairs[i].0 == pairs[i - 1].0 + 1
+}
+
+/// A spliced batch of (index, term) pairs has equal or increasing terms.
+pub open spec fn entries_terms_monotone(pairs: Seq<(Index, Term)>) -> bool {
+    forall|i: int| #![trigger pairs[i]] 0 < i < pairs.len() ==> pairs[i].1 >= pairs[i - 1].1
+}
+
+/// The verdict of `check_splice_entries`.
+pub enum SpliceEntriesCheck {
+    /// The batch is empty (the caller handles this before checking).
+    Empty,
+    /// The first entry has index or term 0.
+    ZeroIndexOrTerm,
+    /// The batch's indexes are not contiguous.
+    NonContiguous,
+    /// The batch's terms regress.
+    TermRegression,
+    /// The batch is well-formed.
+    WellFormed,
+}
+
+/// Verified well-formedness check for a spliced batch, as (index, term) pairs:
+/// nonzero first index and term, contiguous indexes, and monotone terms.
+/// (Clippy allows: Verus wants `&Vec` and `len() == 0`, which vstd specs.)
+#[allow(clippy::ptr_arg, clippy::len_zero)]
+pub fn check_splice_entries(pairs: &Vec<(Index, Term)>) -> (r: SpliceEntriesCheck)
+    ensures match r {
+        SpliceEntriesCheck::Empty => pairs@.len() == 0,
+        SpliceEntriesCheck::ZeroIndexOrTerm => {
+            pairs@.len() > 0 && (pairs@[0].0 == 0 || pairs@[0].1 == 0)
+        },
+        SpliceEntriesCheck::NonContiguous => !entries_contiguous(pairs@),
+        SpliceEntriesCheck::TermRegression => !entries_terms_monotone(pairs@),
+        SpliceEntriesCheck::WellFormed => {
+            &&& pairs@.len() > 0
+            &&& pairs@[0].0 > 0 && pairs@[0].1 > 0
+            &&& entries_contiguous(pairs@)
+            &&& entries_terms_monotone(pairs@)
+        },
+    },
+{
+    if pairs.len() == 0 {
+        return SpliceEntriesCheck::Empty;
+    }
+    if pairs[0].0 == 0 || pairs[0].1 == 0 {
+        return SpliceEntriesCheck::ZeroIndexOrTerm;
+    }
+    let mut i: usize = 1;
+    while i < pairs.len()
+        invariant
+            1 <= i <= pairs@.len(),
+            forall|j: int| #![trigger pairs@[j]] 0 < j < i ==> pairs@[j].0 == pairs@[j - 1].0 + 1,
+        decreases pairs@.len() - i,
+    {
+        // An index at u64::MAX can't have a successor, so the batch is not
+        // contiguous (and computing `+ 1` would overflow).
+        if pairs[i - 1].0 == u64::MAX || pairs[i].0 != pairs[i - 1].0 + 1 {
+            assert(pairs@[i as int].0 != pairs@[i as int - 1].0 + 1);
+            return SpliceEntriesCheck::NonContiguous;
+        }
+        i += 1;
+    }
+    let mut i: usize = 1;
+    while i < pairs.len()
+        invariant
+            1 <= i <= pairs@.len(),
+            forall|j: int| #![trigger pairs@[j]] 0 < j < i ==> pairs@[j].1 >= pairs@[j - 1].1,
+        decreases pairs@.len() - i,
+    {
+        if pairs[i].1 < pairs[i - 1].1 {
+            assert(pairs@[i as int].1 < pairs@[i as int - 1].1);
+            return SpliceEntriesCheck::TermRegression;
+        }
+        i += 1;
+    }
+    SpliceEntriesCheck::WellFormed
+}
+
+/// The verdict of `check_splice_connect`.
+pub enum SpliceConnectCheck {
+    /// The batch's last term is beyond the current term.
+    TermBeyondCurrent,
+    /// The batch's first term regresses the base entry's term.
+    BaseTermRegression,
+    /// The batch doesn't touch the existing log.
+    NoTouch,
+    /// The batch connects to the existing log.
+    Connects,
+}
+
+/// Verified splice connection check: the batch must not exceed the current
+/// term, and must connect to the existing log without a term regression.
+/// `base_term` is the term of the log entry just before the batch's first
+/// index, or None if there is no such entry.
+pub fn check_splice_connect(
+    st: &LogState,
+    first_index: Index,
+    first_term: Term,
+    last_term: Term,
+    base_term: Option<Term>,
+) -> (r: SpliceConnectCheck)
+    ensures match r {
+        SpliceConnectCheck::TermBeyondCurrent => last_term > st.term,
+        SpliceConnectCheck::BaseTermRegression => {
+            last_term <= st.term && (base_term matches Some(bt) && first_term < bt)
+        },
+        SpliceConnectCheck::NoTouch => {
+            last_term <= st.term && base_term is None && first_index != 1
+        },
+        SpliceConnectCheck::Connects => {
+            &&& last_term <= st.term // term doesn't exceed the current term
+            &&& match base_term {
+                Some(bt) => first_term >= bt, // no term regression at the base
+                None => first_index == 1, // or the batch starts the log
+            }
+        },
+    },
+{
+    if last_term > st.term {
+        return SpliceConnectCheck::TermBeyondCurrent;
+    }
+    match base_term {
+        Some(bt) => {
+            if first_term < bt {
+                SpliceConnectCheck::BaseTermRegression
+            } else {
+                SpliceConnectCheck::Connects
+            }
+        }
+        None => {
+            if first_index == 1 {
+                SpliceConnectCheck::Connects
+            } else {
+                SpliceConnectCheck::NoTouch
+            }
+        }
+    }
+}
+
+/// Verified splice transition: refuses to write at or below the commit index
+/// (committed entries are immutable), and moves the last index/term to the
+/// batch's last entry. `first_index` is the first index actually written
+/// (after skipping entries already in the log); `last_index`/`last_term` are
+/// the batch's last entry. Returns None iff the batch writes below the commit
+/// index.
+pub fn splice_state(
+    st: &LogState,
+    first_index: Index,
+    last_index: Index,
+    last_term: Term,
+) -> (r: Option<LogState>)
+    ensures match r {
+        Some(new) => {
+            &&& first_index > st.commit_index // committed entries never change
+            &&& new.last_index == last_index && new.last_term == last_term
+            &&& new.term == st.term && new.vote == st.vote
+            &&& new.commit_index == st.commit_index && new.commit_term == st.commit_term
+            &&& wf(*st) && last_term <= st.term && first_index <= last_index ==> wf(new)
+        },
+        None => first_index <= st.commit_index,
+    },
+{
+    if first_index <= st.commit_index {
+        return None;
+    }
+    Some(LogState {
+        term: st.term,
+        vote: st.vote,
+        last_index,
+        last_term,
+        commit_index: st.commit_index,
+        commit_term: st.commit_term,
+    })
+}
+
+} // verus!
+
 /// The Raft log stores a sequence of arbitrary commands (typically writes) that
 /// are replicated across nodes and applied sequentially to the local state
 /// machine. Each entry contains an index, command, and the term in which the
@@ -94,18 +489,10 @@ pub struct Log {
     /// to allow runtime selection of the engine and avoid propagating the
     /// generic type parameters throughout Raft.
     pub engine: Box<dyn storage::Engine>,
-    /// The current term.
-    term: Term,
-    /// Our leader vote in the current term, if any.
-    vote: Option<NodeID>,
-    /// The index of the last stored entry.
-    last_index: Index,
-    /// The term of the last stored entry.
-    last_term: Term,
-    /// The index of the last committed entry.
-    commit_index: Index,
-    /// The term of the last committed entry.
-    commit_term: Term,
+    /// The in-memory state (term, vote, last and commit index/term). Only
+    /// mutated via the verified transitions in the `verus!` block above, which
+    /// enforce the log invariants over it.
+    state: LogState,
     /// If true, fsync entries to disk when appended. This is mandated by Raft,
     /// but comes with a hefty performance penalty (especially since we don't
     /// optimize for it by batching entries before fsyncing). Disabling it will
@@ -142,7 +529,11 @@ impl Log {
             .unwrap_or((0, 0));
 
         let fsync = true; // fsync by default
-        Ok(Self { engine, term, vote, last_index, last_term, commit_index, commit_term, fsync })
+        // NB: this state is loaded from unverified storage, so the verified
+        // transitions preserve the `wf` invariant rather than assume it: with
+        // fsync disabled, a crash can leave the commit index ahead of the log.
+        let state = LogState { term, vote, last_index, last_term, commit_index, commit_term };
+        Ok(Self { engine, state, fsync })
     }
 
     /// Controls whether to fsync writes. Disabling this may violate Raft
@@ -153,37 +544,39 @@ impl Log {
 
     /// Returns the commit index and term.
     pub fn get_commit_index(&self) -> (Index, Term) {
-        (self.commit_index, self.commit_term)
+        (self.state.commit_index, self.state.commit_term)
     }
 
     /// Returns the last log index and term.
     pub fn get_last_index(&self) -> (Index, Term) {
-        (self.last_index, self.last_term)
+        (self.state.last_index, self.state.last_term)
     }
 
     /// Returns the current term (0 if none) and vote.
     pub fn get_term_vote(&self) -> (Term, Option<NodeID>) {
-        (self.term, self.vote)
+        (self.state.term, self.state.vote)
     }
 
     /// Stores the current term and cast vote (if any). Enforces that the term
     /// does not regress, and that we only vote for one node in a term. append()
     /// will use this term, and splice() can't write entries beyond it.
     pub fn set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> Result<()> {
-        assert!(term > 0, "can't set term 0");
-        assert!(term >= self.term, "term regression {} → {}", self.term, term);
-        assert!(term > self.term || self.vote.is_none() || vote == self.vote, "can't change vote");
-
-        if term == self.term && vote == self.vote {
-            return Ok(());
-        }
+        // The verified transition enforces term/vote invariants.
+        let state = match set_term_vote_state(&self.state, term, vote) {
+            TermVoteCheck::ZeroTerm => panic!("can't set term 0"),
+            TermVoteCheck::TermRegression => {
+                panic!("term regression {} → {}", self.state.term, term)
+            }
+            TermVoteCheck::VoteChange => panic!("can't change vote"),
+            TermVoteCheck::Noop => return Ok(()),
+            TermVoteCheck::Update(state) => state,
+        };
         self.engine.set(&Key::TermVote.encode(), bincode::serialize(&(term, vote)))?;
         // Always fsync, even with Log::fsync = false. Term changes are rare, so
         // this doesn't materially affect performance, and double voting could
         // lead to multiple leaders and split brain which is really bad.
         self.engine.flush()?;
-        self.term = term;
-        self.vote = vote;
+        self.state = state;
         Ok(())
     }
 
@@ -191,33 +584,40 @@ impl Log {
     /// disk, returning its index. None implies a noop command, typically after
     /// Raft leader changes.
     pub fn append(&mut self, command: Option<Vec<u8>>) -> Result<Index> {
-        assert!(self.term > 0, "can't append entry in term 0");
-        let entry = Entry { index: self.last_index + 1, term: self.term, command };
+        // The verified transition guarantees the entry is at last_index + 1
+        // (index contiguity) in the current term (term monotonicity).
+        let (index, state) = match append_state(&self.state) {
+            AppendCheck::ZeroTerm => panic!("can't append entry in term 0"),
+            AppendCheck::IndexOverflow => panic!("log index overflow"),
+            AppendCheck::Append(index, state) => (index, state),
+        };
+        let entry = Entry { index, term: state.last_term, command };
         self.engine.set(&Key::Entry(entry.index).encode(), entry.encode())?;
         if self.fsync {
             self.engine.flush()?;
         }
-        self.last_index = entry.index;
-        self.last_term = entry.term;
+        self.state = state;
         Ok(entry.index)
     }
 
     /// Commits entries up to and including the given index. The index must
     /// exist and be at or after the current commit index.
     pub fn commit(&mut self, index: Index) -> Result<Index> {
-        let term = match self.get(index)? {
-            Some(entry) if entry.index < self.commit_index => {
-                panic!("commit index regression {} → {}", self.commit_index, entry.index);
-            }
-            Some(entry) if entry.index == self.commit_index => return Ok(index),
-            Some(entry) => entry.term,
-            None => panic!("commit index {index} does not exist"),
+        let Some(entry) = self.get(index)? else {
+            panic!("commit index {index} does not exist");
         };
-        self.engine.set(&Key::CommitIndex.encode(), bincode::serialize(&(index, term)))?;
+        // The verified transition guarantees the commit index never regresses.
+        let state = match commit_state(&self.state, entry.index, entry.term) {
+            CommitCheck::Regression => {
+                panic!("commit index regression {} → {}", self.state.commit_index, entry.index)
+            }
+            CommitCheck::Noop => return Ok(index),
+            CommitCheck::Commit(state) => state,
+        };
+        self.engine.set(&Key::CommitIndex.encode(), bincode::serialize(&(index, entry.term)))?;
         // NB: the commit index doesn't need to be fsynced, since the entries
         // are fsynced and the commit index can be recovered from the quorum.
-        self.commit_index = index;
-        self.commit_term = term;
+        self.state = state;
         Ok(index)
     }
 
@@ -230,10 +630,10 @@ impl Log {
     pub fn has(&mut self, index: Index, term: Term) -> Result<bool> {
         // Fast path: check against last_index. This is the common case when
         // followers process appends or heartbeats.
-        if index == 0 || index > self.last_index {
+        if index == 0 || index > self.state.last_index {
             return Ok(false);
         }
-        if (index, term) == (self.last_index, self.last_term) {
+        if (index, term) == (self.state.last_index, self.state.last_term) {
             return Ok(true);
         }
         Ok(self.get(index)?.map(|e| e.term == term).unwrap_or(false))
@@ -260,10 +660,10 @@ impl Log {
         // NB: we don't assert that commit_index >= applied_index, because the
         // local commit index is not flushed to durable storage -- if lost on
         // restart, it can be recovered from the logs of a quorum.
-        if applied_index >= self.commit_index {
+        if applied_index >= self.state.commit_index {
             return Iterator::new(Box::new(std::iter::empty()));
         }
-        self.scan(applied_index + 1..=self.commit_index)
+        self.scan(applied_index + 1..=self.state.commit_index)
     }
 
     /// Splices a set of entries into the log and flushes it to disk. New
@@ -277,30 +677,36 @@ impl Log {
     /// above the previous (base) entry's term and at or below the current term.
     pub fn splice(&mut self, entries: Vec<Entry>) -> Result<Index> {
         let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Ok(self.last_index); // empty input is noop
+            return Ok(self.state.last_index); // empty input is noop
         };
 
-        // Check that the entries are well-formed.
-        assert!(first.index > 0 && first.term > 0, "spliced entry has index or term 0",);
-        assert!(
-            entries.windows(2).all(|w| w[0].index + 1 == w[1].index),
-            "spliced entries are not contiguous"
-        );
-        assert!(
-            entries.windows(2).all(|w| w[0].term <= w[1].term),
-            "spliced entries have term regression",
-        );
+        // Check that the entries are well-formed (nonzero first index/term,
+        // contiguous indexes, monotone terms), using the verified checker.
+        let pairs: Vec<(Index, Term)> = entries.iter().map(|e| (e.index, e.term)).collect();
+        match check_splice_entries(&pairs) {
+            SpliceEntriesCheck::Empty => unreachable!(), // handled above
+            SpliceEntriesCheck::ZeroIndexOrTerm => panic!("spliced entry has index or term 0"),
+            SpliceEntriesCheck::NonContiguous => panic!("spliced entries are not contiguous"),
+            SpliceEntriesCheck::TermRegression => panic!("spliced entries have term regression"),
+            SpliceEntriesCheck::WellFormed => {}
+        }
 
-        // Check that the entries connect to the existing log (if any), and that the
-        // term doesn't regress.
-        assert!(last.term <= self.term, "splice term {} beyond current {}", last.term, self.term);
-        match self.get(first.index - 1)? {
-            Some(base) if first.term < base.term => {
-                panic!("splice term regression {} → {}", base.term, first.term)
+        // Check that the entries connect to the existing log (if any), and that
+        // the term doesn't regress, using the verified checker. The base entry
+        // (just before the first spliced index) is fetched from unverified
+        // storage; first.index - 1 can't underflow since first.index > 0.
+        let base_term = self.get(first.index - 1)?.map(|base| base.term);
+        match check_splice_connect(&self.state, first.index, first.term, last.term, base_term) {
+            SpliceConnectCheck::TermBeyondCurrent => {
+                panic!("splice term {} beyond current {}", last.term, self.state.term)
             }
-            Some(_) => {}
-            None if first.index == 1 => {}
-            None => panic!("first index {} must touch existing log", first.index),
+            SpliceConnectCheck::BaseTermRegression => {
+                panic!("splice term regression {} → {}", base_term.unwrap(), first.term)
+            }
+            SpliceConnectCheck::NoTouch => {
+                panic!("first index {} must touch existing log", first.index)
+            }
+            SpliceConnectCheck::Connects => {}
         }
 
         // Skip entries that are already in the log.
@@ -319,27 +725,29 @@ impl Log {
 
         // If all entries already exist then we're done.
         let Some(first) = entries.first() else {
-            return Ok(self.last_index);
+            return Ok(self.state.last_index);
+        };
+
+        // The verified transition refuses to write below the commit index,
+        // since committed entries must be immutable.
+        let Some(state) = splice_state(&self.state, first.index, last.index, last.term) else {
+            panic!("spliced entries below commit index");
         };
 
         // Write the entries that weren't already in the log, and remove the
-        // tail of the old log if any. We can't write below the commit index,
-        // since these entries must be immutable.
-        assert!(first.index > self.commit_index, "spliced entries below commit index");
-
+        // tail of the old log if any.
         for entry in entries {
             self.engine.set(&Key::Entry(entry.index).encode(), entry.encode())?;
         }
-        for index in last.index + 1..=self.last_index {
+        for index in last.index + 1..=self.state.last_index {
             self.engine.delete(&Key::Entry(index).encode())?;
         }
         if self.fsync {
             self.engine.flush()?;
         }
 
-        self.last_index = last.index;
-        self.last_term = last.term;
-        Ok(self.last_index)
+        self.state = state;
+        Ok(self.state.last_index)
     }
 
     /// Returns log engine status.
