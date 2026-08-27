@@ -24,6 +24,7 @@ set -euo pipefail
 VERIFY_MODULES=(
   encoding::keycode
   sql::types::value
+  storage::mvcc
 )
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

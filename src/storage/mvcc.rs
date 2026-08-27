@@ -341,14 +341,12 @@ impl TransactionState {
     /// a consistent version both before and after any active transaction at
     /// that version commits its writes. See the module documentation for
     /// details.
+    ///
+    /// Delegates to the Verus-verified `is_visible_core`, which is proven to
+    /// compute `spec_is_visible` — the visibility relation of the verified
+    /// snapshot-isolation model at the bottom of this file.
     fn is_visible(&self, version: Version) -> bool {
-        if self.active.contains(&version) {
-            false
-        } else if self.read_only {
-            version < self.version
-        } else {
-            version <= self.version
-        }
+        is_visible_core(&self.active, self.version, self.read_only, version)
     }
 }
 
@@ -535,6 +533,12 @@ impl<E: Engine> Transaction<E> {
         // (either a newer version, or an uncommitted version in our past). We
         // can only conflict with the latest key, since all transactions enforce
         // the same invariant.
+        //
+        // That invariant is machine-checked: the verified model at the bottom
+        // of this file proves (`thm_conflict_check_exact`) that under the
+        // system invariant `inv`, this latest-version-only check accepts
+        // exactly when *no* version of the key is invisible, and that the
+        // invariant is preserved by every transaction operation.
         let from = Key::Version(
             key.into(),
             self.state.active.first().copied().unwrap_or(self.state.version + 1),
@@ -748,6 +752,1021 @@ impl<I: engine::ScanIterator> Iterator for VersionIterator<'_, I> {
         self.try_next().transpose()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Verus-verified model of MVCC snapshot isolation
+// ---------------------------------------------------------------------------
+//
+// This block builds an abstract, spec-level model of the MVCC engine above and
+// proves its core isolation properties. The model state mirrors the engine's
+// persistent keys one-to-one:
+//
+//   ModelState.next    <->  Key::NextVersion
+//   ModelState.active  <->  the set of Key::TxnActive(v) records
+//   ModelState.snap    <->  Key::TxnActiveSnapshot(v) (total on allocated
+//                           versions; the code omits the record when the set
+//                           was empty and reads a missing record as empty)
+//   ModelState.store   <->  Key::Version(key, version) => value records,
+//                           as a map (key, version) -> Option<value>,
+//                           None modeling a deletion tombstone
+//   ModelState.aborted <->  ghost only: versions that rolled back, so that
+//                           "committed" is definable (allocated, not active,
+//                           not aborted). The engine needs no such record
+//                           because a rolled-back txn erases all its writes —
+//                           which is exactly invariant clause `inv_no_aborted_writes`.
+//
+// Transitions model Transaction::begin / write_version / commit / rollback.
+// Each transition is one atomic step, matching the engine mutex held across
+// the corresponding operation. TxnWrite(v, key) records are modeled
+// implicitly: they exist precisely to let rollback(v) find the store entries
+// with version v, which the model removes directly. Read-only and time-travel
+// transactions never write and are modeled as observers (`wf_observer`), not
+// state. The model relies on the engine scan returning Key::Version(key, v)
+// entries grouped by key and ordered by version — that is the keycode
+// order-preservation property verified in `encoding::keycode`.
+//
+// `write` is guarded by exactly the check `write_version` performs: scan the
+// versions of the key from `active.first().unwrap_or(version + 1)`
+// (`is_scan_floor`) to `u64::MAX`, and error iff the *last* version in that
+// range is invisible (`check_passes`). The centerpiece theorem
+// `thm_conflict_check_exact` proves the comment in `write_version` ("we can
+// only conflict with the latest key, since all transactions enforce the same
+// invariant"): under the inductive invariant `inv`, this latest-only check
+// accepts exactly when no version of the key is invisible
+// (`no_write_conflict`). The invariant's load-bearing clauses are:
+//
+//   inv_uncommitted_latest  an uncommitted version is the latest version of
+//                           its key,
+//   inv_no_concurrent_writes  for any two versions of one key, the earlier
+//                           writer had ended before the later writer began,
+//   inv_snapshots_coherent  begin-snapshots are mutually consistent.
+//
+// `lemma_inv_init` and `thm_inv_preserved` prove `inv` holds initially and is
+// preserved by every step — the induction the code comment appeals to.
+//
+// The isolation theorems map to the anomaly goldenscripts under
+// src/storage/testscripts/mvcc:
+//
+//   anomaly_dirty_read    thm_uncommitted_invisible, thm_reads_see_only_committed
+//   anomaly_dirty_write   thm_no_dirty_write
+//   anomaly_fuzzy_read,
+//   anomaly_read_skew,
+//   anomaly_phantom_read  thm_snapshot_stability, thm_repeatable_read: a live
+//                         transaction's entire visible key/value slice — and
+//                         hence any point read or scan over it — is unchanged
+//                         by any other transaction's begin/write/commit/rollback
+//   anomaly_lost_update   thm_first_writer_wins: of two conflicting writers the
+//                         later one errored unless the earlier had committed
+//                         first, and then its write was visible to the later
+//                         writer — an update is never blindly overwritten
+//   anomaly_write_skew    intentionally NOT prevented: snapshot isolation only
+//                         detects write-write conflicts, and no theorem here
+//                         claims serializability
+//   rollback              thm_rollback_erases, thm_aborted_stays_gone
+//
+// `verus!` erases everything below to nothing under a normal `cargo build`,
+// except `is_visible_core`, which erases to the plain function body that
+// `TransactionState::is_visible` calls.
+use vstd::prelude::*;
+
+verus! {
+
+broadcast use {vstd::std_specs::btree::group_btree_axioms, vstd::laws_cmp::group_laws_cmp};
+
+// ---- Visibility -----------------------------------------------------------
+
+/// Spec mirror of `TransactionState::is_visible`: which versions a transaction
+/// at `version` with begin-time active set `active` can see. This single
+/// relation drives reads, scans, and the write-conflict check.
+pub open spec fn spec_is_visible(active: Set<u64>, version: u64, read_only: bool, w: u64) -> bool {
+    if active.contains(w) {
+        false
+    } else if read_only {
+        w < version
+    } else {
+        w <= version
+    }
+}
+
+/// Verified executable core of `TransactionState::is_visible`, proven to
+/// compute `spec_is_visible` over the abstract view of the active set.
+pub fn is_visible_core(active: &BTreeSet<u64>, version: u64, read_only: bool, candidate: u64) -> (r:
+    bool)
+    ensures
+        r == spec_is_visible(active@, version, read_only, candidate),
+{
+    if active.contains(&candidate) {
+        false
+    } else if read_only {
+        candidate < version
+    } else {
+        candidate <= version
+    }
+}
+
+// ---- Model state ----------------------------------------------------------
+
+/// The abstract MVCC state. See the block comment above for the field-by-field
+/// correspondence with the engine's persistent keys.
+pub struct ModelState {
+    /// The next version to allocate (Key::NextVersion).
+    pub next: u64,
+    /// Versions of currently active (uncommitted) read-write transactions.
+    pub active: Set<u64>,
+    /// For every version ever allocated: the active set when it began.
+    pub snap: Map<u64, Set<u64>>,
+    /// Versioned writes: (key, version) -> value, None being a tombstone.
+    pub store: Map<(Seq<u8>, u64), Option<Seq<u8>>>,
+    /// Ghost: versions whose transaction rolled back.
+    pub aborted: Set<u64>,
+}
+
+/// Whether version `v` has been allocated to some read-write transaction.
+pub open spec fn allocated(s: ModelState, v: u64) -> bool {
+    1 <= v < s.next
+}
+
+/// Whether the store holds a version `w` of `key`.
+pub open spec fn has_version(s: ModelState, key: Seq<u8>, w: u64) -> bool {
+    s.store.contains_key((key, w))
+}
+
+/// Visibility for the read-write transaction at version `v`.
+pub open spec fn txn_visible(s: ModelState, v: u64, w: u64) -> bool {
+    spec_is_visible(s.snap[v], v, false, w)
+}
+
+/// A version that has ended without rolling back: its writes are permanent.
+pub open spec fn committed(s: ModelState, v: u64) -> bool {
+    allocated(s, v) && !s.active.contains(v) && !s.aborted.contains(v)
+}
+
+// ---- The inductive invariant ----------------------------------------------
+
+/// The system invariant: holds initially and is preserved by every transition
+/// (`lemma_inv_init`, `thm_inv_preserved`). The final three clauses are the
+/// invariant the `write_version` comment appeals to.
+pub open spec fn inv(s: ModelState) -> bool {
+    // Versions start at 1.
+    &&& 1 <= s.next
+    // Active transactions hold allocated versions.
+    &&& forall|v: u64| #[trigger] s.active.contains(v) ==> allocated(s, v)
+    // Rolled-back transactions hold allocated versions and have ended.
+    &&& forall|v: u64|
+        #[trigger] s.aborted.contains(v) ==> allocated(s, v) && !s.active.contains(v)
+    // Exactly the allocated versions have a begin snapshot.
+    &&& forall|v: u64| #[trigger] s.snap.contains_key(v) ==> allocated(s, v)
+    &&& forall|v: u64| #[trigger] allocated(s, v) ==> s.snap.contains_key(v)
+    // A begin snapshot only holds older allocated versions: the transactions
+    // active when v began had begun (and taken their versions) before v.
+    &&& forall|v: u64, w: u64|
+        s.snap.contains_key(v) && #[trigger] s.snap[v].contains(w) ==> 1 <= w < v
+    // A transaction still active now, with a version below v, was already
+    // active when v began — active sets only lose members over time, and new
+    // members take fresh higher versions.
+    &&& forall|v: u64, w: u64|
+        #![trigger s.snap[v].contains(w)]
+        #![trigger s.active.contains(w), s.snap.contains_key(v)]
+        s.snap.contains_key(v) && s.active.contains(w) && w < v ==> s.snap[v].contains(w)
+    // Versioned writes hold allocated versions.
+    &&& forall|k: Seq<u8>, w: u64| #[trigger] s.store.contains_key((k, w)) ==> allocated(s, w)
+    // inv_no_aborted_writes: no writes from rolled-back transactions survive.
+    &&& forall|k: Seq<u8>, w: u64|
+        #[trigger] s.store.contains_key((k, w)) ==> !s.aborted.contains(w)
+    // inv_uncommitted_latest: an uncommitted version is the latest version of
+    // its key. This is what makes "check only the latest version" complete:
+    // an uncommitted-conflict can only sit at the top.
+    &&& forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s.store.contains_key((k, w)), s.store.contains_key((k, w2))]
+        s.store.contains_key((k, w)) && s.active.contains(w) && s.store.contains_key((k, w2))
+            ==> w2 <= w
+    // inv_no_concurrent_writes: for any two versions of one key, the earlier
+    // writer had already ended when the later writer began — no two
+    // transactions that overlap in time both write the same key.
+    &&& forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s.store.contains_key((k, w)), s.store.contains_key((k, w2))]
+        s.store.contains_key((k, w)) && s.store.contains_key((k, w2)) && w < w2
+            ==> !s.snap[w2].contains(w)
+    // inv_snapshots_coherent: begin snapshots are mutually consistent. If w
+    // was still active when u began, while m (with w < m < u) had already
+    // ended by then, then m's entire lifetime fell inside w's, so w was
+    // active when m began.
+    &&& forall|u: u64, m: u64, w: u64|
+        #![trigger s.snap[u].contains(w), s.snap.contains_key(m)]
+        s.snap.contains_key(u) && s.snap.contains_key(m) && s.snap[u].contains(w)
+            && !s.snap[u].contains(m) && w < m && m < u ==> s.snap[m].contains(w)
+}
+
+// ---- Transitions ----------------------------------------------------------
+
+/// The initial state: no versions allocated, everything empty.
+pub open spec fn init() -> ModelState {
+    ModelState {
+        next: 1,
+        active: Set::empty(),
+        snap: Map::empty(),
+        store: Map::empty(),
+        aborted: Set::empty(),
+    }
+}
+
+/// Model artifact: the u64 version counter must not overflow. (toyDB would
+/// need 2^64 - 1 transactions to get here.)
+pub open spec fn can_begin(s: ModelState) -> bool {
+    s.next < u64::MAX
+}
+
+/// Transaction::begin: allocate version s.next, snapshot the active set,
+/// join the active set. One atomic step, like the code under the engine mutex.
+pub open spec fn begin(s: ModelState) -> ModelState {
+    ModelState {
+        next: (s.next + 1) as u64,
+        active: s.active.insert(s.next),
+        snap: s.snap.insert(s.next, s.active),
+        store: s.store,
+        aborted: s.aborted,
+    }
+}
+
+pub open spec fn can_commit(s: ModelState, v: u64) -> bool {
+    s.active.contains(v)
+}
+
+/// Transaction::commit: remove the TxnActive record. The writes stay; this
+/// single removal is what atomically publishes them to later transactions.
+pub open spec fn commit(s: ModelState, v: u64) -> ModelState {
+    ModelState {
+        next: s.next,
+        active: s.active.remove(v),
+        snap: s.snap,
+        store: s.store,
+        aborted: s.aborted,
+    }
+}
+
+pub open spec fn can_rollback(s: ModelState, v: u64) -> bool {
+    s.active.contains(v)
+}
+
+/// Transaction::rollback: delete every store entry at version v (found via
+/// the TxnWrite(v, ..) records in the code), then leave the active set. The
+/// snapshot record stays behind for time-travel queries, as in the code.
+pub open spec fn rollback(s: ModelState, v: u64) -> ModelState {
+    ModelState {
+        next: s.next,
+        active: s.active.remove(v),
+        snap: s.snap,
+        store: s.store.remove_keys(s.store.dom().filter(|p: (Seq<u8>, u64)| p.1 == v)),
+        aborted: s.aborted.insert(v),
+    }
+}
+
+/// The lower bound of the conflict-scan range in `write_version`:
+/// `self.state.active.first().copied().unwrap_or(self.state.version + 1)`,
+/// i.e. the smallest version in the begin snapshot, or version + 1 when the
+/// snapshot is empty.
+pub open spec fn is_scan_floor(a: Set<u64>, v: u64, lo: u64) -> bool {
+    &&& forall|w: u64| #[trigger] a.contains(w) ==> lo <= w
+    &&& (a.contains(lo) || (lo == v + 1 && forall|w: u64| !(#[trigger] a.contains(w))))
+}
+
+/// `m` is the greatest version of `key` in the scanned range `lo..=u64::MAX`:
+/// what `engine.scan(from..=to).last()` returns in `write_version`.
+pub open spec fn range_max(s: ModelState, key: Seq<u8>, lo: u64, m: u64) -> bool {
+    &&& has_version(s, key, m)
+    &&& lo <= m
+    &&& forall|w: u64| #[trigger] has_version(s, key, w) && lo <= w ==> w <= m
+}
+
+/// The conflict check exactly as `write_version` performs it: pass iff the
+/// scanned range is empty or its greatest version is visible.
+pub open spec fn check_passes(s: ModelState, v: u64, key: Seq<u8>, lo: u64) -> bool {
+    forall|m: u64| #[trigger] range_max(s, key, lo, m) ==> txn_visible(s, v, m)
+}
+
+/// The full (unoptimized) conflict condition: *no* version of the key,
+/// anywhere in history, is invisible to the writer. `thm_conflict_check_exact`
+/// proves `check_passes` equivalent to this under `inv`.
+pub open spec fn no_write_conflict(s: ModelState, v: u64, key: Seq<u8>) -> bool {
+    forall|w: u64| #[trigger] has_version(s, key, w) ==> txn_visible(s, v, w)
+}
+
+pub open spec fn can_write(s: ModelState, v: u64, key: Seq<u8>) -> bool {
+    &&& s.active.contains(v)
+    &&& exists|lo: u64|
+        #[trigger] is_scan_floor(s.snap[v], v, lo) && check_passes(s, v, key, lo)
+}
+
+/// Transaction::set / delete via write_version: record the new version at the
+/// writer's own version. `value` None is a deletion tombstone.
+pub open spec fn write(s: ModelState, v: u64, key: Seq<u8>, value: Option<Seq<u8>>) -> ModelState {
+    ModelState {
+        next: s.next,
+        active: s.active,
+        snap: s.snap,
+        store: s.store.insert((key, v), value),
+        aborted: s.aborted,
+    }
+}
+
+/// One step of the system, taken by the transaction at version `actor`
+/// (for begin: the version being allocated).
+pub open spec fn step(s: ModelState, s2: ModelState, actor: u64) -> bool {
+    ||| (can_begin(s) && actor == s.next && s2 == begin(s))
+    ||| (can_commit(s, actor) && s2 == commit(s, actor))
+    ||| (can_rollback(s, actor) && s2 == rollback(s, actor))
+    ||| exists|key: Seq<u8>, value: Option<Seq<u8>>|
+        can_write(s, actor, key) && s2 == #[trigger] write(s, actor, key, value)
+}
+
+// ---- The conflict check is exact ------------------------------------------
+
+/// `m` is the greatest version of `key` in `[lo, b)`.
+spec fn range_max_below(s: ModelState, key: Seq<u8>, lo: u64, b: u64, m: u64) -> bool {
+    &&& lo <= m < b
+    &&& has_version(s, key, m)
+    &&& forall|w: u64| lo <= w < b && #[trigger] has_version(s, key, w) ==> w <= m
+}
+
+/// Any nonempty set of versions of `key` in `[lo, b)` has a greatest element.
+proof fn lemma_version_range_has_max(s: ModelState, key: Seq<u8>, lo: u64, b: u64)
+    requires
+        exists|w: u64| lo <= w < b && #[trigger] has_version(s, key, w),
+    ensures
+        exists|m: u64| #[trigger] range_max_below(s, key, lo, b, m),
+    decreases b,
+{
+    let w0 = choose|w: u64| lo <= w < b && #[trigger] has_version(s, key, w);
+    let t = (b - 1) as u64;
+    if has_version(s, key, t) && lo <= t {
+        assert(range_max_below(s, key, lo, b, t));
+    } else {
+        // The top slot b - 1 is unoccupied (lo <= t holds since lo <= w0 <= t),
+        // so the witness sits in [lo, b - 1) and the max there is the max.
+        assert(lo <= w0 < t && has_version(s, key, w0));
+        lemma_version_range_has_max(s, key, lo, t);
+        let m = choose|m: u64| #[trigger] range_max_below(s, key, lo, t, m);
+        assert forall|w: u64| lo <= w < b && #[trigger] has_version(s, key, w) implies w <= m by {
+            assert(w != t);
+        }
+        assert(range_max_below(s, key, lo, b, m));
+    }
+}
+
+/// If any version of `key` is at or above `lo`, the scanned range has a
+/// greatest element (all versions are below s.next by `inv`).
+proof fn lemma_range_has_max(s: ModelState, key: Seq<u8>, lo: u64)
+    requires
+        inv(s),
+        exists|w: u64| lo <= w && #[trigger] has_version(s, key, w),
+    ensures
+        exists|m: u64| #[trigger] range_max(s, key, lo, m),
+{
+    let w0 = choose|w: u64| lo <= w && #[trigger] has_version(s, key, w);
+    assert(allocated(s, w0));
+    lemma_version_range_has_max(s, key, lo, s.next);
+    let m = choose|m: u64| #[trigger] range_max_below(s, key, lo, s.next, m);
+    assert forall|w: u64| #[trigger] has_version(s, key, w) && lo <= w implies w <= m by {
+        assert(allocated(s, w));
+    }
+    assert(range_max(s, key, lo, m));
+}
+
+/// THE CENTERPIECE: under the invariant, `write_version`'s latest-version-only
+/// conflict check accepts exactly when no version of the key — latest or
+/// buried — is invisible to the writer. This discharges the code comment "we
+/// can only conflict with the latest key, since all transactions enforce the
+/// same invariant".
+///
+/// Soundness (passes ==> nothing invisible) is the interesting direction:
+/// * Versions below the scan floor are below every member of the begin
+///   snapshot and below the writer's own version, hence visible.
+/// * For a buried version w below the range's max m: w can only be invisible
+///   by sitting in the writer's begin snapshot; then `inv_snapshots_coherent`
+///   places w in m's begin snapshot, contradicting `inv_no_concurrent_writes`.
+pub proof fn thm_conflict_check_exact(s: ModelState, v: u64, key: Seq<u8>, lo: u64)
+    requires
+        inv(s),
+        s.active.contains(v),
+        is_scan_floor(s.snap[v], v, lo),
+    ensures
+        check_passes(s, v, key, lo) <==> no_write_conflict(s, v, key),
+{
+    assert(allocated(s, v));
+    assert(s.snap.contains_key(v));
+    // Completeness: the range max is itself a version, so if every version is
+    // visible then so is the max.
+    if no_write_conflict(s, v, key) {
+        assert forall|m: u64| #[trigger] range_max(s, key, lo, m) implies txn_visible(
+            s,
+            v,
+            m,
+        ) by {
+            assert(has_version(s, key, m));
+        }
+    }
+    // Soundness.
+    if check_passes(s, v, key, lo) {
+        assert forall|w: u64| #[trigger] has_version(s, key, w) implies txn_visible(s, v, w) by {
+            if w < lo {
+                // Below the floor: below every snapshot member, and below v.
+                assert(!s.snap[v].contains(w));
+                if s.snap[v].contains(lo) {
+                    assert(lo < v);  // snapshot members precede v
+                } else {
+                    assert(lo == v + 1);
+                }
+                assert(w <= v);
+            } else {
+                assert(lo <= w && has_version(s, key, w));
+                lemma_range_has_max(s, key, lo);
+                let m = choose|m: u64| #[trigger] range_max(s, key, lo, m);
+                assert(txn_visible(s, v, m));
+                assert(w <= m);
+                assert(m <= v);
+                if w != m && s.snap[v].contains(w) {
+                    // w was uncommitted when v began, yet a later version m of
+                    // the same key exists: impossible.
+                    if m == v {
+                        // v itself wrote later: inv_no_concurrent_writes on
+                        // (w, v) says w was not in v's begin snapshot.
+                        assert(s.store.contains_key((key, w)) && s.store.contains_key((key, v)));
+                        assert(false);
+                    } else {
+                        // w < m < v: coherence puts w in m's begin snapshot,
+                        // conflicting with inv_no_concurrent_writes on (w, m).
+                        assert(allocated(s, m));
+                        assert(s.snap.contains_key(m));
+                        assert(s.snap[m].contains(w));
+                        assert(s.store.contains_key((key, w)) && s.store.contains_key((key, m)));
+                        assert(false);
+                    }
+                }
+                assert(!s.snap[v].contains(w));
+            }
+        }
+    }
+}
+
+// ---- The invariant is inductive -------------------------------------------
+
+/// The initial state satisfies the invariant.
+pub proof fn lemma_inv_init()
+    ensures
+        inv(init()),
+{
+}
+
+proof fn lemma_inv_begin(s: ModelState)
+    requires
+        inv(s),
+        can_begin(s),
+    ensures
+        inv(begin(s)),
+{
+    let s2 = begin(s);
+    let n = s.next;
+    // Snapshot domain: exactly [1, next + 1).
+    assert forall|v: u64| #[trigger] allocated(s2, v) implies s2.snap.contains_key(v) by {
+        if v != n {
+            assert(allocated(s, v));
+        }
+    }
+    // New snapshot only holds older versions; still-active-below is inherited.
+    assert forall|v: u64, w: u64|
+        s2.snap.contains_key(v) && #[trigger] s2.snap[v].contains(w) implies 1 <= w < v by {
+        if v == n {
+            assert(s.active.contains(w));
+        }
+    }
+    assert forall|v: u64, w: u64|
+        s2.snap.contains_key(v) && s2.active.contains(w) && w < v implies #[trigger] s2.snap[v]
+            .contains(w) by {
+        assert(w != n);
+        assert(s.active.contains(w));
+        if v != n {
+            assert(s.snap.contains_key(v));
+        }
+    }
+    // The fresh version has no writes yet, so store clauses are inherited.
+    assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
+        s2,
+        w,
+    ) && !s2.aborted.contains(w) by {
+        assert(allocated(s, w));
+    }
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.active.contains(w) && s2.store.contains_key(
+            (k, w2),
+        ) implies w2 <= w by {
+        assert(s.store.contains_key((k, w)));
+        assert(allocated(s, w));
+        assert(w != n);
+    }
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.store.contains_key((k, w2)) && w < w2
+            implies !s2.snap[w2].contains(w) by {
+        assert(allocated(s, w2));
+        assert(w2 != n);
+        assert(s2.snap[w2] == s.snap[w2]);
+    }
+    // Snapshot coherence: the only new snapshot is snap[n] == s.active, and
+    // for it the claim is exactly the still-active-below clause of inv(s).
+    assert forall|u: u64, m: u64, w: u64|
+        #![trigger s2.snap[u].contains(w), s2.snap.contains_key(m)]
+        s2.snap.contains_key(u) && s2.snap.contains_key(m) && s2.snap[u].contains(w)
+            && !s2.snap[u].contains(m) && w < m && m < u implies s2.snap[m].contains(w) by {
+        assert(m != n);
+        assert(s2.snap[m] == s.snap[m]);
+        if u == n {
+            // snap[n] = s.active: w active now and w < m, so w was active
+            // when m began.
+            assert(s.active.contains(w));
+            assert(s.snap.contains_key(m));
+        } else {
+            assert(s2.snap[u] == s.snap[u]);
+            assert(s.snap.contains_key(u));
+        }
+    }
+}
+
+proof fn lemma_inv_commit(s: ModelState, v: u64)
+    requires
+        inv(s),
+        can_commit(s, v),
+    ensures
+        inv(commit(s, v)),
+{
+    let s2 = commit(s, v);
+    assert forall|x: u64| #[trigger] allocated(s2, x) implies s2.snap.contains_key(x) by {
+        assert(allocated(s, x));
+    }
+}
+
+proof fn lemma_inv_rollback(s: ModelState, v: u64)
+    requires
+        inv(s),
+        can_rollback(s, v),
+    ensures
+        inv(rollback(s, v)),
+{
+    let s2 = rollback(s, v);
+    assert forall|x: u64| #[trigger] allocated(s2, x) implies s2.snap.contains_key(x) by {
+        assert(allocated(s, x));
+    }
+    assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
+        s2,
+        w,
+    ) && !s2.aborted.contains(w) by {
+        assert(s.store.contains_key((k, w)));
+    }
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.active.contains(w) && s2.store.contains_key(
+            (k, w2),
+        ) implies w2 <= w by {
+        assert(s.store.contains_key((k, w)) && s.store.contains_key((k, w2)));
+    }
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.store.contains_key((k, w2)) && w < w2
+            implies !s2.snap[w2].contains(w) by {
+        assert(s.store.contains_key((k, w)) && s.store.contains_key((k, w2)));
+    }
+}
+
+proof fn lemma_inv_write(s: ModelState, v: u64, key: Seq<u8>, value: Option<Seq<u8>>)
+    requires
+        inv(s),
+        can_write(s, v, key),
+    ensures
+        inv(write(s, v, key, value)),
+{
+    let lo = choose|lo: u64|
+        #[trigger] is_scan_floor(s.snap[v], v, lo) && check_passes(s, v, key, lo);
+    thm_conflict_check_exact(s, v, key, lo);
+    assert(no_write_conflict(s, v, key));
+    let s2 = write(s, v, key, value);
+    assert(allocated(s, v));
+    assert(s.snap.contains_key(v));
+    assert forall|x: u64| #[trigger] allocated(s2, x) implies s2.snap.contains_key(x) by {
+        assert(allocated(s, x));
+    }
+    assert forall|k: Seq<u8>, w: u64| #[trigger] s2.store.contains_key((k, w)) implies allocated(
+        s2,
+        w,
+    ) && !s2.aborted.contains(w) by {
+        if k != key || w != v {
+            assert(s.store.contains_key((k, w)));
+        }
+    }
+    // Uncommitted-is-latest: the writer's fresh version is the new maximum
+    // (every prior version is visible, hence <= v), and no *other* active
+    // transaction holds a version of this key (a visible version is not in
+    // the begin snapshot, but any other still-active lower version would be).
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.active.contains(w) && s2.store.contains_key(
+            (k, w2),
+        ) implies w2 <= w by {
+        if k == key {
+            if w != v {
+                assert(s.store.contains_key((k, w)));
+                assert(has_version(s, key, w));
+                assert(txn_visible(s, v, w));
+                assert(w < v);
+                assert(s.snap[v].contains(w));  // still-active-below
+                assert(false);
+            } else {
+                if w2 != v {
+                    assert(has_version(s, key, w2));
+                    assert(txn_visible(s, v, w2));
+                }
+            }
+        } else {
+            assert(s.store.contains_key((k, w)) && s.store.contains_key((k, w2)));
+        }
+    }
+    // No-concurrent-writes: every prior version of this key was visible, so
+    // in particular outside the writer's begin snapshot.
+    assert forall|k: Seq<u8>, w: u64, w2: u64|
+        #![trigger s2.store.contains_key((k, w)), s2.store.contains_key((k, w2))]
+        s2.store.contains_key((k, w)) && s2.store.contains_key((k, w2)) && w < w2
+            implies !s2.snap[w2].contains(w) by {
+        if k == key && w2 == v {
+            if w != v {
+                assert(has_version(s, key, w));
+                assert(txn_visible(s, v, w));
+            }
+        } else if k == key && w == v {
+            assert(s.store.contains_key((k, w2)));
+            assert(has_version(s, key, w2));
+            assert(txn_visible(s, v, w2));
+            assert(false);  // no version above v existed
+        } else {
+            assert(s.store.contains_key((k, w)) && s.store.contains_key((k, w2)));
+        }
+    }
+}
+
+/// The invariant is preserved by every step: the induction behind the
+/// `write_version` comment.
+pub proof fn thm_inv_preserved(s: ModelState, s2: ModelState, actor: u64)
+    requires
+        inv(s),
+        step(s, s2, actor),
+    ensures
+        inv(s2),
+{
+    if can_begin(s) && actor == s.next && s2 == begin(s) {
+        lemma_inv_begin(s);
+    } else if can_commit(s, actor) && s2 == commit(s, actor) {
+        lemma_inv_commit(s, actor);
+    } else if can_rollback(s, actor) && s2 == rollback(s, actor) {
+        lemma_inv_rollback(s, actor);
+    } else {
+        let (key, value) = choose|key: Seq<u8>, value: Option<Seq<u8>>|
+            can_write(s, actor, key) && s2 == #[trigger] write(s, actor, key, value);
+        lemma_inv_write(s, actor, key, value);
+    }
+}
+
+// ---- Observers: transactions as readers -----------------------------------
+
+/// A well-formed reader at version `obs` using active-set snapshot `a`: every
+/// transaction still active now with a version below `obs` is in `a`. This
+/// holds for all three ways the code builds a `TransactionState`, per the
+/// three lemmas below, and is preserved by every step
+/// (`thm_snapshot_stability`).
+pub open spec fn wf_observer(s: ModelState, obs: u64, a: Set<u64>, ro: bool) -> bool {
+    &&& obs <= s.next
+    &&& forall|w: u64|
+        #![trigger s.active.contains(w)]
+        #![trigger a.contains(w)]
+        s.active.contains(w) && w < obs ==> a.contains(w)
+}
+
+/// A live read-write transaction reads via its begin snapshot (Transaction::begin).
+pub proof fn lemma_rw_txn_is_observer(s: ModelState, u: u64)
+    requires
+        inv(s),
+        s.active.contains(u),
+    ensures
+        wf_observer(s, u, s.snap[u], false),
+{
+    assert(allocated(s, u));
+    assert(s.snap.contains_key(u));
+}
+
+/// A read-only transaction at the current version with the current active set
+/// (Transaction::begin_read_only with as_of None).
+pub proof fn lemma_ro_now_is_observer(s: ModelState)
+    requires
+        inv(s),
+    ensures
+        wf_observer(s, s.next, s.active, true),
+{
+}
+
+/// A time-travel transaction at a past version with that version's restored
+/// begin snapshot (Transaction::begin_read_only with as_of; a missing
+/// TxnActiveSnapshot record decodes as the empty set it was).
+pub proof fn lemma_ro_as_of_is_observer(s: ModelState, v: u64)
+    requires
+        inv(s),
+        allocated(s, v),
+    ensures
+        wf_observer(s, v, s.snap[v], true),
+{
+    assert(s.snap.contains_key(v));
+}
+
+// ---- No dirty reads -------------------------------------------------------
+
+/// An uncommitted transaction's version is invisible to every other reader:
+/// nobody can observe in-progress writes (goldenscript anomaly_dirty_read).
+pub proof fn thm_uncommitted_invisible(s: ModelState, obs: u64, a: Set<u64>, ro: bool, v: u64)
+    requires
+        inv(s),
+        wf_observer(s, obs, a, ro),
+        s.active.contains(v),
+        ro || v != obs,
+    ensures
+        !spec_is_visible(a, obs, ro, v),
+{
+    if v < obs {
+        assert(a.contains(v));
+    }
+}
+
+/// Contrapositive on the store: every version a reader can see (other than a
+/// read-write transaction's own) is committed — reads never return dirty or
+/// rolled-back data.
+pub proof fn thm_reads_see_only_committed(
+    s: ModelState,
+    obs: u64,
+    a: Set<u64>,
+    ro: bool,
+    key: Seq<u8>,
+    w: u64,
+)
+    requires
+        inv(s),
+        wf_observer(s, obs, a, ro),
+        has_version(s, key, w),
+        spec_is_visible(a, obs, ro, w),
+        ro || w != obs,
+    ensures
+        committed(s, w),
+{
+    if s.active.contains(w) {
+        thm_uncommitted_invisible(s, obs, a, ro, w);
+    }
+    assert(allocated(s, w));
+}
+
+// ---- No dirty writes ------------------------------------------------------
+
+/// When the conflict check lets a write proceed, every existing version of the
+/// key (other than the writer's own earlier write) is committed: a write never
+/// clobbers another transaction's uncommitted data (anomaly_dirty_write).
+pub proof fn thm_no_dirty_write(s: ModelState, v: u64, key: Seq<u8>, w: u64)
+    requires
+        inv(s),
+        can_write(s, v, key),
+        has_version(s, key, w),
+        w != v,
+    ensures
+        committed(s, w),
+        txn_visible(s, v, w),
+{
+    let lo = choose|lo: u64|
+        #[trigger] is_scan_floor(s.snap[v], v, lo) && check_passes(s, v, key, lo);
+    thm_conflict_check_exact(s, v, key, lo);
+    assert(txn_visible(s, v, w));
+    assert(allocated(s, v));
+    assert(s.snap.contains_key(v));
+    if s.active.contains(w) {
+        assert(w < v);
+        assert(s.snap[v].contains(w));  // still-active-below
+        assert(false);
+    }
+    assert(allocated(s, w));
+}
+
+/// Restatement of the structural invariant from the `write_version` comment:
+/// an uncommitted version is always the latest version of its key.
+pub proof fn thm_uncommitted_is_latest(s: ModelState, key: Seq<u8>, w: u64, w2: u64)
+    requires
+        inv(s),
+        has_version(s, key, w),
+        s.active.contains(w),
+        has_version(s, key, w2),
+    ensures
+        w2 <= w,
+{
+}
+
+// ---- Repeatable reads: snapshot stability ---------------------------------
+
+/// A reader's entire visible slice of the store — every (key, version) it can
+/// see, with its value — is untouched by any other transaction's begin, write,
+/// commit, or rollback, and the reader stays well-formed. Point reads, range
+/// scans, and prefix scans are all functions of this slice, so none of them
+/// can ever change mid-transaction: no fuzzy reads, no read skew, no phantoms
+/// within a snapshot (anomaly_fuzzy_read, anomaly_read_skew,
+/// anomaly_phantom_read). In particular a *commit* by another transaction
+/// changes nothing either: its writes stay invisible until the reader ends.
+pub proof fn thm_snapshot_stability(
+    s: ModelState,
+    s2: ModelState,
+    actor: u64,
+    obs: u64,
+    a: Set<u64>,
+    ro: bool,
+)
+    requires
+        inv(s),
+        step(s, s2, actor),
+        wf_observer(s, obs, a, ro),
+        ro || actor != obs,
+    ensures
+        wf_observer(s2, obs, a, ro),
+        forall|key: Seq<u8>, w: u64|
+            #![trigger has_version(s, key, w)]
+            #![trigger has_version(s2, key, w)]
+            spec_is_visible(a, obs, ro, w) ==> (has_version(s2, key, w) <==> has_version(
+                s,
+                key,
+                w,
+            )),
+        forall|key: Seq<u8>, w: u64|
+            spec_is_visible(a, obs, ro, w) && #[trigger] has_version(s, key, w) ==> s2.store[
+                (key, w)
+            ] == s.store[(key, w)],
+{
+    if can_begin(s) && actor == s.next && s2 == begin(s) {
+        assert forall|w: u64| #[trigger] s2.active.contains(w) && w < obs implies a.contains(
+            w,
+        ) by {
+            assert(w != s.next);
+        }
+    } else if can_commit(s, actor) && s2 == commit(s, actor) {
+    } else if can_rollback(s, actor) && s2 == rollback(s, actor) {
+        thm_uncommitted_invisible(s, obs, a, ro, actor);
+        assert forall|key: Seq<u8>, w: u64|
+            spec_is_visible(a, obs, ro, w) && #[trigger] has_version(s, key, w) implies s2.store[
+            (key, w)
+        ] == s.store[(key, w)] by {
+            assert(w != actor);
+        }
+    } else {
+        let (key0, value0) = choose|key0: Seq<u8>, value0: Option<Seq<u8>>|
+            can_write(s, actor, key0) && s2 == #[trigger] write(s, actor, key0, value0);
+        thm_uncommitted_invisible(s, obs, a, ro, actor);
+        assert forall|key: Seq<u8>, w: u64|
+            spec_is_visible(a, obs, ro, w) && #[trigger] has_version(s, key, w) implies s2.store[
+            (key, w)
+        ] == s.store[(key, w)] by {
+            assert(w != actor);
+        }
+    }
+}
+
+/// The read a transaction performs — the greatest visible version of a key,
+/// and its value — is identical before and after any other transaction's
+/// step: reads are repeatable for the whole life of the snapshot.
+pub open spec fn is_read_result(
+    s: ModelState,
+    obs: u64,
+    a: Set<u64>,
+    ro: bool,
+    key: Seq<u8>,
+    w: u64,
+) -> bool {
+    &&& has_version(s, key, w)
+    &&& spec_is_visible(a, obs, ro, w)
+    &&& forall|w2: u64|
+        #[trigger] has_version(s, key, w2) && spec_is_visible(a, obs, ro, w2) ==> w2 <= w
+}
+
+pub proof fn thm_repeatable_read(
+    s: ModelState,
+    s2: ModelState,
+    actor: u64,
+    obs: u64,
+    a: Set<u64>,
+    ro: bool,
+    key: Seq<u8>,
+    w: u64,
+)
+    requires
+        inv(s),
+        step(s, s2, actor),
+        wf_observer(s, obs, a, ro),
+        ro || actor != obs,
+    ensures
+        is_read_result(s, obs, a, ro, key, w) <==> is_read_result(s2, obs, a, ro, key, w),
+        is_read_result(s, obs, a, ro, key, w) ==> s2.store[(key, w)] == s.store[(key, w)],
+{
+    thm_snapshot_stability(s, s2, actor, obs, a, ro);
+    if is_read_result(s, obs, a, ro, key, w) {
+        assert forall|w2: u64|
+            #[trigger] has_version(s2, key, w2) && spec_is_visible(a, obs, ro, w2) implies w2
+            <= w by {
+            assert(has_version(s, key, w2));
+        }
+        assert(is_read_result(s2, obs, a, ro, key, w));
+    }
+    if is_read_result(s2, obs, a, ro, key, w) {
+        assert forall|w2: u64|
+            #[trigger] has_version(s, key, w2) && spec_is_visible(a, obs, ro, w2) implies w2
+            <= w by {
+            assert(has_version(s2, key, w2));
+        }
+        assert(is_read_result(s, obs, a, ro, key, w));
+    }
+}
+
+// ---- Write-write conflicts: first writer wins -----------------------------
+
+/// For any two versions of the same key ever recorded, the earlier writer had
+/// committed before the later writer began — and therefore the earlier write
+/// was *visible* to the later writer. Concurrent transactions can never both
+/// write a key (the later one hits Error::Serialization instead), so no
+/// update is ever overwritten by a transaction that couldn't see it
+/// (anomaly_lost_update, set_conflict, delete_conflict).
+pub proof fn thm_first_writer_wins(s: ModelState, key: Seq<u8>, w1: u64, w2: u64)
+    requires
+        inv(s),
+        has_version(s, key, w1),
+        has_version(s, key, w2),
+        w1 < w2,
+    ensures
+        !s.snap[w2].contains(w1),
+        committed(s, w1),
+        txn_visible(s, w2, w1),
+{
+    assert(allocated(s, w1));
+    if s.active.contains(w1) {
+        assert(w2 <= w1);  // uncommitted-is-latest
+        assert(false);
+    }
+}
+
+// ---- Rollback restores invisibility ---------------------------------------
+
+/// Rollback removes exactly the transaction's own writes: afterwards no trace
+/// of its version remains, and every other key/version survives untouched.
+/// Combined with `thm_uncommitted_invisible` (nobody ever saw those writes
+/// while it was active) and `thm_snapshot_stability` (the rollback step
+/// changes no other reader's view), the transaction leaves no observable
+/// trace whatsoever.
+pub proof fn thm_rollback_erases(s: ModelState, v: u64)
+    requires
+        inv(s),
+        can_rollback(s, v),
+    ensures
+        forall|key: Seq<u8>| !has_version(rollback(s, v), key, v),
+        forall|key: Seq<u8>, w: u64|
+            w != v ==> (#[trigger] has_version(rollback(s, v), key, w) <==> has_version(
+                s,
+                key,
+                w,
+            )),
+        forall|key: Seq<u8>, w: u64|
+            w != v && #[trigger] has_version(s, key, w) ==> rollback(s, v).store[(key, w)]
+                == s.store[(key, w)],
+{
+}
+
+/// A rolled-back version never reappears: it stays aborted and no step can
+/// ever write at it again (writers write only at their own live version).
+pub proof fn thm_aborted_stays_gone(s: ModelState, s2: ModelState, actor: u64, v: u64)
+    requires
+        inv(s),
+        step(s, s2, actor),
+        s.aborted.contains(v),
+    ensures
+        s2.aborted.contains(v),
+        forall|key: Seq<u8>| !has_version(s2, key, v),
+{
+    assert(!s.active.contains(v));
+    assert forall|key: Seq<u8>| !has_version(s2, key, v) by {
+        assert(!s.store.contains_key((key, v)));
+        if !(can_begin(s) && actor == s.next && s2 == begin(s)) && !(can_commit(s, actor) && s2
+            == commit(s, actor)) && !(can_rollback(s, actor) && s2 == rollback(s, actor)) {
+            let (key0, value0) = choose|key0: Seq<u8>, value0: Option<Seq<u8>>|
+                can_write(s, actor, key0) && s2 == #[trigger] write(s, actor, key0, value0);
+            assert(s.active.contains(actor));
+            assert(actor != v);
+        }
+    }
+}
+
+} // verus!
 
 /// Most storage tests are Goldenscripts under src/storage/testscripts.
 #[cfg(test)]
