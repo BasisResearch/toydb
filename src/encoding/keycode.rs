@@ -39,7 +39,6 @@
 
 use std::ops::Bound;
 
-use itertools::Either;
 use serde::de::{
     Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer as _, SeqAccess, VariantAccess,
     Visitor,
@@ -170,6 +169,289 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
     }
 }
 
+// --- Verus-verified core of the bool key encoding --------------------------
+//
+// A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
+// `serialize_bool` / `deserialize_bool`). The round trip is trivial but we
+// state it so the encoder/decoder are pinned to the same byte convention.
+
+/// The single-byte key for a bool: 1 for true, 0 for false.
+pub open spec fn bool_key(b: bool) -> u8 {
+    if b { 1u8 } else { 0u8 }
+}
+
+/// Executable encoder, proven to compute `bool_key`.
+pub fn encode_bool_key(b: bool) -> (r: u8)
+    ensures r == bool_key(b),
+{
+    if b { 1u8 } else { 0u8 }
+}
+
+/// Executable decoder, proven to invert the encoding for the two valid bytes.
+pub fn decode_bool_key(byte: u8) -> (r: bool)
+    requires byte == 0u8 || byte == 1u8,
+    ensures bool_key(r) == byte,
+{
+    byte == 1u8
+}
+
+// --- Verus-verified core of the byte-string key encoding -------------------
+//
+// A byte slice is encoded by escaping each 0x00 as the pair `0x00 0xff` and
+// appending a `0x00 0x00` terminator (see `serialize_bytes` /
+// `decode_next_bytes` below). This makes the encoding self-terminating and,
+// because the terminator `0x00 0x00` is <= any escaped continuation, order-
+// preserving so that a prefix orders before a longer string.
+//
+// `bytes_enc` is the mathematical encoding; `bytes_dec` is its parser, returning
+// the decoded content together with the bytes that follow the terminator.
+// `bytes_roundtrip` proves they are inverse on every input, which is exactly the
+// property keycode relies on to deserialize a key unambiguously.
+
+/// The escaped bytes of `v` *without* the terminator: each `0x00` becomes the
+/// pair `0x00 0xff`, every other byte is copied verbatim.
+pub open spec fn esc_all(v: Seq<u8>) -> Seq<u8>
+    decreases v.len(),
+{
+    if v.len() == 0 {
+        Seq::empty()
+    } else {
+        let esc = if v[0] == 0u8 { seq![0u8, 255u8] } else { seq![v[0]] };
+        esc + esc_all(v.subrange(1, v.len() as int))
+    }
+}
+
+/// The full escaped encoding of a byte string: escaped body then the
+/// `0x00 0x00` terminator.
+pub open spec fn bytes_enc(v: Seq<u8>) -> Seq<u8> {
+    esc_all(v) + seq![0u8, 0u8]
+}
+
+/// The parser: given an encoded stream, returns the decoded byte string and the
+/// bytes remaining after the terminator. On malformed input it returns empty
+/// sequences (never reached for `bytes_enc` output, per `bytes_roundtrip`).
+pub open spec fn bytes_dec(s: Seq<u8>) -> (Seq<u8>, Seq<u8>)
+    decreases s.len(),
+{
+    if s.len() < 2 {
+        (Seq::<u8>::empty(), Seq::<u8>::empty())
+    } else if s[0] == 0u8 {
+        if s[1] == 0u8 {
+            // terminator
+            (Seq::<u8>::empty(), s.subrange(2, s.len() as int))
+        } else if s[1] == 255u8 {
+            // escaped 0x00
+            let rest = bytes_dec(s.subrange(2, s.len() as int));
+            (seq![0u8] + rest.0, rest.1)
+        } else {
+            (Seq::<u8>::empty(), Seq::<u8>::empty())
+        }
+    } else {
+        // literal byte
+        let rest = bytes_dec(s.subrange(1, s.len() as int));
+        (seq![s[0]] + rest.0, rest.1)
+    }
+}
+
+/// Encoding then parsing recovers the original byte string and leaves any
+/// trailing bytes untouched: `bytes_dec(bytes_enc(v) + suffix) == (v, suffix)`.
+/// Taking `suffix == []` gives the plain round trip `bytes_dec(bytes_enc(v)).0
+/// == v`.
+pub proof fn bytes_roundtrip(v: Seq<u8>, suffix: Seq<u8>)
+    ensures bytes_dec(bytes_enc(v) + suffix) == (v, suffix),
+    decreases v.len(),
+{
+    let s = bytes_enc(v) + suffix;
+    if v.len() == 0 {
+        assert(esc_all(v) == Seq::<u8>::empty());
+        assert(bytes_enc(v) =~= seq![0u8, 0u8]);
+        assert(s =~= seq![0u8, 0u8] + suffix);
+        assert(s.len() >= 2);
+        assert(s[0] == 0u8 && s[1] == 0u8);
+        assert(s.subrange(2, s.len() as int) =~= suffix);
+    } else {
+        let tail = v.subrange(1, v.len() as int);
+        bytes_roundtrip(tail, suffix);
+        // enc(v) = esc(v[0]) + esc_all(tail) + [0,0]; regroup so the suffix
+        // rides along with the tail's full encoding.
+        assert(bytes_enc(tail) + suffix =~= esc_all(tail) + seq![0u8, 0u8] + suffix);
+        if v[0] == 0u8 {
+            assert(esc_all(v) =~= seq![0u8, 255u8] + esc_all(tail));
+            assert(s =~= seq![0u8, 255u8] + (bytes_enc(tail) + suffix));
+            assert(s.len() >= 2);
+            assert(s[0] == 0u8 && s[1] == 255u8);
+            assert(s.subrange(2, s.len() as int) =~= bytes_enc(tail) + suffix);
+            assert(v =~= seq![0u8] + tail);
+        } else {
+            assert(esc_all(v) =~= seq![v[0]] + esc_all(tail));
+            assert(s =~= seq![v[0]] + (bytes_enc(tail) + suffix));
+            assert(s.len() >= 2);
+            assert(s[0] == v[0] && s[0] != 0u8);
+            assert(s.subrange(1, s.len() as int) =~= bytes_enc(tail) + suffix);
+            assert(v =~= seq![v[0]] + tail);
+        }
+    }
+}
+
+/// `esc_all` is a homomorphism from concatenation to concatenation: escaping a
+/// concatenation is the concatenation of the escapes. This is what lets the
+/// executable encoder build the result one byte at a time.
+pub proof fn esc_all_concat(a: Seq<u8>, b: Seq<u8>)
+    ensures esc_all(a + b) == esc_all(a) + esc_all(b),
+    decreases a.len(),
+{
+    if a.len() == 0 {
+        assert(a + b =~= b);
+        assert(esc_all(a) =~= Seq::<u8>::empty());
+    } else {
+        let a0 = a.subrange(1, a.len() as int);
+        esc_all_concat(a0, b);
+        assert((a + b).len() > 0);
+        assert((a + b)[0] == a[0]);
+        assert((a + b).subrange(1, (a + b).len() as int) =~= a0 + b);
+    }
+}
+
+/// The escape of a single byte, matching `esc_all` on a one-element sequence.
+pub proof fn esc_all_single(b: u8)
+    ensures
+        esc_all(seq![b]) == (if b == 0u8 { seq![0u8, 255u8] } else { seq![b] }),
+{
+    assert(seq![b].subrange(1, 1) =~= Seq::<u8>::empty());
+    assert(esc_all(Seq::<u8>::empty()) =~= Seq::<u8>::empty());
+}
+
+/// Executable encoder, proven to compute `bytes_enc(v)`: escape each `0x00` as
+/// `0x00 0xff` and append the `0x00 0x00` terminator. This is the verified core
+/// that `serialize_bytes` calls.
+pub fn encode_bytes(v: &[u8]) -> (r: Vec<u8>)
+    ensures r@ == bytes_enc(v@),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < v.len()
+        invariant
+            0 <= i <= v.len(),
+            out@ == esc_all(v@.subrange(0, i as int)),
+        decreases v.len() - i,
+    {
+        let b = v[i];
+        proof {
+            esc_all_concat(v@.subrange(0, i as int), seq![b]);
+            esc_all_single(b);
+            assert(v@.subrange(0, i as int + 1) =~= v@.subrange(0, i as int) + seq![b]);
+        }
+        if b == 0u8 {
+            out.push(0u8);
+            out.push(255u8);
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    proof {
+        assert(v@.subrange(0, v.len() as int) =~= v@);
+    }
+    out.push(0u8);
+    out.push(0u8);
+    assert(out@ =~= esc_all(v@) + seq![0u8, 0u8]);
+    out
+}
+
+/// The outcome of `decode_bytes`: either the decoded byte string with the
+/// number of input bytes consumed, or one of the two malformed-input cases,
+/// mirroring the diagnostics `decode_next_bytes` reports.
+pub enum DecodeBytes {
+    /// `Decoded(bytes, taken)`: the parsed content and the number of input
+    /// bytes consumed (up to and including the `0x00 0x00` terminator).
+    Decoded(Vec<u8>, usize),
+    /// A `0x00` was not followed by `0x00` (terminator) or `0xff` (escape).
+    InvalidEscape,
+    /// The input ran out at an element boundary with no terminator.
+    UnexpectedEnd,
+}
+
+/// Executable decoder, proven to compute `bytes_dec(s)` on success: it returns
+/// `Decoded(decoded, taken)` where `decoded` is the parsed byte string and
+/// `taken` is the number of input bytes consumed (up to and including the
+/// terminator). Malformed input yields `InvalidEscape` or `UnexpectedEnd`,
+/// matching the two cases `decode_next_bytes` distinguishes. This is the
+/// verified core that `decode_next_bytes` calls.
+pub fn decode_bytes(s: &[u8]) -> (r: DecodeBytes)
+    ensures
+        match r {
+            DecodeBytes::Decoded(d, n) => {
+                &&& n <= s@.len()
+                &&& d@ == bytes_dec(s@).0
+                &&& n as int == s@.len() - bytes_dec(s@).1.len()
+                &&& s@.subrange(n as int, s@.len() as int) == bytes_dec(s@).1
+            }
+            _ => true,
+        },
+{
+    let ghost full = s@;
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut pos: usize = 0;
+    assert(full.subrange(0, full.len() as int) =~= full);
+    assert(decoded@ + bytes_dec(full).0 =~= bytes_dec(full).0);
+    loop
+        invariant
+            pos <= s@.len(),
+            s@ == full,
+            bytes_dec(full).0 == decoded@ + bytes_dec(
+                full.subrange(pos as int, full.len() as int),
+            ).0,
+            bytes_dec(full).1 == bytes_dec(full.subrange(pos as int, full.len() as int)).1,
+        decreases s@.len() - pos,
+    {
+        let ghost suf = full.subrange(pos as int, full.len() as int);
+        if s.len() - pos < 2 {
+            // Fewer than two bytes remain: no room for a terminator. A lone
+            // trailing 0x00 is a truncated escape; anything else is a missing
+            // terminator (matching decode_next_bytes' two error paths).
+            if pos < s.len() && s[pos] == 0 {
+                return DecodeBytes::InvalidEscape;
+            } else {
+                return DecodeBytes::UnexpectedEnd;
+            }
+        }
+        let b0 = s[pos];
+        let b1 = s[pos + 1];
+        assert(suf.len() >= 2);
+        assert(suf[0] == b0 && suf[1] == b1);
+        if b0 == 0 {
+            if b1 == 0 {
+                // Terminator: the decoded bytes so far are the full result.
+                assert(bytes_dec(suf).0 =~= Seq::<u8>::empty());
+                assert(bytes_dec(suf).1 =~= full.subrange(pos as int + 2, full.len() as int));
+                assert(decoded@ =~= bytes_dec(full).0);
+                return DecodeBytes::Decoded(decoded, pos + 2);
+            } else if b1 == 255 {
+                // Escaped 0x00.
+                let ghost suf2 = full.subrange(pos as int + 2, full.len() as int);
+                assert(suf.subrange(2, suf.len() as int) =~= suf2);
+                assert(bytes_dec(suf).0 =~= seq![0u8] + bytes_dec(suf2).0);
+                assert(bytes_dec(suf).1 == bytes_dec(suf2).1);
+                decoded.push(0);
+                pos += 2;
+                assert(decoded@ + bytes_dec(suf2).0 =~= bytes_dec(full).0);
+            } else {
+                // Invalid escape sequence.
+                return DecodeBytes::InvalidEscape;
+            }
+        } else {
+            // Literal byte.
+            let ghost suf1 = full.subrange(pos as int + 1, full.len() as int);
+            assert(suf.subrange(1, suf.len() as int) =~= suf1);
+            assert(bytes_dec(suf).0 =~= seq![b0] + bytes_dec(suf1).0);
+            assert(bytes_dec(suf).1 == bytes_dec(suf1).1);
+            decoded.push(b0);
+            pos += 1;
+            assert(decoded@ + bytes_dec(suf1).0 =~= bytes_dec(full).0);
+        }
+    }
+}
+
 } // verus!
 
 /// Serializes a key to a binary Keycode representation.
@@ -198,6 +480,400 @@ pub fn deserialize<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
     Ok(t)
 }
 
+// --- Verus-verified core of prefix range scans -----------------------------
+//
+// `prefix_range` turns a key prefix into a `[start, end)` byte range such that
+// scanning that range visits exactly the keys that begin with the prefix. This
+// is what makes prefix scans correct — e.g. scanning one SQL table (whose rows
+// share a key prefix) or the tail of the Raft log. The verified core
+// `prefix_end` computes the exclusive upper bound (a `None` result means the
+// scan runs to the end of the keyspace), proven against the lexicographic byte
+// order that the storage engine maintains.
+verus! {
+
+/// Strict lexicographic order on byte strings: compare byte by byte, and a
+/// proper prefix orders before its extensions. This is the order the storage
+/// engine keeps keys in.
+pub open spec fn lex_lt(a: Seq<u8>, b: Seq<u8>) -> bool
+    decreases a.len(),
+{
+    if a.len() == 0 {
+        b.len() > 0
+    } else if b.len() == 0 {
+        false
+    } else if a[0] != b[0] {
+        a[0] < b[0]
+    } else {
+        lex_lt(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int))
+    }
+}
+
+/// Non-strict lexicographic order.
+pub open spec fn lex_le(a: Seq<u8>, b: Seq<u8>) -> bool {
+    a == b || lex_lt(a, b)
+}
+
+/// `p` is a prefix of `k`: `k` starts with all of `p`'s bytes.
+pub open spec fn is_prefix(p: Seq<u8>, k: Seq<u8>) -> bool {
+    p.len() <= k.len() && k.subrange(0, p.len() as int) == p
+}
+
+/// A prefix orders at-or-before any key it prefixes.
+pub proof fn lemma_prefix_implies_le(p: Seq<u8>, k: Seq<u8>)
+    requires is_prefix(p, k),
+    ensures lex_le(p, k),
+    decreases p.len(),
+{
+    if p.len() == 0 {
+        // Empty prefix: p == k (k has length >= 0 and k[0..0] == p == []) or p < k.
+        if k.len() == 0 {
+            assert(p =~= k);
+        } else {
+            assert(lex_lt(p, k));
+        }
+    } else {
+        // p[0] == k[0]; the tails are still in the prefix relation.
+        assert(k[0] == p[0]) by {
+            assert(k.subrange(0, p.len() as int)[0] == p[0]);
+        }
+        assert(k.len() > 0);
+        let p1 = p.subrange(1, p.len() as int);
+        let k1 = k.subrange(1, k.len() as int);
+        assert(is_prefix(p1, k1)) by {
+            assert(k1.subrange(0, p1.len() as int) =~= p1);
+        }
+        lemma_prefix_implies_le(p1, k1);
+        // Fold the tail comparison back up to the full strings.
+        if p == k {
+            assert(lex_le(p, k));
+        } else {
+            // p != k with equal heads forces the tails to differ, so the IH
+            // gives a strict order on the tails, which lifts to p < k.
+            assert(p1 != k1) by {
+                if p1 =~= k1 {
+                    assert(p =~= k);
+                }
+            }
+            assert(lex_lt(p1, k1));
+            assert(lex_lt(p, k));
+        }
+    }
+}
+
+/// Build `lex_lt(a, b)` from a first point of difference: `a` and `b` agree on
+/// `[0, m)` and `a[m] < b[m]`.
+pub proof fn lemma_lex_lt_at(a: Seq<u8>, b: Seq<u8>, m: int)
+    requires
+        0 <= m < a.len(),
+        m < b.len(),
+        forall|j: int| 0 <= j < m ==> a[j] == b[j],
+        a[m] < b[m],
+    ensures
+        lex_lt(a, b),
+    decreases m,
+{
+    if m == 0 {
+        // a[0] != b[0] with a[0] < b[0]: lex_lt reduces to the head comparison.
+    } else {
+        assert(a[0] == b[0]);
+        let a1 = a.subrange(1, a.len() as int);
+        let b1 = b.subrange(1, b.len() as int);
+        assert forall|j: int| 0 <= j < m - 1 implies a1[j] == b1[j] by {
+            assert(a1[j] == a[j + 1]);
+            assert(b1[j] == b[j + 1]);
+        }
+        assert(a1[m - 1] == a[m] && b1[m - 1] == b[m]);
+        lemma_lex_lt_at(a1, b1, m - 1);
+    }
+}
+
+/// From strict order, the heads are ordered `<=`.
+pub proof fn lemma_head_le_from_lt(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_lt(a, b),
+        a.len() > 0,
+        b.len() > 0,
+    ensures
+        a[0] <= b[0],
+{
+}
+
+/// From strict order with equal heads, the tails are strictly ordered.
+pub proof fn lemma_tail_lt_from_lt(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_lt(a, b),
+        a.len() > 0,
+        b.len() > 0,
+        a[0] == b[0],
+    ensures
+        lex_lt(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int)),
+{
+}
+
+/// From non-strict order with equal heads, the tails are non-strictly ordered.
+pub proof fn lemma_le_tail(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_le(a, b),
+        a.len() > 0,
+        b.len() > 0,
+        a[0] == b[0],
+    ensures
+        lex_le(a.subrange(1, a.len() as int), b.subrange(1, b.len() as int)),
+{
+    if a =~= b {
+        assert(a.subrange(1, a.len() as int) =~= b.subrange(1, b.len() as int));
+    } else {
+        lemma_tail_lt_from_lt(a, b);
+    }
+}
+
+/// Lift `is_prefix` over a shared head byte.
+pub proof fn lemma_prefix_lift(p: Seq<u8>, k: Seq<u8>)
+    requires
+        p.len() > 0,
+        k.len() > 0,
+        p[0] == k[0],
+        is_prefix(p.subrange(1, p.len() as int), k.subrange(1, k.len() as int)),
+    ensures
+        is_prefix(p, k),
+{
+    let p1 = p.subrange(1, p.len() as int);
+    let k1 = k.subrange(1, k.len() as int);
+    assert(k1.subrange(0, p1.len() as int) =~= p1);
+    assert(k.subrange(0, p.len() as int) =~= p) by {
+        assert forall|j: int| #![auto] 0 <= j < p.len() implies k.subrange(0, p.len() as int)[j] == p[j] by {
+            if j >= 1 {
+                assert(k1[j - 1] == k[j]);
+                assert(p1[j - 1] == p[j]);
+                assert(k1.subrange(0, p1.len() as int)[j - 1] == p1[j - 1]);
+            }
+        }
+    }
+}
+
+/// When the prefix is all `0xff`, being `>=` the prefix already implies being
+/// prefixed by it: no byte can exceed `0xff`, so a key can only be `>=` an
+/// all-`0xff` prefix by extending it.
+pub proof fn lemma_allff(p: Seq<u8>, k: Seq<u8>)
+    requires
+        forall|j: int| 0 <= j < p.len() ==> p[j] == 255,
+        lex_le(p, k),
+    ensures
+        is_prefix(p, k),
+    decreases p.len(),
+{
+    if p.len() == 0 {
+        assert(k.subrange(0, 0) =~= p);
+    } else if p =~= k {
+        assert(k.subrange(0, p.len() as int) =~= p);
+    } else {
+        assert(lex_lt(p, k));
+        assert(k.len() > 0);
+        lemma_head_le_from_lt(p, k);
+        assert(p[0] == 255);
+        assert(k[0] == 255);
+        let p1 = p.subrange(1, p.len() as int);
+        let k1 = k.subrange(1, k.len() as int);
+        lemma_le_tail(p, k);
+        assert forall|j: int| 0 <= j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_allff(p1, k1);
+        lemma_prefix_lift(p, k);
+    }
+}
+
+/// From non-strict order, the heads are ordered `<=`.
+pub proof fn lemma_head_le_from_le(a: Seq<u8>, b: Seq<u8>)
+    requires
+        lex_le(a, b),
+        a.len() > 0,
+        b.len() > 0,
+    ensures
+        a[0] <= b[0],
+{
+    if a =~= b {
+    } else {
+        lemma_head_le_from_lt(a, b);
+    }
+}
+
+/// Forward direction of prefix-range correctness: every key prefixed by `p`
+/// lies in `[p, end)`, where `end` is `p` truncated after its last non-`0xff`
+/// byte `i`, with that byte incremented.
+pub proof fn lemma_prefix_end_fwd(p: Seq<u8>, i: int, e: Seq<u8>, k: Seq<u8>)
+    requires
+        0 <= i < p.len(),
+        p[i] != 255,
+        e == p.subrange(0, i) + seq![((p[i] + 1) as u8)],
+        is_prefix(p, k),
+    ensures
+        lex_le(p, k),
+        lex_lt(k, e),
+{
+    lemma_prefix_implies_le(p, k);
+    assert(e.len() == i + 1);
+    assert(i < k.len());
+    assert forall|j: int| 0 <= j < i implies k[j] == e[j] by {
+        assert(k.subrange(0, p.len() as int)[j] == p[j]);
+        assert(e[j] == p[j]);
+    }
+    assert(k[i] == p[i]) by {
+        assert(k.subrange(0, p.len() as int)[i] == p[i]);
+    }
+    assert(e[i] == (p[i] + 1) as u8);
+    assert(k[i] < e[i]);
+    lemma_lex_lt_at(k, e, i);
+}
+
+/// Backward direction of prefix-range correctness: every key in `[p, end)` is
+/// prefixed by `p`. Together with the forward direction this makes the range
+/// exact. Proved by induction on `i`, peeling one shared head byte at a time.
+pub proof fn lemma_prefix_end_bwd(p: Seq<u8>, i: int, e: Seq<u8>, k: Seq<u8>)
+    requires
+        0 <= i < p.len(),
+        p[i] != 255,
+        forall|j: int| i < j < p.len() ==> p[j] == 255,
+        e == p.subrange(0, i) + seq![((p[i] + 1) as u8)],
+        lex_le(p, k),
+        lex_lt(k, e),
+    ensures
+        is_prefix(p, k),
+    decreases i,
+{
+    assert(e.len() == i + 1);
+    assert(k.len() > 0);
+    lemma_head_le_from_le(p, k);
+    lemma_head_le_from_lt(k, e);
+    let p1 = p.subrange(1, p.len() as int);
+    let k1 = k.subrange(1, k.len() as int);
+    if i == 0 {
+        // end == [p[0]+1]. k[0] can only be p[0] (p[0]+1 would force k >= end).
+        assert(e[0] == (p[0] + 1) as u8);
+        if k[0] == e[0] {
+            lemma_tail_lt_from_lt(k, e);
+            assert(e.subrange(1, e.len() as int).len() == 0);
+            assert(false);
+        }
+        assert(k[0] == p[0]);
+        lemma_le_tail(p, k);
+        assert forall|j: int| 0 <= j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_allff(p1, k1);
+        lemma_prefix_lift(p, k);
+    } else {
+        // e[0] == p[0]; the head must match and we recurse on the tails.
+        assert(e[0] == p[0]);
+        assert(k[0] == p[0]);
+        lemma_le_tail(p, k);
+        lemma_tail_lt_from_lt(k, e);
+        let e1 = e.subrange(1, e.len() as int);
+        assert(e1 == p1.subrange(0, i - 1) + seq![((p1[i - 1] + 1) as u8)]) by {
+            assert(p1[i - 1] == p[i]);
+            assert forall|m: int| 0 <= m < i implies e1[m] == (p1.subrange(0, i - 1) + seq![
+                ((p1[i - 1] + 1) as u8),
+            ])[m] by {
+                assert(e1[m] == e[m + 1]);
+                if m < i - 1 {
+                    assert(p1.subrange(0, i - 1)[m] == p1[m]);
+                    assert(p1[m] == p[m + 1]);
+                    assert(e[m + 1] == p[m + 1]);
+                }
+            }
+        }
+        assert forall|j: int| i - 1 < j < p1.len() implies p1[j] == 255 by {
+            assert(p1[j] == p[j + 1]);
+        }
+        lemma_prefix_end_bwd(p1, i - 1, e1, k1);
+        lemma_prefix_lift(p, k);
+    }
+}
+
+/// Executable core of `prefix_range`: computes the exclusive upper bound key for
+/// a prefix scan, or `None` (scan to the end of the keyspace) when the prefix is
+/// empty or all `0xff`. Proven correct: the returned bound makes the range
+/// `[prefix, end)` contain *exactly* the keys prefixed by `prefix`.
+pub fn prefix_end(prefix: &[u8]) -> (r: Option<Vec<u8>>)
+    ensures
+        match r {
+            Option::None => forall|k: Seq<u8>|
+                #![trigger is_prefix(prefix@, k)]
+                is_prefix(prefix@, k) <==> lex_le(prefix@, k),
+            Option::Some(e) => forall|k: Seq<u8>|
+                #![trigger is_prefix(prefix@, k)]
+                is_prefix(prefix@, k) <==> (lex_le(prefix@, k) && lex_lt(k, e@)),
+        },
+{
+    let n = prefix.len();
+    let mut i = n;
+    while i > 0
+        invariant
+            i <= n,
+            n == prefix.len(),
+            forall|j: int| i <= j < n ==> prefix@[j] == 255,
+        decreases i,
+    {
+        if prefix[i - 1] != 255 {
+            let idx = i - 1;
+            assert(prefix@[idx as int] != 255);
+            assert(forall|j: int| idx < j < n ==> prefix@[j] == 255);
+            // Build e = prefix[0..idx] ++ [prefix[idx] + 1].
+            let mut e: Vec<u8> = Vec::new();
+            let mut m: usize = 0;
+            while m < idx
+                invariant
+                    m <= idx,
+                    idx < n,
+                    n == prefix.len(),
+                    e@ == prefix@.subrange(0, m as int),
+                decreases idx - m,
+            {
+                e.push(prefix[m]);
+                assert(prefix@.subrange(0, m as int + 1) =~= prefix@.subrange(0, m as int)
+                    + seq![prefix@[m as int]]);
+                m += 1;
+            }
+            assert(prefix@[idx as int] < 255);
+            let last = prefix[idx] + 1;
+            e.push(last);
+            assert(e@ =~= prefix@.subrange(0, idx as int) + seq![((prefix@[idx as int] + 1) as u8)]);
+            proof {
+                assert forall|k: Seq<u8>|
+                    #![trigger is_prefix(prefix@, k)]
+                    is_prefix(prefix@, k) <==> (lex_le(prefix@, k) && lex_lt(k, e@)) by {
+                    if is_prefix(prefix@, k) {
+                        lemma_prefix_end_fwd(prefix@, idx as int, e@, k);
+                    }
+                    if lex_le(prefix@, k) && lex_lt(k, e@) {
+                        lemma_prefix_end_bwd(prefix@, idx as int, e@, k);
+                    }
+                }
+            }
+            return Some(e);
+        }
+        i -= 1;
+    }
+    // i == 0: every byte is 0xff (or the prefix is empty), so the scan has no
+    // upper bound.
+    assert(forall|j: int| 0 <= j < n ==> prefix@[j] == 255);
+    proof {
+        assert forall|k: Seq<u8>|
+            #![trigger is_prefix(prefix@, k)]
+            is_prefix(prefix@, k) <==> lex_le(prefix@, k) by {
+            if is_prefix(prefix@, k) {
+                lemma_prefix_implies_le(prefix@, k);
+            }
+            if lex_le(prefix@, k) {
+                lemma_allff(prefix@, k);
+            }
+        }
+    }
+    None
+}
+
+} // verus!
+
 /// Generates a key range for a key prefix, used e.g. for prefix scans.
 ///
 /// The exclusive end bound is generated by adding 1 to the value of the last
@@ -207,10 +883,12 @@ pub fn deserialize<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
 /// prefixes after it.
 pub fn prefix_range(prefix: &[u8]) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let start = Bound::Included(prefix.to_vec());
-    let end = match prefix.iter().rposition(|&b| b != 0xff) {
-        Some(i) => Bound::Excluded(
-            prefix.iter().take(i).copied().chain(std::iter::once(prefix[i] + 1)).collect(),
-        ),
+    // `prefix_end` is the Verus-verified core: it computes the exclusive upper
+    // bound (`Some`) or signals an unbounded scan (`None`), proven to make
+    // `[prefix, end)` cover exactly the keys prefixed by `prefix`. See the
+    // `verus!` block above.
+    let end = match prefix_end(prefix) {
+        Some(e) => Bound::Excluded(e),
         None => Bound::Unbounded,
     };
     (start, end)
@@ -312,14 +990,10 @@ impl serde::ser::Serializer for &mut Serializer {
     //
     // We can't use e.g. length prefix encoding, since it doesn't sort correctly.
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        let bytes = v
-            .iter()
-            .flat_map(|&byte| match byte {
-                0x00 => Either::Left([0x00, 0xff].into_iter()),
-                byte => Either::Right([byte].into_iter()),
-            })
-            .chain([0x00, 0x00]);
-        self.output.extend(bytes);
+        // `encode_bytes` is the Verus-verified core, proven to compute
+        // `bytes_enc` (escape each 0x00 as 0x00ff, append the 0x0000
+        // terminator). See the `verus!` block above.
+        self.output.extend(encode_bytes(v));
         Ok(())
     }
 
@@ -478,22 +1152,20 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Decodes and chops off the next encoded byte slice.
+    ///
+    /// The parse itself is delegated to `decode_bytes`, the Verus-verified core
+    /// proven to compute `bytes_dec` (see the `verus!` block above); this
+    /// wrapper just advances `self.input` and maps the two malformed-input
+    /// cases to the diagnostics this function has always reported.
     fn decode_next_bytes(&mut self) -> Result<Vec<u8>> {
-        let mut decoded = Vec::new();
-        let mut iter = self.input.iter().enumerate();
-        let taken = loop {
-            match iter.next() {
-                Some((_, 0x00)) => match iter.next() {
-                    Some((i, 0x00)) => break i + 1,        // terminator
-                    Some((_, 0xff)) => decoded.push(0x00), // escaped 0x00
-                    _ => return errdata!("invalid escape sequence"),
-                },
-                Some((_, b)) => decoded.push(*b),
-                None => return errdata!("unexpected end of input"),
+        match decode_bytes(self.input) {
+            DecodeBytes::Decoded(decoded, taken) => {
+                self.input = &self.input[taken..];
+                Ok(decoded)
             }
-        };
-        self.input = &self.input[taken..];
-        Ok(decoded)
+            DecodeBytes::InvalidEscape => errdata!("invalid escape sequence"),
+            DecodeBytes::UnexpectedEnd => errdata!("unexpected end of input"),
+        }
     }
 }
 

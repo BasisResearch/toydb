@@ -161,6 +161,96 @@ impl PartialOrd for Value {
     }
 }
 
+// --- Verus-verified core of integer arithmetic -----------------------------
+//
+// SQL integer arithmetic must never silently wrap around: `checked_add` and
+// friends return the exact mathematical result when it fits in an `i64`, or a
+// well-defined "integer overflow" error otherwise. The helpers below are the
+// verified core the `Integer`/`Integer` branches call — each is proven to
+// return `Some(exact result)` precisely when that result fits, and `None`
+// precisely on overflow (using a wide `i128` intermediate that cannot itself
+// overflow). `verus!` erases to plain `fn`s under a normal `cargo build`.
+use vstd::prelude::*;
+
+verus! {
+
+/// Checked `i64` addition: `Some(a + b)` when it fits, else `None` (overflow).
+pub fn checked_add_i64(a: i64, b: i64) -> (r: Option<i64>)
+    ensures
+        match r {
+            Some(v) => v == a + b,
+            None => a + b > i64::MAX || a + b < i64::MIN,
+        },
+{
+    let wide: i128 = a as i128 + b as i128;
+    if wide > i64::MAX as i128 || wide < i64::MIN as i128 {
+        None
+    } else {
+        Some(wide as i64)
+    }
+}
+
+/// Checked `i64` subtraction: `Some(a - b)` when it fits, else `None`.
+pub fn checked_sub_i64(a: i64, b: i64) -> (r: Option<i64>)
+    ensures
+        match r {
+            Some(v) => v == a - b,
+            None => a - b > i64::MAX || a - b < i64::MIN,
+        },
+{
+    let wide: i128 = a as i128 - b as i128;
+    if wide > i64::MAX as i128 || wide < i64::MIN as i128 {
+        None
+    } else {
+        Some(wide as i64)
+    }
+}
+
+/// The product of two `i64`-range values fits in an `i128`: each factor has
+/// magnitude at most `2^63`, so the product has magnitude at most `2^126`,
+/// comfortably inside `i128`'s `±(2^127 - 1)` range.
+proof fn lemma_i128_mul_fits(a: i128, b: i128)
+    requires
+        -9223372036854775808 <= a <= 9223372036854775808,
+        -9223372036854775808 <= b <= 9223372036854775808,
+    ensures
+        i128::MIN <= a * b <= i128::MAX,
+{
+    assert(a * b <= 9223372036854775808 * 9223372036854775808) by (nonlinear_arith)
+        requires
+            -9223372036854775808 <= a <= 9223372036854775808,
+            -9223372036854775808 <= b <= 9223372036854775808,
+    ;
+    assert(-(9223372036854775808 * 9223372036854775808) <= a * b) by (nonlinear_arith)
+        requires
+            -9223372036854775808 <= a <= 9223372036854775808,
+            -9223372036854775808 <= b <= 9223372036854775808,
+    ;
+}
+
+/// Checked `i64` multiplication: `Some(a * b)` when it fits, else `None`.
+pub fn checked_mul_i64(a: i64, b: i64) -> (r: Option<i64>)
+    ensures
+        match r {
+            Some(v) => v == a * b,
+            None => a * b > i64::MAX || a * b < i64::MIN,
+        },
+{
+    let wa: i128 = a as i128;
+    let wb: i128 = b as i128;
+    proof {
+        lemma_i128_mul_fits(wa, wb);
+    }
+    let wide: i128 = wa * wb;
+    if wide > i64::MAX as i128 || wide < i64::MIN as i128 {
+        None
+    } else {
+        Some(wide as i64)
+    }
+}
+
+} // verus!
+
 impl Value {
     /// Returns the value's datatype, or None for null values.
     pub fn datatype(&self) -> Option<DataType> {
@@ -187,7 +277,7 @@ impl Value {
         use Value::*;
 
         Ok(match (self, other) {
-            (Integer(lhs), Integer(rhs)) => match lhs.checked_add(*rhs) {
+            (Integer(lhs), Integer(rhs)) => match checked_add_i64(*lhs, *rhs) {
                 Some(i) => Integer(i),
                 None => return errinput!("integer overflow"),
             },
@@ -221,7 +311,7 @@ impl Value {
         use Value::*;
 
         Ok(match (self, other) {
-            (Integer(lhs), Integer(rhs)) => match lhs.checked_mul(*rhs) {
+            (Integer(lhs), Integer(rhs)) => match checked_mul_i64(*lhs, *rhs) {
                 Some(i) => Integer(i),
                 None => return errinput!("integer overflow"),
             },
@@ -281,7 +371,7 @@ impl Value {
         use Value::*;
 
         Ok(match (self, other) {
-            (Integer(lhs), Integer(rhs)) => match lhs.checked_sub(*rhs) {
+            (Integer(lhs), Integer(rhs)) => match checked_sub_i64(*lhs, *rhs) {
                 Some(i) => Integer(i),
                 None => return errinput!("integer overflow"),
             },
