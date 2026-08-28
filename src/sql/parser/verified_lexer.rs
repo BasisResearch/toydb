@@ -3895,4 +3895,128 @@ pub proof fn lemma_lex_mtok_seq_roundtrip(ms: Seq<MTok>, fuel: nat)
 }
 
 
+// -- L24: locality for the string/ident scanners + unified dispatcher -----------
+
+/// `scan_to_quote` is suffix-local.
+pub proof fn lemma_scan_to_quote_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        scan_to_quote(input, pos) == pos + scan_to_quote(input.subrange(pos, input.len() as int), 0),
+    decreases input.len() - pos,
+{
+    let sub = input.subrange(pos, input.len() as int);
+    if pos < input.len() {
+        assert(sub[0] == input[pos]);
+        if input[pos] != 39 {
+            lemma_scan_to_quote_local(input, pos + 1);
+            lemma_scan_to_quote_local(sub, 1);
+            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
+        }
+    }
+}
+
+/// Bounds for `scan_to_quote`.
+pub proof fn lemma_scan_to_quote_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        pos <= scan_to_quote(input, pos) <= input.len(),
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && input[pos] != 39 {
+        lemma_scan_to_quote_bounds(input, pos + 1);
+    }
+}
+
+/// `lscan_string_m` is suffix-local (same char view, shifted end).
+pub proof fn lemma_lscan_string_m_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_string_m(input, pos).0 == lscan_string_m(input.subrange(pos, input.len() as int), 0).0,
+        lscan_string_m(input, pos).1 == pos + lscan_string_m(input.subrange(pos, input.len() as int), 0).1
+            || lscan_string_m(input, pos).0 is None,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n && input[pos] == 39 {
+        assert(sub[0] == input[pos]);
+        lemma_scan_to_quote_local(input, pos + 1);
+        lemma_scan_to_quote_local(sub, 1);
+        lemma_scan_to_quote_bounds(sub, 1);
+        let cs = scan_to_quote(sub, 1);
+        let ci = scan_to_quote(input, pos + 1);
+        assert(input.subrange(pos + 1, n) =~= sub.subrange(1, sub.len() as int));
+        assert(ci == pos + cs);
+        assert((ci < n) == (cs < sub.len()));
+        if ci < n {
+            assert(input.subrange(pos + 1, ci) =~= sub.subrange(1, cs));
+        }
+    }
+}
+
+/// `lscan_ident_m` is suffix-local.
+pub proof fn lemma_lscan_ident_m_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_ident_m(input, pos).0 == lscan_ident_m(input.subrange(pos, input.len() as int), 0).0,
+        lscan_ident_m(input, pos).1 == pos + lscan_ident_m(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n && is_ident_start(input[pos]) {
+        assert(sub[0] == input[pos]);
+        lemma_scan_ident_end_local(input, pos);
+        lemma_scan_ident_end_bounds(sub, 0);
+        let es = scan_ident_end(sub, 0);
+        let e = scan_ident_end(input, pos);
+        assert(e == pos + es);
+        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
+    }
+}
+
+/// `lscan_mtok` is suffix-local: scanning at `pos` yields the same mirror token as
+/// scanning the suffix at `0`, end shifted by `pos`.
+pub proof fn lemma_lscan_mtok_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_mtok(input, pos).0 == lscan_mtok(input.subrange(pos, input.len() as int), 0).0,
+        lscan_mtok(input, pos).1 == pos + lscan_mtok(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    lemma_skip_ws_local(input, pos);
+    lemma_skip_ws_bounds(sub, 0);
+    let ps = skip_ws(sub, 0);
+    let p = skip_ws(input, pos);
+    assert(p == pos + ps);
+    if p < n {
+        assert(ps < sub.len());
+        assert(sub[ps] == input[p]);
+        let b = input[p];
+        assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
+        if b == 39 {
+            lemma_lscan_string_m_local(input, p);
+            lemma_lscan_string_m_local(sub, ps);
+        } else if is_digit(b) {
+            lemma_lscan_num_full_local(input, p);
+            lemma_lscan_num_full_local(sub, ps);
+        } else if is_ident_start(b) {
+            lemma_lscan_keyword_local(input, p);
+            lemma_lscan_keyword_local(sub, ps);
+            lemma_lscan_ident_m_local(input, p);
+            lemma_lscan_ident_m_local(sub, ps);
+        } else {
+            lemma_lscan_sym_local(input, p);
+            lemma_lscan_sym_local(sub, ps);
+        }
+    } else {
+        assert(ps >= sub.len());
+    }
+}
+
+
 } // verus!
