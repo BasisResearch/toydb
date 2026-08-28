@@ -266,12 +266,19 @@ order) but is not on the critical path.
    `lemma_view_map_insert` / `lemma_view_map_empty` + the BTreeMap insert view. Added
    `seq_to_map` (head inserted last). NOTE: parse turned out to be the *easier* half —
    it never touches `iter()`, just recursion + insert.
-5. **Print exec** (remaining): loop `it.next()` accumulating a ghost seq `S`; invariant
-   ties emitted tokens to `sprint_set_list(view of consumed)` (borrow values). Then a
-   coverage lemma `seq_to_map(S) == view_map(m@)` (S enumerates m@'s pairs, unique keys)
-   closes the roundtrip: parse(print(m)) = `seq_to_map(S)` = `view_map(m@)`. The `iter()`
-   loop is the last substantial multi-Update piece; then wire it into the Update
-   statement print/parse (relax the single-assignment restriction).
+**Coverage lemma** — DONE (2026-08-28, 174 verified). `lemma_seq_to_map_enumerates`:
+a unique-key enumeration `S` of a finite map builds exactly that map
+(`seq_to_map(S) == m`). Induction peeling the head, recursing on `m.remove(head.0)`.
+This is the glue that equates `parse(print(m))`'s `seq_to_map(S)` with `view_map(m@)`.
+
+5. **Print exec** (the ONLY multi-Update piece left): loop `it.next()` accumulating a
+   ghost seq `S`; invariant ties emitted tokens to `sprint_set_list(view of consumed)`
+   and `S ++ remaining(it) == full`. Borrow values (no clone). `S` inherits iter()'s
+   sorted/unique/covering properties, so `lemma_seq_to_map_enumerates` + the existing
+   `lemma_sparse_set_list_sprint` + `parse_set_map_exec` close the roundtrip. Then relax
+   the single-assignment restriction in the Update statement print/parse. Everything the
+   print loop needs (parse builder, view_map, seq_to_map, coverage, uniqueness) is now
+   proven — only the `iter()` accumulation loop itself remains.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
