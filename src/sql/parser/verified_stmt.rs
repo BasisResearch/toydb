@@ -311,12 +311,18 @@ pub open spec fn col_default_toks(c: SColumn) -> Seq<TokenView> {
     }
 }
 
+// The column codec (`sprint_column`'s six optional clauses especially) is the
+// single heaviest chunk of the module. Kept opaque so its body is not a global
+// SMT axiom weighing on every unrelated proof — revealed locally in the column
+// lemmas and the column exec printers/parsers.
+#[verifier::opaque]
 pub open spec fn sprint_column(c: SColumn) -> Seq<TokenView> {
     seq![TokenView::Ident(c.name), datatype_kw(c.datatype)]
         + col_pk_toks(c) + col_null_toks(c) + col_unique_toks(c) + col_index_toks(c)
         + col_ref_toks(c) + col_default_toks(c)
 }
 
+#[verifier::opaque]
 pub open spec fn sprint_columns(cols: Seq<SColumn>) -> Seq<TokenView>
     decreases cols,
 {
@@ -336,6 +342,7 @@ pub open spec fn sdepth_column(c: SColumn) -> nat {
     }
 }
 
+#[verifier::opaque]
 pub open spec fn slist_depth_columns(cols: Seq<SColumn>) -> nat
     decreases cols,
 {
@@ -1291,6 +1298,7 @@ pub proof fn lemma_sparse_column_sprint(c: SColumn, tail: Seq<TokenView>, fuel: 
     ensures
         sparse_column(sprint_column(c) + tail, fuel) == (Some(c), tail),
 {
+    reveal(sprint_column);
     datatype_kw_roundtrip(c.datatype);
     let pk = col_pk_toks(c);
     let nul = col_null_toks(c);
@@ -1405,6 +1413,9 @@ pub proof fn lemma_sparse_columns_sprint(cols: Seq<SColumn>, tail: Seq<TokenView
         sparse_columns(sprint_columns(cols) + tail, fuel) == (Some(cols), tail),
     decreases cols,
 {
+    reveal(sprint_columns);
+    reveal(sprint_column);
+    reveal(slist_depth_columns);
     reveal_with_fuel(sparse_columns, 1);
     if cols.len() == 1 {
         lemma_sparse_column_sprint(cols[0], tail, fuel);
@@ -3044,6 +3055,8 @@ pub fn print_columns_slice(cols: &[ast::Column]) -> (r: Vec<super::Token>)
     decreases cols.len(),
 {
     reveal_with_fuel(token_views, 1);
+    reveal(sprint_columns);
+    reveal(sprint_column);
     if cols.len() == 1 {
         proof {
             view_columns_step(cols@);
@@ -4915,6 +4928,7 @@ pub proof fn sdepth_column_le_len(c: SColumn)
     ensures sdepth_column(c) <= sprint_column(c).len(),
 {
     reveal(printable_column);
+    reveal(sprint_column);
     let base = seq![TokenView::Ident(c.name), datatype_kw(c.datatype)];
     assert(sprint_column(c) =~= base + col_pk_toks(c) + col_null_toks(c) + col_unique_toks(c)
         + col_index_toks(c) + col_ref_toks(c) + col_default_toks(c));
@@ -4927,12 +4941,14 @@ pub proof fn sdepth_column_le_len(c: SColumn)
     }
 }
 
-#[verifier::rlimit(25000)]
+#[verifier::rlimit(40000)]
 pub proof fn slist_depth_columns_le_len(cols: Seq<SColumn>)
     requires all_printable_columns(cols),
     ensures slist_depth_columns(cols) <= sprint_columns(cols).len() + 1,
     decreases cols,
 {
+    reveal_with_fuel(slist_depth_columns, 2);
+    reveal_with_fuel(sprint_columns, 2);
     if cols.len() == 0 {
     } else if cols.len() == 1 {
         sdepth_column_le_len(cols[0]);
@@ -5618,6 +5634,7 @@ pub fn print_column_exec(c: &ast::Column) -> (r: Vec<super::Token>)
     ensures token_views(r@) == sprint_column(view_column(*c)),
 {
     reveal_with_fuel(token_views, 3);
+    reveal(sprint_column);
     let ghost vc = view_column(*c);
     let mut r: Vec<super::Token> = Vec::new();
     r.push(super::Token::Ident(c.name.clone()));
