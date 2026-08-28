@@ -37,6 +37,8 @@ use super::verified_roundtrip::{
 #[allow(unused_imports)]
 use vstd::std_specs::cmp::{OrdSpec, PartialOrdSpec};
 #[allow(unused_imports)]
+use vstd::std_specs::iter::IteratorSpec;
+#[allow(unused_imports)]
 use super::verified_production::{token_view, token_views, token_views_concat};
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
@@ -2831,6 +2833,34 @@ pub proof fn sprint_set_list_snoc(s: Seq<(String, Option<SExpr>)>, x: (String, O
     }
 }
 
+/// `all_printable_assigns` is preserved by appending a printable entry.
+pub proof fn lemma_all_printable_assigns_snoc(
+    s: Seq<(String, Option<SExpr>)>,
+    x: (String, Option<SExpr>),
+)
+    requires
+        all_printable_assigns(s),
+        printable_assign(x),
+    ensures
+        all_printable_assigns(s + seq![x]),
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        assert(s + seq![x] =~= seq![x]);
+        assert(seq![x].len() == 1);
+        assert(seq![x][0] == x);
+        assert((seq![x]).drop_first() =~= Seq::<(String, Option<SExpr>)>::empty());
+        assert(all_printable_assigns(Seq::<(String, Option<SExpr>)>::empty()));
+        assert(all_printable_assigns(seq![x]));
+    } else {
+        assert((s + seq![x])[0] == s[0]);
+        assert((s + seq![x]).drop_first() =~= s.drop_first() + seq![x]);
+        assert(printable_assign(s[0]));
+        lemma_all_printable_assigns_snoc(s.drop_first(), x);
+        assert(all_printable_assigns(s + seq![x]));
+    }
+}
+
 pub open spec fn set_list_depth(items: Seq<(String, Option<SExpr>)>) -> nat
     decreases items,
 {
@@ -4922,6 +4952,8 @@ pub open spec fn seq_to_map(s: Seq<(String, Option<SExpr>)>)
 /// builds is exactly that map. The glue that will close the print roundtrip:
 /// `parse(print(m))` yields `seq_to_map(S)` for `S` = the (sorted, unique-key,
 /// covering) `iter()` enumeration of `m`, and this lemma equates that with `m`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40000)]
 pub proof fn lemma_seq_to_map_enumerates(
     s: Seq<(String, Option<SExpr>)>,
     m: vstd::map::Map<String, Option<SExpr>>,
@@ -5931,6 +5963,186 @@ pub fn print_assign_exec(k: &String, v: &Option<ast::Expression>) -> (r: Vec<sup
         },
     }
     r
+}
+
+/// Print the full set-list of a `BTreeMap` by iterating in sorted order, returning the
+/// tokens and the ghost view-entry seq they encode. The last multi-Update piece: a
+/// prophetic `iter()` accumulation loop, stepped by `sprint_set_list_snoc` +
+/// `print_assign_exec`, closed by `lemma_seq_to_map_enumerates` (the collected seq
+/// enumerates `view_map(m@)` — covering via the iter spec, unique keys via
+/// `lemma_increasing_keys_distinct`).
+#[verifier::rlimit(100000)]
+pub fn print_set_map_exec(m: &std::collections::BTreeMap<String, Option<ast::Expression>>)
+    -> (r: (Vec<super::Token>, Ghost<Seq<(String, Option<SExpr>)>>))
+    requires
+        forall|k: String| #[trigger] m@.dom().contains(k) ==> (match m@[k] {
+            Some(e) => printable_se(view_expr(e)),
+            None => true,
+        }),
+    ensures
+        token_views(r.0@) == sprint_set_list(r.1@),
+        all_printable_assigns(r.1@),
+        r.1@.len() == m@.dom().len(),
+        seq_to_map(r.1@) == view_map(m@),
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    reveal_with_fuel(token_views, 3);
+    proof { axiom_string_key_obeys_cmp(); }
+    let mut it = m.iter();
+    let ghost full = it.remaining();
+    let mut r: Vec<super::Token> = Vec::new();
+    let ghost consumed: Seq<(String, Option<SExpr>)> = Seq::empty();
+    let mut started: bool = false;
+    proof {
+        assert(sprint_set_list(consumed) =~= Seq::<TokenView>::empty());
+        assert(token_views(r@) =~= sprint_set_list(consumed));
+        assert(full.skip(0) =~= full);
+        // iter() ensures (gated on the trusted key_obeys_cmp axiom).
+        assert(full.len() == m@.dom().len());
+        assert(forall|i: int| 0 <= i < full.len() ==>
+            m@.contains_key(*full[i].0) && m@[*full[i].0] == *full[i].1);
+        assert(forall|k: String| #[trigger] m@.contains_key(k) ==>
+            full.contains((&k, &m@[k])));
+        assert(vstd::std_specs::btree::increasing_seq(
+            full.map_values(|kv: (&String, &Option<ast::Expression>)| *kv.0)));
+        assert(it.obeys_prophetic_iter_laws());
+    }
+    let m_len = m.len();
+    let mut count: usize = 0;
+    while count < m_len
+        invariant
+            count == consumed.len(),
+            count <= m_len,
+            m_len == full.len(),
+            it.obeys_prophetic_iter_laws(),
+            consumed.len() + it.remaining().len() == full.len(),
+            it.remaining() == full.skip(consumed.len() as int),
+            forall|i: int| 0 <= i < consumed.len() ==>
+                #[trigger] consumed[i] == (*full[i].0, view_opt(*full[i].1)),
+            token_views(r@) == sprint_set_list(consumed),
+            all_printable_assigns(consumed),
+            started == (consumed.len() > 0),
+            full.len() == m@.dom().len(),
+            forall|i: int| 0 <= i < full.len() ==>
+                m@.contains_key(*full[i].0) && m@[*full[i].0] == *full[i].1,
+            forall|k: String| #[trigger] m@.contains_key(k) ==> full.contains((&k, &m@[k])),
+            vstd::std_specs::btree::increasing_seq(
+                full.map_values(|kv: (&String, &Option<ast::Expression>)| *kv.0)),
+            forall|k: String| #[trigger] m@.dom().contains(k) ==> (match m@[k] {
+                Some(e) => printable_se(view_expr(e)),
+                None => true,
+            }),
+        decreases m_len - count,
+    {
+        let ghost done = consumed.len() as int;
+        proof {
+            assert(it.remaining() == full.skip(done));
+            assert(it.remaining().len() == full.len() - done);
+            assert(done < full.len());
+        }
+        let opt = it.next();
+        match opt {
+            Some((k, v)) => {
+                proof {
+                    assert(full.skip(done).len() > 0);
+                    assert(full.skip(done)[0] == full[done]);
+                    assert(m@.contains_key(*full[done].0));
+                    assert(m@[*full[done].0] == *full[done].1);
+                }
+                let ghost entry = (*k, view_opt(*v));
+                let ghost consumed_old = consumed;
+                let ghost r_pre = r@;
+                if started {
+                    r.push(super::Token::Comma);
+                }
+                let ghost r_mid = r@;
+                let mut ab = print_assign_exec(k, v);
+                let ghost abo = ab@;
+                r.append(&mut ab);
+                proof {
+                    reveal_with_fuel(token_views, 2);
+                    lemma_sprint_assign_view(*k, *v);
+                    assert(token_views(abo) == sprint_assign(entry));
+                    sprint_set_list_snoc(consumed_old, entry);
+                    assert(printable_assign(entry)) by {
+                        assert(m@.contains_key(*full[done].0));
+                        assert(m@[*full[done].0] == *full[done].1);
+                    }
+                    lemma_all_printable_assigns_snoc(consumed_old, entry);
+                    if started {
+                        assert(r_mid =~= r_pre + seq![super::Token::Comma]);
+                        token_views_concat(r_pre, seq![super::Token::Comma]);
+                        assert(token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+                        token_views_concat(r_mid, abo);
+                        assert(r@ =~= r_mid + abo);
+                        assert(token_views(r@)
+                            =~= sprint_set_list(consumed_old) + seq![TokenView::Comma]
+                                + sprint_assign(entry));
+                    } else {
+                        assert(r_mid =~= r_pre);
+                        token_views_concat(r_mid, abo);
+                        assert(r@ =~= r_mid + abo);
+                        assert(consumed_old.len() == 0);
+                        assert(token_views(r@) =~= sprint_assign(entry));
+                    }
+                    consumed = consumed_old + seq![entry];
+                    assert(consumed[done] == entry);
+                    assert(entry == (*full[done].0, view_opt(*full[done].1)));
+                    assert(it.remaining() == full.skip(done + 1));
+                    assert(full.skip(done + 1) =~= full.skip(consumed.len() as int));
+                    assert(consumed.len() == done + 1);
+                    assert(forall|i: int| 0 <= i < consumed.len() ==>
+                        #[trigger] consumed[i] == (*full[i].0, view_opt(*full[i].1)));
+                }
+                started = true;
+            },
+            None => {
+                proof {
+                    // count < m_len == full.len(), so remaining is non-empty: dead arm.
+                    assert(it.remaining().len() > 0);
+                    assert(false);
+                }
+            },
+        }
+        count = count + 1;
+    }
+    proof { assert(consumed.len() == full.len()); }
+    // Coverage: `consumed` enumerates `view_map(m@)`, so builds it.
+    proof {
+        let vm = view_map(m@);
+        assert(vm.dom() =~= m@.dom());
+        assert(consumed.len() == full.len());
+        let keys = full.map_values(|kv: (&String, &Option<ast::Expression>)| *kv.0);
+        lemma_increasing_keys_distinct(keys);
+        assert forall|i: int| 0 <= i < full.len() implies #[trigger] keys[i] == *full[i].0 by {
+            assert(keys[i] == (|kv: (&String, &Option<ast::Expression>)| *kv.0)(full[i]));
+        }
+        assert forall|i: int| 0 <= i < consumed.len() implies
+            #[trigger] vm.dom().contains(consumed[i].0) && vm[consumed[i].0] == consumed[i].1 by {
+            assert(consumed[i] == (*full[i].0, view_opt(*full[i].1)));
+            assert(m@.contains_key(*full[i].0));
+            assert(vm[*full[i].0] == view_opt(m@[*full[i].0]));
+        }
+        assert forall|k: String| vm.dom().contains(k) implies
+            exists|i: int| 0 <= i < consumed.len() && (#[trigger] consumed[i]).0 == k by {
+            assert(m@.contains_key(k));
+            assert(full.contains((&k, &m@[k])));
+            let i = choose|i: int| 0 <= i < full.len() && full[i] == (&k, &m@[k]);
+            assert(consumed[i] == (*full[i].0, view_opt(*full[i].1)));
+        }
+        assert forall|i: int, j: int| 0 <= i < j < consumed.len() implies
+            consumed[i].0 != consumed[j].0 by {
+            assert(consumed[i] == (*full[i].0, view_opt(*full[i].1)));
+            assert(consumed[j] == (*full[j].0, view_opt(*full[j].1)));
+            assert(keys[i] == *full[i].0);
+            assert(keys[j] == *full[j].0);
+            assert(keys[i] != keys[j]);
+            assert(consumed[i].0 == keys[i]);
+            assert(consumed[j].0 == keys[j]);
+        }
+        lemma_seq_to_map_enumerates(consumed, vm);
+    }
+    (r, Ghost(consumed))
 }
 
 /// Executable printer for a single-assignment `UPDATE`. Mirrors `print_select_exec`:
