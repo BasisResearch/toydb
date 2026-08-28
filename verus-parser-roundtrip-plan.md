@@ -100,9 +100,32 @@ assumptions; grows the audited trust surface by exactly one). On top of it:
 roundtrip). The Select-into-unified-headline fuel doubling is still the one
 mechanical extension left within S5 (Select is verified standalone).
 
-**Phase 4 — production cutover** is not started (replace the two
-`std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
-executable parsers, run the SQL suite green, retire the spec-parser proofs).
+**Phase 4 — production cutover** is not started, and has a hard prerequisite that
+S5 does not yet satisfy. The verified executable parsers are *sound but
+incomplete*: they accept only the `printable_stmt` domain (Select without
+`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, single-assignment `Update`, no
+`JOIN` types). The production SQL suite (`tests/scripts/queries`) uses `GROUP BY`
+and `ORDER BY`, so a straight swap of `parser.rs`'s recursive descent for
+`parse_stmt_full_exec` would make those queries fail — a regression, not a cutover.
+A fast-path-with-fallback would work around it but is exactly the "digital twin"
+the plan rules out (two implementations, differential behaviour).
+
+So a sound *single-implementation* cutover is gated on first extending the
+verified parser to the full production grammar:
+1. **Finish Select** — the five remaining clauses (`GROUP BY` expr-list, `HAVING`
+   expr, `ORDER BY` expr+Direction list, `LIMIT`/`OFFSET` expr), each one more
+   optional clause over machinery already proven.
+2. **Join types** — `INNER`/`LEFT`/`RIGHT`/`CROSS`/`FULL` in the FROM tree
+   (currently the mirror carries the plain join; the typed variants need the
+   keyword prefixes threaded through `sprint_from`/`sparse_from`).
+3. **Multi-assignment Update** — the sorted-`iter()` bridge over `Map` equality
+   (the general case `extract_one_entry` was built for the singleton).
+4. **Byte-cursor lexer** — retarget the production `Lexer` onto
+   `verified.rs::next_token` (self-contained; independent of 1-3).
+
+Only then does the parser swap keep the suite green. Items 1-3 are verification
+work in the established mirror+exec style; item 4 is a lexer refactor plus a
+token-stream equivalence argument.
 
 The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
 force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
