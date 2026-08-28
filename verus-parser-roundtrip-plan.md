@@ -139,19 +139,34 @@ a boundary-terminated bare-expr comma-list parser (unlike the CloseParen-termina
 `sparse_args`), the reusable codec for `GROUP BY`/`ORDER BY`. Committed, 144
 verified. Marked opaque so its unfolding axiom doesn't bloat the column lemma.
 
-**Blocker found — module-scale SMT wall (2026-08-28).** The full `GROUP BY`
-integration was built and the *mirror* verified (sprint/sparse/printable/sdepth +
-`sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`, 143
-verified), but it was reverted because it tips `slist_depth_columns_le_len` — an
-unrelated, pre-existing, resource-fragile CreateTable lemma — from green into
-"postcondition not satisfied", and this does **not** respond to `rlimit` (tried
-8000→100000). `verified_stmt.rs` is ~5000 lines; adding more grammar grows the
-global SMT context past what that lemma can discharge. So the *real* first step of
-item 1 is structural: **split `verified_stmt.rs` into modules** (or opaque-harden
-the column codec so its lemma's context stays small) *before* adding the five
-Select clauses. The `GROUP BY` mirror is a solved problem modulo that split; the
-exec side additionally needs `parse_expr_list_exec` (refining the opaque
-`sparse_expr_list`) and a where+group exec helper refining `sparse_where_group`.
+**Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
+integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
+`sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`), but
+it tips `slist_depth_columns_le_len` — an unrelated, pre-existing, resource-fragile
+CreateTable lemma — from green to "postcondition not satisfied", and this does
+**not** respond to `rlimit` (tried 8000→100000). Root cause: `verified_stmt.rs` is
+~5000 lines, and every `open spec fn` body is a global SMT axiom, so growing the
+grammar grows every proof's background past what that fragile lemma can discharge.
+
+*Committed enabler:* `sprint_select_body` / `sdepth_select_body`
+(`#[verifier::opaque]`) now hold the Select clause structure, so Select-grammar
+growth no longer enlarges the global `sprint_stmt`/`sdepth_stmt` axioms (revealed
+in the Select lemma + `print_select_exec`). This restored 144-green and is the
+template for the fix. But re-applying `GROUP BY` still re-tips the column lemma:
+the column codec itself (`sprint_column` — 6 optional clauses — `sprint_columns`,
+`slist_depth_columns`) sits in *every* proof's background directly.
+
+*Next linchpin (do this first, before the five clauses):* opaque-harden the column
+codec the same way — make `sprint_column`/`sprint_columns`/`slist_depth_columns`
+`#[verifier::opaque]` and `reveal` them locally in `lemma_sparse_column(s)_sprint`,
+`slist_depth_columns_le_len`, `sdepth_column_le_len`, and `print_column(s)_exec`
+(and extract the CreateTable case of `sprint_stmt`/`sdepth_stmt` into opaque
+helpers, mirroring `sprint_select_body`). That removes the 6-clause bulk from the
+background of every non-column proof and bounds the column lemmas' own queries.
+Once green, re-apply the `GROUP BY` mirror (a solved problem) and add the exec:
+`parse_expr_list_exec` (refining opaque `sparse_expr_list`) + a where+group exec
+helper refining `sparse_where_group`, then the remaining four clauses reuse the
+same codec/opaque-helper recipe.
 
 The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
 force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
