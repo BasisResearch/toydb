@@ -3,20 +3,24 @@
 //
 // opencode plugin for the Verus verification-telemetry system (Component 2).
 //
-// Three jobs, mirroring the Claude Code hooks:
-//   * session start -> fail-closed HARD GATE. Probe the Verus MCP `version`
-//     tool; if the server is missing or unhealthy, abort the session with a
-//     message that the Verus MCP server is required.
-//   * tool execute  -> BRANCH GUARD. Check bash commands against the repo's
-//     branch discipline (initials-prefixed branches, no direct commits/pushes
-//     to main; see CLAUDE.md / AGENTS.md) and block violations, like the
-//     Claude Code PreToolUse hook.
-//   * session end   -> fail-soft CAPTURE. Read the session from the opencode
-//     SQLite store, map it to the shared envelope, and POST it.
+// opencode's plugin API (as of 1.18.x) has NO `session.start` / `session.end`
+// hooks — those keys are silently ignored. The real surface we use:
+//   * `event` (generic bus-event handler) —
+//       session.created -> gate probe. opencode cannot abort a session from
+//       an event handler, so the gate is a LOUD warning (stderr / opencode
+//       log), not a hard block; capture keeps gate_violation visible on the
+//       dashboard instead.
+//       session.idle   -> fail-soft CAPTURE, fired after each turn. The
+//       ingest endpoint upserts by session_id, so one upload per idle is
+//       idempotent and crash-safe (unlike an end-of-session-only capture).
+//   * `tool.execute.before` — BRANCH GUARD. Check bash commands against the
+//     repo's branch discipline (initials-prefixed branches, no direct
+//     commits/pushes to main; see CLAUDE.md / AGENTS.md), like the Claude
+//     Code PreToolUse hook.
 //
 // Both jobs delegate to committed Python (stdlib only) so the mapping/merge
 // logic is shared with the other adapters. The plugin resolves the repo root
-// from the session directory and runs the scripts from the checked-out toyDB.
+// from its own location and runs the scripts from the checked-out toyDB.
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -41,24 +45,6 @@ function runPython(args, extraEnv) {
 
 export const VerusTelemetry = async ({ project, directory }) => {
   return {
-    // ---- Hard gate at session start -------------------------------------
-    "session.start": async () => {
-      if (!existsSync(RUNNER)) return;
-      const res = runPython(["gate"]);
-      const healthy = res.status === 0;
-      if (!healthy) {
-        const reason = (res.stdout || res.stderr || "probe failed").trim();
-        // Fail closed: abort the session.
-        throw new Error(
-          "Verus MCP server is required to work on toyDB. The verus-tools-mcp " +
-            "server did not respond to a `version` probe, so this session is " +
-            "blocked (fail-closed gate). Ensure verus-tools-mcp is installed and " +
-            "the committed opencode `mcp` config registers it. Reason: " +
-            reason
-        );
-      }
-    },
-
     // ---- Branch-discipline guard on bash commands -----------------------
     // Same policy and same guard script as the Claude Code PreToolUse hook.
     // Exit 2 => violation (throw blocks the call, message reaches the agent);
@@ -79,16 +65,33 @@ export const VerusTelemetry = async ({ project, directory }) => {
       }
     },
 
-    // ---- Fail-soft capture at session end -------------------------------
-    "session.end": async (input) => {
-      if (!existsSync(RUNNER)) return;
-      const sessionId =
-        (input && (input.sessionID || input.sessionId || input.id)) || "";
-      const args = ["capture"];
-      if (sessionId) args.push(sessionId);
-      if (directory) args.push("--directory", directory);
+    // ---- Gate (session.created) + capture (session.idle) ----------------
+    // Delivered through the generic `event` hook: opencode has no dedicated
+    // session-start/session-end plugin hooks. Always fail-soft — a telemetry
+    // error must never break the user's session or other event subscribers.
+    event: async ({ event }) => {
+      if (!event || !existsSync(RUNNER)) return;
       try {
-        runPython(args);
+        if (event.type === "session.created") {
+          const res = runPython(["gate"]);
+          if (res.status !== 0) {
+            const reason = (res.stdout || res.stderr || "probe failed").trim();
+            console.error(
+              "[verus-gate] Verus MCP server is required to work on toyDB, " +
+                "but the `version` probe failed. This session is UNGATED and " +
+                "will be recorded with gate_violation on the dashboard. " +
+                "Reason: " + reason
+            );
+          }
+        }
+        if (event.type === "session.idle") {
+          const sessionId =
+            event.properties && event.properties.sessionID;
+          const args = ["capture"];
+          if (sessionId) args.push(sessionId);
+          if (directory) args.push("--directory", directory);
+          runPython(args);
+        }
       } catch (_err) {
         // Never break the user's session on a telemetry error.
       }

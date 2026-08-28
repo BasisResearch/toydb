@@ -32,11 +32,20 @@ impl<'a, C: Catalog> Planner<'a, C> {
             CreateTable { name, columns } => self.build_create_table(name, columns),
             DropTable { name, if_exists } => self.build_drop_table(name, if_exists),
 
-            Delete { table, r#where } => self.build_delete(table, r#where),
+            Delete { table, where_clause } => self.build_delete(table, where_clause),
             Insert { table, columns, values } => self.build_insert(table, columns, values),
-            Update { table, set, r#where } => self.build_update(table, set, r#where),
-            Select { select, from, r#where, group_by, having, order_by, offset, limit } => {
-                self.build_select(select, from, r#where, group_by, having, order_by, offset, limit)
+            Update { table, set, where_clause } => self.build_update(table, set, where_clause),
+            Select { select, from, where_clause, group_by, having, order_by, offset, limit } => {
+                self.build_select(
+                    select,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    order_by,
+                    offset,
+                    limit,
+                )
             }
 
             // Transaction and explain statements are handled by Session.
@@ -83,10 +92,10 @@ impl<'a, C: Catalog> Planner<'a, C> {
     }
 
     /// Builds a DELETE plan.
-    fn build_delete(&self, table: String, r#where: Option<ast::Expression>) -> Result<Plan> {
+    fn build_delete(&self, table: String, where_clause: Option<ast::Expression>) -> Result<Plan> {
         let table = self.catalog.must_get_table(&table)?;
         let scope = Scope::from_table(&table)?;
-        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
+        let filter = where_clause.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
         Ok(Plan::Delete {
             table: table.name.clone(),
             primary_key: table.primary_key,
@@ -129,11 +138,11 @@ impl<'a, C: Catalog> Planner<'a, C> {
         &self,
         table: String,
         set: BTreeMap<String, Option<ast::Expression>>,
-        r#where: Option<ast::Expression>,
+        where_clause: Option<ast::Expression>,
     ) -> Result<Plan> {
         let table = self.catalog.must_get_table(&table)?;
         let scope = Scope::from_table(&table)?;
-        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
+        let filter = where_clause.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
         let mut expressions = Vec::with_capacity(set.len());
         for (column, expr) in set {
             let index = scope.lookup_column(None, &column)?;
@@ -160,7 +169,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
         &self,
         mut select: Vec<(ast::Expression, Option<String>)>,
         from: Vec<ast::From>,
-        r#where: Option<ast::Expression>,
+        where_clause: Option<ast::Expression>,
         group_by: Vec<ast::Expression>,
         having: Option<ast::Expression>,
         order_by: Vec<(ast::Expression, ast::Direction)>,
@@ -200,8 +209,8 @@ impl<'a, C: Catalog> Planner<'a, C> {
         }
 
         // Build WHERE clause.
-        if let Some(r#where) = r#where {
-            let predicate = Self::build_expression(r#where, &scope)?;
+        if let Some(where_clause) = where_clause {
+            let predicate = Self::build_expression(where_clause, &scope)?;
             node = Node::Filter { source: Box::new(node), predicate };
         }
 
@@ -317,9 +326,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
             }
 
             // A two-way join. The left or right nodes may be chained joins.
-            ast::From::Join { mut left, mut right, r#type, predicate } => {
+            ast::From::Join { mut left, mut right, join_type, predicate } => {
                 // Right joins are built as a left join then column swap.
-                if r#type == ast::JoinType::Right {
+                if join_type == ast::JoinType::Right {
                     (left, right) = (right, left)
                 }
 
@@ -330,11 +339,11 @@ impl<'a, C: Catalog> Planner<'a, C> {
 
                 // Build the join node.
                 let predicate = predicate.map(|e| Self::build_expression(e, &scope)).transpose()?;
-                let outer = r#type.is_outer();
+                let outer = join_type.is_outer();
                 let mut node = Node::NestedLoopJoin { left, right, predicate, outer };
 
                 // For right joins, swap the columns.
-                if r#type == ast::JoinType::Right {
+                if join_type == ast::JoinType::Right {
                     let size = left_size + right_size;
                     let targets = (0..size).map(|i| Some((i + right_size) % size)).collect_vec();
                     scope = scope.remap(&targets);

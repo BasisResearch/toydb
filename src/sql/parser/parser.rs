@@ -1,7 +1,9 @@
-use std::iter::Peekable;
 use std::ops::Add;
 
-use super::{Keyword, Lexer, Token, ast};
+#[cfg(test)]
+use super::stream::SliceTokenStream;
+use super::stream::{PeekStream, TokenStream};
+use super::{Keyword, Token, ast, float_trust, verified_integer};
 use crate::errinput;
 use crate::error::Result;
 use crate::sql::types::DataType;
@@ -14,18 +16,21 @@ use crate::sql::types::DataType;
 /// ensures the syntax is well-formed, and does not know whether e.g. a given
 /// table or column exists or which kind of join to use -- that is the job of
 /// the planner.
-pub struct Parser<'a> {
-    pub lexer: Peekable<Lexer<'a>>,
+pub struct Parser;
+
+/// The parser implementation, generic over its streaming token source.
+struct StreamingParser<S> {
+    stream: S,
 }
 
-impl Parser<'_> {
+impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        let mut parser = Self::new(statement);
+        let mut parser = StreamingParser::new(TokenStream::new(statement));
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
-        if let Some(token) = parser.lexer.next().transpose()? {
+        if let Some(token) = parser.stream.next()? {
             return errinput!("unexpected token {token}");
         }
         Ok(statement)
@@ -35,22 +40,47 @@ impl Parser<'_> {
     /// be parsed as a single expression. Only used in tests.
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
-        let mut parser = Self::new(expr);
+        let mut parser = StreamingParser::new(TokenStream::new(expr));
         let expression = parser.parse_expression()?;
-        if let Some(token) = parser.lexer.next().transpose()? {
+        if let Some(token) = parser.stream.next()? {
             return errinput!("unexpected token {token}");
         }
         Ok(expression)
     }
 
-    /// Creates a new parser for the given raw SQL string.
-    fn new(input: &str) -> Parser<'_> {
-        Parser { lexer: Lexer::new(input).peekable() }
+    /// Parses a canonical token sequence as one complete expression.
+    #[cfg(test)]
+    pub(crate) fn parse_expr_tokens(tokens: &[Token]) -> Result<ast::Expression> {
+        let mut parser = StreamingParser::new(SliceTokenStream::new(tokens));
+        let expression = parser.parse_expression()?;
+        if let Some(token) = parser.stream.next()? {
+            return errinput!("unexpected token {token}");
+        }
+        Ok(expression)
+    }
+
+    /// Parses a canonical token sequence as one complete statement.
+    #[cfg(test)]
+    pub(crate) fn parse_statement_tokens(tokens: &[Token]) -> Result<ast::Statement> {
+        let mut parser = StreamingParser::new(SliceTokenStream::new(tokens));
+        let statement = parser.parse_statement()?;
+        parser.skip(Token::Semicolon);
+        if let Some(token) = parser.stream.next()? {
+            return errinput!("unexpected token {token}");
+        }
+        Ok(statement)
+    }
+}
+
+impl<S: PeekStream> StreamingParser<S> {
+    /// Creates a parser over a streaming token source.
+    fn new(stream: S) -> Self {
+        Self { stream }
     }
 
     /// Fetches the next lexer token, or errors if none is found.
     fn next(&mut self) -> Result<Token> {
-        self.lexer.next().transpose()?.ok_or_else(|| errinput!("unexpected end of input"))
+        self.stream.next()?.ok_or_else(|| errinput!("unexpected end of input"))
     }
 
     /// Returns the next identifier, or errors if not found.
@@ -103,7 +133,7 @@ impl Parser<'_> {
 
     /// Peeks the next lexer token if any, but transposes it for convenience.
     fn peek(&mut self) -> Result<Option<&Token>> {
-        self.lexer.peek().map(|r| r.as_ref().map_err(|err| err.clone())).transpose()
+        self.stream.peek()
     }
 
     /// Parses a SQL statement.
@@ -149,7 +179,12 @@ impl Parser<'_> {
             self.expect(Keyword::System.into())?;
             self.expect(Keyword::Time.into())?;
             match self.next()? {
-                Token::Number(n) => as_of = Some(n.parse()?),
+                Token::Number(n) => match verified_integer::parse_u64(&n) {
+                    Some(version) => as_of = Some(version),
+                    None => {
+                        return errinput!("invalid system time {}", String::from_utf8_lossy(&n));
+                    }
+                },
                 token => return errinput!("unexpected token {token}, wanted number"),
             }
         }
@@ -261,7 +296,7 @@ impl Parser<'_> {
         self.expect(Keyword::Delete.into())?;
         self.expect(Keyword::From.into())?;
         let table = self.next_ident()?;
-        Ok(ast::Statement::Delete { table, r#where: self.parse_where_clause()? })
+        Ok(ast::Statement::Delete { table, where_clause: self.parse_where_clause()? })
     }
 
     /// Parses an INSERT statement.
@@ -324,7 +359,7 @@ impl Parser<'_> {
                 break;
             }
         }
-        Ok(ast::Statement::Update { table, set, r#where: self.parse_where_clause()? })
+        Ok(ast::Statement::Update { table, set, where_clause: self.parse_where_clause()? })
     }
 
     /// Parses a SELECT statement.
@@ -332,7 +367,7 @@ impl Parser<'_> {
         Ok(ast::Statement::Select {
             select: self.parse_select_clause()?,
             from: self.parse_from_clause()?,
-            r#where: self.parse_where_clause()?,
+            where_clause: self.parse_where_clause()?,
             group_by: self.parse_group_by_clause()?,
             having: self.parse_having_clause()?,
             order_by: self.parse_order_by_clause()?,
@@ -372,15 +407,15 @@ impl Parser<'_> {
         let mut from = Vec::new();
         loop {
             let mut from_item = self.parse_from_table()?;
-            while let Some(r#type) = self.parse_from_join()? {
+            while let Some(join_type) = self.parse_from_join()? {
                 let left = Box::new(from_item);
                 let right = Box::new(self.parse_from_table()?);
                 let mut predicate = None;
-                if r#type != ast::JoinType::Cross {
+                if join_type != ast::JoinType::Cross {
                     self.expect(Keyword::On.into())?;
                     predicate = Some(self.parse_expression()?)
                 }
-                from_item = ast::From::Join { left, right, r#type, predicate };
+                from_item = ast::From::Join { left, right, join_type, predicate };
             }
             from.push(from_item);
             if !self.next_is(Token::Comma) {
@@ -655,15 +690,27 @@ impl Parser<'_> {
             Token::Asterisk => ast::Expression::All,
 
             // Literal value.
-            Token::Number(n) if n.chars().all(|c| c.is_ascii_digit()) => {
-                ast::Literal::Integer(n.parse()?).into()
+            Token::Number(n) if n.iter().all(u8::is_ascii_digit) => {
+                match verified_integer::parse_i64(&n) {
+                    Some(value) => ast::Literal::Integer(value).into(),
+                    None => {
+                        return errinput!("number too large to fit in target type");
+                    }
+                }
             }
-            Token::Number(n) => ast::Literal::Float(n.parse()?).into(),
+            Token::Number(n) => match float_trust::parse_f64(&n) {
+                Some(value) => ast::Literal::Float(value).into(),
+                None => {
+                    return errinput!("invalid float literal {}", String::from_utf8_lossy(&n));
+                }
+            },
             Token::String(s) => ast::Literal::String(s).into(),
             Token::Keyword(Keyword::True) => ast::Literal::Boolean(true).into(),
             Token::Keyword(Keyword::False) => ast::Literal::Boolean(false).into(),
             Token::Keyword(Keyword::Infinity) => ast::Literal::Float(f64::INFINITY).into(),
-            Token::Keyword(Keyword::NaN) => ast::Literal::Float(f64::NAN).into(),
+            Token::Keyword(Keyword::NaN) => {
+                ast::Literal::Float(float_trust::canonical_nan()).into()
+            }
             Token::Keyword(Keyword::Null) => ast::Literal::Null.into(),
 
             // Function call.
@@ -752,7 +799,7 @@ impl Parser<'_> {
             self.expect(Keyword::Is.into())?;
             let not = self.next_is(Keyword::Not.into());
             let value = match self.next()? {
-                Token::Keyword(Keyword::NaN) => ast::Literal::Float(f64::NAN),
+                Token::Keyword(Keyword::NaN) => ast::Literal::Float(float_trust::canonical_nan()),
                 Token::Keyword(Keyword::Null) => ast::Literal::Null,
                 token => return errinput!("unexpected token {token}"),
             };

@@ -4,8 +4,10 @@
 This directory (plus `.codex/`, `.opencode/`, `.mcp.json`, `opencode.json` at the
 repo root) instruments toyDB so that **every agent session is captured** and
 **no agent runs without the Verus MCP server connected**. A fresh clone is
-instrumented with no extra setup for Claude Code and opencode; Codex needs a
-one-time user-level config merge (it has no per-repo config).
+instrumented with no extra setup for Claude Code and opencode; Codex needs the
+project to be trusted once (`~/.codex/config.toml`: `projects."<path>".trust_level
+= "trusted"`) plus a one-time `/hooks` trust review (or
+`--dangerously-bypass-hook-trust`).
 
 Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md`
 (in the research repo). The uploaded document is the session-trace envelope
@@ -35,10 +37,13 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
     tests/                   fixtures + `test_adapters.py`, `test_branch_mark.py`
   skills/mark-failed/        Claude Code `/mark-failed` skill -> mark_branch.py
 .codex/
-  config.toml                user-merge fragment: [mcp_servers.verus] + Stop hook
+  config.toml                project-scoped config (Codex >= 0.150 loads it for
+                             trusted projects): [mcp_servers.verus] + Stop hook
   hooks/verus_stop.py        Codex Stop-hook entry point
 .opencode/
-  plugin/verus-telemetry.js  session-start gate + session-end capture
+  plugin/verus-telemetry.js  gate + capture via the generic `event` hook
+                             (session.created / session.idle) + branch guard
+                             via `tool.execute.before`
   plugin/verus_runner.py     Python entry the plugin shells out to
   command/mark-failed.md     opencode `/mark-failed` command -> mark_branch.py
 .mcp.json                    Claude Code TEAM DEFAULT: dev hot-reload HTTP server
@@ -158,7 +163,7 @@ session is denied, never allowed through.
 | Agent   | Gate                                             | Capture                          |
 |---------|--------------------------------------------------|----------------------------------|
 | Claude  | `SessionStart` hook probes `version`; blocks if unreachable, warns (allows) if dirty | `Stop` hook reads `transcript_path` |
-| opencode| plugin probes at session start; aborts session   | plugin reads SQLite at session end |
+| opencode| plugin probes on `session.created`; warns loudly (opencode has no hook that can abort a session) | plugin captures on `session.idle` (per turn; ingest upserts by session_id) |
 | Codex   | no pre-run event → best-effort: `gate_violation` marked on the trace | `Stop` hook reads the rollout log |
 
 Codex is best-effort until it ships a session-start hook; the committed
@@ -221,9 +226,15 @@ refused; marks never rename or delete the branch.
 
 ## Codex one-time setup
 
-Codex reads only `~/.codex/config.toml`. Merge the blocks from
-`.codex/config.toml` into it, replacing `/ABSOLUTE/PATH/TO/toydb` with your clone
-path. Codex trust-reviews the hook command on first run.
+Codex (>= 0.150) loads `.codex/config.toml` as a project config layer once the
+project is trusted. Trust the clone once in `~/.codex/config.toml`:
+
+    [projects."/path/to/toydb"]
+    trust_level = "trusted"
+
+then review the project hooks once via `/hooks` in the CLI (or launch with
+`--dangerously-bypass-hook-trust`). The Stop-hook command resolves the repo
+root via `git rev-parse`, so it works in any clone without editing the file.
 
 ## Tests
 

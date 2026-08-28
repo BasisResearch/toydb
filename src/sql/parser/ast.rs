@@ -1,14 +1,23 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
+use vstd::prelude::*;
+
 use crate::sql::types::DataType;
+
+verus! {
+
+#[verifier::external_type_specification]
+#[allow(dead_code)]
+pub struct ExDataType(DataType);
 
 /// SQL statements are represented as an Abstract Syntax Tree (AST). The
 /// statement is the root node of this tree, and describes the syntactic
 /// structure of a SQL statement. It is built from a raw SQL string by the
 /// parser, and passed on to the planner which validates it and builds an
 /// execution plan from it.
-#[derive(Debug)]
+#[allow(inconsistent_fields)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Statement {
     /// BEGIN: begins a new transaction.
     Begin {
@@ -42,7 +51,7 @@ pub enum Statement {
         /// The table to delete from.
         table: String,
         /// WHERE: optional condition to match rows to delete.
-        r#where: Option<Expression>,
+        where_clause: Option<Expression>,
     },
     /// INSERT INTO: inserts new rows into a table.
     Insert {
@@ -57,7 +66,7 @@ pub enum Statement {
     Update {
         table: String,
         set: BTreeMap<String, Option<Expression>>, // column → value, None for default value
-        r#where: Option<Expression>,
+        where_clause: Option<Expression>,
     },
     /// SELECT: selects rows, possibly from a table.
     Select {
@@ -66,7 +75,7 @@ pub enum Statement {
         /// FROM: tables to select from.
         from: Vec<From>,
         /// WHERE: optional condition to filter rows.
-        r#where: Option<Expression>,
+        where_clause: Option<Expression>,
         /// GROUP BY: expressions to group and aggregate by.
         group_by: Vec<Expression>,
         /// HAVING: expression to filter groups by.
@@ -81,7 +90,8 @@ pub enum Statement {
 }
 
 /// A FROM item.
-#[derive(Debug)]
+#[allow(inconsistent_fields)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum From {
     /// A table.
     Table {
@@ -97,14 +107,14 @@ pub enum From {
         /// The right table to join.
         right: Box<From>,
         /// The join type.
-        r#type: JoinType,
+        join_type: JoinType,
         /// The join condition. None for a cross join.
         predicate: Option<Expression>,
     },
 }
 
 /// A CREATE TABLE column definition.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
     pub datatype: DataType,
@@ -117,13 +127,15 @@ pub struct Column {
 }
 
 /// JOIN types.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinType {
     Cross,
     Inner,
     Left,
     Right,
 }
+
+} // verus!
 
 impl JoinType {
     // If true, the join is an outer join, where rows with no join matches are
@@ -136,16 +148,102 @@ impl JoinType {
     }
 }
 
+verus! {
+
 /// ORDER BY direction.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Direction {
     #[default]
     Ascending,
     Descending,
 }
 
+} // verus!
+
+impl Clone for Column {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            datatype: self.datatype,
+            primary_key: self.primary_key,
+            nullable: self.nullable,
+            default: self.default.clone(),
+            unique: self.unique,
+            index: self.index,
+            references: self.references.clone(),
+        }
+    }
+}
+
+impl Clone for Statement {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Begin { read_only, as_of } => {
+                Self::Begin { read_only: *read_only, as_of: *as_of }
+            }
+            Self::Commit => Self::Commit,
+            Self::Rollback => Self::Rollback,
+            Self::Explain(statement) => Self::Explain(statement.clone()),
+            Self::CreateTable { name, columns } => {
+                Self::CreateTable { name: name.clone(), columns: columns.clone() }
+            }
+            Self::DropTable { name, if_exists } => {
+                Self::DropTable { name: name.clone(), if_exists: *if_exists }
+            }
+            Self::Delete { table, where_clause } => {
+                Self::Delete { table: table.clone(), where_clause: where_clause.clone() }
+            }
+            Self::Insert { table, columns, values } => Self::Insert {
+                table: table.clone(),
+                columns: columns.clone(),
+                values: values.clone(),
+            },
+            Self::Update { table, set, where_clause } => Self::Update {
+                table: table.clone(),
+                set: set.clone(),
+                where_clause: where_clause.clone(),
+            },
+            Self::Select {
+                select,
+                from,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+            } => Self::Select {
+                select: select.clone(),
+                from: from.clone(),
+                where_clause: where_clause.clone(),
+                group_by: group_by.clone(),
+                having: having.clone(),
+                order_by: order_by.clone(),
+                limit: limit.clone(),
+                offset: offset.clone(),
+            },
+        }
+    }
+}
+
+impl Clone for From {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Table { name, alias } => Self::Table { name: name.clone(), alias: alias.clone() },
+            Self::Join { left, right, join_type, predicate } => Self::Join {
+                left: left.clone(),
+                right: right.clone(),
+                join_type: *join_type,
+                predicate: predicate.clone(),
+            },
+        }
+    }
+}
+
+verus! {
+
 /// SQL expressions, e.g. `a + 7 > b`. Can be nested.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub enum Expression {
     /// All columns, i.e. *.
     All,
@@ -160,7 +258,7 @@ pub enum Expression {
 }
 
 /// Expression literal values.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Literal {
     Null,
     Boolean(bool),
@@ -168,6 +266,8 @@ pub enum Literal {
     Float(f64),
     String(String),
 }
+
+} // verus!
 
 /// To allow using expressions and literals in e.g. hashmaps, implement simple
 /// equality by value for all types, including Null and f64::NAN. This only
@@ -201,12 +301,14 @@ impl Hash for Literal {
     }
 }
 
+verus! {
+
 /// Expression operators.
 ///
 /// Since this is a recursive data structure, we have to box each child
 /// expression, which incurs a heap allocation. There are clever ways to get
 /// around this, but we keep it simple.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub enum Operator {
     And(Box<Expression>, Box<Expression>), // a AND b
     Not(Box<Expression>),                  // NOT a
@@ -231,6 +333,61 @@ pub enum Operator {
     Subtract(Box<Expression>, Box<Expression>),     // a - b
 
     Like(Box<Expression>, Box<Expression>), // a LIKE b
+}
+
+} // verus!
+
+impl Clone for Literal {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Null => Self::Null,
+            Self::Boolean(value) => Self::Boolean(*value),
+            Self::Integer(value) => Self::Integer(*value),
+            Self::Float(value) => Self::Float(*value),
+            Self::String(value) => Self::String(value.clone()),
+        }
+    }
+}
+
+impl Clone for Expression {
+    fn clone(&self) -> Self {
+        match self {
+            Self::All => Self::All,
+            Self::Column(table, column) => Self::Column(table.clone(), column.clone()),
+            Self::Literal(literal) => Self::Literal(literal.clone()),
+            Self::Function(name, arguments) => Self::Function(name.clone(), arguments.clone()),
+            Self::Operator(operator) => Self::Operator(operator.clone()),
+        }
+    }
+}
+
+impl Clone for Operator {
+    fn clone(&self) -> Self {
+        match self {
+            Self::And(lhs, rhs) => Self::And(lhs.clone(), rhs.clone()),
+            Self::Not(expression) => Self::Not(expression.clone()),
+            Self::Or(lhs, rhs) => Self::Or(lhs.clone(), rhs.clone()),
+            Self::Equal(lhs, rhs) => Self::Equal(lhs.clone(), rhs.clone()),
+            Self::GreaterThan(lhs, rhs) => Self::GreaterThan(lhs.clone(), rhs.clone()),
+            Self::GreaterThanOrEqual(lhs, rhs) => {
+                Self::GreaterThanOrEqual(lhs.clone(), rhs.clone())
+            }
+            Self::Is(expression, literal) => Self::Is(expression.clone(), literal.clone()),
+            Self::LessThan(lhs, rhs) => Self::LessThan(lhs.clone(), rhs.clone()),
+            Self::LessThanOrEqual(lhs, rhs) => Self::LessThanOrEqual(lhs.clone(), rhs.clone()),
+            Self::NotEqual(lhs, rhs) => Self::NotEqual(lhs.clone(), rhs.clone()),
+            Self::Add(lhs, rhs) => Self::Add(lhs.clone(), rhs.clone()),
+            Self::Divide(lhs, rhs) => Self::Divide(lhs.clone(), rhs.clone()),
+            Self::Exponentiate(lhs, rhs) => Self::Exponentiate(lhs.clone(), rhs.clone()),
+            Self::Factorial(expression) => Self::Factorial(expression.clone()),
+            Self::Identity(expression) => Self::Identity(expression.clone()),
+            Self::Multiply(lhs, rhs) => Self::Multiply(lhs.clone(), rhs.clone()),
+            Self::Negate(expression) => Self::Negate(expression.clone()),
+            Self::Remainder(lhs, rhs) => Self::Remainder(lhs.clone(), rhs.clone()),
+            Self::Subtract(lhs, rhs) => Self::Subtract(lhs.clone(), rhs.clone()),
+            Self::Like(lhs, rhs) => Self::Like(lhs.clone(), rhs.clone()),
+        }
+    }
 }
 
 impl Expression {
