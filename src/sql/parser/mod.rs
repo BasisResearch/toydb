@@ -1,6 +1,8 @@
 //! Parses raw SQL strings into a structured Abstract Syntax Tree.
 
 pub mod ast;
+#[cfg(test)]
+pub(crate) mod differential;
 pub mod float_trust;
 mod lexer;
 mod parser;
