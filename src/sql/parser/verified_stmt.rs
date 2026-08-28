@@ -2798,6 +2798,39 @@ pub open spec fn sprint_set_list(items: Seq<(String, Option<SExpr>)>) -> Seq<Tok
     }
 }
 
+/// Appending one entry at the end of a set-list: `sprint_set_list` grows by a
+/// leading `Comma` then the new assignment (or just the assignment if the list
+/// was empty). The append identity the print `iter()` loop's invariant steps on.
+pub proof fn sprint_set_list_snoc(s: Seq<(String, Option<SExpr>)>, x: (String, Option<SExpr>))
+    ensures
+        sprint_set_list(s + seq![x]) == (if s.len() == 0 {
+            sprint_assign(x)
+        } else {
+            sprint_set_list(s) + seq![TokenView::Comma] + sprint_assign(x)
+        }),
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        assert(s + seq![x] =~= seq![x]);
+    } else {
+        assert((s + seq![x])[0] == s[0]);
+        assert((s + seq![x]).drop_first() =~= s.drop_first() + seq![x]);
+        assert((s + seq![x]).len() >= 2);
+        sprint_set_list_snoc(s.drop_first(), x);
+        if s.len() == 1 {
+            assert(s.drop_first().len() == 0);
+            assert(sprint_set_list(s) == sprint_assign(s[0]));
+            assert(sprint_set_list(s + seq![x])
+                =~= sprint_set_list(s) + seq![TokenView::Comma] + sprint_assign(x));
+        } else {
+            assert(sprint_set_list(s)
+                == sprint_assign(s[0]) + seq![TokenView::Comma] + sprint_set_list(s.drop_first()));
+            assert(sprint_set_list(s + seq![x])
+                =~= sprint_set_list(s) + seq![TokenView::Comma] + sprint_assign(x));
+        }
+    }
+}
+
 pub open spec fn set_list_depth(items: Seq<(String, Option<SExpr>)>) -> nat
     decreases items,
 {
