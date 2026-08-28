@@ -3644,6 +3644,106 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+#[verifier::rlimit(8000)]
+pub fn print_stmt_full_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires printable_stmt(view_stmt(*s)), full_exec_ok(view_stmt(*s)),
+    ensures token_views(r@) == sprint_stmt(view_stmt(*s)),
+    decreases s,
+{
+    reveal(printable_stmt);
+    reveal(full_exec_ok);
+    reveal_with_fuel(token_views, 6);
+    match s {
+        ast::Statement::Commit => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Commit));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            r
+        },
+        ast::Statement::Rollback => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Rollback));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            r
+        },
+        ast::Statement::Begin { .. } => print_begin_exec(s),
+        ast::Statement::CreateTable { .. } => print_createtable_exec(s),
+        ast::Statement::Insert { .. } => print_insert_exec(s),
+        ast::Statement::DropTable { name, if_exists } => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Drop));
+            r.push(super::Token::Keyword(Keyword::Table));
+            if *if_exists {
+                r.push(super::Token::Keyword(Keyword::If));
+                r.push(super::Token::Keyword(Keyword::Exists));
+            }
+            r.push(super::Token::Ident(name.clone()));
+            proof {
+                if *if_exists {
+                    assert(r@.drop_first().drop_first().drop_first().drop_first().drop_first()
+                        =~= Seq::<super::Token>::empty());
+                } else {
+                    assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                }
+            }
+            r
+        },
+        ast::Statement::Delete { table, where_clause } => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Delete));
+            r.push(super::Token::Keyword(Keyword::From));
+            r.push(super::Token::Ident(table.clone()));
+            match where_clause {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Where));
+                    let ghost head = r@;
+                    let mut body = print_expr_exec(e);
+                    let ghost body_old = body@;
+                    r.append(&mut body);
+                    proof {
+                        assert(r@ =~= head + body_old);
+                        token_views_concat(head, body_old);
+                        assert(head.drop_first().drop_first().drop_first().drop_first()
+                            =~= Seq::<super::Token>::empty());
+                        assert(token_views(head) =~= seq![
+                            TokenView::Keyword(Keyword::Delete),
+                            TokenView::Keyword(Keyword::From),
+                            TokenView::Ident(*table),
+                            TokenView::Keyword(Keyword::Where),
+                        ]);
+                    }
+                    r
+                },
+                None => {
+                    proof {
+                        assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    }
+                    r
+                },
+            }
+        },
+        ast::Statement::Explain(inner) => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Explain));
+            let ghost head = r@;
+            let mut body = print_stmt_full_exec(inner);
+            let ghost body_old = body@;
+            r.append(&mut body);
+            proof {
+                assert(r@ =~= head + body_old);
+                token_views_concat(head, body_old);
+                assert(head.drop_first() =~= Seq::<super::Token>::empty());
+                assert(token_views(head) =~= seq![TokenView::Keyword(Keyword::Explain)]);
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
 /// Statement kinds the unified executable parser recovers: everything except
 /// Select and Update (whose exec parsers are not built yet), Explain recursively.
 pub open spec fn full_exec_ok(s: SStmt) -> bool
