@@ -366,16 +366,29 @@ char-sequence **view** `Seq<char>` in spec, and refine the exec at the `s@` leve
   `lscan_string_m` + `lemma_lscan_string_m` + `scan_string_token_exec`. Quote-free
   ASCII; the `''` escape is a mechanical extension. Axiom-free.
 
-**Remaining lexer work — unify + faithfulness.** Every token class now has a
-verified scanner; what is left is (1) **integrate** them into one whole-input
-roundtrip over a spec-constructible mirror token `MTok` (byte-determined variants
-plus `MIdent`/`MString` carrying `Seq<char>`) — a mechanical rebuild of L15/L16/L17
-over `MTok`, reusing the locality and roundtrip sub-lemmas — and a unified exec
-`Vec<u8> -> Vec<Token>` covering all kinds; (2) **quoted identifiers** (`"..."`)
-and the `''`/`""` escapes; (3) **unicode** — idents/whitespace use `is_ws`/ASCII
-lowercasing vs production's `char::is_whitespace`/`to_lowercase` (ASCII is
-axiom-free; non-ASCII needs the `unicode_trust` model). Then ast-equivalence + the
-`parser.rs`/`lexer.rs` cutover.
+**UNIFIED VERIFIED LEXER COMPLETE (2026-08-28, L21-L25, 130 verified, axiom-free).**
+All five token classes are tied into one executable `Vec<u8> -> Vec<Token>` lexer
+with an end-to-end roundtrip, over a spec-constructible mirror token `MTok`
+(byte-determined variants plus `MIdent`/`MString` carrying `Seq<char>`):
+- **L21-L22** — `MTok` + `tok_view` (real `Token` -> mirror), unified single-token
+  dispatcher `lscan_mtok`, and `lemma_lscan_mtok` (unified single-token roundtrip
+  composing the five per-class lemmas).
+- **L23** — whole-input unified roundtrip `lemma_lex_mtok_seq_roundtrip` (L16's
+  space-separator + seq-slice design over `MTok`).
+- **L24** — suffix-locality for the string/ident scanners + the unified dispatcher
+  (`lemma_lscan_mtok_local`), the position/slice bridge prerequisite.
+- **L25** — `lscan_mtok_exec` (unified exec dispatcher) + `lex_mtok_exec` (the
+  fuel-free loop producing the real `Vec<Token>`, refining `lex_mtok_from` via the
+  bridge `lemma_lex_mtok_from_eq_seq`) + the headline `lemma_lex_mtok_roundtrip`:
+  tokenizing the printed form of any printable token list recovers it. ASCII input.
+
+**Remaining before cutover:** (1) **quoted identifiers** (`"..."`) and the
+`''`/`""` escapes (mechanical extensions of L19/L20); (2) **unicode faithfulness**
+— the verified lexer uses `is_ws`/ASCII lowercasing, production uses
+`char::is_whitespace`/`to_lowercase` (ASCII is axiom-free; non-ASCII needs the
+`unicode_trust` model); (3) **ast-equivalence** argument that the verified
+lexer+parser is a sound drop-in; (4) the `parser.rs`/`lexer.rs` swap, run
+`tests/scripts/queries` green.
 
 **Production lexer STARTED (2026-08-28, `verified_lexer.rs`, in verify.sh — 18 modules).**
 Same discipline as the grammar: smallest self-contained verified bricks, produces the
