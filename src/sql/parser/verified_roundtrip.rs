@@ -1389,12 +1389,30 @@ pub proof fn view_args_step(s: Seq<ast::Expression>)
     assert(view_args(s) =~= seq![view_expr(s[0])] + view_args(s.drop_first()));
 }
 
+/// The head element's depth is below the list depth (termination of the
+/// printer's list -> element recursion).
+pub proof fn slist_depth_head_decreases(args: Seq<ast::Expression>)
+    requires args.len() > 0,
+    ensures sdepth(view_expr(args[0])) < slist_depth(view_args(args)),
+{
+    view_args_step(args);
+}
+
+/// The tail's list depth is below the list depth (termination of the printer's
+/// list -> tail recursion).
+pub proof fn slist_depth_tail_decreases(args: Seq<ast::Expression>)
+    requires args.len() > 0,
+    ensures slist_depth(view_args(args.drop_first())) < slist_depth(view_args(args)),
+{
+    view_args_step(args);
+}
+
 /// Executable comma-list printer refining `sprint_args`.
 #[verifier::rlimit(4000)]
-pub fn print_args_slice(s: &[ast::Expression], fuel: usize) -> (r: Vec<super::Token>)
-    requires all_printable_se(view_args(s@)), fuel >= slist_depth(view_args(s@)),
+pub fn print_args_slice(s: &[ast::Expression]) -> (r: Vec<super::Token>)
+    requires all_printable_se(view_args(s@)),
     ensures verified_production::token_views(r@) == sprint_args(view_args(s@)),
-    decreases fuel,
+    decreases slist_depth(view_args(s@)),
 {
     reveal_with_fuel(verified_production::token_views, 1);
     if s.len() == 0 {
@@ -1408,21 +1426,24 @@ pub fn print_args_slice(s: &[ast::Expression], fuel: usize) -> (r: Vec<super::To
             assert(view_args(s@.drop_first()) =~= Seq::<SExpr>::empty());
             assert(all_printable_se(view_args(s@)));
             assert(sprint_args(view_args(s@)) == sprint(view_args(s@)[0]));
+            slist_depth_head_decreases(s@);
         }
-        print_expr_exec(&s[0], fuel - 1)
+        print_expr_exec(&s[0])
     } else {
         proof {
             view_args_len(s@);
             view_args_step(s@);
             sdepth_positive(view_expr(s@[0]));
+            slist_depth_head_decreases(s@);
+            slist_depth_tail_decreases(s@);
         }
-        let mut r = print_expr_exec(&s[0], fuel - 1);
+        let mut r = print_expr_exec(&s[0]);
         let ghost p0 = r@;
         r.push(super::Token::Comma);
         let ghost head = r@;
         let rest = vstd::slice::slice_subrange(s, 1, s.len());
         proof { assert(rest@ =~= s@.drop_first()); }
-        let mut more = print_args_slice(rest, fuel - 1);
+        let mut more = print_args_slice(rest);
         let ghost more_old = more@;
         r.append(&mut more);
         proof {
@@ -1444,10 +1465,10 @@ pub fn print_args_slice(s: &[ast::Expression], fuel: usize) -> (r: Vec<super::To
 
 /// Executable expression printer refining `sprint` at the `view_expr` level.
 #[verifier::rlimit(8000)]
-pub fn print_expr_exec(e: &ast::Expression, fuel: usize) -> (r: Vec<super::Token>)
-    requires printable_se(view_expr(*e)), fuel >= sdepth(view_expr(*e)),
+pub fn print_expr_exec(e: &ast::Expression) -> (r: Vec<super::Token>)
+    requires printable_se(view_expr(*e)),
     ensures verified_production::token_views(r@) == sprint(view_expr(*e)),
-    decreases fuel,
+    decreases sdepth(view_expr(*e)),
 {
     reveal(printable_se);
     reveal_with_fuel(verified_production::token_views, 3);
@@ -1496,7 +1517,7 @@ pub fn print_expr_exec(e: &ast::Expression, fuel: usize) -> (r: Vec<super::Token
         },
         ast::Expression::Function(name, args) => {
             let arg_slice = args.as_slice();
-            let mut body = print_args_slice(arg_slice, fuel - 1);
+            let mut body = print_args_slice(arg_slice);
             r.push(super::Token::Ident(name.clone()));
             r.push(super::Token::OpenParen);
             let ghost head = r@;
@@ -1518,15 +1539,15 @@ pub fn print_expr_exec(e: &ast::Expression, fuel: usize) -> (r: Vec<super::Token
         },
         ast::Expression::Operator(op) => { let out = match op {
             ast::Operator::Not(inner) => wrap_unary(super::Token::Keyword(Keyword::Not),
-                print_expr_exec(&**inner, fuel - 1)),
+                print_expr_exec(&**inner)),
             ast::Operator::Identity(inner) => wrap_unary(super::Token::Plus,
-                print_expr_exec(&**inner, fuel - 1)),
+                print_expr_exec(&**inner)),
             ast::Operator::Negate(inner) => wrap_unary(super::Token::Minus,
-                print_expr_exec(&**inner, fuel - 1)),
+                print_expr_exec(&**inner)),
             ast::Operator::Factorial(inner) =>
-                wrap_factorial(print_expr_exec(&**inner, fuel - 1)),
+                wrap_factorial(print_expr_exec(&**inner)),
             ast::Operator::Is(inner, lit) => {
-                let inner_v = print_expr_exec(&**inner, fuel - 1);
+                let inner_v = print_expr_exec(&**inner);
                 let is_tok = match lit {
                     ast::Literal::Null => super::Token::Keyword(Keyword::Null),
                     _ => super::Token::Keyword(Keyword::NaN),
@@ -1534,35 +1555,35 @@ pub fn print_expr_exec(e: &ast::Expression, fuel: usize) -> (r: Vec<super::Token
                 wrap_is(inner_v, is_tok)
             },
             ast::Operator::And(l, rr) => wrap_binary(super::Token::Keyword(Keyword::And),
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Or(l, rr) => wrap_binary(super::Token::Keyword(Keyword::Or),
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Equal(l, rr) => wrap_binary(super::Token::Equal,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::GreaterThan(l, rr) => wrap_binary(super::Token::GreaterThan,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::GreaterThanOrEqual(l, rr) => wrap_binary(super::Token::GreaterThanOrEqual,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::LessThan(l, rr) => wrap_binary(super::Token::LessThan,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::LessThanOrEqual(l, rr) => wrap_binary(super::Token::LessThanOrEqual,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::NotEqual(l, rr) => wrap_binary(super::Token::NotEqual,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Add(l, rr) => wrap_binary(super::Token::Plus,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Divide(l, rr) => wrap_binary(super::Token::Slash,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Exponentiate(l, rr) => wrap_binary(super::Token::Caret,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Multiply(l, rr) => wrap_binary(super::Token::Asterisk,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Remainder(l, rr) => wrap_binary(super::Token::Percent,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Subtract(l, rr) => wrap_binary(super::Token::Minus,
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
             ast::Operator::Like(l, rr) => wrap_binary(super::Token::Keyword(Keyword::Like),
-                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+                print_expr_exec(&**l), print_expr_exec(&**rr)),
         };
         proof { assert(verified_production::token_views(out@) == sprint(view_expr(*e))); }
         out },
@@ -1607,16 +1628,16 @@ pub fn roundtrip_exec(e: &ast::Expression, toks: &Vec<super::Token>) -> (out: as
 
 /// Fully self-contained end-to-end roundtrip: printing a printable expression
 /// with the executable printer and parsing the result with the executable
-/// parser recovers the expression up to its structural view. `fuel` is any
-/// bound on the expression's mirror depth (e.g. its printed token count).
-pub fn print_parse_roundtrip_exec(e: &ast::Expression, fuel: usize) -> (out: ast::Expression)
+/// parser recovers the expression up to its structural view. No fuel to supply;
+/// the printer recurses on a ghost depth measure and the parser fuels itself
+/// from the printed token count.
+pub fn print_parse_roundtrip_exec(e: &ast::Expression) -> (out: ast::Expression)
     requires
         printable_se(view_expr(*e)),
-        fuel >= sdepth(view_expr(*e)),
     ensures
         view_expr(out) == view_expr(*e),
 {
-    let toks = print_expr_exec(e, fuel);
+    let toks = print_expr_exec(e);
     roundtrip_exec(e, &toks)
 }
 
