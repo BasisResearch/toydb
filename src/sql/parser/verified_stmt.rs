@@ -2465,6 +2465,68 @@ pub proof fn lemma_sparse_set_list_sprint(items: Seq<(String, Option<SExpr>)>, t
     }
 }
 
+// -- bare expr comma-list terminated by a boundary (GROUP BY) -----------------
+//
+// `sparse_args` is parenthesis-terminated (it stops on `CloseParen`), so it can't
+// read `GROUP BY a, b` (terminated by a clause keyword or end). This is the
+// boundary-terminated analogue, printing with the shared `sprint_args`.
+
+#[verifier::opaque]
+pub open spec fn sparse_expr_list(input: Seq<TokenView>, fuel: nat)
+    -> (Option<Seq<SExpr>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse(input, fuel) {
+            (Some(e), r) => {
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    match sparse_expr_list(r.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![e] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![e]), r)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+#[verifier::rlimit(4000)]
+pub proof fn lemma_sparse_expr_list_sprint(items: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_se(items),
+        items.len() >= 1,
+        fuel >= slist_depth(items),
+        tail.len() == 0 || (tail[0] != TokenView::Comma
+            && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen),
+    ensures
+        sparse_expr_list(sprint_args(items) + tail, fuel) == (Some(items), tail),
+    decreases items,
+{
+    reveal_with_fuel(sparse_expr_list, 2);
+    if items.len() == 1 {
+        assert(boundary(tail));
+        lemma_sparse_sprint(items[0], tail, fuel);
+        assert(sprint_args(items) + tail =~= sprint(items[0]) + tail);
+        assert(seq![items[0]] =~= items);
+    } else {
+        let rest = items.drop_first();
+        let item_tail = seq![TokenView::Comma] + (sprint_args(rest) + tail);
+        assert(boundary(item_tail)) by { assert(item_tail[0] == TokenView::Comma); }
+        lemma_sparse_sprint(items[0], item_tail, fuel);
+        lemma_sparse_expr_list_sprint(rest, tail, (fuel - 1) as nat);
+        assert(sprint_args(items) =~= sprint(items[0]) + seq![TokenView::Comma] + sprint_args(rest));
+        assert(sprint_args(items) + tail =~= sprint(items[0]) + item_tail);
+        assert(item_tail[0] == TokenView::Comma);
+        assert(item_tail.drop_first() =~= sprint_args(rest) + tail);
+        assert(seq![items[0]] + rest =~= items);
+    }
+}
+
 // -- select-list (exprs with optional AS alias; `*` may not be aliased) ------
 
 pub open spec fn sprint_select_item(item: (SExpr, Option<String>)) -> Seq<TokenView> {
