@@ -24,7 +24,8 @@
 #![cfg(test)]
 
 use super::ast::{self, Expression, Literal, Operator, Statement};
-use super::{Parser, Token};
+use super::{Lexer, Parser, Token, verified_precedence};
+use crate::errinput;
 use crate::error::Result;
 
 /// The verified-path statement parser under test.
@@ -35,9 +36,15 @@ pub(crate) fn parse_new(sql: &str) -> Result<Statement> {
     Parser::parse(sql)
 }
 
-/// The verified-path expression parser under test. See [`parse_new`].
+/// The verified-path expression parser under test: lex with the production
+/// lexer, then run the Verus-verified precedence-climbing parser
+/// ([`verified_precedence`]). Requires the whole token vector to be consumed.
 pub(crate) fn parse_expr_new(expr: &str) -> Result<Expression> {
-    Parser::parse_expr(expr)
+    let tokens: Vec<Token> = Lexer::new(expr).collect::<Result<_>>()?;
+    match verified_precedence::parse_expression(&tokens) {
+        Some(expression) => Ok(expression),
+        None => errinput!("failed to parse expression: {expr}"),
+    }
 }
 
 /// Asserts the legacy and verified-path parsers agree on `sql`: both accept
@@ -380,5 +387,54 @@ const CONCRETE_SYNTAX_CORPUS: &[&str] = &[
 fn concrete_syntax_corpus_agrees() {
     for sql in CONCRETE_SYNTAX_CORPUS {
         check_statement(sql);
+    }
+}
+
+/// Bare expressions with concrete precedence/associativity, function calls, and
+/// postfix operators, feeding the verified precedence parser directly (the
+/// statement corpus reaches it only through clauses). Every entry must build
+/// the same AST as the production precedence-climbing parser.
+const CONCRETE_EXPR_CORPUS: &[&str] = &[
+    "1 + 2 * 3",
+    "1 * 2 + 3",
+    "2 ^ 3 ^ 2",
+    "2 ^ 3 ^ 2 - 4 * 3",
+    "1 - 2 - 3",
+    "1 - 2 + 3",
+    "a AND b OR c",
+    "a OR b AND c",
+    "NOT a AND b",
+    "NOT NOT a",
+    "-a + b",
+    "- - a",
+    "+a * -b",
+    "a = b AND c != d",
+    "a < b < c",
+    "a IS NULL",
+    "a IS NOT NULL",
+    "a IS NAN",
+    "a IS NOT NAN",
+    "a!",
+    "a! + b!",
+    "1 + NULL IS NULL",
+    "NOT a IS NULL",
+    "a LIKE b AND c",
+    "count(a)",
+    "sum(a + b * c)",
+    "f(g(h(x)))",
+    "f(a, b, c)",
+    "f()",
+    "(1 + 2) * 3",
+    "t.a + t.b",
+    "INFINITY + NAN",
+    "-2 ^ 2",
+    "a >= b <= c",
+    "a % b * c",
+];
+
+#[test]
+fn concrete_expr_corpus_agrees() {
+    for expr in CONCRETE_EXPR_CORPUS {
+        check_expression(expr);
     }
 }

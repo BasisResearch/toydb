@@ -91,6 +91,14 @@ pub fn canonical_nan() -> (r: f64)
     f64::NAN
 }
 
+/// Constructs positive infinity, the value the production parser builds for the
+/// `INFINITY` keyword. Non-finite, so outside the finite-roundtrip domain; the
+/// precedence parser only needs to construct it.
+#[verifier::external_body]
+pub fn infinity() -> (r: f64) {
+    f64::INFINITY
+}
+
 /// Connects bit equality to Verus equality for the one NaN payload admitted
 /// by the canonical `IS NAN` syntax.
 #[verifier::external_body]

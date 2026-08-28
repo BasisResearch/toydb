@@ -35,6 +35,7 @@ VERIFY_MODULES=(
   sql::parser::verified_function_list
   sql::parser::verified_integer
   sql::parser::verified_lists
+  sql::parser::verified_precedence
   sql::parser::verified_production
   sql::parser::verified_roundtrip
   sql::parser::verified_simple_statement

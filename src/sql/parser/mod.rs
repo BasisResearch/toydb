@@ -15,6 +15,7 @@ pub mod verified_function_list;
 pub mod verified_integer;
 pub mod verified_lexer;
 pub mod verified_lists;
+pub mod verified_precedence;
 pub mod verified_production;
 pub mod verified_roundtrip;
 pub mod verified_simple_statement;
