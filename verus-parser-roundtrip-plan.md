@@ -1,14 +1,16 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
-Status: **E0-E4 complete; statement roundtrip S0-S5 largely complete (2026-08-28)**
+Status: **E0-E4 complete; statement roundtrip S0-S5 complete (2026-08-28)**
 — the full expression-grammar roundtrip is verified end to end; the statement
 *mirror* roundtrip is verified for all 10 `ast::Statement` kinds (S0-S4); and the
-*executable* print+parse layer (S5) is verified for 9 of 10 kinds both directions,
-with a unified end-to-end headline over 8 of them, in
-`src/sql/parser/verified_stmt.rs` (133 verified / 0 errors under `verify.sh`).
-Only `Update` (its `BTreeMap` set) lacks an executable layer, and Phase 4
-(production cutover) is not started. Owner: kg (parser). Verified module opt-in
-via `scripts/verus/verify.sh`.
+*executable* print+parse layer (S5) is now verified for **all 10 kinds** both
+directions, with end-to-end roundtrip headlines (a unified one over 8 kinds plus
+standalone `print_parse_roundtrip_select` and `print_parse_roundtrip_update`), in
+`src/sql/parser/verified_stmt.rs` (142 verified / 0 errors under `verify.sh`).
+`Update`'s `BTreeMap` set was unblocked with a single trusted axiom,
+`axiom_string_key_obeys_cmp` (`String`'s `Ord` obeys the cmp laws — analogous to
+the `float_trust` assumptions). Phase 4 (production cutover) is not started.
+Owner: kg (parser). Verified module opt-in via `scripts/verus/verify.sh`.
 
 ## Statement layer status (2026-08-27)
 
@@ -77,19 +79,26 @@ refining `sprint_stmt`/`sparse_stmt` at `view_stmt` (133 verified / 0 errors):
   (`sdepth_stmt(s) <= 2*sprint_stmt(s).len()`) plus a from-tree `steps_depth`
   length bound — a mechanical extension, not attempted here.
 
-**Remaining S5 — Update (blocked in vstd, root cause pinned).** `Update` still
-has no exec print/parse, and a verified probe (2026-08-28) shows *why*: vstd's
-`BTreeMap` `insert` view postcondition (`m@ == old(m)@.insert(k,v)`) and its
-`iter` spec are both gated on `obeys_cmp::<String>()`, and vstd provides **no
-proof of `obeys_cmp::<String>()`** (the `laws_cmp` lemmas cover primitives, not
-`String`). So both directions are blocked at the library level, not by a proof
-being avoided: `insert` can't establish the built map's view (parse), and `iter`
-can't be used to read the sole entry (print). Unblocking needs a trusted
-`obeys_cmp::<String>()` axiom (a true statement about `String`'s `Ord`, analogous
-to the `float_trust` assumptions — it would grow the audited trust surface by
-one) and then, for print, the prophetic `iter()` reasoning to extract and prove
-the single `(k,v)` equals `dom().choose()`. `stmt_injective` for the whole
-grammar is also outstanding.
+**S5 — Update (DONE, 2026-08-28).** The `BTreeMap` barrier was pinned by a
+verified probe (vstd's `BTreeMap` `insert` view and `iter` spec are both gated on
+`key_obeys_cmp_spec::<String>()`, which vstd does not prove for `String`) and then
+unblocked with one trusted axiom, `axiom_string_key_obeys_cmp` (`String`'s `Ord`
+is a genuine total order obeying the cmp laws — analogous to the `float_trust`
+assumptions; grows the audited trust surface by exactly one). On top of it:
+- `build_one_entry_map(k,v)` proves `m@ == Map::empty().insert(k,v)` (parse side).
+- `extract_one_entry(m)` pulls the sole `(k,v)` via `iter().next()` — the `next`
+  spec pops `remaining()[0]`, and for a one-entry map the `iter` spec pins it to
+  the map (print side; key cloned value-exact, value borrowed to dodge the
+  `Option<Expression>` deep-clone relation).
+- `print_update_exec` / `parse_assign_exec` / `parse_update_exec` +
+  `lemma_sparse_update_sprint` + `update_sdepth_le_len` +
+  `print_parse_roundtrip_update` give the single-assignment `UPDATE` roundtrip.
+  Multi-assignment (trailing comma) is outside `view_stmt`'s domain and is
+  rejected as the relaxed `None` disjunct (`lemma_sparse_set_list_len`).
+
+`stmt_injective` for the whole grammar remains outstanding (not required for the
+roundtrip). The Select-into-unified-headline fuel doubling is still the one
+mechanical extension left within S5 (Select is verified standalone).
 
 **Phase 4 — production cutover** is not started (replace the two
 `std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
