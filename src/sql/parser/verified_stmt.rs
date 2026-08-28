@@ -1296,6 +1296,571 @@ pub open spec fn sparse_insert(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
+// ---- FROM join tree (S3) ---------------------------------------------------
+//
+// A `From` item is a left-deep join tree whose right child is always a table.
+// The printer emits it left-to-right; the parser reads the leftmost table then
+// a forward list of join steps and folds them left-deep, so no left-recursion
+// is needed. `fold_joins`/`from_head`/`from_steps` decompose the tree into
+// (head table, step list) and the identities below reassemble it.
+
+pub struct SJoinStep {
+    pub join_type: ast::JoinType,
+    pub right: SFrom,
+    pub predicate: Option<SExpr>,
+}
+
+pub enum SFrom {
+    Table { name: String, alias: Option<String> },
+    Join { left: Box<SFrom>, right: Box<SFrom>, join_type: ast::JoinType, predicate: Option<SExpr> },
+}
+
+pub open spec fn view_from(f: ast::From) -> SFrom
+    decreases f,
+{
+    match f {
+        ast::From::Table { name, alias } => SFrom::Table { name, alias },
+        ast::From::Join { left, right, join_type, predicate } => SFrom::Join {
+            left: Box::new(view_from(*left)),
+            right: Box::new(view_from(*right)),
+            join_type,
+            predicate: match predicate {
+                Some(e) => Some(view_expr(e)),
+                None => None,
+            },
+        },
+    }
+}
+
+pub open spec fn is_stable(f: SFrom) -> bool {
+    match f {
+        SFrom::Table { .. } => true,
+        _ => false,
+    }
+}
+
+pub open spec fn printable_from(f: SFrom) -> bool
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => true,
+        SFrom::Join { left, right, join_type, predicate } =>
+            is_stable(*right)
+            && (match join_type {
+                ast::JoinType::Cross => predicate is None,
+                _ => predicate is Some && printable_se(predicate->Some_0),
+            })
+            && printable_from(*left),
+    }
+}
+
+// -- tree <-> (head table, step list) decomposition --------------------------
+
+pub open spec fn from_head(f: SFrom) -> SFrom
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => f,
+        SFrom::Join { left, .. } => from_head(*left),
+    }
+}
+
+pub open spec fn from_steps(f: SFrom) -> Seq<SJoinStep>
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => Seq::empty(),
+        SFrom::Join { left, right, join_type, predicate } =>
+            from_steps(*left) + seq![SJoinStep { join_type, right: *right, predicate }],
+    }
+}
+
+pub open spec fn apply_step(acc: SFrom, step: SJoinStep) -> SFrom {
+    SFrom::Join {
+        left: Box::new(acc),
+        right: Box::new(step.right),
+        join_type: step.join_type,
+        predicate: step.predicate,
+    }
+}
+
+pub open spec fn fold_joins(head: SFrom, steps: Seq<SJoinStep>) -> SFrom
+    decreases steps,
+{
+    if steps.len() == 0 {
+        head
+    } else {
+        fold_joins(apply_step(head, steps[0]), steps.drop_first())
+    }
+}
+
+pub proof fn fold_append(h: SFrom, xs: Seq<SJoinStep>, ys: Seq<SJoinStep>)
+    ensures fold_joins(h, xs + ys) == fold_joins(fold_joins(h, xs), ys),
+    decreases xs,
+{
+    if xs.len() == 0 {
+        assert(xs + ys =~= ys);
+    } else {
+        assert((xs + ys)[0] == xs[0]);
+        assert((xs + ys).drop_first() =~= xs.drop_first() + ys);
+        fold_append(apply_step(h, xs[0]), xs.drop_first(), ys);
+    }
+}
+
+pub proof fn fold_decomp(f: SFrom)
+    ensures fold_joins(from_head(f), from_steps(f)) == f,
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => {},
+        SFrom::Join { left, right, join_type, predicate } => {
+            fold_decomp(*left);
+            let step = SJoinStep { join_type, right: *right, predicate };
+            fold_append(from_head(*left), from_steps(*left), seq![step]);
+            assert(from_steps(f) =~= from_steps(*left) + seq![step]);
+            reveal_with_fuel(fold_joins, 2);
+            assert(seq![step][0] == step);
+            assert(seq![step].drop_first() =~= Seq::<SJoinStep>::empty());
+            assert(fold_joins(*left, seq![step]) == apply_step(*left, step));
+            assert(apply_step(*left, step) == f);
+        },
+    }
+}
+
+// -- printer -----------------------------------------------------------------
+
+pub open spec fn sprint_table(f: SFrom) -> Seq<TokenView> {
+    match f {
+        SFrom::Table { name, alias: None } => seq![TokenView::Ident(name)],
+        SFrom::Table { name, alias: Some(a) } =>
+            seq![TokenView::Ident(name), TokenView::Keyword(Keyword::As), TokenView::Ident(a)],
+        _ => Seq::empty(),
+    }
+}
+
+pub open spec fn join_kws(jt: ast::JoinType) -> Seq<TokenView> {
+    match jt {
+        ast::JoinType::Cross => seq![TokenView::Keyword(Keyword::Cross), TokenView::Keyword(Keyword::Join)],
+        ast::JoinType::Inner => seq![TokenView::Keyword(Keyword::Inner), TokenView::Keyword(Keyword::Join)],
+        ast::JoinType::Left => seq![TokenView::Keyword(Keyword::Left), TokenView::Keyword(Keyword::Join)],
+        ast::JoinType::Right => seq![TokenView::Keyword(Keyword::Right), TokenView::Keyword(Keyword::Join)],
+    }
+}
+
+pub open spec fn is_cross(jt: ast::JoinType) -> bool {
+    match jt {
+        ast::JoinType::Cross => true,
+        _ => false,
+    }
+}
+
+pub open spec fn step_toks(step: SJoinStep) -> Seq<TokenView> {
+    join_kws(step.join_type) + sprint_table(step.right)
+        + (match step.predicate {
+            Some(e) => seq![TokenView::Keyword(Keyword::On)] + sprint(e),
+            None => Seq::empty(),
+        })
+}
+
+pub open spec fn sprint_steps(steps: Seq<SJoinStep>) -> Seq<TokenView>
+    decreases steps,
+{
+    if steps.len() == 0 {
+        Seq::empty()
+    } else {
+        step_toks(steps[0]) + sprint_steps(steps.drop_first())
+    }
+}
+
+pub open spec fn sprint_from(f: SFrom) -> Seq<TokenView>
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => sprint_table(f),
+        SFrom::Join { left, right, join_type, predicate } =>
+            sprint_from(*left)
+                + join_kws(join_type) + sprint_table(*right)
+                + (match predicate {
+                    Some(e) => seq![TokenView::Keyword(Keyword::On)] + sprint(e),
+                    None => Seq::empty(),
+                }),
+    }
+}
+
+pub proof fn sprint_steps_append(xs: Seq<SJoinStep>, ys: Seq<SJoinStep>)
+    ensures sprint_steps(xs + ys) == sprint_steps(xs) + sprint_steps(ys),
+    decreases xs,
+{
+    if xs.len() == 0 {
+        assert(xs + ys =~= ys);
+    } else {
+        assert((xs + ys)[0] == xs[0]);
+        assert((xs + ys).drop_first() =~= xs.drop_first() + ys);
+        sprint_steps_append(xs.drop_first(), ys);
+    }
+}
+
+/// `sprint_from(f) == sprint_table(from_head(f)) + sprint_steps(from_steps(f))`.
+pub proof fn sprint_decomp(f: SFrom)
+    ensures sprint_from(f) == sprint_table(from_head(f)) + sprint_steps(from_steps(f)),
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => {
+            assert(sprint_steps(from_steps(f)) =~= Seq::<TokenView>::empty());
+        },
+        SFrom::Join { left, right, join_type, predicate } => {
+            sprint_decomp(*left);
+            let step = SJoinStep { join_type, right: *right, predicate };
+            sprint_steps_append(from_steps(*left), seq![step]);
+            assert(from_steps(f) =~= from_steps(*left) + seq![step]);
+            assert(sprint_steps(seq![step]) =~= step_toks(step)) by {
+                reveal_with_fuel(sprint_steps, 2);
+                assert(seq![step][0] == step);
+                assert(seq![step].drop_first() =~= Seq::<SJoinStep>::empty());
+            }
+            assert(sprint_from(f) =~= sprint_from(*left) + step_toks(step));
+        },
+    }
+}
+
+// -- FROM fuel + printable over the step decomposition -----------------------
+
+pub open spec fn step_depth(step: SJoinStep) -> nat {
+    match step.predicate {
+        Some(e) => 1 + sdepth(e),
+        None => 1,
+    }
+}
+
+pub open spec fn steps_depth(steps: Seq<SJoinStep>) -> nat
+    decreases steps,
+{
+    if steps.len() == 0 {
+        1
+    } else {
+        let d = step_depth(steps[0]);
+        let rest = steps_depth(steps.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+pub open spec fn sdepth_from(f: SFrom) -> nat {
+    (1 + steps_depth(from_steps(f))) as nat
+}
+
+pub open spec fn printable_step(step: SJoinStep) -> bool {
+    is_stable(step.right)
+        && (match step.join_type {
+            ast::JoinType::Cross => step.predicate is None,
+            _ => step.predicate is Some && printable_se(step.predicate->Some_0),
+        })
+}
+
+pub open spec fn all_printable_steps(steps: Seq<SJoinStep>) -> bool
+    decreases steps,
+{
+    if steps.len() == 0 {
+        true
+    } else {
+        printable_step(steps[0]) && all_printable_steps(steps.drop_first())
+    }
+}
+
+pub proof fn all_printable_steps_append(xs: Seq<SJoinStep>, ys: Seq<SJoinStep>)
+    ensures all_printable_steps(xs + ys) == (all_printable_steps(xs) && all_printable_steps(ys)),
+    decreases xs,
+{
+    if xs.len() == 0 {
+        assert(xs + ys =~= ys);
+    } else {
+        assert((xs + ys)[0] == xs[0]);
+        assert((xs + ys).drop_first() =~= xs.drop_first() + ys);
+        all_printable_steps_append(xs.drop_first(), ys);
+    }
+}
+
+/// `printable_from` guarantees a stable head table and printable step list.
+pub proof fn printable_from_decomp(f: SFrom)
+    requires printable_from(f),
+    ensures
+        is_stable(from_head(f)),
+        all_printable_steps(from_steps(f)),
+    decreases f,
+{
+    match f {
+        SFrom::Table { .. } => {},
+        SFrom::Join { left, right, join_type, predicate } => {
+            printable_from_decomp(*left);
+            let step = SJoinStep { join_type, right: *right, predicate };
+            all_printable_steps_append(from_steps(*left), seq![step]);
+            assert(printable_step(step));
+            assert(all_printable_steps(seq![step])) by {
+                reveal_with_fuel(all_printable_steps, 2);
+                assert(seq![step][0] == step);
+                assert(printable_step(step));
+                assert(seq![step].drop_first() =~= Seq::<SJoinStep>::empty());
+            }
+            assert(from_steps(f) =~= from_steps(*left) + seq![step]);
+        },
+    }
+}
+
+// -- parser ------------------------------------------------------------------
+
+pub open spec fn is_join_kw(t: TokenView) -> bool {
+    t == TokenView::Keyword(Keyword::Cross)
+        || t == TokenView::Keyword(Keyword::Inner)
+        || t == TokenView::Keyword(Keyword::Left)
+        || t == TokenView::Keyword(Keyword::Right)
+}
+
+pub open spec fn join_type_of(t: TokenView) -> Option<ast::JoinType> {
+    if t == TokenView::Keyword(Keyword::Cross) {
+        Some(ast::JoinType::Cross)
+    } else if t == TokenView::Keyword(Keyword::Inner) {
+        Some(ast::JoinType::Inner)
+    } else if t == TokenView::Keyword(Keyword::Left) {
+        Some(ast::JoinType::Left)
+    } else if t == TokenView::Keyword(Keyword::Right) {
+        Some(ast::JoinType::Right)
+    } else {
+        None
+    }
+}
+
+pub open spec fn sparse_table(input: Seq<TokenView>) -> (Option<SFrom>, Seq<TokenView>) {
+    if input.len() == 0 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                if input.len() >= 3 && input[1] == TokenView::Keyword(Keyword::As) {
+                    match input[2] {
+                        TokenView::Ident(a) => (
+                            Some(SFrom::Table { name, alias: Some(a) }),
+                            input.drop_first().drop_first().drop_first(),
+                        ),
+                        _ => (None, input),
+                    }
+                } else {
+                    (Some(SFrom::Table { name, alias: None }), input.drop_first())
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+pub open spec fn sparse_step(input: Seq<TokenView>, fuel: nat) -> (Option<SJoinStep>, Seq<TokenView>) {
+    if input.len() >= 2 && input[1] == TokenView::Keyword(Keyword::Join) {
+        match join_type_of(input[0]) {
+            Some(jt) => match sparse_table(input.drop_first().drop_first()) {
+                (Some(right), r) => {
+                    if is_cross(jt) {
+                        (Some(SJoinStep { join_type: jt, right, predicate: None }), r)
+                    } else if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::On) {
+                        match sparse(r.drop_first(), fuel) {
+                            (Some(e), r2) => (
+                                Some(SJoinStep { join_type: jt, right, predicate: Some(e) }),
+                                r2,
+                            ),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (None, input)
+                    }
+                },
+                (None, _) => (None, input),
+            },
+            None => (None, input),
+        }
+    } else {
+        (None, input)
+    }
+}
+
+pub open spec fn sparse_steps(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<SJoinStep>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if input.len() >= 1 && is_join_kw(input[0]) {
+        if fuel == 0 {
+            (None, input)
+        } else {
+            match sparse_step(input, fuel) {
+                (Some(step), rest) => match sparse_steps(rest, (fuel - 1) as nat) {
+                    (Some(more), rest2) => (Some(seq![step] + more), rest2),
+                    (None, _) => (None, input),
+                },
+                (None, _) => (None, input),
+            }
+        }
+    } else {
+        (Some(Seq::empty()), input)
+    }
+}
+
+pub open spec fn sparse_from(input: Seq<TokenView>, fuel: nat) -> (Option<SFrom>, Seq<TokenView>) {
+    match sparse_table(input) {
+        (Some(head), r) => match sparse_steps(r, fuel) {
+            (Some(steps), r2) => (Some(fold_joins(head, steps)), r2),
+            (None, _) => (None, input),
+        },
+        (None, _) => (None, input),
+    }
+}
+
+// -- roundtrip ---------------------------------------------------------------
+
+pub open spec fn step_tail_ok(tail: Seq<TokenView>) -> bool {
+    tail.len() == 0
+        || (tail[0] != TokenView::Keyword(Keyword::As)
+            && tail[0] != TokenView::Period
+            && tail[0] != TokenView::OpenParen)
+}
+
+pub open spec fn from_tail_ok(tail: Seq<TokenView>) -> bool {
+    step_tail_ok(tail) && (tail.len() == 0 || !is_join_kw(tail[0]))
+}
+
+pub proof fn lemma_sparse_table_sprint(t: SFrom, tail: Seq<TokenView>)
+    requires
+        is_stable(t),
+        tail.len() == 0 || tail[0] != TokenView::Keyword(Keyword::As),
+    ensures
+        sparse_table(sprint_table(t) + tail) == (Some(t), tail),
+{
+    match t {
+        SFrom::Table { name, alias: None } => {
+            assert(sprint_table(t) + tail =~= seq![TokenView::Ident(name)] + tail);
+            assert((sprint_table(t) + tail).drop_first() =~= tail);
+        },
+        SFrom::Table { name, alias: Some(a) } => {
+            assert(sprint_table(t) + tail =~= seq![
+                TokenView::Ident(name), TokenView::Keyword(Keyword::As), TokenView::Ident(a),
+            ] + tail);
+            assert((sprint_table(t) + tail).drop_first().drop_first().drop_first() =~= tail);
+        },
+        _ => {},
+    }
+}
+
+pub proof fn lemma_sparse_step_sprint(step: SJoinStep, tail: Seq<TokenView>, fuel: nat)
+    requires
+        printable_step(step),
+        fuel >= step_depth(step),
+        step_tail_ok(tail),
+    ensures
+        sparse_step(step_toks(step) + tail, fuel) == (Some(step), tail),
+{
+    let input = step_toks(step) + tail;
+    // join keywords
+    assert(input[0] == join_kws(step.join_type)[0]);
+    assert(input[1] == TokenView::Keyword(Keyword::Join));
+    assert(join_type_of(input[0]) == Some(step.join_type)) by {
+        match step.join_type {
+            ast::JoinType::Cross => {},
+            ast::JoinType::Inner => {},
+            ast::JoinType::Left => {},
+            ast::JoinType::Right => {},
+        }
+    }
+    let after_jt = input.drop_first().drop_first();
+    let pred_toks = match step.predicate {
+        Some(e) => seq![TokenView::Keyword(Keyword::On)] + sprint(e),
+        None => Seq::<TokenView>::empty(),
+    };
+    assert(after_jt =~= sprint_table(step.right) + (pred_toks + tail));
+    // the right table's tail (pred_toks + tail) never starts with AS
+    assert((pred_toks + tail).len() == 0 || (pred_toks + tail)[0] != TokenView::Keyword(Keyword::As)) by {
+        match step.predicate {
+            Some(e) => { assert((pred_toks + tail)[0] == TokenView::Keyword(Keyword::On)); },
+            None => { assert(pred_toks + tail =~= tail); },
+        }
+    }
+    lemma_sparse_table_sprint(step.right, pred_toks + tail);
+    match step.predicate {
+        Some(e) => {
+            assert(!is_cross(step.join_type));
+            assert(pred_toks + tail =~= seq![TokenView::Keyword(Keyword::On)] + (sprint(e) + tail));
+            assert((pred_toks + tail)[0] == TokenView::Keyword(Keyword::On));
+            assert((pred_toks + tail).drop_first() =~= sprint(e) + tail);
+            lemma_sparse_sprint(e, tail, fuel);
+        },
+        None => {
+            assert(is_cross(step.join_type));
+            assert(pred_toks + tail =~= tail);
+        },
+    }
+}
+
+/// The step-list roundtrip (a forward list of join steps).
+#[verifier::rlimit(4000)]
+pub proof fn lemma_sparse_steps_sprint(steps: Seq<SJoinStep>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_steps(steps),
+        fuel >= steps_depth(steps),
+        from_tail_ok(tail),
+    ensures
+        sparse_steps(sprint_steps(steps) + tail, fuel) == (Some(steps), tail),
+    decreases steps,
+{
+    reveal_with_fuel(sparse_steps, 1);
+    if steps.len() == 0 {
+        assert(sprint_steps(steps) + tail =~= tail);
+    } else {
+        let rest = steps.drop_first();
+        let rest_tail = sprint_steps(rest) + tail;
+        // input starts with steps[0]'s join keyword
+        assert(sprint_steps(steps) + tail =~= step_toks(steps[0]) + rest_tail);
+        assert(step_toks(steps[0])[0] == join_kws(steps[0].join_type)[0]);
+        assert(is_join_kw(step_toks(steps[0])[0]));
+        assert((sprint_steps(steps) + tail)[0] == step_toks(steps[0])[0]);
+        // rest_tail is a valid step tail (starts with a join kw, comma, or clause kw)
+        assert(step_tail_ok(rest_tail)) by {
+            if rest.len() == 0 {
+                assert(rest_tail =~= tail);
+            } else {
+                assert(rest_tail =~= step_toks(rest[0]) + (sprint_steps(rest.drop_first()) + tail));
+                assert(rest_tail[0] == join_kws(rest[0].join_type)[0]);
+            }
+        }
+        lemma_sparse_step_sprint(steps[0], rest_tail, fuel);
+        lemma_sparse_steps_sprint(rest, tail, (fuel - 1) as nat);
+        assert(seq![steps[0]] + rest =~= steps);
+        assert(sparse_steps(sprint_steps(steps) + tail, fuel) == (Some(steps), tail));
+    }
+}
+
+/// The FROM join-tree roundtrip.
+pub proof fn lemma_sparse_from_sprint(f: SFrom, tail: Seq<TokenView>, fuel: nat)
+    requires
+        printable_from(f),
+        fuel >= steps_depth(from_steps(f)),
+        from_tail_ok(tail),
+    ensures
+        sparse_from(sprint_from(f) + tail, fuel) == (Some(f), tail),
+{
+    sprint_decomp(f);
+    printable_from_decomp(f);
+    fold_decomp(f);
+    let steps = from_steps(f);
+    let head = from_head(f);
+    let head_tail = sprint_steps(steps) + tail;
+    assert(sprint_from(f) + tail =~= sprint_table(head) + head_tail);
+    // head_tail never starts with AS (join kw or from tail)
+    assert(head_tail.len() == 0 || head_tail[0] != TokenView::Keyword(Keyword::As)) by {
+        if steps.len() == 0 {
+            assert(head_tail =~= tail);
+        } else {
+            assert(head_tail =~= step_toks(steps[0]) + (sprint_steps(steps.drop_first()) + tail));
+            assert(head_tail[0] == join_kws(steps[0].join_type)[0]);
+        }
+    }
+    lemma_sparse_table_sprint(head, head_tail);
+    lemma_sparse_steps_sprint(steps, tail, fuel);
+}
+
 /// The canonical mirror statement printer roundtrips at self-supplied fuel.
 pub proof fn mirror_roundtrip_stmt(s: SStmt)
     requires printable_stmt(s),
