@@ -220,9 +220,13 @@ concatenation; `print_select_exec` then just `token_views_concat`s the two halve
 under one `reveal(sprint_select_body)`. Generalises recipe rule (1) from opaque
 *parsers* to *any* exec function that assembles many clauses.
 
-**Remaining for the parser cutover:** the join *types* in the FROM tree, and
-multi-assignment `Update` (the sorted-`iter()` bridge). Then the byte-cursor lexer
-(from scratch) and the ast-equivalence argument for the actual swap.
+**Remaining for the parser cutover:** multi-assignment `Update` (the sorted-`iter()`
+bridge over `Map` equality). NOTE: the FROM-tree join *types* are already DONE — all
+four (`Cross`/`Inner`/`Left`/`Right`, `join_kws` + `join_type_of`) roundtrip mirror +
+exec (`sparse_step`/`parse_step_exec`, Cross⟹no predicate else `ON e`), landed with
+the S3/S5 join-tree work. So the whole `SELECT` grammar (clauses + FROM joins) and
+CreateTable/Insert/Delete are complete; only multi-`Update` grammar is left. Then the
+real gates: the byte-cursor lexer (from scratch) and the ast-equivalence argument.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
