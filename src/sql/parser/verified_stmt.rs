@@ -6653,6 +6653,120 @@ pub fn update_set_roundtrip_exec(
     }
 }
 
+/// Full multi-assignment statement roundtrip for `UPDATE table SET <assignments>
+/// WHERE e`. Extends `update_set_roundtrip_exec` with the trailing `WHERE` clause:
+/// the set-list parses up to the `WHERE` keyword (a boundary, not a comma), then the
+/// predicate expression roundtrips via `parse_expr_exec` / `lemma_sparse_sprint`.
+#[verifier::rlimit(60000)]
+pub fn update_set_where_roundtrip_exec(
+    table: &String,
+    set: &std::collections::BTreeMap<String, Option<ast::Expression>>,
+    e: &ast::Expression,
+) -> (r: (String, std::collections::BTreeMap<String, Option<ast::Expression>>, ast::Expression))
+    requires
+        set@.dom().len() >= 1,
+        forall|k: String| #[trigger] set@.dom().contains(k) ==> (match set@[k] {
+            Some( v) => printable_se(view_expr(v)),
+            None => true,
+        }),
+        printable_se(view_expr(*e)),
+    ensures
+        r.0 == *table,
+        view_map(r.1@) == view_map(set@),
+        view_expr(r.2) == view_expr(*e),
+{
+    reveal_with_fuel(token_views, 4);
+    let mut toks: Vec<super::Token> = Vec::new();
+    toks.push(super::Token::Keyword(Keyword::Update));
+    toks.push(super::Token::Ident(table.clone()));
+    toks.push(super::Token::Keyword(Keyword::Set));
+    let ghost prefix = toks@;
+    proof {
+        assert(token_views(prefix) =~= seq![
+            TokenView::Keyword(Keyword::Update),
+            TokenView::Ident(*table),
+            TokenView::Keyword(Keyword::Set),
+        ]);
+    }
+    let (mut sl, s_ghost) = print_set_map_exec(set);
+    let ghost s = s_ghost@;
+    let ghost slo = sl@;
+    toks.append(&mut sl);
+    let ghost after_set = toks@;
+    toks.push(super::Token::Keyword(Keyword::Where));
+    let ghost wk = toks@;
+    let mut eb = print_expr_exec(e);
+    let ghost ebo = eb@;
+    toks.append(&mut eb);
+    let ghost wherepart = seq![TokenView::Keyword(Keyword::Where)] + sprint(view_expr(*e));
+    let ghost tail3 = seq![super::Token::Keyword(Keyword::Where)] + ebo;
+    proof {
+        assert(after_set =~= prefix + slo);
+        assert(wk =~= after_set + seq![super::Token::Keyword(Keyword::Where)]);
+        assert(toks@ =~= wk + ebo);
+        // subrange(3) == slo ++ [Where] ++ ebo
+        assert(toks@.subrange(3, toks@.len() as int) =~= slo + tail3);
+        token_views_concat(slo, tail3);
+        token_views_concat(seq![super::Token::Keyword(Keyword::Where)], ebo);
+        assert(token_views(seq![super::Token::Keyword(Keyword::Where)])
+            =~= seq![TokenView::Keyword(Keyword::Where)]);
+        assert(token_views(tail3) =~= wherepart);
+        assert(token_views(toks@.subrange(3, toks@.len() as int))
+            =~= sprint_set_list(s) + wherepart);
+    }
+    let fuel = toks.len();
+    proof {
+        token_views_len(toks@);
+        token_views_len(slo);
+        set_list_depth_le_len_ne(s);
+        super::verified_roundtrip::sdepth_le_len(view_expr(*e));
+        assert(fuel as nat >= set_list_depth(s));
+        assert(wherepart.len() == 0 || (wherepart[0] != TokenView::Comma
+            && wherepart[0] != TokenView::Period && wherepart[0] != TokenView::OpenParen));
+        lemma_sparse_set_list_sprint(s, wherepart, fuel as nat);
+        assert(sparse_set_list(sprint_set_list(s) + wherepart, fuel as nat) == (Some(s), wherepart));
+    }
+    let (mopt, p) = parse_set_map_exec(&toks, 3, fuel);
+    match mopt {
+        Some(mm) => {
+            proof {
+                assert(view_map(mm@) == seq_to_map(s));
+                assert(seq_to_map(s) == view_map(set@));
+                // srest == wherepart == token_views(subrange(p))
+                token_views_len(toks@.subrange(p as int, toks@.len() as int));
+                token_views_suffix(toks@, p as int);
+                assert(token_views(toks@.subrange(p as int, toks@.len() as int)) == wherepart);
+                assert(wherepart[0] == TokenView::Keyword(Keyword::Where));
+                assert(toks@[p as int] == super::Token::Keyword(Keyword::Where));
+                assert(p < toks@.len());
+                assert(token_views(toks@.subrange(p as int + 1, toks@.len() as int))
+                    == sprint(view_expr(*e)));
+                // Establish the expr roundtrip BEFORE parse_expr so its None arm is dead.
+                assert(boundary(Seq::<TokenView>::empty()));
+                lemma_sparse_sprint(view_expr(*e), Seq::<TokenView>::empty(), fuel as nat);
+                assert(sprint(view_expr(*e)) + Seq::<TokenView>::empty()
+                    =~= sprint(view_expr(*e)));
+                assert(sparse(sprint(view_expr(*e)), fuel as nat)
+                    == (Some(view_expr(*e)), Seq::<TokenView>::empty()));
+            }
+            let (eopt, ep) = parse_expr_exec(&toks, p + 1, fuel);
+            match eopt {
+                Some(ee) => {
+                    (table.clone(), mm, ee)
+                },
+                None => {
+                    proof { assert(false); }
+                    (table.clone(), mm, ast::Expression::All)
+                },
+            }
+        },
+        None => {
+            proof { assert(false); }
+            (table.clone(), std::collections::BTreeMap::new(), ast::Expression::All)
+        },
+    }
+}
+
 /// Executable parser for a single-assignment `UPDATE`, refining `sparse_update`.
 /// A trailing comma (multi-assignment) is outside `view_stmt`'s domain, so this
 /// returns `None` there (the relaxed `None` disjunct).
