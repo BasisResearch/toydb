@@ -27,6 +27,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }
 [package.metadata.verus]
 verify = true
 
+[lints.rust]
+# The Verus toolchain sets this cfg when verifying; ghost-only imports in
+# verified modules are gated on it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_keep_ghost)"] }
+
 [dependencies]
 # vstd is Verus's verified std. Published on crates.io; it compiles under a
 # normal `cargo build` (the `verus!` macro erases ghost code), so keeping it a

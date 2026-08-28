@@ -7,8 +7,12 @@ use itertools::Itertools as _;
 use log::{debug, info};
 use rand::RngExt as _;
 
+use vstd::prelude::Ghost;
+
 use super::log::{Index, Log};
 use super::message::{Envelope, Message, ReadSequence, Request, RequestID, Response, Status};
+use super::refine;
+use super::safety;
 use super::state::State;
 use super::{ELECTION_TIMEOUT_RANGE, HEARTBEAT_INTERVAL, MAX_APPEND_ENTRIES};
 use crate::errinput;
@@ -172,6 +176,15 @@ pub struct RawNode<R: Role> {
     tx: Sender<Envelope>,
     /// Node options.
     opts: Options,
+    /// Ghost (zero-sized, proof-only): this node's abstract state in the
+    /// verified safety model, threaded through the verified step cores in
+    /// `raft::refine`. Every safety-relevant state change routes through a
+    /// core whose postcondition proves the change is a model transition.
+    habs: Ghost<safety::MHost>,
+    /// Ghost (zero-sized, proof-only): abstract counterparts of messages this
+    /// node has received or sent, trusted to be in the model's message
+    /// history (network non-forgery; see `raft::refine`).
+    evid: Ghost<vstd::set::Set<safety::Msg>>,
     /// Role-specific state.
     role: R,
 }
@@ -186,8 +199,23 @@ impl<R: Role> RawNode<R> {
             state: self.state,
             tx: self.tx,
             opts: self.opts,
+            habs: self.habs,
+            evid: self.evid,
             role,
         }
+    }
+
+    /// The refinement layer's index for a cluster member: its rank in the
+    /// (agreed) member set. The safety model numbers hosts 0..n; ranks are
+    /// consistent across nodes because the member set is (trusted assumption
+    /// 4 in `raft::refine`).
+    fn rank(&self, id: NodeID) -> u8 {
+        self.peers.iter().chain([&self.id]).filter(|p| **p < id).count() as u8
+    }
+
+    /// The cluster size for the refinement layer.
+    fn size(&self) -> u8 {
+        self.cluster_size() as u8
     }
 
     /// Returns the node's current term.
@@ -277,7 +305,15 @@ impl RawNode<Follower> {
             return errinput!("node ID {id} can't be in peers");
         }
         let role = Follower::new(None, 0);
-        let mut node = Self { id, peers, log, state, tx, opts, role };
+        // Recover the ghost abstract state from durable storage (trusted
+        // storage integrity; covers both fresh starts and crash-restarts,
+        // the model's t_restart).
+        let (term, vote) = log.get_term_vote();
+        let (last_index, last_term) = log.get_last_index();
+        let (commit_index, _) = log.get_commit_index();
+        let habs = refine::recover_abs(term, vote, last_index, last_term, commit_index);
+        let evid = refine::empty_evidence();
+        let mut node = Self { id, peers, log, state, tx, opts, habs, evid, role };
         node.role.election_timeout = node.random_election_timeout();
 
         // Apply any pending entries following restart. State machine writes are
@@ -331,6 +367,14 @@ impl RawNode<Follower> {
             // We'll find out if we step a message from it.
             assert_ne!(term, self.term(), "can't become leaderless follower in current term");
             info!("Discovered new term {term}");
+            // Verified: this step is the model's t_bump_term transition.
+            self.habs = refine::core_bump_term(
+                self.habs,
+                self.rank(self.id),
+                self.size(),
+                self.term(),
+                term,
+            );
             self.log.set_term_vote(term, None)?;
             self.role = Follower::new(None, self.random_election_timeout());
         }
@@ -371,6 +415,23 @@ impl RawNode<Follower> {
                 // and respond to the heartbeat. last_index always has the
                 // leader's term, since it only appends entries in its term.
                 let match_index = if self.log.has(last_index, msg.term)? { last_index } else { 0 };
+                // Verified: a match is the model's t_send_ack transition, and
+                // echoing the read sequence number is t_confirm_read.
+                refine::core_send_ack(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    msg.term,
+                    last_index,
+                    match_index != 0,
+                );
+                refine::core_confirm_read(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    msg.term,
+                    read_seq,
+                );
                 self.send(msg.from, Message::HeartbeatResponse { match_index, read_seq })?;
 
                 // Advance the commit index and apply entries. We can only do
@@ -378,6 +439,23 @@ impl RawNode<Follower> {
                 // that the logs are identical up to match_index. This also
                 // implies that the commit_index is present in our log.
                 if match_index != 0 && commit_index > self.log.get_commit_index().0 {
+                    // Verified: the advance is the model's t_recv_commit
+                    // transition, justified by the heartbeat's ghost commit
+                    // record (trusted network evidence).
+                    let rec = refine::recv_commit_evidence();
+                    let habs = refine::core_recv_commit(
+                        self.habs,
+                        self.rank(self.id),
+                        self.size(),
+                        msg.term,
+                        commit_index,
+                        last_index,
+                        match_index != 0,
+                        self.log.get_commit_index().0,
+                        rec,
+                    )
+                    .expect("commit advance without verified transition");
+                    self.habs = habs;
                     self.log.commit(commit_index)?;
                     self.maybe_apply()?;
                 }
@@ -396,16 +474,40 @@ impl RawNode<Follower> {
                 }
 
                 // If the base entry matches our log, append the entries.
-                if base_index == 0 || self.log.has(base_index, base_term)? {
-                    let match_index = entries.last().map(|e| e.index).unwrap_or(base_index);
-                    self.log.splice(entries)?;
-                    self.send(msg.from, Message::AppendResponse { match_index, reject_index: 0 })?;
-                } else {
-                    // Otherwise, reject the base index. If the local log is
-                    // shorter than the base index, lower the reject index to
-                    // skip all missing entries.
-                    let reject_index = min(base_index, self.log.get_last_index().0 + 1);
-                    self.send(msg.from, Message::AppendResponse { reject_index, match_index: 0 })?;
+                // Verified: the base check, splice result, and ack index are
+                // the model's t_recv_append transition (the splice transition
+                // logic itself is verified in raft::log).
+                let base_ok = base_index == 0 || self.log.has(base_index, base_term)?;
+                let aentries = refine::recv_append_view(entries.len());
+                match refine::core_recv_append(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    msg.term,
+                    base_index,
+                    base_term,
+                    entries.len(),
+                    aentries,
+                    base_ok,
+                ) {
+                    Some((match_index, habs)) => {
+                        self.log.splice(entries)?;
+                        self.habs = habs;
+                        self.send(
+                            msg.from,
+                            Message::AppendResponse { match_index, reject_index: 0 },
+                        )?;
+                    }
+                    None => {
+                        // Otherwise, reject the base index. If the local log is
+                        // shorter than the base index, lower the reject index to
+                        // skip all missing entries.
+                        let reject_index = min(base_index, self.log.get_last_index().0 + 1);
+                        self.send(
+                            msg.from,
+                            Message::AppendResponse { reject_index, match_index: 0 },
+                        )?;
+                    }
                 }
             }
 
@@ -417,35 +519,55 @@ impl RawNode<Follower> {
                     None => self = self.into_follower(msg.term, Some(msg.from))?,
                 }
 
-                // Confirm the read.
+                // Confirm the read. Verified: the model's t_confirm_read.
+                refine::core_confirm_read(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    msg.term,
+                    seq,
+                );
                 self.send(msg.from, Message::ReadResponse { seq })?;
             }
 
-            // A candidate is requesting our vote. We only grant one per term.
+            // A candidate is requesting our vote. We only grant one per term:
+            // we can't vote if we already voted for someone else this term
+            // (repeating a vote for the same node is fine), and we only vote
+            // if the candidate's log is at least as up-to-date as ours — at
+            // least one node in any quorum must have all committed entries,
+            // and this ensures we'll only elect a leader that has all
+            // committed entries. See section 5.4.1 in the Raft paper.
+            // Verified: both checks and the resulting term/vote update are
+            // the model's t_grant transition (core_grant).
             Message::Campaign { last_index, last_term } => {
-                // Don't vote if we already voted for someone else in this term.
-                // We can repeat our vote for the same node though.
-                if let (_, Some(vote)) = self.log.get_term_vote()
-                    && msg.from != vote
-                {
-                    self.send(msg.from, Message::CampaignResponse { vote: false })?;
-                    return Ok(self.into());
-                }
-
-                // Only vote if the candidate's log is at least as long as ours.
-                // At least one node in any quorum must have all committed
-                // entries, and this ensures we'll only elect a leader that has
-                // all committed entries. See section 5.4.1 in the Raft paper.
+                let (term, vote) = self.log.get_term_vote();
                 let (log_index, log_term) = self.log.get_last_index();
-                if log_term > last_term || log_term == last_term && log_index > last_index {
-                    self.send(msg.from, Message::CampaignResponse { vote: false })?;
-                    return Ok(self.into());
+                let clog = refine::recv_campaign_view(last_index, last_term);
+                match refine::core_grant(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    term,
+                    vote.map(|v| self.rank(v)),
+                    log_index,
+                    log_term,
+                    self.rank(msg.from),
+                    last_index,
+                    last_term,
+                    clog,
+                ) {
+                    Some(habs) => {
+                        // Grant the vote.
+                        info!("Voting for {} in term {} election", msg.from, msg.term);
+                        self.log.set_term_vote(msg.term, Some(msg.from))?;
+                        self.habs = habs;
+                        self.send(msg.from, Message::CampaignResponse { vote: true })?;
+                    }
+                    None => {
+                        self.send(msg.from, Message::CampaignResponse { vote: false })?;
+                        return Ok(self.into());
+                    }
                 }
-
-                // Grant the vote.
-                info!("Voting for {} in term {} election", msg.from, msg.term);
-                self.log.set_term_vote(msg.term, Some(msg.from))?;
-                self.send(msg.from, Message::CampaignResponse { vote: true })?;
             }
 
             // Forward client requests to the leader, or abort them if there is
@@ -549,12 +671,22 @@ impl RawNode<Candidate> {
             // We lost the election, follow the winner.
             assert_eq!(term, self.term(), "can't follow leader in different term");
             info!("Lost election, following leader {leader} in term {term}");
+            // Verified: this step is the model's t_step_down transition.
+            self.habs = refine::core_step_down(self.habs, self.rank(self.id), self.size());
             Ok(self.into_role(Follower::new(Some(leader), election_timeout)))
         } else {
             // We found a new term, but we don't necessarily know who the leader
             // is yet. We'll find out when we step a message from it.
             assert_ne!(term, self.term(), "can't become leaderless follower in current term");
             info!("Discovered new term {term}");
+            // Verified: this step is the model's t_bump_term transition.
+            self.habs = refine::core_bump_term(
+                self.habs,
+                self.rank(self.id),
+                self.size(),
+                self.term(),
+                term,
+            );
             self.log.set_term_vote(term, None)?;
             Ok(self.into_role(Follower::new(None, election_timeout)))
         }
@@ -566,16 +698,37 @@ impl RawNode<Candidate> {
         assert_ne!(term, 0, "leaders can't have term 0");
         assert_eq!(vote, Some(self.id), "leader did not vote for self");
 
+        // Verified: winning is the model's t_become_leader transition — the
+        // quorum arithmetic is checked by the core, and the transition
+        // includes the noop entry appended below (section 5.4.2). The votes
+        // recorded in the ghost state carry the network evidence.
+        let habs = refine::core_become_leader(
+            self.habs,
+            self.rank(self.id),
+            self.size(),
+            term,
+            self.role.votes.len(),
+        )
+        .expect("leadership without verified vote quorum");
+
         info!("Won election for term {term}, becoming leader");
         let peers = self.peers.clone();
         let (last_index, _) = self.log.get_last_index();
         let mut node = self.into_role(Leader::new(peers, last_index));
+        node.habs = habs;
 
-        // Propose an empty command when assuming leadership, to disambiguate
+        // Append an empty command when assuming leadership, to disambiguate
         // previous entries in the log. See section 5.4.2 in the Raft paper.
         // We do this prior to the heartbeat, to avoid a wasted replication
         // roundtrip if the heartbeat response indicates the peer is behind.
-        node.propose(None)?;
+        // (Part of the t_become_leader step above, so appended directly
+        // rather than through propose's t_propose core.)
+        let index = node.log.append(None)?;
+        for peer in node.peers.iter().copied().sorted() {
+            if index == node.progress(peer).next_index {
+                node.maybe_send_append(peer, false)?;
+            }
+        }
         node.maybe_commit_and_apply()?;
         node.heartbeat()?;
 
@@ -597,8 +750,19 @@ impl RawNode<Candidate> {
 
         match msg.message {
             // If we received a vote, record it. If the vote gives us quorum,
-            // assume leadership.
+            // assume leadership. Verified: recording the vote is the model's
+            // t_collect_vote transition, with the voter's grant-time log as
+            // ghost network evidence.
             Message::CampaignResponse { vote: true } => {
+                let vlog = refine::recv_vote_view();
+                self.habs = refine::core_collect_vote(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    self.term(),
+                    self.rank(msg.from),
+                    vlog,
+                );
                 self.role.votes.insert(msg.from);
                 if self.role.votes.len() >= self.quorum_size() {
                     return Ok(self.into_leader()?.into());
@@ -645,13 +809,17 @@ impl RawNode<Candidate> {
     }
 
     /// Hold a new election by increasing the term, voting for ourself, and
-    /// soliciting votes from all peers.
+    /// soliciting votes from all peers. Verified: the model's t_campaign
+    /// transition (core_campaign), which also emits the ghost Campaign
+    /// message carrying our log view and our implicit self-vote.
     fn campaign(&mut self) -> Result<()> {
-        let term = self.term() + 1;
+        let (term, habs) =
+            refine::core_campaign(self.habs, self.rank(self.id), self.size(), self.term());
         info!("Starting new election for term {term}");
         self.role = Candidate::new(self.random_election_timeout());
         self.role.votes.insert(self.id); // vote for ourself
         self.log.set_term_vote(term, Some(self.id))?;
+        self.habs = habs;
 
         let (last_index, last_term) = self.log.get_last_index();
         self.broadcast(Message::Campaign { last_index, last_term })
@@ -788,6 +956,9 @@ impl RawNode<Leader> {
             self.send(read.from, Message::ClientResponse { id: read.id, response })?;
         }
 
+        // Verified: this step is the model's t_bump_term transition.
+        self.habs =
+            refine::core_bump_term(self.habs, self.rank(self.id), self.size(), self.term(), term);
         self.log.set_term_vote(term, None)?;
         let election_timeout = self.random_election_timeout();
         Ok(self.into_role(Follower::new(None, election_timeout)))
@@ -813,6 +984,22 @@ impl RawNode<Leader> {
                 let (last_index, _) = self.log.get_last_index();
                 assert!(match_index <= last_index, "future match index");
                 assert!(read_seq <= self.role.read_seq, "future read sequence number");
+
+                // Ghost evidence: the response's abstract ack and read
+                // confirmation are in the model's history (trusted network
+                // non-forgery; they back later commit/read quorums).
+                if match_index > 0 {
+                    self.evid =
+                        refine::note_ack(self.evid, self.rank(msg.from), msg.term, match_index);
+                }
+                if read_seq > 0 {
+                    self.evid = refine::note_read_confirm(
+                        self.evid,
+                        self.rank(msg.from),
+                        msg.term,
+                        read_seq,
+                    );
+                }
 
                 // If the read sequence number advances, try to execute reads.
                 if self.progress(msg.from).advance_read(read_seq) {
@@ -847,6 +1034,9 @@ impl RawNode<Leader> {
                 let (last_index, _) = self.log.get_last_index();
                 assert!(match_index <= last_index, "future match index");
 
+                // Ghost evidence: the follower's abstract ack (see above).
+                self.evid = refine::note_ack(self.evid, self.rank(msg.from), msg.term, match_index);
+
                 if self.progress(msg.from).advance(match_index) {
                     self.maybe_commit_and_apply()?;
                 }
@@ -860,6 +1050,11 @@ impl RawNode<Leader> {
             // A follower confirmed our read sequence number. If it advances,
             // try to execute reads.
             Message::ReadResponse { seq } => {
+                // Ghost evidence: the follower's abstract read confirmation.
+                if seq > 0 {
+                    self.evid =
+                        refine::note_read_confirm(self.evid, self.rank(msg.from), msg.term, seq);
+                }
                 if self.progress(msg.from).advance_read(seq) {
                     self.maybe_read()?;
                 }
@@ -905,12 +1100,24 @@ impl RawNode<Leader> {
 
             // A client submitted a read request. To ensure linearizability, we
             // must confirm that we are still the leader by sending the read's
-            // sequence number and wait for quorum confirmation.
+            // sequence number and wait for quorum confirmation. Verified: the
+            // model's t_submit_read transition, which also records the read
+            // and our own confirmation in the ghost history.
             Message::ClientRequest { id, request: Request::Read(command) } => {
-                self.role.read_seq += 1;
-                let read = Read { seq: self.role.read_seq, from: msg.from, id, command };
+                let (seq, habs) = refine::core_submit_read(
+                    self.habs,
+                    self.rank(self.id),
+                    self.size(),
+                    self.term(),
+                    self.role.read_seq,
+                );
+                self.role.read_seq = seq;
+                self.habs = habs;
+                self.evid =
+                    refine::note_read_confirm(self.evid, self.rank(self.id), self.term(), seq);
+                let read = Read { seq, from: msg.from, id, command };
                 self.role.reads.push_back(read);
-                self.broadcast(Message::Read { seq: self.role.read_seq })?;
+                self.broadcast(Message::Read { seq })?;
                 if self.cluster_size() == 1 {
                     self.maybe_read()?;
                 }
@@ -959,14 +1166,27 @@ impl RawNode<Leader> {
         let read_seq = self.role.read_seq;
         assert_eq!(last_term, self.term(), "leader's last_term not in current term");
 
+        // Verified: re-announcing the commit index is the model's
+        // t_send_commit transition, carrying our ghost commit witness.
+        refine::core_send_commit(
+            self.habs,
+            self.rank(self.id),
+            self.size(),
+            self.term(),
+            commit_index,
+        );
         self.role.since_heartbeat = 0;
         self.broadcast(Message::Heartbeat { last_index, commit_index, read_seq })
     }
 
     /// Proposes a command for consensus by appending it to our log and
     /// replicating it to peers. If successful, it will eventually be committed
-    /// and applied to the state machine.
+    /// and applied to the state machine. Verified: the model's t_propose
+    /// transition (core_propose).
     fn propose(&mut self, command: Option<Vec<u8>>) -> Result<Index> {
+        let cmd = refine::cmd_ghost(&command);
+        self.habs =
+            refine::core_propose(self.habs, self.rank(self.id), self.size(), self.term(), cmd);
         let index = self.log.append(command)?;
         for peer in self.peers.iter().copied().sorted() {
             // Eagerly send the entry to the peer if it's in steady state and
@@ -998,11 +1218,50 @@ impl RawNode<Leader> {
 
         // We can only safely commit an entry from our own term (see section
         // 5.4.2 in Raft paper).
-        match self.log.get(commit_index)? {
-            Some(entry) if entry.term == self.term() => {}
-            Some(_) => return Ok(old_index),
+        let ci_term_ok = match self.log.get(commit_index)? {
+            Some(entry) => entry.term == self.term(),
             None => panic!("commit index {commit_index} missing"),
+        };
+        if !ci_term_ok {
+            return Ok(old_index);
         }
+
+        // Verified: counting our own last entry is the model's t_send_ack
+        // (its term is ours), and the commit is t_leader_commit — the core
+        // re-validates that a strict majority's acked match indexes reach
+        // commit_index and that the entry there is from our own term, backed
+        // by the accumulated ack evidence.
+        refine::core_send_ack(
+            self.habs,
+            self.rank(self.id),
+            self.size(),
+            self.term(),
+            last_index,
+            true,
+        );
+        self.evid = refine::note_ack(self.evid, self.rank(self.id), self.term(), last_index);
+        let members: Vec<(NodeID, Index)> = self
+            .role
+            .progress
+            .iter()
+            .map(|(id, p)| (*id, p.match_index))
+            .chain([(self.id, last_index)])
+            .collect();
+        let members: Vec<(u8, u64)> =
+            members.into_iter().map(|(id, m)| (self.rank(id), m)).collect();
+        let habs = refine::core_leader_commit(
+            self.habs,
+            self.rank(self.id),
+            self.size(),
+            self.term(),
+            commit_index,
+            old_index,
+            ci_term_ok,
+            &members,
+            self.evid,
+        )
+        .expect("commit without verified quorum");
+        self.habs = habs;
 
         // Commit entries.
         self.log.commit(commit_index)?;
@@ -1056,6 +1315,33 @@ impl RawNode<Leader> {
         // can keep pulling until we hit quorum_read_seq.
         while let Some(read) = self.role.reads.front() {
             if read.seq > quorum_read_seq {
+                break;
+            }
+            // Verified gate: a strict majority has confirmed this read's
+            // sequence number (backed by confirmation evidence) and our
+            // committed tail is from our own term. By the model's
+            // thm_read_linearizable, the read then reflects every write that
+            // was committed anywhere in the cluster when it was submitted.
+            let confirms: Vec<(NodeID, ReadSequence)> = self
+                .role
+                .progress
+                .iter()
+                .map(|(id, p)| (*id, p.read_seq))
+                .chain([(self.id, self.role.read_seq)])
+                .collect();
+            let confirms: Vec<(u8, u64)> =
+                confirms.into_iter().map(|(id, s)| (self.rank(id), s)).collect();
+            if !refine::core_can_serve(
+                self.habs,
+                self.rank(self.id),
+                self.size(),
+                self.term(),
+                read.seq,
+                commit_index,
+                commit_term == self.term(),
+                &confirms,
+                self.evid,
+            ) {
                 break;
             }
             let read = self.role.reads.pop_front().unwrap();
@@ -1123,6 +1409,16 @@ impl RawNode<Leader> {
             progress.next_index = last.index + 1;
         }
 
+        // Verified: sending this window of our log is the model's
+        // t_send_append transition.
+        refine::core_send_append(
+            self.habs,
+            self.rank(self.id),
+            self.size(),
+            self.term(),
+            base_index,
+            base_index + entries.len() as u64,
+        );
         debug!("Replicating {} entries with base {base_index} to {peer}", entries.len());
         self.send(peer, Message::Append { base_index, base_term, entries })
     }
@@ -1662,7 +1958,23 @@ mod tests {
                 let Some(Node::Follower(node)) = self.nodes.remove(&id) else {
                     return Err(format!("invalid leader {id}").into());
                 };
-                self.nodes.insert(id, node.into_candidate()?.into_leader()?.into());
+                // Record every peer's (implicit) vote, as the real election
+                // path would, so the verified quorum check in into_leader is
+                // satisfied.
+                let mut node = node.into_candidate()?;
+                for peer in node.peers.iter().copied().sorted() {
+                    let vlog = refine::recv_vote_view();
+                    node.habs = refine::core_collect_vote(
+                        node.habs,
+                        node.rank(node.id),
+                        node.size(),
+                        node.term(),
+                        node.rank(peer),
+                        vlog,
+                    );
+                    node.role.votes.insert(peer);
+                }
+                self.nodes.insert(id, node.into_leader()?.into());
                 self.receive(id, quiet)?;
                 self.stabilize(&self.ids.clone(), true, quiet)?;
             }

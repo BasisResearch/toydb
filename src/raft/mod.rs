@@ -247,6 +247,10 @@ mod node;
 // declares are ghost bookkeeping, hence the dead_code allowance).
 #[allow(dead_code)]
 mod safety;
+// The node-local refinement layer: verified step cores proving that the step
+// functions implement the safety model's transitions. Called from `node`.
+#[allow(dead_code, unused_variables)]
+mod refine;
 mod state;
 
 use std::ops::Range;

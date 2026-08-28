@@ -61,15 +61,19 @@
 //!
 //! # Trust boundary
 //!
-//! This is a **model-only** proof, in the spirit of protocol-level
-//! verification (TLA+, Verdi, IronFleet's protocol layer): the connection
-//! between the model transitions and `node.rs` is by inspection of the
-//! documented correspondence, not by machine-checked refinement of the
-//! executable code. Node-local state invariants of the log are separately
-//! verified in `raft::log`; a refinement proof connecting `RawNode` to this
-//! model (ironkv-style) is the natural next level and out of scope here.
+//! This module is the protocol-level proof (in the spirit of TLA+, Verdi,
+//! and IronFleet's protocol layer). The connection to the executable code
+//! has two machine-checked layers and a trusted rim:
+//!
+//! * `raft::refine` verifies that the step functions' decision logic and
+//!   state changes implement these model transitions (node-local
+//!   refinement via verified step cores), under the trusted assumptions
+//!   documented there (network non-forgery, storage integrity, the
+//!   mechanical shell in `node.rs`).
+//! * `raft::log` verifies the log's own state-transition invariants.
+//!
 //! Liveness (elections eventually succeed, requests eventually commit) is
-//! also out of scope — Raft's liveness is timing-dependent by design.
+//! out of scope — Raft's liveness is timing-dependent by design.
 //!
 //! # Proof structure
 //!
@@ -109,11 +113,11 @@ verus! {
 // Abstract state
 // ---------------------------------------------------------------------------
 
-/// An abstract log entry: the term it was proposed in, and an abstract command
-/// identifier (0 is the leader's election noop; see `Log::append(None)`).
+/// An abstract log entry: the term it was proposed in, and the command
+/// payload (None is the leader's election noop; see `Log::append(None)`).
 pub struct AEntry {
     pub term: nat,
-    pub cmd: nat,
+    pub cmd: Option<Seq<u8>>,
 }
 
 /// A node role, mirroring `Node::{Follower, Candidate, Leader}`.
@@ -570,7 +574,7 @@ pub open spec fn t_collect_vote(pre: GState, post: GState, i: int, v: int, vlog:
 /// freezes the election evidence.
 pub open spec fn t_become_leader(pre: GState, post: GState, i: int) -> bool {
     let h = pre.hosts[i];
-    let newlog = h.log.push(AEntry { term: h.term, cmd: 0 });
+    let newlog = h.log.push(AEntry { term: h.term, cmd: None });
     &&& 0 <= i < pre.n
     &&& h.role is Candidate
     &&& is_quorum(pre.n, h.votes)
@@ -592,7 +596,7 @@ pub open spec fn t_become_leader(pre: GState, post: GState, i: int) -> bool {
 }
 
 /// `RawNode::<Leader>::propose`: append a client command to the leader's log.
-pub open spec fn t_propose(pre: GState, post: GState, i: int, cmd: nat) -> bool {
+pub open spec fn t_propose(pre: GState, post: GState, i: int, cmd: Option<Seq<u8>>) -> bool {
     let h = pre.hosts[i];
     let newlog = h.log.push(AEntry { term: h.term, cmd });
     &&& 0 <= i < pre.n
@@ -723,6 +727,40 @@ pub open spec fn t_recv_commit(pre: GState, post: GState, i: int, ci: nat, mi: n
     &&& unch_ghost(pre, post)
 }
 
+/// Discovering a higher term (`into_follower(term, None)` on any
+/// higher-term message, before the message itself is stepped): become a
+/// leaderless follower in the new term with a cleared vote. Modeled as a
+/// spontaneous step — it only removes power, so safety cannot depend on
+/// what prompted it — which also covers a crash between the term bump and
+/// the follow-up step.
+pub open spec fn t_bump_term(pre: GState, post: GState, i: int, t: nat) -> bool {
+    let h = pre.hosts[i];
+    &&& 0 <= i < pre.n
+    &&& t > h.term
+    &&& post.n == pre.n
+    &&& post.hosts == pre.hosts.update(i, MHost {
+        term: t,
+        vote: None,
+        role: MRole::Follower,
+        ..h
+    })
+    &&& post.net == pre.net
+    &&& unch_ghost(pre, post)
+}
+
+/// A candidate stepping down to follower in its own term
+/// (`Candidate::into_follower(term, Some(leader))` on discovering the
+/// election's winner). Only the volatile role changes.
+pub open spec fn t_step_down(pre: GState, post: GState, i: int) -> bool {
+    let h = pre.hosts[i];
+    &&& 0 <= i < pre.n
+    &&& h.role is Candidate
+    &&& post.n == pre.n
+    &&& post.hosts == pre.hosts.update(i, MHost { role: MRole::Follower, ..h })
+    &&& post.net == pre.net
+    &&& unch_ghost(pre, post)
+}
+
 /// A crash-restart (`Node::new` after restart): durable state (term, vote,
 /// log, commit) survives; volatile role state resets to follower.
 pub open spec fn t_restart(pre: GState, post: GState, i: int) -> bool {
@@ -786,13 +824,15 @@ pub enum TStep {
     Grant { v: int, c: int, term: nat, clog: Seq<AEntry> },
     CollectVote { i: int, v: int, vlog: Seq<AEntry> },
     BecomeLeader { i: int },
-    Propose { i: int, cmd: nat },
+    Propose { i: int, cmd: Option<Seq<u8>> },
     SendAppend { i: int, b: nat, e: nat },
     RecvAppend { i: int, term: nat, base: nat, bterm: nat, entries: Seq<AEntry> },
     SendAck { i: int, mi: nat },
     LeaderCommit { i: int, ci: nat, q: Map<int, nat> },
     SendCommit { i: int, ci: nat },
     RecvCommit { i: int, ci: nat, mi: nat, rec: CommitRec },
+    BumpTerm { i: int, term: nat },
+    StepDown { i: int },
     Restart { i: int },
     SubmitRead { i: int },
     ConfirmRead { i: int, term: nat, seq: nat },
@@ -812,6 +852,8 @@ pub open spec fn next_step(pre: GState, post: GState, step: TStep) -> bool {
         TStep::LeaderCommit { i, ci, q } => t_leader_commit(pre, post, i, ci, q),
         TStep::SendCommit { i, ci } => t_send_commit(pre, post, i, ci),
         TStep::RecvCommit { i, ci, mi, rec } => t_recv_commit(pre, post, i, ci, mi, rec),
+        TStep::BumpTerm { i, term } => t_bump_term(pre, post, i, term),
+        TStep::StepDown { i } => t_step_down(pre, post, i),
         TStep::Restart { i } => t_restart(pre, post, i),
         TStep::SubmitRead { i } => t_submit_read(pre, post, i),
         TStep::ConfirmRead { i, term, seq } => t_confirm_read(pre, post, i, term, seq),
@@ -1936,7 +1978,7 @@ proof fn become_leader_preserves(pre: GState, post: GState, i: int)
 {
     let h = pre.hosts[i];
     let u = h.term;
-    let newlog = h.log.push(AEntry { term: u, cmd: 0 });
+    let newlog = h.log.push(AEntry { term: u, cmd: None });
     lemma_election_fresh(pre, i);
     assert(host_ok(pre, i));
     let m1 = pre.leader_log;
@@ -2238,7 +2280,7 @@ proof fn become_leader_preserves(pre: GState, post: GState, i: int)
     }
 }
 
-proof fn propose_preserves(pre: GState, post: GState, i: int, cmd: nat)
+proof fn propose_preserves(pre: GState, post: GState, i: int, cmd: Option<Seq<u8>>)
     requires inv(pre), t_propose(pre, post, i, cmd),
     ensures inv(post),
 {
@@ -3286,6 +3328,153 @@ proof fn recv_commit_preserves(pre: GState, post: GState, i: int, ci: nat, mi: n
     }
 }
 
+proof fn bump_term_preserves(pre: GState, post: GState, i: int, t: nat)
+    requires inv(pre), t_bump_term(pre, post, i, t),
+    ensures inv(post),
+{
+    let h = pre.hosts[i];
+    assert(host_ok(pre, i));
+    assert forall|j: int| 0 <= j < post.n implies #[trigger] host_ok(post, j) by {
+        assert(host_ok(pre, j));
+    }
+    assert(inv_msgs(post)) by {
+        assert forall|c: int, t2: nat, clog: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Campaign { c, term: t2, clog }) implies campaign_msg_ok(post, c, t2, clog) by {
+            assert(campaign_msg_ok(pre, c, t2, clog));
+        }
+        assert forall|v: int, c: int, t2: nat, vlog: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Vote { v, c, term: t2, vlog }) implies vote_msg_ok(post, v, c, t2, vlog) by {
+            assert(vote_msg_ok(pre, v, c, t2, vlog));
+            if v == i && post.hosts[i].term == t2 {
+                // The bump moved i's term strictly above every voted term.
+                assert(pre.hosts[i].term >= t2);
+                assert(false);
+            }
+        }
+        assert forall|t2: nat, b2: nat, bt2: nat, entries2: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Append { term: t2, base: b2, bterm: bt2, entries: entries2 }) implies append_msg_ok(post, t2, b2, bt2, entries2) by {
+            assert(append_msg_ok(pre, t2, b2, bt2, entries2));
+        }
+        assert forall|v: int, t2: nat, mi2: nat|
+            #[trigger] post.net.contains(Msg::Ack { v, term: t2, mi: mi2 }) implies ack_msg_ok(post, v, t2, mi2) by {
+            assert(ack_msg_ok(pre, v, t2, mi2));
+            if v == i && post.hosts[i].term == t2 {
+                assert(pre.hosts[i].term >= t2);
+                assert(false);
+            }
+        }
+    }
+    assert forall|u2: nat| #[trigger] post.leader_log.dom().contains(u2) implies lterm_ok(post, u2) by {
+        assert(lterm_ok(pre, u2));
+    }
+
+    // Persistence: i's term grew, widening its compliance ranges; no new
+    // messages, and its log is unchanged.
+    assert forall|v2: int, t0: nat, mi: nat|
+        #[trigger] post.net.contains(Msg::Ack { v: v2, term: t0, mi }) implies ack_persist_ok(post, v2, t0, mi) by {
+        assert(pre.net.contains(Msg::Ack { v: v2, term: t0, mi }));
+        assert(ack_persist_ok(pre, v2, t0, mi));
+        if v2 == i {
+            assert forall|i2: nat| i2 <= mi
+                && #[trigger] mid_compliant(post.leader_log, t0, (post.hosts[v2].term + 1) as nat, i2)
+                implies prefix_eq(post.hosts[v2].log, post.leader_log[t0], i2) by {
+                lemma_mid_narrow(pre.leader_log, t0, (pre.hosts[i].term + 1) as nat, (t + 1) as nat, i2);
+                assert(prefix_eq(pre.hosts[i].log, pre.leader_log[t0], i2));
+            }
+        }
+    }
+    assert forall|v2: int, c2: int, u2: nat, vlog2: Seq<AEntry>, t0: nat, mi: nat|
+        #[trigger] post.net.contains(Msg::Vote { v: v2, c: c2, term: u2, vlog: vlog2 })
+        && #[trigger] post.net.contains(Msg::Ack { v: v2, term: t0, mi })
+        && t0 < u2 implies vote_persist_ok(post, u2, vlog2, t0, mi) by {
+        assert(pre.net.contains(Msg::Vote { v: v2, c: c2, term: u2, vlog: vlog2 }));
+        assert(pre.net.contains(Msg::Ack { v: v2, term: t0, mi }));
+        assert(vote_persist_ok(pre, u2, vlog2, t0, mi));
+    }
+
+    // Commit families: framed; host i's term only grows.
+    assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
+        assert(host_commit_ok(pre, j2));
+        if pre.hosts[j2].commit > 0 {
+            assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+    }
+    assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
+        assert(commit_rec_ok(pre, rec));
+    }
+    assert forall|t9: nat, ci9: nat, rec: CommitRec|
+        #[trigger] post.net.contains(Msg::Commit { term: t9, ci: ci9, rec }) implies commit_msg_ok(post, t9, ci9, rec) by {
+        assert(pre.net.contains(Msg::Commit { term: t9, ci: ci9, rec }));
+        assert(commit_msg_ok(pre, t9, ci9, rec));
+    }
+    assert forall|rec: CommitRec, u9: nat|
+        #[trigger] post.commits.contains(rec) && #[trigger] post.leader_log.dom().contains(u9) && u9 > rec.term
+        implies prefix_eq(post.leader_log[u9], post.leader_log[rec.term], rec.ci) by {
+        assert(pre.commits.contains(rec) && pre.leader_log.dom().contains(u9));
+        assert(prefix_eq(pre.leader_log[u9], pre.leader_log[rec.term], rec.ci));
+    }
+    assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_leader_ok(post, rec) by {
+        assert(commit_rec_ok(pre, rec));
+        assert(lterm_ok(pre, rec.term));
+        assert(commit_leader_ok(pre, rec));
+    }
+}
+
+proof fn step_down_preserves(pre: GState, post: GState, i: int)
+    requires inv(pre), t_step_down(pre, post, i),
+    ensures inv(post),
+{
+    assert forall|j: int| 0 <= j < post.n implies #[trigger] host_ok(post, j) by {
+        assert(host_ok(pre, j));
+    }
+    assert(inv_msgs(post)) by {
+        assert forall|c: int, t2: nat, clog: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Campaign { c, term: t2, clog }) implies campaign_msg_ok(post, c, t2, clog) by {
+            assert(campaign_msg_ok(pre, c, t2, clog));
+        }
+        assert forall|v: int, c: int, t2: nat, vlog: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Vote { v, c, term: t2, vlog }) implies vote_msg_ok(post, v, c, t2, vlog) by {
+            assert(vote_msg_ok(pre, v, c, t2, vlog));
+        }
+        assert forall|t2: nat, b2: nat, bt2: nat, entries2: Seq<AEntry>|
+            #[trigger] post.net.contains(Msg::Append { term: t2, base: b2, bterm: bt2, entries: entries2 }) implies append_msg_ok(post, t2, b2, bt2, entries2) by {
+            assert(append_msg_ok(pre, t2, b2, bt2, entries2));
+        }
+        assert forall|v: int, t2: nat, mi2: nat|
+            #[trigger] post.net.contains(Msg::Ack { v, term: t2, mi: mi2 }) implies ack_msg_ok(post, v, t2, mi2) by {
+            assert(ack_msg_ok(pre, v, t2, mi2));
+        }
+    }
+    assert forall|u2: nat| #[trigger] post.leader_log.dom().contains(u2) implies lterm_ok(post, u2) by {
+        assert(lterm_ok(pre, u2));
+    }
+    assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
+        assert(host_commit_ok(pre, j2));
+        if pre.hosts[j2].commit > 0 {
+            assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+    }
+    assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
+        assert(commit_rec_ok(pre, rec));
+    }
+    assert forall|t9: nat, ci9: nat, rec: CommitRec|
+        #[trigger] post.net.contains(Msg::Commit { term: t9, ci: ci9, rec }) implies commit_msg_ok(post, t9, ci9, rec) by {
+        assert(pre.net.contains(Msg::Commit { term: t9, ci: ci9, rec }));
+        assert(commit_msg_ok(pre, t9, ci9, rec));
+    }
+    assert forall|rec: CommitRec, u9: nat|
+        #[trigger] post.commits.contains(rec) && #[trigger] post.leader_log.dom().contains(u9) && u9 > rec.term
+        implies prefix_eq(post.leader_log[u9], post.leader_log[rec.term], rec.ci) by {
+        assert(pre.commits.contains(rec) && pre.leader_log.dom().contains(u9));
+        assert(prefix_eq(pre.leader_log[u9], pre.leader_log[rec.term], rec.ci));
+    }
+    assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_leader_ok(post, rec) by {
+        assert(commit_rec_ok(pre, rec));
+        assert(lterm_ok(pre, rec.term));
+        assert(commit_leader_ok(pre, rec));
+    }
+}
+
 proof fn restart_preserves(pre: GState, post: GState, i: int)
     requires inv(pre), t_restart(pre, post, i),
     ensures inv(post),
@@ -3564,6 +3753,8 @@ pub proof fn step_preserves_inv(pre: GState, post: GState, step: TStep)
         TStep::LeaderCommit { i, ci, q } => leader_commit_preserves(pre, post, i, ci, q),
         TStep::SendCommit { i, ci } => send_commit_preserves(pre, post, i, ci),
         TStep::RecvCommit { i, ci, mi, rec } => recv_commit_preserves(pre, post, i, ci, mi, rec),
+        TStep::BumpTerm { i, term } => bump_term_preserves(pre, post, i, term),
+        TStep::StepDown { i } => step_down_preserves(pre, post, i),
         TStep::Restart { i } => restart_preserves(pre, post, i),
         TStep::SubmitRead { i } => submit_read_preserves(pre, post, i),
         TStep::ConfirmRead { i, term, seq } => confirm_read_preserves(pre, post, i, term, seq),
