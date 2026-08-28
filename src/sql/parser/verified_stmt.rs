@@ -3644,6 +3644,33 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+// -- Update executable codec (single-assignment; trusted String cmp axiom) ----
+//
+// vstd does not prove `key_obeys_cmp_spec::<String>()`, which gates the
+// `BTreeMap` `insert` view and `iter` spec. `String`'s `Ord` is a genuine total
+// order that obeys the cmp laws, so we assume this one fact — a true statement,
+// audited here, analogous to the three `float_trust` assumptions. It is the only
+// new axiom the statement layer introduces.
+#[verifier::external_body]
+pub proof fn axiom_string_key_obeys_cmp()
+    ensures vstd::std_specs::btree::key_obeys_cmp_spec::<String>(),
+{
+}
+
+/// Build a one-entry `BTreeMap` with a known view.
+pub fn build_one_entry_map(k: String, v: Option<ast::Expression>)
+    -> (m: std::collections::BTreeMap<String, Option<ast::Expression>>)
+    ensures
+        m@ == vstd::map::Map::<String, Option<ast::Expression>>::empty().insert(k, v),
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    proof { axiom_string_key_obeys_cmp(); }
+    let mut m: std::collections::BTreeMap<String, Option<ast::Expression>> =
+        std::collections::BTreeMap::new();
+    m.insert(k, v);
+    m
+}
+
 // -- Select FROM join-tree exec parser ---------------------------------------
 
 pub fn parse_table_exec(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<ast::From>, usize))
