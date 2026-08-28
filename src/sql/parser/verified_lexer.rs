@@ -471,4 +471,99 @@ pub fn scan_digits_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
     }
 }
 
+// -- L4: identifier scanning (unquoted char-run) ------------------------------
+//
+// An unquoted identifier is `[A-Za-z_][A-Za-z0-9_]*`. The production lexer then
+// lowercases it and classifies it as a keyword if it matches the keyword table;
+// that canonicalisation (lowercasing, keyword lookup) is a later brick. This
+// brick proves the char-run core: a maximal identifier run re-scans to itself
+// under an identifier-continuation boundary — the same shape as L3.
+
+/// Identifier start byte: `A`-`Z`, `a`-`z`, or `_`.
+pub open spec fn is_ident_start(b: u8) -> bool {
+    (65 <= b <= 90) || (97 <= b <= 122) || b == 95
+}
+
+/// Identifier continuation byte: a start byte or a digit.
+pub open spec fn is_ident_cont(b: u8) -> bool {
+    is_ident_start(b) || is_digit(b)
+}
+
+/// Every byte after the first is an identifier-continuation byte, and the first
+/// is an identifier-start byte (the shape of a well-formed unquoted identifier).
+pub open spec fn is_ident_bytes(s: Seq<u8>) -> bool {
+    s.len() >= 1 && is_ident_start(s[0])
+        && (forall|i: int| 0 <= i < s.len() ==> is_ident_cont(#[trigger] s[i]))
+}
+
+/// End of the maximal identifier-continuation run starting at `pos`.
+pub open spec fn scan_ident_end(input: Seq<u8>, pos: int) -> int
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_ident_cont(input[pos]) {
+        scan_ident_end(input, pos + 1)
+    } else {
+        pos
+    }
+}
+
+/// Maximal-run characterization for identifiers (mirrors `lemma_scan_digits_end_run`).
+pub proof fn lemma_scan_ident_end_run(input: Seq<u8>, pos: int, k: int)
+    requires
+        0 <= pos <= k <= input.len(),
+        forall|i: int| pos <= i < k ==> is_ident_cont(#[trigger] input[i]),
+        k == input.len() || !is_ident_cont(input[k]),
+    ensures
+        scan_ident_end(input, pos) == k,
+    decreases k - pos,
+{
+    if pos < k {
+        assert(is_ident_cont(input[pos]));
+        lemma_scan_ident_end_run(input, pos + 1, k);
+    }
+}
+
+/// Identifier roundtrip: a well-formed identifier byte run followed by a
+/// non-continuation boundary byte (or end) re-scans to exactly itself.
+pub proof fn lemma_scan_ident_roundtrip(d: Seq<u8>, tail: Seq<u8>)
+    requires
+        is_ident_bytes(d),
+        tail.len() == 0 || !is_ident_cont(tail[0]),
+    ensures
+        scan_ident_end(d + tail, 0) == d.len(),
+{
+    let input = d + tail;
+    assert forall|i: int| 0 <= i < d.len() implies is_ident_cont(#[trigger] input[i]) by {
+        assert(input[i] == d[i]);
+    }
+    if tail.len() == 0 {
+        assert(input.len() == d.len());
+    } else {
+        assert(input[d.len() as int] == tail[0]);
+    }
+    lemma_scan_ident_end_run(input, 0, d.len() as int);
+}
+
+/// Executable maximal identifier-run scanner, refining `scan_ident_end`.
+pub fn scan_ident_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
+    requires
+        pos <= input.len(),
+    ensures
+        r == scan_ident_end(input@, pos as int),
+    decreases input.len() - pos,
+{
+    if pos < input.len() {
+        let b = input[pos];
+        let cont = ((65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8)
+            || (48u8 <= b && b <= 57u8);
+        if cont {
+            scan_ident_exec(input, pos + 1)
+        } else {
+            pos
+        }
+    } else {
+        pos
+    }
+}
+
 } // verus!
