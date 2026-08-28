@@ -5838,6 +5838,83 @@ pub open spec fn is_supdate(s: SStmt) -> bool {
     }
 }
 
+/// `sprint_assign` re-expressed by matching the value `o` directly (rather than
+/// through `view_opt`), so an exec printer that matches `&Option` and the spec use
+/// the same binding. Bridges `print_assign_exec`'s ensures to the `sprint_assign`
+/// / `sprint_set_list` world.
+pub proof fn lemma_sprint_assign_view(k: String, o: Option<ast::Expression>)
+    ensures
+        sprint_assign((k, view_opt(o))) == seq![TokenView::Ident(k), TokenView::Equal]
+            + (match o {
+                Some(e) => sprint(view_expr(e)),
+                None => seq![TokenView::Keyword(Keyword::Default)],
+            }),
+{
+    match o {
+        Some(e) => {
+            assert(view_opt(o) == Some(view_expr(e)));
+            assert(sprint_assign((k, view_opt(o)))
+                =~= seq![TokenView::Ident(k), TokenView::Equal] + sprint(view_expr(e)));
+        },
+        None => {
+            assert(view_opt(o) == None::<SExpr>);
+            assert(sprint_assign((k, view_opt(o)))
+                =~= seq![TokenView::Ident(k), TokenView::Equal]
+                    + seq![TokenView::Keyword(Keyword::Default)]);
+        },
+    }
+}
+
+/// Print one `k = v` assignment, borrowing the value (no clone). The ensures is
+/// phrased with the `match v` binding — like `print_select_head_exec`'s WHERE arm —
+/// so the exec and spec matches align with no reference-payload relating needed;
+/// `lemma_sprint_assign_view` bridges it to `sprint_assign`. Body of the print loop.
+pub fn print_assign_exec(k: &String, v: &Option<ast::Expression>) -> (r: Vec<super::Token>)
+    requires
+        match v { Some(e) => printable_se(view_expr(*e)), None => true },
+    ensures
+        token_views(r@) == seq![TokenView::Ident(*k), TokenView::Equal]
+            + (match v {
+                Some(e) => sprint(view_expr(*e)),
+                None => seq![TokenView::Keyword(Keyword::Default)],
+            }),
+{
+    reveal_with_fuel(token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::Ident(k.clone()));
+    r.push(super::Token::Equal);
+    let ghost head = r@;
+    proof {
+        assert(token_views(head) =~= seq![TokenView::Ident(*k), TokenView::Equal]);
+    }
+    match v {
+        Some(e) => {
+            let mut eb = print_expr_exec(e);
+            let ghost ebo = eb@;
+            r.append(&mut eb);
+            proof {
+                token_views_concat(head, ebo);
+                assert(token_views(r@)
+                    =~= seq![TokenView::Ident(*k), TokenView::Equal] + sprint(view_expr(*e)));
+            }
+        },
+        None => {
+            r.push(super::Token::Keyword(Keyword::Default));
+            proof {
+                assert(r@ =~= head + seq![super::Token::Keyword(Keyword::Default)]);
+                token_views_concat(head, seq![super::Token::Keyword(Keyword::Default)]);
+                assert(token_views(seq![super::Token::Keyword(Keyword::Default)])
+                    =~= seq![TokenView::Keyword(Keyword::Default)]);
+                assert(token_views(head) =~= seq![TokenView::Ident(*k), TokenView::Equal]);
+                assert(token_views(r@)
+                    =~= seq![TokenView::Ident(*k), TokenView::Equal]
+                        + seq![TokenView::Keyword(Keyword::Default)]);
+            }
+        },
+    }
+    r
+}
+
 /// Executable printer for a single-assignment `UPDATE`. Mirrors `print_select_exec`:
 /// build the token vector incrementally, discharging `token_views` by concatenation.
 pub fn print_update_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
