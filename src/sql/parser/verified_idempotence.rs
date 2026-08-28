@@ -30,13 +30,21 @@
 //!   hypothesis on the Phase-3 headlines below is *necessary*, not a temporary
 //!   crutch: it carves out exactly the inputs whose parse the printer can
 //!   reproduce. Discharging it for a given input reduces to showing the parsed
-//!   literals are finite and in range. At the statement level there is a second
-//!   load-bearing guard of the same flavour: `SELECT * AS a` parses to a
-//!   `(All, Some("a"))` select item that the printer cannot reproduce (an
-//!   aliased `*`), so `finite_floats_stmt` carries `All ==> no alias` alongside
-//!   float finiteness. Every other structural constraint (`is_stable` right
-//!   children, `CROSS`/predicate coupling, list `len >= 1`) is recovered from
-//!   the parser image, not required.
+//!   literals are finite and in range. The infinite-float case is a *genuine*
+//!   non-printability: `literal_views(Float(inf)) == None`, so an overflow float
+//!   has no canonical print at all.
+//!
+//!   At the statement level `finite_floats_stmt` carries a second guard,
+//!   `All ==> no alias`, but of a *different* nature — it is a domain guard, not
+//!   an unreproducible printout. `SELECT * AS a` prints fine (`* AS a`) and the
+//!   mirror parser reparses it back to `(All, Some("a"))`, so it actually
+//!   roundtrips. The clause is in `printable_select_item` because it defines the
+//!   canonical/production select grammar (SQL does not alias `*`); the mirror
+//!   parser is incidentally more permissive. It is load-bearing here only
+//!   because Phase 3 is factored through `printable_stmt` (whose Phase-2 lemma
+//!   requires it), not because the print cannot be reproduced. Every other
+//!   structural constraint (`is_stable` right children, `CROSS`/predicate
+//!   coupling, list `len >= 1`) is recovered from the parser image, not required.
 //!
 //! - **Phase 2 — printer right-inverts on the printable image.**
 //!   `printable(a) ==> parse(print(a)) = (Some(a), [])`. This is exactly the
