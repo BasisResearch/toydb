@@ -2873,12 +2873,13 @@ pub open spec fn set_list_depth(items: Seq<(String, Option<SExpr>)>) -> nat
     }
 }
 
-/// One assignment's fuel measure is bounded by its printed length.
+/// One assignment's fuel measure is strictly below its printed length (the
+/// `Ident =` prefix gives the slack), so a non-empty set-list needs no `+1` fuel.
 pub proof fn assign_depth_le_len(a: (String, Option<SExpr>))
     requires
         printable_assign(a),
     ensures
-        assign_depth(a) <= sprint_assign(a).len(),
+        assign_depth(a) + 1 <= sprint_assign(a).len(),
 {
     match a.1 {
         Some(e) => {
@@ -2905,6 +2906,26 @@ pub proof fn set_list_depth_le_len(s: Seq<(String, Option<SExpr>)>)
     } else {
         assign_depth_le_len(s[0]);
         set_list_depth_le_len(s.drop_first());
+    }
+}
+
+/// Tighter bound for a non-empty set-list (no `+1`): the token count is itself a
+/// valid fuel, so the roundtrip needs no overflow-prone `len + 1`.
+pub proof fn set_list_depth_le_len_ne(s: Seq<(String, Option<SExpr>)>)
+    requires
+        all_printable_assigns(s),
+        s.len() >= 1,
+    ensures
+        set_list_depth(s) <= sprint_set_list(s).len(),
+    decreases s,
+{
+    reveal_with_fuel(set_list_depth, 2);
+    reveal_with_fuel(sprint_set_list, 2);
+    if s.len() == 1 {
+        assign_depth_le_len(s[0]);
+    } else {
+        assign_depth_le_len(s[0]);
+        set_list_depth_le_len_ne(s.drop_first());
     }
 }
 
@@ -6504,6 +6525,62 @@ pub fn parse_set_map_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
             }
         },
         None => (None, pos),
+    }
+}
+
+/// End-to-end multi-assignment set-list roundtrip: parsing the print of a
+/// `BTreeMap`'s assignments rebuilds a map with the same `SExpr`-view (`view_map`).
+/// The multi-Update headline at the order-free view level (multi-assignment maps
+/// are outside `view_stmt`'s domain, so this is a standalone `view_map` headline,
+/// not a `view_stmt` refinement). Composes the verified print loop, parse builder,
+/// the set-list mirror roundtrip, and the `set_list_depth_le_len` fuel bound.
+#[verifier::rlimit(40000)]
+pub fn set_map_roundtrip_exec(
+    m: &std::collections::BTreeMap<String, Option<ast::Expression>>,
+) -> (r: std::collections::BTreeMap<String, Option<ast::Expression>>)
+    requires
+        m@.dom().len() >= 1,
+        forall|k: String| #[trigger] m@.dom().contains(k) ==> (match m@[k] {
+            Some(e) => printable_se(view_expr(e)),
+            None => true,
+        }),
+    ensures
+        view_map(r@) == view_map(m@),
+{
+    let (toks, Ghost(s)) = print_set_map_exec(m);
+    proof {
+        token_views_len(toks@);
+        assert(sprint_set_list(s).len() == toks@.len());
+        assert(s.len() == m@.dom().len());
+        assert(s.len() >= 1);
+    }
+    let fuel = toks.len();
+    proof {
+        set_list_depth_le_len_ne(s);
+        assert(fuel as nat >= set_list_depth(s));
+        lemma_sparse_set_list_sprint(s, Seq::<TokenView>::empty(), fuel as nat);
+        assert(sprint_set_list(s) + Seq::<TokenView>::empty() =~= sprint_set_list(s));
+        assert(sparse_set_list(sprint_set_list(s), fuel as nat)
+            == (Some(s), Seq::<TokenView>::empty()));
+        token_views_len(toks@);
+    }
+    let (mopt, pos) = parse_set_map_exec(&toks, 0, fuel);
+    proof {
+        assert(toks@.subrange(0, toks@.len() as int) =~= toks@);
+        assert(token_views(toks@) == sprint_set_list(s));
+    }
+    match mopt {
+        Some(mm) => {
+            proof {
+                assert(view_map(mm@) == seq_to_map(s));
+                assert(seq_to_map(s) == view_map(m@));
+            }
+            mm
+        },
+        None => {
+            proof { assert(false); }
+            vstd::pervasive::unreached()
+        },
     }
 }
 
