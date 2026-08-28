@@ -2068,6 +2068,7 @@ pub proof fn lemma_sparse_table_sprint(t: SFrom, tail: Seq<TokenView>)
     }
 }
 
+#[verifier::rlimit(15000)]
 pub proof fn lemma_sparse_step_sprint(step: SJoinStep, tail: Seq<TokenView>, fuel: nat)
     requires
         printable_step(step),
@@ -3671,6 +3672,59 @@ pub fn build_one_entry_map(k: String, v: Option<ast::Expression>)
     m
 }
 
+/// Extract the sole `(key, value)` of a one-entry `BTreeMap`. `iter().next()`
+/// pops `remaining()[0]`, and for a single-entry map the `iter` spec pins that
+/// pair to the map's contents. The key is cloned (`String::clone` is value-exact);
+/// the value is borrowed, so no fragile `Option<Expression>` clone is needed.
+pub fn extract_one_entry<'a>(
+    m: &'a std::collections::BTreeMap<String, Option<ast::Expression>>,
+) -> (r: (String, &'a Option<ast::Expression>))
+    requires
+        m@.dom().len() == 1,
+    ensures
+        m@.contains_key(r.0) && m@[r.0] == *r.1,
+        m@ =~= vstd::map::Map::<String, Option<ast::Expression>>::empty().insert(r.0, *r.1),
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    proof { axiom_string_key_obeys_cmp(); }
+    let mut it = m.iter();
+    let ghost rem = vstd::std_specs::iter::IteratorSpec::remaining(&it);
+    proof {
+        // iter() ensures (gated on key_obeys_cmp_spec::<String>(), now axiomatic).
+        assert(rem.len() == m@.dom().len());
+        assert(rem.len() == 1);
+    }
+    let first = it.next();
+    match first {
+        Some((k, v)) => {
+            let rk = k.clone();
+            proof {
+                // next() popped the head: first == Some(rem[0]).
+                assert(first == Some(rem[0]));
+                assert(k == rem[0].0 && v == rem[0].1);
+                // iter() forall at i == 0 pins this pair to the map.
+                assert(m@.contains_key(*rem[0].0));
+                assert(m@[*rem[0].0] == *rem[0].1);
+                assert(rk == *rem[0].0);
+                assert(*v == *rem[0].1);
+                assert(m@.contains_key(rk));
+                assert(m@[rk] == *v);
+                assert(m@.dom() =~= set![rk]);
+                assert(m@ =~= vstd::map::Map::<String, Option<ast::Expression>>::empty()
+                    .insert(rk, *v));
+            }
+            (rk, v)
+        },
+        None => {
+            proof {
+                // rem.len() == 1 > 0, so next() returns Some — this arm is dead.
+                assert(false);
+            }
+            vstd::pervasive::unreached()
+        },
+    }
+}
+
 // -- Select FROM join-tree exec parser ---------------------------------------
 
 pub fn parse_table_exec(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<ast::From>, usize))
@@ -4192,7 +4246,7 @@ pub proof fn sdepth_column_le_len(c: SColumn)
     }
 }
 
-#[verifier::rlimit(8000)]
+#[verifier::rlimit(15000)]
 pub proof fn slist_depth_columns_le_len(cols: Seq<SColumn>)
     requires all_printable_columns(cols),
     ensures slist_depth_columns(cols) <= sprint_columns(cols).len() + 1,
