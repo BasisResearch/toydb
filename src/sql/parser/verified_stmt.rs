@@ -2873,6 +2873,41 @@ pub open spec fn set_list_depth(items: Seq<(String, Option<SExpr>)>) -> nat
     }
 }
 
+/// One assignment's fuel measure is bounded by its printed length.
+pub proof fn assign_depth_le_len(a: (String, Option<SExpr>))
+    requires
+        printable_assign(a),
+    ensures
+        assign_depth(a) <= sprint_assign(a).len(),
+{
+    match a.1 {
+        Some(e) => {
+            super::verified_roundtrip::sdepth_le_len(e);
+        },
+        None => {},
+    }
+}
+
+/// The set-list fuel measure is bounded by its printed token length (so the token
+/// count is a valid fuel for `sparse_set_list` in the roundtrip).
+pub proof fn set_list_depth_le_len(s: Seq<(String, Option<SExpr>)>)
+    requires
+        all_printable_assigns(s),
+    ensures
+        set_list_depth(s) <= sprint_set_list(s).len() + 1,
+    decreases s,
+{
+    reveal_with_fuel(set_list_depth, 2);
+    reveal_with_fuel(sprint_set_list, 2);
+    if s.len() == 0 {
+    } else if s.len() == 1 {
+        assign_depth_le_len(s[0]);
+    } else {
+        assign_depth_le_len(s[0]);
+        set_list_depth_le_len(s.drop_first());
+    }
+}
+
 pub open spec fn all_printable_assigns(items: Seq<(String, Option<SExpr>)>) -> bool
     decreases items,
 {
