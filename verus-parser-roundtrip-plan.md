@@ -340,15 +340,29 @@ REAL production `Token` (not `verified.rs`'s Phase-0 toy), byte cursor over `Seq
 - **L4 — unquoted identifier char-run:** `is_ident_start`/`_cont`/`is_ident_bytes` +
   `scan_ident_end` + `lemma_scan_ident_end_run` + `lemma_scan_ident_roundtrip` +
   `scan_ident_exec`. Same maximal-munch shape as L3.
-- **Remaining lexer bricks:** number decimal/exponent extension; strings (quotes +
-  escapes, Unicode — expands the trust surface); identifier lowercasing + keyword
-  classification (ident-then-lookup); quoted identifiers; line comments; then the
-  single-token DISPATCHER (skip_ws then classify the first byte to the right scanner)
-  and the whole-input token-LIST scanner + its roundtrip (inter-token separator
-  canonicalisation — two adjacent `Number`s/idents need a space or they re-lex as one),
-  and the executable `Vec<u8> -> Vec<Token>` top-level lexer. THEN ast-equivalence +
-  cutover. Multi-week. The five bricks done (L0-L4) are the mechanically-clean core;
-  each reuses the token-level boundary discipline at the byte level.
+- **L5 — single-token dispatcher:** `lex_token_end` (skip_ws then classify first byte to
+  number/ident/operator/punctuation) + `lemma_lex_token_end_bounds` / `_progress` (strict
+  advance on a token start — the termination fact). Gotcha: establish `0 <= p` via
+  `lemma_skip_ws_bounds` so the dispatcher's guard unfolds to the token arm.
+- **L6 — exec dispatcher + spec token-list:** `lex_token_end_exec` (runnable, composes the
+  L0-L5 exec scanners) + `lex_all_ends` (fuel-bounded spec whole-input scanner) +
+  `lemma_lex_all_ends_bounded`.
+- **L7 — token-list fuel stability:** `lemma_lex_all_ends_fuel_stable` (fuel >= len-pos ⟹
+  more fuel changes nothing) — lets a fuel-free exec loop refine the fuel-bounded spec.
+- **L8 — executable token-list loop:** `lex_all_ends_exec`, a fuel-free `while` refining
+  `lex_all_ends` at fuel `len+1` (the sparse→exec loop pattern, tokenizer edition). A
+  **runnable verified tokenizer skeleton** over the core token classes. Key: pin `fuel`/
+  `whole` in the invariant (ghost defs don't auto-carry into the loop); `reveal_with_fuel`
+  to unfold each step; realign tail fuel via L7; `ends_int` bridges `Vec<usize>`→`Seq<int>`.
+- **Remaining lexer bricks:** number decimal/exponent extension; strings (quotes + escapes,
+  Unicode — expands the trust surface); identifier lowercasing + keyword classification;
+  quoted identifiers; line comments; wiring those arms into the dispatcher; then the
+  whole-input token-LIST ROUNDTRIP (print tokens → re-lex, with inter-token separator
+  canonicalisation — two adjacent `Number`s/idents need a space or they re-lex as one) and
+  the executable `Vec<u8> -> Vec<Token>` top-level lexer producing real `Token`s. THEN
+  ast-equivalence + cutover. Multi-week. Nine bricks done (L0-L8): the mechanically-clean
+  core plus a runnable tokenizer skeleton, each reusing the token-level boundary discipline
+  at the byte level and the parser's fuel/sparse→exec patterns.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
