@@ -2134,6 +2134,7 @@ pub proof fn lemma_sym_token_props(tv: TokenView)
         !is_digit(lex_print_sym(sym_token_of(tv))[0]),
         !is_ident_start(lex_print_sym(sym_token_of(tv))[0]),
         !is_ws(lex_print_sym(sym_token_of(tv))[0]),
+        lex_print_sym(sym_token_of(tv))[0] != 39,
 {
     match tv {
         TokenView::Period => {
@@ -3571,6 +3572,187 @@ pub fn scan_string_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>
         }
     } else {
         (None, pos)
+    }
+}
+
+
+// -- L21: unified token mirror MTok + single-token dispatcher -------------------
+//
+// Ties the five scanners into one whole-input roundtrip. The spec token must be
+// spec-constructible, so `Ident`/`String` carry their char-view `Seq<char>` (not a
+// `String`). `tok_view` maps a real `Token` to its `MTok`; the roundtrip and exec
+// refinement are stated over `MTok` (byte-determined variants compared directly,
+// String payloads by char view), exactly as the expression layer used `view_expr`.
+
+/// Spec mirror of a production `Token`: `String` payloads become their char view.
+pub enum MTok {
+    MNum(Seq<u8>),
+    MKw(Keyword),
+    MIdent(Seq<char>),
+    MString(Seq<char>),
+    MSym(TokenView),
+}
+
+/// View a real `Token` as its mirror (String payloads -> `Seq<char>`).
+pub open spec fn tok_view(t: Token) -> MTok {
+    match t {
+        Token::Number(v) => MTok::MNum(v@),
+        Token::Keyword(k) => MTok::MKw(k),
+        Token::Ident(s) => MTok::MIdent(s@),
+        Token::String(s) => MTok::MString(s@),
+        _ => MTok::MSym(token_view(t)),
+    }
+}
+
+/// Unified single-token dispatcher over all five classes, producing an `MTok`.
+pub open spec fn lscan_mtok(input: Seq<u8>, pos: int) -> (Option<MTok>, int) {
+    let p = skip_ws(input, pos);
+    if 0 <= p < input.len() {
+        let b = input[p];
+        if b == 39 {
+            let r = lscan_string_m(input, p);
+            match r.0 {
+                Some(cv) => (Some(MTok::MString(cv)), r.1),
+                None => (None, r.1),
+            }
+        } else if is_digit(b) {
+            let r = lscan_num_full(input, p);
+            match r.0 {
+                Some(TokenView::Number(v)) => (Some(MTok::MNum(v)), r.1),
+                _ => (None, r.1),
+            }
+        } else if is_ident_start(b) {
+            let rk = lscan_keyword(input, p);
+            match rk.0 {
+                Some(kw) => (Some(MTok::MKw(kw)), rk.1),
+                None => {
+                    let ri = lscan_ident_m(input, p);
+                    match ri.0 {
+                        Some(cv) => (Some(MTok::MIdent(cv)), ri.1),
+                        None => (None, ri.1),
+                    }
+                }
+            }
+        } else {
+            let r = lscan_sym(input, p);
+            match r.0 {
+                Some(t) => (Some(MTok::MSym(token_view(t))), r.1),
+                None => (None, r.1),
+            }
+        }
+    } else {
+        (None, p)
+    }
+}
+
+
+/// Canonical byte print of a mirror token.
+pub open spec fn mprint(mt: MTok) -> Seq<u8> {
+    match mt {
+        MTok::MNum(v) => v,
+        MTok::MKw(kw) => kw_text(kw),
+        MTok::MIdent(cs) => ascii_bytes(cs),
+        MTok::MString(cs) => seq![39u8] + ascii_bytes(cs) + seq![39u8],
+        MTok::MSym(tv) => lex_print_sym(sym_token_of(tv)),
+    }
+}
+
+/// A printable mirror token: each class's re-scan precondition.
+pub open spec fn printable_mtok(mt: MTok) -> bool {
+    match mt {
+        MTok::MNum(v) => v.len() >= 1 && is_digit(v[0]) && rescans_num(v),
+        MTok::MKw(_) => true,
+        MTok::MIdent(cs) => cs.len() >= 1 && all_lower_letter_chars(cs)
+            && classify_kw(ascii_bytes(cs)) is None,
+        MTok::MString(cs) => all_ascii_chars(cs)
+            && (forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 39),
+        MTok::MSym(tv) => is_sym_view(tv),
+    }
+}
+
+/// The tail boundary each mirror token needs (strings are self-delimiting).
+pub open spec fn tail_ok_mtok(mt: MTok, tail: Seq<u8>) -> bool {
+    match mt {
+        MTok::MNum(_) => num_tail_ok(tail),
+        MTok::MKw(_) => tail.len() == 0 || !is_ident_cont(tail[0]),
+        MTok::MIdent(_) => tail.len() == 0 || !is_ident_cont(tail[0]),
+        MTok::MString(_) => true,
+        MTok::MSym(tv) => op_tail_ok(sym_token_of(tv), tail),
+    }
+}
+
+/// Unified single-token roundtrip over all five classes. Axiom-free.
+pub proof fn lemma_lscan_mtok(mt: MTok, tail: Seq<u8>)
+    requires
+        printable_mtok(mt),
+        tail_ok_mtok(mt, tail),
+    ensures
+        lscan_mtok(mprint(mt) + tail, 0) == (Some(mt), mprint(mt).len() as int),
+{
+    let input = mprint(mt) + tail;
+    match mt {
+        MTok::MNum(v) => {
+            assert(mprint(mt) == v);
+            assert(input[0] == v[0]);
+            assert(is_digit(input[0]));
+            assert(!is_ws(input[0]));
+            assert(skip_ws(input, 0) == 0);
+            assert(input[0] != 39);
+            // number arm
+            assert(rescans_num(v));
+            assert(num_tail_ok(tail));
+            assert(scan_num_full_end(input, 0) == v.len());
+            assert(input.subrange(0, v.len() as int) =~= v);
+        }
+        MTok::MKw(kw) => {
+            lemma_kw_text_shape(kw);
+            assert(mprint(mt) == kw_text(kw));
+            assert(input[0] == kw_text(kw)[0]);
+            assert(is_lower_letter(kw_text(kw)[0]));
+            assert(!is_ws(input[0]) && !is_digit(input[0]) && is_ident_start(input[0]));
+            assert(input[0] != 39);
+            assert(skip_ws(input, 0) == 0);
+            lemma_lscan_keyword(kw, tail);
+        }
+        MTok::MIdent(cs) => {
+            lemma_ident_bytes_lower(cs);
+            assert(mprint(mt) == ascii_bytes(cs));
+            assert(cs.len() >= 1);
+            assert(ascii_bytes(cs).len() == cs.len());
+            assert(input[0] == ascii_bytes(cs)[0]);
+            assert(is_lower_letter(ascii_bytes(cs)[0]));
+            assert(is_ident_start(input[0]) && !is_digit(input[0]) && !is_ws(input[0]));
+            assert(input[0] != 39);
+            assert(skip_ws(input, 0) == 0);
+            // keyword arm returns None (cs not a keyword), then ident arm
+            lemma_ascii_lower_idem(ascii_bytes(cs));
+            lemma_lower_letters_ident_bytes(ascii_bytes(cs));
+            lemma_scan_ident_roundtrip(ascii_bytes(cs), tail);
+            assert(input.subrange(0, ascii_bytes(cs).len() as int) =~= ascii_bytes(cs));
+            assert(classify_kw(ascii_lower_seq(input.subrange(0, scan_ident_end(input, 0)))) is None);
+            lemma_lscan_ident_m(cs, tail);
+        }
+        MTok::MString(cs) => {
+            assert(mprint(mt) == seq![39u8] + ascii_bytes(cs) + seq![39u8]);
+            assert(input == seq![39u8] + ascii_bytes(cs) + seq![39u8] + tail) by {
+                assert((seq![39u8] + ascii_bytes(cs) + seq![39u8]) + tail
+                    =~= seq![39u8] + ascii_bytes(cs) + seq![39u8] + tail);
+            }
+            assert(input[0] == 39);
+            assert(!is_ws(input[0]));
+            assert(skip_ws(input, 0) == 0);
+            lemma_lscan_string_m(cs, tail);
+        }
+        MTok::MSym(tv) => {
+            lemma_sym_token_props(tv);
+            let t = sym_token_of(tv);
+            assert(mprint(mt) == lex_print_sym(t));
+            assert(input[0] == lex_print_sym(t)[0]);
+            assert(!is_ws(input[0]) && !is_digit(input[0]) && !is_ident_start(input[0]));
+            assert(input[0] != 39);
+            assert(skip_ws(input, 0) == 0);
+            lemma_lscan_sym(t, tail);
+        }
     }
 }
 
