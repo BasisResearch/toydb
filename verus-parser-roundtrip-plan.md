@@ -50,16 +50,25 @@ the same style as the expression layer, with an `SStmt::Unsupported` catch-all s
 All 10 statement kinds now have verified **mirror** roundtrips
 (`lemma_sparse_stmt_sprint`, 72 verified / 0 errors).
 
-**S5 — executable statement layer + headline (partial).** `print_stmt_exec`
-builds a real `Vec<Token>` for the list-free statements (Commit / Rollback /
-DropTable / Delete-with-WHERE / Explain), proved
-`token_views(r@) == sprint_stmt(view_stmt(*s))`, delegating to `print_expr_exec`.
-**Remaining S5:** the executable *parser* (`parse_stmt_exec` refining
-`sparse_stmt` at `view_stmt`, with the `Explain` recursion and the non-list-free
-keyword cases), the end-to-end headline `print_parse_roundtrip_stmt`, and the
-executable printer/parser for the container statements (their exec list
-codecs — columns, rows, from-trees, select-list, set-list). This is a large but
-mechanical extension of the `parse_expr_exec`/`print_expr_exec` pattern.
+**S5 — executable statement layer + headline (in progress).**
+- **Flat list-free kinds — done, end to end.** `print_stmt_exec` +
+  `parse_stmt_exec` + headline `print_parse_roundtrip_stmt` for Commit /
+  Rollback / DropTable / Delete-with-WHERE (Delete's WHERE through the real
+  `parse_expr_exec`). The parser is stated as the *flat restriction* of
+  `sparse_stmt`.
+- **Insert — done, both directions.** `print_insert_exec` (via `print_names_slice`
+  / `print_row_exec` / `print_rows_slice`) and `parse_insert_exec` (via
+  `parse_names_exec` / `parse_rows_exec`) — the first *container* statement fully
+  at the executable level (optional column list + nested VALUES rows). This is
+  the template for the rest.
+
+**Remaining S5:** the same exec print+parse pair for **CreateTable** (the 6-clause
+column codec), **Select** (the recursive join-tree exec), **Update** (the
+`BTreeMap` `iter()`/`insert` exec — the S4 residual), plus **Begin** (number
+payload) and **Explain** (parser recursion); then a single top-level
+`print_stmt_exec`/`parse_stmt_exec` dispatcher over all kinds and the unified
+headline + `stmt_injective`. Each container follows Insert's pattern; the
+join-tree and `BTreeMap` executable code are the genuinely hard parts.
 
 **Phase 4 — production cutover** is not started (replace the two
 `std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
