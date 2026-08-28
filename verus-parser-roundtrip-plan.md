@@ -228,6 +228,30 @@ the S3/S5 join-tree work. So the whole `SELECT` grammar (clauses + FROM joins) a
 CreateTable/Insert/Delete are complete; only multi-`Update` grammar is left. Then the
 real gates: the byte-cursor lexer (from scratch) and the ast-equivalence argument.
 
+**Multi-`Update` — concrete design (scoped 2026-08-28; the vstd `iter()` spec makes
+it tractable, and it needs NO Expression-level `==`).** `std_specs/btree.rs`'s `iter()`
+postcondition pins `IteratorSpec::remaining(&it)` to be: length `= m@.dom().len()`,
+each entry in `m@`, `remaining.unref().to_set() == m@.kv_pairs()`, `no_duplicates()`,
+and `increasing_seq(remaining.map_values(|kv| *kv.0))` (keys sorted). So the sorted
+entry seq is a *pinned function of `m@`*, even though a pure spec fn can't compute the
+sort. Plan (5 pieces, each a green increment):
+1. **Uniqueness lemma** (pure): two strictly-key-increasing seqs with equal
+   `to_set()` are equal (induction on the min-key head; uses
+   `axiom_increasing_seq_meaning` + the `String` cmp axiom). This is the foundation.
+2. **`update_normal(m@) : Seq<(String, Option<SExpr>)>`** = `choose |S|` sorted-no-dup
+   with `S.to_set() == { (k, view_opt(m@[k])) }`; well-defined by (1). Note it's over
+   *SExpr* values (view of each), so it depends only on keys + value-views — both
+   preserved by any view-level roundtrip, which is why no Expression `==` is needed.
+3. **Extend `view_stmt`** multi-`Update` arm from `Unsupported` to
+   `SStmt::Update { set: update_normal(set@), .. }`; the existing Seq-based
+   `sprint_set_list`/`sparse_set_list` + `lemma_sparse_set_list_sprint` then apply.
+4. **Print exec**: loop `it.next()` accumulating a ghost seq; invariant ties it to
+   `remaining` (borrow values, never clone — dodges the `Option<Expression>::clone`
+   non-`==` issue), emit `sprint_assign` per entry; the collected seq `== update_normal`
+   by (1). 5. **Parse exec**: fold `insert` over the parsed seq into a fresh `BTreeMap`;
+   the built `m'@` has the same `kv_pairs` (view-level) so `update_normal(m'@) ==
+   update_normal(m@)`, giving the `view_stmt`-level headline. Est. multi-session.
+
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
 `sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`), but
