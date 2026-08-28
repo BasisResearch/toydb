@@ -29,9 +29,9 @@ use vstd::prelude::*;
 use super::verified_production::TokenView;
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, print_expr_exec,
-    printable_se, sdepth, slist_depth, sparse, sparse_args, sprint, sprint_args, view_args,
-    view_expr, SExpr,
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, parse_expr_exec,
+    print_expr_exec, printable_se, sdepth, sdepth_le_len, slist_depth, sparse, sparse_args, sprint,
+    sprint_args, token_views_len, token_views_suffix, view_args, view_expr, SExpr,
 };
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
@@ -2772,6 +2772,226 @@ pub fn print_stmt_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
         _ => {
             proof { assert(false); }
             r
+        },
+    }
+}
+
+/// The non-recursive list-free statements the executable parser recovers
+/// (Explain is excluded to keep the parser recursion-free).
+pub open spec fn flat_exec_ok(s: SStmt) -> bool {
+    match s {
+        SStmt::Commit => true,
+        SStmt::Rollback => true,
+        SStmt::DropTable { .. } => true,
+        SStmt::Delete { .. } => true,
+        _ => false,
+    }
+}
+
+pub proof fn flat_implies_exec_ok(s: SStmt)
+    requires flat_exec_ok(s),
+    ensures exec_ok(s),
+{
+    reveal(exec_ok);
+}
+
+/// For a printable flat statement, the fuel `sprint_stmt(s).len()` bounds
+/// `sdepth_stmt(s)` (so the headline can fuel the parser from the token count).
+pub proof fn flat_sdepth_le_len(s: SStmt)
+    requires printable_stmt(s), flat_exec_ok(s),
+    ensures sdepth_stmt(s) <= sprint_stmt(s).len(),
+{
+    reveal(printable_stmt);
+    match s {
+        SStmt::Commit => {},
+        SStmt::Rollback => {},
+        SStmt::DropTable { name, if_exists } => {},
+        SStmt::Delete { table, where_clause } => {
+            match where_clause {
+                Some(e) => { sdepth_le_len(e); },
+                None => {},
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Executable parser for the flat list-free statements, refining `sparse_stmt`
+/// at the `view_stmt` level. Sound (never wrong) and complete on the flat
+/// domain: it returns `None` exactly when `sparse_stmt` yields nothing flat.
+#[verifier::rlimit(20000)]
+pub fn parse_stmt_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_stmt(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && flat_exec_ok(sopt.unwrap())
+                    && view_stmt(st) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None || !flat_exec_ok(sopt.unwrap()),
+            }
+    }),
+{
+    reveal_with_fuel(sparse_stmt, 1);
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    match &toks[pos] {
+        super::Token::Keyword(Keyword::Commit) => {
+            proof { token_views_suffix(toks@, pos as int); }
+            (Some(ast::Statement::Commit), pos + 1)
+        },
+        super::Token::Keyword(Keyword::Rollback) => {
+            proof { token_views_suffix(toks@, pos as int); }
+            (Some(ast::Statement::Rollback), pos + 1)
+        },
+        super::Token::Keyword(Keyword::Drop) => {
+            if pos + 1 < toks.len() && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Table)) {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+                if pos + 2 < toks.len() && pos + 3 < toks.len()
+                    && matches!(toks[pos + 2], super::Token::Keyword(Keyword::If))
+                    && matches!(toks[pos + 3], super::Token::Keyword(Keyword::Exists)) {
+                    proof {
+                        token_views_suffix(toks@, pos as int + 2);
+                        token_views_suffix(toks@, pos as int + 3);
+                    }
+                    if pos + 4 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 4); }
+                        match &toks[pos + 4] {
+                            super::Token::Ident(name) => (
+                                Some(ast::Statement::DropTable { name: name.clone(), if_exists: true }),
+                                pos + 5,
+                            ),
+                            _ => (None, pos),
+                        }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 4, toks@.len() as int)); }
+                        (None, pos)
+                    }
+                } else {
+                    if pos + 2 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 2); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                    }
+                    if pos + 2 < toks.len() {
+                        match &toks[pos + 2] {
+                            super::Token::Ident(name) => (
+                                Some(ast::Statement::DropTable { name: name.clone(), if_exists: false }),
+                                pos + 3,
+                            ),
+                            _ => (None, pos),
+                        }
+                    } else {
+                        (None, pos)
+                    }
+                }
+            } else {
+                if pos + 1 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 1); }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                }
+                (None, pos)
+            }
+        },
+        super::Token::Keyword(Keyword::Delete) => {
+            if pos + 1 < toks.len() && pos + 2 < toks.len()
+                && matches!(toks[pos + 1], super::Token::Keyword(Keyword::From)) {
+                proof {
+                    token_views_suffix(toks@, pos as int + 1);
+                    token_views_suffix(toks@, pos as int + 2);
+                }
+                match &toks[pos + 2] {
+                    super::Token::Ident(table) => {
+                        if pos + 3 < toks.len()
+                            && matches!(toks[pos + 3], super::Token::Keyword(Keyword::Where)) {
+                            proof { token_views_suffix(toks@, pos as int + 3); }
+                            let (eopt, epos) = parse_expr_exec(toks, pos + 4, fuel);
+                            match eopt {
+                                Some(e) => (
+                                    Some(ast::Statement::Delete {
+                                        table: table.clone(),
+                                        where_clause: Some(e),
+                                    }),
+                                    epos,
+                                ),
+                                None => (None, pos),
+                            }
+                        } else {
+                            if pos + 3 < toks.len() {
+                                proof { token_views_suffix(toks@, pos as int + 3); }
+                            } else {
+                                proof { token_views_len(toks@.subrange(pos as int + 3, toks@.len() as int)); }
+                            }
+                            (
+                                Some(ast::Statement::Delete {
+                                    table: table.clone(),
+                                    where_clause: None,
+                                }),
+                                pos + 3,
+                            )
+                        }
+                    },
+                    _ => (None, pos),
+                }
+            } else {
+                if pos + 1 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 1); }
+                    if pos + 2 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 2); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                    }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                }
+                (None, pos)
+            }
+        },
+        _ => {
+            reveal_with_fuel(sparse_begin, 1);
+            reveal_with_fuel(sparse_create, 1);
+            reveal_with_fuel(sparse_insert, 1);
+            reveal_with_fuel(sparse_update, 1);
+            reveal_with_fuel(sparse_select, 1);
+            (None, pos)
+        },
+    }
+}
+
+/// End-to-end executable statement roundtrip for the flat list-free statements:
+/// printing then parsing recovers the statement up to `view_stmt`.
+pub fn print_parse_roundtrip_stmt(s: &ast::Statement) -> (out: ast::Statement)
+    requires
+        printable_stmt(view_stmt(*s)),
+        flat_exec_ok(view_stmt(*s)),
+    ensures
+        view_stmt(out) == view_stmt(*s),
+{
+    let ghost sm = view_stmt(*s);
+    proof { flat_implies_exec_ok(sm); }
+    let toks = print_stmt_exec(s);
+    let fuel = toks.len();
+    proof {
+        flat_sdepth_le_len(sm);
+        token_views_len(toks@);
+        lemma_sparse_stmt_sprint(sm, fuel as nat);
+        assert(toks@.subrange(0int, toks@.len() as int) =~= toks@);
+    }
+    let (res, consumed) = parse_stmt_exec(&toks, 0, fuel);
+    match res {
+        Some(out) => out,
+        None => {
+            proof { assert(false); }
+            ast::Statement::Commit
         },
     }
 }
