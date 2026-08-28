@@ -809,4 +809,93 @@ pub proof fn lemma_lex_all_ends_fuel_stable(input: Seq<u8>, pos: int, fuel: nat)
     }
 }
 
+// -- L8: executable token-list loop -------------------------------------------
+//
+// The runnable whole-input tokenizer skeleton: repeatedly apply the exec
+// dispatcher, collecting token end positions, and prove the result equals the
+// fuel-bounded spec `lex_all_ends` at the canonical fuel. Fuel bookkeeping in the
+// loop invariant is discharged by L7 stability (a fixed ghost fuel `len + 1`
+// suffices at every cursor position).
+
+/// Int view of a `usize` position sequence, for relating the exec `Vec<usize>` to
+/// the spec `Seq<int>` end-position list.
+pub open spec fn ends_int(v: Seq<usize>) -> Seq<int> {
+    v.map_values(|x: usize| x as int)
+}
+
+/// Executable whole-input token-list scanner: the end positions of every token
+/// from `start`, refining `lex_all_ends` at the canonical fuel `len + 1`.
+#[verifier::rlimit(40000)]
+pub fn lex_all_ends_exec(input: &Vec<u8>, start: usize) -> (r: Vec<usize>)
+    requires
+        start <= input.len(),
+    ensures
+        ends_int(r@) == lex_all_ends(input@, start as int, input@.len() + 1),
+{
+    let ghost fuel: nat = input@.len() + 1;
+    let ghost whole = lex_all_ends(input@, start as int, fuel);
+    let mut r: Vec<usize> = Vec::new();
+    let mut pos: usize = start;
+    proof {
+        assert(ends_int(r@) =~= Seq::<int>::empty());
+    }
+    while pos < input.len()
+        invariant
+            start <= pos <= input.len(),
+            fuel == input@.len() + 1,
+            whole == lex_all_ends(input@, start as int, fuel),
+            ends_int(r@) + lex_all_ends(input@, pos as int, fuel) == whole,
+        decreases input.len() - pos,
+    {
+        let ghost pos0 = pos as int;
+        let e = lex_token_end_exec(input, pos);
+        proof { lemma_lex_token_end_bounds(input@, pos as int); }
+        if e > pos {
+            let ghost r_old = r@;
+            r.push(e);
+            pos = e;
+            proof {
+                // Unfold lex_all_ends at pos0 (fuel > 0), then use L7 stability to
+                // realign the tail fuel from fuel-1 to fuel.
+                reveal_with_fuel(lex_all_ends, 1);
+                assert(e as int == lex_token_end(input@, pos0));
+                assert(0 <= e as int <= input@.len());
+                assert((fuel - 1) as nat == input@.len());
+                assert((fuel - 1) as nat >= input@.len() - (e as int));
+                assert(lex_all_ends(input@, pos0, fuel)
+                    == seq![e as int] + lex_all_ends(input@, e as int, (fuel - 1) as nat));
+                lemma_lex_all_ends_fuel_stable(input@, e as int, (fuel - 1) as nat);
+                assert(lex_all_ends(input@, e as int, (fuel - 1) as nat)
+                    == lex_all_ends(input@, e as int, fuel));
+                assert(ends_int(r@) =~= ends_int(r_old) + seq![e as int]);
+                assert(ends_int(r@) + lex_all_ends(input@, e as int, fuel)
+                    == ends_int(r_old) + (seq![e as int] + lex_all_ends(input@, e as int, fuel)));
+            }
+        } else {
+            proof {
+                // No progress: e <= pos means an unrecognized (deferred-class)
+                // byte. The spec dispatcher agrees (e == lex_token_end), so the
+                // tail is empty and the invariant already gives the postcondition.
+                reveal_with_fuel(lex_all_ends, 1);
+                assert(e as int == lex_token_end(input@, pos as int));
+                assert(lex_token_end(input@, pos as int) <= pos as int);
+                assert(fuel > 0);
+                assert(lex_all_ends(input@, pos as int, fuel) =~= Seq::<int>::empty());
+            }
+            return r;
+        }
+    }
+    proof {
+        // pos == len: skip_ws stays at len, the dispatcher returns len, tail empty.
+        reveal_with_fuel(lex_all_ends, 1);
+        lemma_skip_ws_bounds(input@, pos as int);
+        assert(pos == input.len());
+        assert(skip_ws(input@, pos as int) == pos as int);
+        assert(lex_token_end(input@, pos as int) == pos as int);
+        assert(fuel > 0);
+        assert(lex_all_ends(input@, pos as int, fuel) =~= Seq::<int>::empty());
+    }
+    r
+}
+
 } // verus!
