@@ -304,10 +304,21 @@ headline is what dodged BOTH the Map-sort obstacle (no sorted normal form needed
 spec) and the Expression-`==` obstacle (only value *views* match). This was the "one
 real wall" — done.
 
-Remaining for multi-`Update`: wrap the set-list roundtrip in the full `UPDATE table
-SET .. [WHERE e]` statement (a thin wrapper: the `UPDATE`/`table`/`SET` prefix keywords
-+ optional `WHERE`). Then the real gates: the byte-cursor lexer (multi-week) and the
-ast-equivalence cutover.
+**STATEMENT GRAMMAR COMPLETE (2026-08-28, 187 verified).** Multi-`Update` wrapped in the
+full statement, both cases verified: `update_set_roundtrip_exec` (`UPDATE table SET
+<assignments>`) and `update_set_where_roundtrip_exec` (`.. WHERE e`). The WHERE case:
+the set-list parses up to the `WHERE` keyword (a boundary, `lemma_sparse_set_list_sprint`
+with a WHERE tail), then the predicate roundtrips via `parse_expr_exec` +
+`lemma_sparse_sprint` (establish the expr sparse-roundtrip BEFORE `parse_expr` so its
+None arm is provably dead). With this, the ENTIRE statement grammar roundtrips end to
+end, verified: all six Select clauses + FROM tree with all join types, CreateTable,
+Insert, Delete, single-assignment Update, and multi-assignment Update (no-WHERE + WHERE).
+
+**Phase 4 remaining — grammar DONE, only infrastructure left:** the from-scratch
+production byte-cursor lexer (the existing verified `next_token` is a Phase-0 toy — this
+is the multi-week gate) and the ast-equivalence argument so the verified parser is a
+sound drop-in for the hand-written one, then the actual `parser.rs`/`lexer.rs` swap run
+green against the SQL suite. No grammar work remains.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
