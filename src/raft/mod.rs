@@ -242,6 +242,11 @@
 mod log;
 mod message;
 mod node;
+// The Verus distributed-safety model and proof for the protocol implemented
+// by `node`. Spec/proof only: it erases under a normal build (the types it
+// declares are ghost bookkeeping, hence the dead_code allowance).
+#[allow(dead_code)]
+mod safety;
 mod state;
 
 use std::ops::Range;

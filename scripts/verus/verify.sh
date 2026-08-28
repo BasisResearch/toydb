@@ -24,6 +24,7 @@ set -euo pipefail
 VERIFY_MODULES=(
   encoding::keycode
   raft::log
+  raft::safety
   sql::types::value
 )
 
