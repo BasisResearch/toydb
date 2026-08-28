@@ -566,4 +566,124 @@ pub fn scan_ident_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
     }
 }
 
+// -- L5: single-token dispatcher ----------------------------------------------
+//
+// Composes L0-L4: skip whitespace, then dispatch on the first byte to the right
+// scanner and return the end position of that one token. This is the backbone of
+// the whole-input token-list scanner (repeatedly apply until end). Deferred token
+// classes (strings, quoted identifiers, comments) yield "no advance" for now, so
+// the dispatcher is total but not yet complete — later bricks fill those arms.
+
+/// Monotonicity/bounds for the digit run (needed to show the dispatcher advances).
+pub proof fn lemma_scan_digits_end_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        pos <= scan_digits_end(input, pos) <= input.len(),
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_digit(input[pos]) {
+        lemma_scan_digits_end_bounds(input, pos + 1);
+    }
+}
+
+/// Monotonicity/bounds for the identifier run.
+pub proof fn lemma_scan_ident_end_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        pos <= scan_ident_end(input, pos) <= input.len(),
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_ident_cont(input[pos]) {
+        lemma_scan_ident_end_bounds(input, pos + 1);
+    }
+}
+
+/// A byte that begins a token the dispatcher currently recognizes: digit
+/// (number), ident-start (identifier), operator lead (`< > !`), or munch-free
+/// punctuation. Excludes the deferred classes (`'`/`"` strings and quoted idents,
+/// `-`-comment lead handling, etc. — later bricks).
+pub open spec fn is_token_start(b: u8) -> bool {
+    is_digit(b) || is_ident_start(b) || b == 60 || b == 62 || b == 33
+        || scan_punct1(b) is Some
+}
+
+/// End position of the one token starting at `pos` (after skipping whitespace).
+/// Returns `skip_ws(pos)` unchanged when there is no recognized token there.
+pub open spec fn lex_token_end(input: Seq<u8>, pos: int) -> int {
+    let p = skip_ws(input, pos);
+    if 0 <= p < input.len() {
+        let b = input[p];
+        if is_digit(b) {
+            scan_digits_end(input, p)
+        } else if is_ident_start(b) {
+            scan_ident_end(input, p)
+        } else if b == 60 || b == 62 || b == 33 {
+            lscan_op(input, p).1
+        } else if scan_punct1(b) is Some {
+            p + 1
+        } else {
+            p
+        }
+    } else {
+        p
+    }
+}
+
+/// The dispatcher never moves before the whitespace-skipped cursor and never past
+/// the end.
+pub proof fn lemma_lex_token_end_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        skip_ws(input, pos) <= lex_token_end(input, pos) <= input.len(),
+{
+    let p = skip_ws(input, pos);
+    lemma_skip_ws_bounds(input, pos);
+    if 0 <= p < input.len() {
+        let b = input[p];
+        if is_digit(b) {
+            lemma_scan_digits_end_bounds(input, p);
+        } else if is_ident_start(b) {
+            lemma_scan_ident_end_bounds(input, p);
+        }
+    }
+}
+
+/// When a recognized token starts at the whitespace-skipped cursor, the dispatcher
+/// strictly advances — the progress fact the token-list scanner needs to terminate.
+pub proof fn lemma_lex_token_end_progress(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+        skip_ws(input, pos) < input.len(),
+        is_token_start(input[skip_ws(input, pos)]),
+    ensures
+        skip_ws(input, pos) < lex_token_end(input, pos),
+{
+    lemma_skip_ws_bounds(input, pos);
+    let p = skip_ws(input, pos);
+    let b = input[p];
+    if is_digit(b) {
+        assert(lex_token_end(input, pos) == scan_digits_end(input, p));
+        reveal_with_fuel(scan_digits_end, 1);
+        assert(scan_digits_end(input, p) == scan_digits_end(input, p + 1));
+        lemma_scan_digits_end_bounds(input, p + 1);
+    } else if is_ident_start(b) {
+        assert(lex_token_end(input, pos) == scan_ident_end(input, p));
+        assert(is_ident_cont(b));
+        reveal_with_fuel(scan_ident_end, 1);
+        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
+        lemma_scan_ident_end_bounds(input, p + 1);
+    } else if b == 60 || b == 62 || b == 33 {
+        // lscan_op advances by 1 or 2 (its second component is p+1 or p+2).
+        assert(lex_token_end(input, pos) == lscan_op(input, p).1);
+        assert(lscan_op(input, p).1 >= p + 1);
+    } else {
+        // munch-free punctuation: p + 1.
+        assert(scan_punct1(b) is Some);
+        assert(lex_token_end(input, pos) == p + 1);
+    }
+}
+
 } // verus!
