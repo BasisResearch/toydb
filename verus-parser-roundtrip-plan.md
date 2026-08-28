@@ -165,10 +165,19 @@ extension (5-tuple `sparse_where_group`, threading each clause's tail as the
 subsequent clauses) *verified its own lemma* but re-tipped `lemma_sparse_column_sprint`
 into the "expected rlimit-count" solver crash — that lemma `reveal`s the 6-clause
 `sprint_column`, and the added module bulk crossed the crash threshold (unresponsive
-to rlimit). So the next hardening step, before LIMIT/OFFSET and ORDER BY, is to push
-opacity one level deeper: make the `col_*_toks` clause helpers `#[verifier::opaque]`
-and `reveal` them per-peel-lemma so `lemma_sparse_column_sprint`'s own query shrinks.
-The reverted LIMIT/OFFSET diff is straightforward to replay once that lands.
+to rlimit). Investigated the fix and ruled one out: making the `col_*_toks` clause helpers
+opaque does **not** shrink `lemma_sparse_column_sprint`'s query, because that lemma
+uses all six directly and reasons about their contents (the absent-clause head
+facts), so it must `reveal` all six regardless — opacity only trims *other* proofs'
+background. The lemma is inherently heavy (6 optional clauses) and now sits right at
+the "expected rlimit-count" crash threshold; any further grammar tips it. So the
+genuine next step is **structural: split `verified_stmt.rs`** — move the
+column/CreateTable codec (and ideally each statement kind) into its own module so
+the heavy column lemmas verify against a much smaller global background. Once split,
+the reverted LIMIT/OFFSET diff (5-tuple `sparse_where_group` via the shared
+`sparse_kw_expr` helper + `lemma_sparse_kw_expr_sprint`, threading each clause's tail
+as the subsequent clauses) replays straightforwardly, and the remaining Select
+clauses + ORDER BY follow the same recipe.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
