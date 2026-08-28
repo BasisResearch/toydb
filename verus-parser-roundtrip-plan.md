@@ -1,11 +1,14 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
-Status: **E0-E4 complete; statement mirror layer S0-S3 complete (2026-08-27)** —
-the full expression-grammar print/parse roundtrip is verified end to end, and the
-statement-level mirror roundtrip is verified for 9 of the 10 `ast::Statement`
-kinds in `src/sql/parser/verified_stmt.rs`. Owner: kg (parser). Runs parallel to
-MVCC work (yl), no file overlap. Verified module opt-in via
-`scripts/verus/verify.sh`.
+Status: **E0-E4 complete; statement roundtrip S0-S5 largely complete (2026-08-28)**
+— the full expression-grammar roundtrip is verified end to end; the statement
+*mirror* roundtrip is verified for all 10 `ast::Statement` kinds (S0-S4); and the
+*executable* print+parse layer (S5) is verified for 9 of 10 kinds both directions,
+with a unified end-to-end headline over 8 of them, in
+`src/sql/parser/verified_stmt.rs` (133 verified / 0 errors under `verify.sh`).
+Only `Update` (its `BTreeMap` set) lacks an executable layer, and Phase 4
+(production cutover) is not started. Owner: kg (parser). Verified module opt-in
+via `scripts/verus/verify.sh`.
 
 ## Statement layer status (2026-08-27)
 
@@ -50,25 +53,35 @@ the same style as the expression layer, with an `SStmt::Unsupported` catch-all s
 All 10 statement kinds now have verified **mirror** roundtrips
 (`lemma_sparse_stmt_sprint`, 72 verified / 0 errors).
 
-**S5 — executable statement layer + headline (in progress).**
-- **Flat list-free kinds — done, end to end.** `print_stmt_exec` +
-  `parse_stmt_exec` + headline `print_parse_roundtrip_stmt` for Commit /
-  Rollback / DropTable / Delete-with-WHERE (Delete's WHERE through the real
-  `parse_expr_exec`). The parser is stated as the *flat restriction* of
-  `sparse_stmt`.
-- **Insert — done, both directions.** `print_insert_exec` (via `print_names_slice`
-  / `print_row_exec` / `print_rows_slice`) and `parse_insert_exec` (via
-  `parse_names_exec` / `parse_rows_exec`) — the first *container* statement fully
-  at the executable level (optional column list + nested VALUES rows). This is
-  the template for the rest.
+**S5 — executable statement layer + headline (9/10 kinds done).**
+Executable print+parse verified for **9 of 10 statement kinds**, both directions,
+refining `sprint_stmt`/`sparse_stmt` at `view_stmt` (133 verified / 0 errors):
+- **Begin, Commit, Rollback, DropTable, Delete, Explain** — `parse_begin_exec`,
+  inline flat kinds, recursive Explain.
+- **CreateTable** — `print_column_exec` (per-segment clause helpers avoid the
+  6-clause solver blowup) + `print_columns_slice`/`print_createtable_exec`, and
+  `parse_column_exec` (concrete keyword helpers connect the exec match to the
+  opaque `sparse_column`) + `parse_columns_exec`/`parse_createtable_exec`.
+- **Insert** — name-list + nested VALUES rows, both directions.
+- **Select** — `print_from_exec` (recursive join tree) + from-list + select-list
+  + `print_select_exec`; and `parse_from_item_exec` (a fold accumulator that
+  rebuilds the left-deep tree, refining the opaque `sparse_from`) + from-list +
+  select-list + `parse_select_exec`.
+- **Unified dispatcher + end-to-end headline** `print_parse_roundtrip_stmt_full`
+  (`print_stmt_full_exec` + `parse_stmt_full_exec`) covers the **8** list-free +
+  CreateTable + Insert kinds end to end; fuel = token count, bounded by
+  `full_sdepth_le_len`. Select is verified standalone both directions but not
+  folded into the self-contained headline: `sdepth_stmt(Select)` over-counts
+  relative to its single `SELECT` keyword of slack (e.g. `SELECT 1` has
+  `sdepth 4`, print length 2), so the headline would need a doubled fuel bound
+  (`sdepth_stmt(s) <= 2*sprint_stmt(s).len()`) plus a from-tree `steps_depth`
+  length bound — a mechanical extension, not attempted here.
 
-**Remaining S5:** the same exec print+parse pair for **CreateTable** (the 6-clause
-column codec), **Select** (the recursive join-tree exec), **Update** (the
-`BTreeMap` `iter()`/`insert` exec — the S4 residual), plus **Begin** (number
-payload) and **Explain** (parser recursion); then a single top-level
-`print_stmt_exec`/`parse_stmt_exec` dispatcher over all kinds and the unified
-headline + `stmt_injective`. Each container follows Insert's pattern; the
-join-tree and `BTreeMap` executable code are the genuinely hard parts.
+**Remaining S5 — Update (the one real wall).** `Update` still has no exec
+print/parse. Its `BTreeMap` set needs the executable sorted `iter()` for printing
+and `insert` for parsing, with the roundtrip stated over `Map` view equality (not
+`BTreeMap` `==`). This is the S4 residual and the genuinely hard piece.
+`stmt_injective` for the whole grammar is also outstanding.
 
 **Phase 4 — production cutover** is not started (replace the two
 `std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
