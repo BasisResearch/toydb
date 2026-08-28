@@ -277,17 +277,19 @@ This is the glue that equates `parse(print(m))`'s `seq_to_map(S)` with `view_map
    inherits iter()'s sorted/unique/covering properties, so `lemma_seq_to_map_enumerates`
    + `lemma_sparse_set_list_sprint` + `parse_set_map_exec` close the roundtrip. Then
    relax the single-assignment restriction in the Update statement print/parse.
-   - **GOTCHA found (2026-08-28):** a per-entry printer taking `v: &Option<Expression>`
-     and matching `match v { Some(e) => .. }` does NOT let Verus prove `*v == Some(*e)`
-     (reference-pattern ergonomics on a `&Option` *parameter* lose the payload link).
-     `print_select_item_exec` works because it matches `&item.1` — a field *place* of a
-     `&(pair)` argument. So the per-entry printer must take `a: &(String,
-     Option<Expression>)` and match `&a.1` (place), then the ensures uses `view_opt(a.1)`.
-     The loop then needs owned `(String, Option<Expression>)` pairs — key clone is
-     value-exact, but the value clone is not, so either prove `view_opt` is clone-stable
-     or drive the per-entry proof off the iter `remaining()` ghost (which holds the real
-     pair values) rather than a matched local. Everything else (snoc, parse builder,
-     view_map, seq_to_map, coverage, uniqueness) is proven; only this loop remains.
+   - **Per-entry printer** — DONE (2026-08-28, 177 verified). `print_assign_exec` +
+     `lemma_sprint_assign_view`. The reference-pattern blocker is resolved exactly as
+     predicted: phrase the ensures with the `match v { Some(e) => sprint(view_expr(*e)),
+     None => [Default] }` binding (matching the exec match), never a `view_opt(*v)`
+     projection; `lemma_sprint_assign_view` (value-match on `o`) bridges that form to
+     `sprint_assign((k, view_opt(o)))`. Borrows the value, no clone.
+   - **Remaining: the `iter()` accumulation loop only.** Call `print_assign_exec` per
+     `it.next()` entry, prepending `Comma` after the first (invariant stepped by
+     `sprint_set_list_snoc`), ghost seq `S ++ remaining(it) == full`. Then bridge each
+     entry via `lemma_sprint_assign_view` and close with
+     `lemma_seq_to_map_enumerates` + `lemma_sparse_set_list_sprint` + `parse_set_map_exec`,
+     and relax the single-assignment restriction in the Update statement print/parse.
+     Every supporting lemma is now proven; only the prophetic loop itself remains.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
