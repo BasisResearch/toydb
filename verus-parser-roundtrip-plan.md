@@ -156,6 +156,20 @@ wall is fixed and the first Select clause is done, both directions, 147 verified
 `sprint_select_body`/`sdepth_select_body`/`sparse_where_group` (opaque, so no
 column-lemma regression) + the Select lemma + the two exec parsers.
 
+**HAVING landed (2026-08-28, 147 verified), LIMIT/OFFSET blocked by residual column
+fragility.** `HAVING` went in mirror+exec on the first proof attempt — the recipe
+generalises with zero new debugging. Factored the single-clause parse into a shared
+`sparse_kw_expr(r, kw, fuel)` helper + `lemma_sparse_kw_expr_sprint` (one clause,
+arbitrary boundary tail; used for WHERE/HAVING/LIMIT/OFFSET). The `LIMIT`+`OFFSET`
+extension (5-tuple `sparse_where_group`, threading each clause's tail as the
+subsequent clauses) *verified its own lemma* but re-tipped `lemma_sparse_column_sprint`
+into the "expected rlimit-count" solver crash — that lemma `reveal`s the 6-clause
+`sprint_column`, and the added module bulk crossed the crash threshold (unresponsive
+to rlimit). So the next hardening step, before LIMIT/OFFSET and ORDER BY, is to push
+opacity one level deeper: make the `col_*_toks` clause helpers `#[verifier::opaque]`
+and `reveal` them per-peel-lemma so `lemma_sparse_column_sprint`'s own query shrinks.
+The reverted LIMIT/OFFSET diff is straightforward to replay once that lands.
+
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
 `sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`), but
