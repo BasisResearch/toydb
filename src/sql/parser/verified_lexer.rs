@@ -297,4 +297,87 @@ pub fn scan_op_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
     }
 }
 
+// -- L2: whitespace skipping --------------------------------------------------
+//
+// The lexer skips ASCII whitespace before each token. `skip_ws` advances the
+// cursor past a maximal run of whitespace bytes; the token scanners run at the
+// returned position. This is the first piece of the inter-token machinery the
+// whole-input token-list roundtrip will need.
+
+/// ASCII whitespace: space, tab, newline, carriage return.
+pub open spec fn is_ws(b: u8) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13
+}
+
+/// Advance past a maximal run of whitespace bytes starting at `pos`.
+pub open spec fn skip_ws(input: Seq<u8>, pos: int) -> int
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_ws(input[pos]) {
+        skip_ws(input, pos + 1)
+    } else {
+        pos
+    }
+}
+
+/// `skip_ws` never moves backward and never past the end.
+pub proof fn lemma_skip_ws_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        pos <= skip_ws(input, pos) <= input.len(),
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_ws(input[pos]) {
+        lemma_skip_ws_bounds(input, pos + 1);
+    }
+}
+
+/// `skip_ws` lands on end-of-input or a non-whitespace byte (its defining
+/// fixpoint): the token scanner that runs there never faces leading whitespace.
+pub proof fn lemma_skip_ws_fixpoint(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        skip_ws(input, pos) == input.len()
+            || !is_ws(input[skip_ws(input, pos)]),
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_ws(input[pos]) {
+        lemma_skip_ws_fixpoint(input, pos + 1);
+    }
+}
+
+/// When the current byte is not whitespace, `skip_ws` is a no-op — so printing a
+/// token whose first byte is non-whitespace (all L0/L1 tokens) means a preceding
+/// `skip_ws` leaves the cursor exactly on it.
+pub proof fn lemma_skip_ws_nonws(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos < input.len(),
+        !is_ws(input[pos]),
+    ensures
+        skip_ws(input, pos) == pos,
+{
+}
+
+/// Executable whitespace skip, refining `skip_ws`.
+pub fn skip_ws_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
+    requires
+        pos <= input.len(),
+    ensures
+        r == skip_ws(input@, pos as int),
+    decreases input.len() - pos,
+{
+    if pos < input.len() {
+        let b = input[pos];
+        if b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 {
+            skip_ws_exec(input, pos + 1)
+        } else {
+            pos
+        }
+    } else {
+        pos
+    }
+}
+
 } // verus!
