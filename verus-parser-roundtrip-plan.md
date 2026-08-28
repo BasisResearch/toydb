@@ -320,6 +320,44 @@ is the multi-week gate) and the ast-equivalence argument so the verified parser 
 sound drop-in for the hand-written one, then the actual `parser.rs`/`lexer.rs` swap run
 green against the SQL suite. No grammar work remains.
 
+**Production lexer — RUNNABLE VERIFIED TOKENIZER for byte-determined classes
+(2026-08-28, L12-L17, 89 verified / 0 errors, full suite green, axiom-free).**
+Beyond the L0-L11 bricks below, the lexer now tokenizes **numbers, keywords and
+all symbols** end to end, both directions, culminating in a runnable executable
+`Vec<u8> -> Vec<Token>` producing the *real* production `Token`:
+- **L12** — full number scanner `scan_num_full_end` (int/decimal/exponent,
+  matching `lexer.rs::scan_number_bytes`); roundtrip covers the two printed forms
+  (Rust `f64` Display never emits scientific notation) under `num_tail_ok`.
+- **L13** — keyword classification table (66 keywords). Verus does NOT auto-decide
+  `seq!` literal equality, so `classify_kw` decides on `len` + indexed `byte_at`;
+  the 66-arm roundtrip lemma is split into 6 `spinoff_prover` grouped helpers
+  (each `requires` a keyword disjunction so its `_` arm is vacuous) to stay under
+  rlimit. `classify_kw_exec` refines it.
+- **L14** — ASCII case-folding + keyword-run scanner `lscan_keyword`; the keyword
+  arm roundtrips axiom-free (keywords carry no `String`).
+- **L15** — single-token value dispatcher `lscan_token` + `lemma_lscan_token`
+  (roundtrip for every byte-determined class); symbols compose via `sym_token_of`
+  delegating `lex_print_tv` to the Token-level `lscan_sym`.
+- **L16** — whole-input token-LIST roundtrip `lemma_lex_all_seq_roundtrip`: a
+  single **space is a universal separator** (satisfies every boundary), and
+  `lex_all_seq` strips leading whitespace as a seq slice *before* each scan so all
+  scans run at position 0 (only locality fact: a one-byte `skip_ws` shift).
+- **L17** — scanner suffix-**locality** lemmas (every scanner: scan at `pos` ==
+  scan the suffix at 0, shifted) → `lex_from` (position-based) bridged to
+  `lex_all_seq`; then the executable `lex_all_exec` fuel-free loop refining
+  `lex_from`, and the end-to-end `lemma_lex_all_exec_roundtrip`.
+
+**Remaining lexer work — the `String` trust bridge (the cutover blocker).** The
+only token classes left are **`Ident` (plain, non-keyword) and `String`** (quoted
+`'...'`/`"..."` with `''`/`""` escapes), which carry `String` payloads. The
+grammar carries these opaque, but the *lexer must build a `String` from bytes*,
+which needs a minimal audited byte↔`String` (UTF-8) trust bridge — the one
+planned trust-surface expansion (like `float_trust`). Plain idents also involve
+unicode lowercasing (production uses `char::to_lowercase`; the ASCII case is
+axiom-free, non-ASCII needs the `unicode_trust` model). Whitespace is currently
+ASCII (`is_ws`) vs production's unicode `is_whitespace` — a small gap. After the
+`String` bridge: ast-equivalence + the `parser.rs`/`lexer.rs` cutover.
+
 **Production lexer STARTED (2026-08-28, `verified_lexer.rs`, in verify.sh — 18 modules).**
 Same discipline as the grammar: smallest self-contained verified bricks, produces the
 REAL production `Token` (not `verified.rs`'s Phase-0 toy), byte cursor over `Seq<u8>`.
