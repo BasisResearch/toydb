@@ -31,6 +31,7 @@ VERIFY_MODULES=(
   sql::parser::unicode_trust
   sql::parser::verified
   sql::parser::verified_expression
+  sql::parser::verified_lexer
   sql::parser::verified_function_list
   sql::parser::verified_integer
   sql::parser::verified_lists
