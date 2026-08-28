@@ -1,9 +1,61 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
-Status: **E0-E4 complete (2026-08-27)** — the full expression-grammar
-print/parse roundtrip is verified end to end. Owner: kg (parser). Runs parallel
-to MVCC work (yl), no file overlap. Verified module opt-in via
+Status: **E0-E4 complete; statement mirror layer S0-S3 complete (2026-08-27)** —
+the full expression-grammar print/parse roundtrip is verified end to end, and the
+statement-level mirror roundtrip is verified for 9 of the 10 `ast::Statement`
+kinds in `src/sql/parser/verified_stmt.rs`. Owner: kg (parser). Runs parallel to
+MVCC work (yl), no file overlap. Verified module opt-in via
 `scripts/verus/verify.sh`.
+
+## Statement layer status (2026-08-27)
+
+`src/sql/parser/verified_stmt.rs` (opted into `verify.sh`, 64 verified / 0 errors
+under `--verify-module sql::parser::verified_stmt`) carries the `SStmt` mirror in
+the same style as the expression layer, with an `SStmt::Unsupported` catch-all so
+`view_stmt` stays total as the enum grows. Done:
+
+- **S0/S1 — list-free statements.** `Begin` (READ ONLY / AS OF SYSTEM TIME),
+  `Commit`, `Rollback`, `DropTable` (IF EXISTS), `Explain` (forbids nesting),
+  `Delete` (optional WHERE in the verified expression domain). Mirror roundtrip
+  `lemma_sparse_stmt_sprint` + `mirror_injective_stmt`.
+- **S2 — CreateTable.** Full column codec (name, datatype, PRIMARY KEY,
+  NULL/NOT NULL, UNIQUE, INDEX, REFERENCES, DEFAULT-last with an embedded
+  expression). The 6 optional clauses use `#[verifier::opaque]` parse helpers +
+  cheap per-clause "peel" lemmas to avoid a combinatorial solver blowup.
+- **S3 — Insert + Select.**
+  - `Insert`: optional column-name list + nested `VALUES` rows
+    (`Seq<Seq<SExpr>>`, two-level comma-list lemma).
+  - `Select`: select-list (exprs with optional `AS` alias, `*` unaliased),
+    `FROM` join-tree list, and `WHERE`. The **FROM join tree** is the plan's
+    flagged risk item: rather than fight left-recursion, `SFrom` is decomposed
+    into (head table, forward join-step list) via `from_head`/`from_steps` and
+    reassembled with `fold_joins`; `fold_decomp`/`sprint_decomp` prove the
+    identities, and the parser reads head + forward step-list then folds.
+  - **Remaining in Select:** the clauses `GROUP BY` / `HAVING` / `ORDER BY` /
+    `LIMIT` / `OFFSET` are currently constrained empty/None by `printable_stmt`;
+    each is one more optional clause (an expr, an expr-list, or an
+    expr+Direction list) over the machinery already proven — no new obstacle.
+
+**S4 — Update (blocked / needs a decision).** `Update.set` is a
+`BTreeMap<String, Option<Expression>>`. vstd models `BTreeMap` with an *unordered*
+`Map` view, and there is no cheap spec-level `String` ordering or sorted
+enumeration to canonicalise it to a `Seq` inside a `spec fn view_stmt`. Per the
+original plan's fallback, the verified `Update` domain should be restricted to a
+sorted-key normal form (or the roundtrip stated only at the executable level over
+`BTreeMap::iter`'s sorted order, which needs `BTreeMap` equality reasoning). This
+is the one genuine wall; it is not solved yet.
+
+**S5 — executable statement layer + headline** and **Phase 4 — production
+cutover** are not started. S5 mirrors E3/E4: `parse_stmt_exec`/`print_stmt_exec`
+building real `ast::Statement`, refining `sparse_stmt`/`sprint_stmt` at the
+`view_stmt` level, reusing `parse_expr_exec`/`print_expr_exec` for every embedded
+expression. The list-free statements (S1) are the natural first exec slice.
+
+The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
+force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
+DEFAULT/embedded-expr emitted last so its tail is always a terminator; fold
+decomposition for the left-deep join tree) are recorded in the `kg` memory
+`verus-stmt-roundtrip-s0-s3`.
 
 ## Completion status (2026-08-27)
 
