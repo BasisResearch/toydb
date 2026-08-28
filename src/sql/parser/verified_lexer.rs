@@ -3757,4 +3757,142 @@ pub proof fn lemma_lscan_mtok(mt: MTok, tail: Seq<u8>)
 }
 
 
+// -- L23: whole-input unified token-LIST roundtrip -----------------------------
+//
+// L16 over the unified MTok mirror: print a token list (all five classes) with
+// single-space separators, re-lex, recover it exactly. Same design — the space is
+// a universal separator (self-delimiting strings included) and lex_mtok_seq strips
+// leading whitespace as a seq slice before each scan, so every scan runs at 0.
+
+/// Every mirror token in the list is printable.
+pub open spec fn all_printable_mtok(ms: Seq<MTok>) -> bool {
+    forall|i: int| 0 <= i < ms.len() ==> printable_mtok(#[trigger] ms[i])
+}
+
+/// Print a mirror-token list: each token's bytes then a single space separator.
+pub open spec fn mprint_list(ms: Seq<MTok>) -> Seq<u8>
+    decreases ms.len(),
+{
+    if ms.len() == 0 {
+        Seq::empty()
+    } else {
+        mprint(ms[0]) + seq![32u8] + mprint_list(ms.drop_first())
+    }
+}
+
+/// A printable mirror token prints to a non-empty run with a non-whitespace head.
+pub proof fn lemma_mprint_head(mt: MTok)
+    requires
+        printable_mtok(mt),
+    ensures
+        mprint(mt).len() >= 1,
+        !is_ws(mprint(mt)[0]),
+{
+    match mt {
+        MTok::MNum(v) => { assert(is_digit(v[0])); }
+        MTok::MKw(kw) => {
+            lemma_kw_text_shape(kw);
+            assert(is_lower_letter(kw_text(kw)[0]));
+        }
+        MTok::MIdent(cs) => {
+            lemma_ident_bytes_lower(cs);
+            assert(mprint(mt).len() == cs.len());
+            assert(is_lower_letter(ascii_bytes(cs)[0]));
+        }
+        MTok::MString(cs) => {
+            assert(mprint(mt)[0] == 39);
+        }
+        MTok::MSym(tv) => { lemma_sym_token_props(tv); }
+    }
+}
+
+/// A single space is a valid tail boundary for every printable mirror token.
+pub proof fn lemma_space_tail_ok_mtok(mt: MTok, rest: Seq<u8>)
+    requires
+        printable_mtok(mt),
+    ensures
+        tail_ok_mtok(mt, seq![32u8] + rest),
+{
+    let tail = seq![32u8] + rest;
+    assert(tail[0] == 32);
+}
+
+/// Whole-input scanner over MTok: strip leading whitespace, scan one token at 0,
+/// recurse on the remainder.
+pub open spec fn lex_mtok_seq(input: Seq<u8>, fuel: nat) -> Seq<MTok>
+    decreases fuel,
+{
+    if fuel == 0 {
+        Seq::empty()
+    } else {
+        let stripped = skip_ws_seq(input);
+        if stripped.len() == 0 {
+            Seq::empty()
+        } else {
+            let r = lscan_mtok(stripped, 0);
+            match r.0 {
+                Some(mt) => seq![mt] + lex_mtok_seq(stripped.subrange(r.1, stripped.len() as int), (fuel - 1) as nat),
+                None => Seq::empty(),
+            }
+        }
+    }
+}
+
+/// `lex_mtok_seq` depends on its input only through `skip_ws_seq`.
+pub proof fn lemma_lex_mtok_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
+    requires
+        skip_ws_seq(a) == skip_ws_seq(b),
+    ensures
+        lex_mtok_seq(a, fuel) == lex_mtok_seq(b, fuel),
+{
+    if fuel != 0 {
+        assert(lex_mtok_seq(a, fuel) == lex_mtok_seq(b, fuel));
+    }
+}
+
+/// Whole-input unified token-list roundtrip (all five classes). Axiom-free.
+pub proof fn lemma_lex_mtok_seq_roundtrip(ms: Seq<MTok>, fuel: nat)
+    requires
+        all_printable_mtok(ms),
+        fuel >= ms.len(),
+    ensures
+        lex_mtok_seq(mprint_list(ms), fuel) == ms,
+    decreases ms.len(),
+{
+    if ms.len() == 0 {
+        assert(mprint_list(ms) =~= Seq::<u8>::empty());
+        assert(skip_ws_seq(mprint_list(ms)) =~= Seq::<u8>::empty());
+    } else {
+        let mt = ms[0];
+        let rest = ms.drop_first();
+        assert(printable_mtok(mt));
+        assert(all_printable_mtok(rest)) by {
+            assert forall|i: int| 0 <= i < rest.len() implies printable_mtok(#[trigger] rest[i]) by {
+                assert(rest[i] == ms[i + 1]);
+            }
+        }
+        let input = mprint_list(ms);
+        let tail = seq![32u8] + mprint_list(rest);
+        assert(input == mprint(mt) + seq![32u8] + mprint_list(rest));
+        assert(input == mprint(mt) + tail) by {
+            assert((mprint(mt) + seq![32u8]) + mprint_list(rest)
+                =~= mprint(mt) + (seq![32u8] + mprint_list(rest)));
+        }
+        lemma_mprint_head(mt);
+        assert(input[0] == mprint(mt)[0]);
+        assert(!is_ws(input[0]));
+        lemma_skip_ws_nonws(input, 0);
+        assert(skip_ws_seq(input) =~= input);
+        lemma_space_tail_ok_mtok(mt, mprint_list(rest));
+        lemma_lscan_mtok(mt, tail);
+        let e = mprint(mt).len() as int;
+        assert(lscan_mtok(input, 0) == (Some(mt), e));
+        assert(input.subrange(e, input.len() as int) =~= tail);
+        lemma_skip_ws_seq_prepend_ws(32u8, mprint_list(rest));
+        lemma_lex_mtok_seq_congr(tail, mprint_list(rest), (fuel - 1) as nat);
+        lemma_lex_mtok_seq_roundtrip(rest, (fuel - 1) as nat);
+    }
+}
+
+
 } // verus!
