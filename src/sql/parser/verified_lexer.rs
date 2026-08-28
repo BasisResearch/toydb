@@ -4019,4 +4019,310 @@ pub proof fn lemma_lscan_mtok_local(input: Seq<u8>, pos: int)
 }
 
 
+// -- L25: unified executable lexer (Vec<u8> -> Vec<Token>, all classes) ---------
+
+/// Unified single-token exec dispatcher, refining `lscan_mtok` at the `tok_view`
+/// level, producing the real production `Token`. Requires ASCII input (the
+/// char-per-byte String model; matches the roundtrip domain).
+pub fn lscan_mtok_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+        forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
+    ensures
+        r.1 == lscan_mtok(input@, pos as int).1,
+        match (r.0, lscan_mtok(input@, pos as int).0) {
+            (Some(t), Some(mt)) => tok_view(t) == mt,
+            (None, None) => true,
+            _ => false,
+        },
+{
+    let p = skip_ws_exec(input, pos);
+    if p < input.len() {
+        let b = input[p];
+        if b == 39u8 {
+            proof {
+                lemma_scan_to_quote_bounds(input@, p as int + 1);
+            }
+            scan_string_token_exec(input, p)
+        } else if 48u8 <= b && b <= 57u8 {
+            let e = scan_num_full_exec(input, p);
+            proof { lemma_scan_num_full_bounds(input@, p as int); }
+            let bytes = subrange_vec(input, p, e);
+            (Some(Token::Number(bytes)), e)
+        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
+            let e = scan_ident_exec(input, p);
+            proof { lemma_scan_ident_end_bounds(input@, p as int); }
+            let low = to_lower_vec(input, p, e);
+            match classify_kw_exec(&low) {
+                Some(kw) => (Some(Token::Keyword(kw)), e),
+                None => scan_ident_token_exec(input, p),
+            }
+        } else {
+            scan_sym_exec(input, p)
+        }
+    } else {
+        (None, p)
+    }
+}
+
+
+/// Map a token list to its mirror list.
+pub open spec fn tok_views(tokens: Seq<Token>) -> Seq<MTok>
+    decreases tokens.len(),
+{
+    if tokens.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![tok_view(tokens[0])] + tok_views(tokens.drop_first())
+    }
+}
+
+pub proof fn tok_views_concat(left: Seq<Token>, right: Seq<Token>)
+    ensures tok_views(left + right) == tok_views(left) + tok_views(right),
+    decreases left.len(),
+{
+    reveal_with_fuel(tok_views, 1);
+    if left.len() > 0 {
+        assert(left.drop_first() + right =~= (left + right).drop_first());
+        tok_views_concat(left.drop_first(), right);
+    } else {
+        assert(left + right =~= right);
+    }
+}
+
+/// The unified single-token end never exceeds the input length.
+pub proof fn lemma_lscan_mtok_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        0 <= lscan_mtok(input, pos).1 <= input.len(),
+{
+    lemma_skip_ws_bounds(input, pos);
+    let p = skip_ws(input, pos);
+    if p < input.len() {
+        let b = input[p];
+        if b == 39 {
+            lemma_scan_to_quote_bounds(input, p + 1);
+        } else if is_digit(b) {
+            lemma_scan_num_full_bounds(input, p);
+        } else if is_ident_start(b) {
+            lemma_scan_ident_end_bounds(input, p);
+        }
+    }
+}
+
+/// A recognised unified token advances strictly past its start.
+pub proof fn lemma_lscan_mtok_progress(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+        skip_ws(input, pos) < input.len(),
+        lscan_mtok(input, pos).0 is Some,
+    ensures
+        lscan_mtok(input, pos).1 > pos,
+{
+    lemma_skip_ws_bounds(input, pos);
+    let p = skip_ws(input, pos);
+    let b = input[p];
+    if b == 39 {
+        lemma_scan_to_quote_bounds(input, p + 1);
+    } else if is_digit(b) {
+        lemma_scan_num_full_bounds(input, p);
+    } else if is_ident_start(b) {
+        assert(is_ident_cont(input[p]));
+        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
+        lemma_scan_ident_end_bounds(input, p + 1);
+    }
+}
+
+/// Position-based unified whole-input scanner (mirrors the exec loop).
+pub open spec fn lex_mtok_from(input: Seq<u8>, pos: int, fuel: nat) -> Seq<MTok>
+    decreases fuel,
+{
+    if fuel == 0 {
+        Seq::empty()
+    } else {
+        let p = skip_ws(input, pos);
+        if 0 <= p < input.len() {
+            let r = lscan_mtok(input, pos);
+            match r.0 {
+                Some(mt) => seq![mt] + lex_mtok_from(input, r.1, (fuel - 1) as nat),
+                None => Seq::empty(),
+            }
+        } else {
+            Seq::empty()
+        }
+    }
+}
+
+/// Scanning a unified token at `pos` equals scanning at `skip_ws(input, pos)`.
+pub proof fn lemma_lscan_mtok_skip_ws(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_mtok(input, pos) == lscan_mtok(input, skip_ws(input, pos)),
+{
+    lemma_skip_ws_bounds(input, pos);
+    lemma_skip_ws_idem(input, pos);
+}
+
+/// Bridge: position-based `lex_mtok_from` equals slice-based `lex_mtok_seq`.
+pub proof fn lemma_lex_mtok_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lex_mtok_from(input, pos, fuel) == lex_mtok_seq(input.subrange(pos, input.len() as int), fuel),
+    decreases fuel,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if fuel != 0 {
+        lemma_skip_ws_local(input, pos);
+        lemma_skip_ws_bounds(sub, 0);
+        let p = skip_ws(input, pos);
+        let sp = skip_ws(sub, 0);
+        assert(p == pos + sp);
+        assert(0 <= sp <= sub.len());
+        assert(pos <= p <= n);
+        assert(skip_ws_seq(sub) =~= input.subrange(p, n));
+        if p < n {
+            lemma_lscan_mtok_skip_ws(input, pos);
+            lemma_lscan_mtok_local(input, p);
+            let r = lscan_mtok(input, pos);
+            let rp = lscan_mtok(input, p);
+            assert(r == rp);
+            match r.0 {
+                Some(mt) => {
+                    lemma_lscan_mtok_bounds(input, p);
+                    lemma_lscan_mtok_bounds(input.subrange(p, n), 0);
+                    assert(rp.1 == p + lscan_mtok(input.subrange(p, n), 0).1);
+                    let es = lscan_mtok(input.subrange(p, n), 0).1;
+                    assert(r.1 == p + es);
+                    assert(0 <= es <= n - p);
+                    assert(r.1 <= n);
+                    assert(input.subrange(p, n).subrange(es, (n - p)) =~= input.subrange(r.1, n));
+                    lemma_lex_mtok_from_eq_seq(input, r.1, (fuel - 1) as nat);
+                    assert(input.subrange(r.1, n) =~= sub.subrange((r.1 - pos), sub.len() as int));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// Executable unified lexer: tokenize `input` into a `Vec<Token>` (all five
+/// classes), refining `lex_mtok_from` (hence `lex_mtok_seq`). Requires ASCII input.
+pub fn lex_mtok_exec(input: &Vec<u8>) -> (r: Vec<Token>)
+    requires
+        forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
+    ensures
+        tok_views(r@) == lex_mtok_from(input@, 0, (input.len() + 1) as nat),
+{
+    let mut acc: Vec<Token> = Vec::new();
+    let mut pos: usize = 0;
+    let ghost fuel0: nat = (input.len() + 1) as nat;
+    let ghost rf: nat = fuel0;
+    assert(tok_views(acc@) == Seq::<MTok>::empty()) by {
+        assert(acc@ =~= Seq::<Token>::empty());
+    }
+    while pos < input.len()
+        invariant
+            pos <= input.len(),
+            acc.len() <= pos,
+            fuel0 == input.len() + 1,
+            rf == fuel0 - acc.len(),
+            forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
+            tok_views(acc@) + lex_mtok_from(input@, pos as int, rf) == lex_mtok_from(input@, 0, fuel0),
+        decreases input.len() - pos,
+    {
+        let p = skip_ws_exec(input, pos);
+        if p >= input.len() {
+            assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
+            return acc;
+        }
+        let (ot, e) = lscan_mtok_exec(input, pos);
+        match ot {
+            Some(t) => {
+                let ghost old_acc = acc@;
+                let ghost old_pos = pos as int;
+                let ghost old_rf = rf;
+                proof {
+                    lemma_lscan_mtok_progress(input@, pos as int);
+                    lemma_lscan_mtok_bounds(input@, pos as int);
+                    assert(rf >= 1);
+                    assert(skip_ws(input@, pos as int) < input@.len());
+                    assert(lscan_mtok(input@, pos as int) == (Some(tok_view(t)), e as int));
+                    assert(lex_mtok_from(input@, old_pos, old_rf)
+                        == seq![tok_view(t)] + lex_mtok_from(input@, e as int, (old_rf - 1) as nat));
+                    tok_views_concat(old_acc, seq![t]);
+                    assert(tok_views(seq![t]) == seq![tok_view(t)]) by {
+                        reveal_with_fuel(tok_views, 2);
+                        assert(seq![t].drop_first() =~= Seq::<Token>::empty());
+                    }
+                }
+                acc.push(t);
+                pos = e;
+                proof {
+                    rf = (old_rf - 1) as nat;
+                    assert(acc@ == old_acc + seq![t]);
+                    assert(tok_views(acc@) == tok_views(old_acc) + seq![tok_view(t)]);
+                    assert(tok_views(acc@) + lex_mtok_from(input@, pos as int, rf)
+                        == tok_views(old_acc)
+                           + (seq![tok_view(t)] + lex_mtok_from(input@, pos as int, rf)));
+                    assert(tok_views(old_acc)
+                           + (seq![tok_view(t)] + lex_mtok_from(input@, pos as int, rf))
+                        == tok_views(old_acc) + lex_mtok_from(input@, old_pos, old_rf));
+                }
+            }
+            None => {
+                assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
+                return acc;
+            }
+        }
+    }
+    assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
+    acc
+}
+
+
+/// The printed list is at least as long as the token count, so `input.len()+1`
+/// is always enough fuel.
+pub proof fn lemma_mprint_list_len_ge(ms: Seq<MTok>)
+    requires
+        all_printable_mtok(ms),
+    ensures
+        mprint_list(ms).len() >= ms.len(),
+    decreases ms.len(),
+{
+    if ms.len() != 0 {
+        let rest = ms.drop_first();
+        assert(all_printable_mtok(rest)) by {
+            assert forall|i: int| 0 <= i < rest.len() implies printable_mtok(#[trigger] rest[i]) by {
+                assert(rest[i] == ms[i + 1]);
+            }
+        }
+        assert(printable_mtok(ms[0]));
+        lemma_mprint_head(ms[0]);
+        lemma_mprint_list_len_ge(rest);
+    }
+}
+
+/// End-to-end unified lexer roundtrip (spec level, all five token classes):
+/// tokenizing the printed form of a printable token list recovers the list.
+/// Composed with `lex_mtok_exec`'s postcondition, this gives
+/// `tok_views(lex_mtok_exec(mprint_list(ms))@) == ms`.
+pub proof fn lemma_lex_mtok_roundtrip(ms: Seq<MTok>, input: Seq<u8>)
+    requires
+        all_printable_mtok(ms),
+        input == mprint_list(ms),
+    ensures
+        lex_mtok_from(input, 0, (input.len() + 1) as nat) == ms,
+{
+    lemma_lex_mtok_from_eq_seq(input, 0, (input.len() + 1) as nat);
+    assert(input.subrange(0, input.len() as int) =~= input);
+    lemma_mprint_list_len_ge(ms);
+    assert(ms.len() <= input.len() + 1);
+    lemma_lex_mtok_seq_roundtrip(ms, (input.len() + 1) as nat);
+}
+
+
 } // verus!
