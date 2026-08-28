@@ -33,11 +33,94 @@ landed in `src/sql/parser/verified_roundtrip.rs` (opted into `verify.sh`,
 Trust surface is unchanged: the only axioms are the three `float_trust`
 assumptions. Everything else is axiom-free.
 
-**Remaining follow-on** (not yet started): the statement layer (original
-Phase 3, "Statements follow the same shape" below) — `Statement` carries `Vec`s
-too and needs the same mirror + executable treatment, reusing the expression
-executable parser. And Phase 4's production cutover (swap `Parser`'s
-`Peekable<Lexer>` / `Lexer`'s `Peekable<Chars>` for the verified functions).
+The expression headline is fuel-free: `print_expr_exec` recurses on the ghost
+measure `sdepth(view_expr(*e))` (a `decreases` may be ghost even for exec code),
+so `print_parse_roundtrip_exec(e)` takes only the expression and `printable_se`.
+An executable `usize` fuel counter was avoided on purpose — `sdepth` is an
+unbounded `nat`, so a counter would need an unprovable "AST fits in `usize`"
+bound to rule out overflow.
+
+**Remaining work** — the statement layer and the production cutover — is scoped
+concretely in "Remaining work" below.
+
+## Remaining work — statement roundtrip + cutover
+
+The statement layer reuses the expression pieces wholesale: `parse_expr_exec` /
+`print_expr_exec` for every embedded expression, `sparse` / `sprint` for the
+mirror, and the `view_expr` bridge. What is new is the statement-level mirror
+`SStmt` (a `Seq`-based mirror of `ast::Statement`, embedding `SExpr` for
+expression children), and the keyword-driven wrappers around the expression
+grammar. Same three-layer shape as E0-E4: mirror + roundtrip, then executable
+refinement at a `view_stmt` level.
+
+The wrinkles are all about the containers `Statement` carries, so the phases are
+ordered by container difficulty rather than by statement kind.
+
+- **S0 — mirror scaffold + bridge.** `SStmt`, `view_stmt: ast::Statement ->
+  SStmt`, `sprint_stmt`, `sdepth_stmt`. Expression children go through the
+  existing `view_expr` / `sprint`. Small, mirrors E0.
+
+- **S1 — list-free statements.** `Begin` / `Commit` / `Rollback` / `DropTable`
+  / `Explain` (recursive wrapper, forbid `Explain(Explain(_))`), and `Delete`
+  with an optional `where` in the verified expression domain. The spec-level
+  encodings already exist in `verified_production` (`control_tokens`,
+  `drop_table_tokens`, `begin_views`, `delete_views`); port them onto `SStmt`
+  and prove `sparse_stmt(sprint_stmt(s)) == (Some(s), [])`. Reuse
+  `lemma_sparse_sprint` for the embedded `Delete` predicate.
+
+- **S2 — single-level lists.** `CreateTable` columns, `Select`'s `select` (with
+  `Option<String>` aliases and the `All`-only-unaliased rule via the existing
+  `contains_all` predicate), `group_by`, `order_by` (with `Direction`), and
+  `Insert`'s optional column-name list. Each is one comma list over an
+  expression (or name), so the `sparse_args` / comma-list lemma from
+  `verified_roundtrip` is the template; write one statement-list lemma and
+  instantiate it per position.
+
+- **S3 — nested lists and the join tree.** `Insert.values : Vec<Vec<Expression>>`
+  is a comma list of parenthesised comma lists, so the mirror needs
+  `Seq<Seq<SExpr>>` and a two-level list lemma (outer list of rows, inner list
+  of values). `Select.from : Vec<From>` with `From::Join` is a left-deep
+  recursive tree (right child always a table, `CROSS JOIN` alone omits its
+  predicate); mirror it as a recursive `SFrom` and prove its roundtrip with the
+  join-associativity direction fixed by the printer, reusing `printable_from`.
+
+- **S4 — `Update.set : BTreeMap<String, Option<Expression>>`.** The hard one.
+  A `BTreeMap` has no canonical printable order that Verus models cheaply, and
+  its equality is not view-determined. Decide the representation up front:
+  carry the assignments in the mirror as a `Seq<(String, Option<SExpr>)>` sorted
+  by key, have `print_stmt_exec` emit them in that fixed order, and have the
+  parser rebuild the `BTreeMap` — stating the roundtrip through a `view_stmt`
+  that canonicalises the map to the same sorted sequence (so map equality is
+  never needed, exactly as `view_expr` sidesteps `Vec` equality). If Verus's
+  `BTreeMap` model is too thin to rebuild from a sequence, restrict the verified
+  `Update` domain to a sorted-key normal form and document the gap.
+
+- **S5 — executable statements + headline.** `parse_stmt_exec` / `print_stmt_exec`
+  building real `ast::Statement`, refining `sparse_stmt` / `sprint_stmt` at
+  `view_stmt`, delegating every expression to `parse_expr_exec` /
+  `print_expr_exec`. Headlines `print_parse_roundtrip_stmt` (fuel-free, same
+  ghost-measure `decreases` trick) and `stmt_injective`.
+
+### Phase 4 — production cutover (independent of S0-S5)
+
+Replace the two `std::iter::Peekable`s with the verified cursors so the verified
+functions become the production functions (coverage numerator up, denominator
+flat):
+
+- `Lexer.chars : Peekable<Chars>` -> the byte cursor `next_token(&[u8], pos)`
+  from `verified.rs`.
+- `Parser.lexer : Peekable<Lexer>` -> the `TokenStream` / `PeekStream` leaf.
+- Swap `parse.rs`'s recursive-descent expression/statement parsers for
+  `parse_expr_exec` / `parse_stmt_exec`, and delete the std-iterator plumbing.
+- Run the existing SQL suite green. Budget the ripple onto `verified_production`
+  / `verified_statements` (the spec-parser-backed statement proofs) — migrate
+  them onto the executable parser, then retire the spec parser.
+
+### Phase 5 — optional refinements
+
+Minimal-parenthesisation printer (mirror `types::ExpressionDisplay`) reproved to
+roundtrip via the precedence-table argument, and the lift to string level once
+the byte-cursor lexer's own roundtrip is proved (`parse(print_str(e)) == e`).
 
 ## Original plan follows
 
