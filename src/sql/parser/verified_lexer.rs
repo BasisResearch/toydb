@@ -3212,6 +3212,15 @@ pub proof fn lemma_u8_char_u8(b: u8)
 {
 }
 
+/// An ASCII char's `u8` cast preserves its value.
+pub proof fn lemma_char_u8_val(c: char)
+    requires
+        (c as u32) < 128,
+    ensures
+        (c as u8) as u32 == (c as u32),
+{
+}
+
 /// Every char is ASCII (fits in one byte).
 pub open spec fn all_ascii_chars(cs: Seq<char>) -> bool {
     forall|i: int| 0 <= i < cs.len() ==> (cs[i] as u32) < 128
@@ -3280,6 +3289,149 @@ pub fn build_ascii_string(input: &Vec<u8>, p: usize, e: usize) -> (r: String)
         i += 1;
     }
     s
+}
+
+
+// -- L19: identifier token scanner at the char-view level (ASCII, axiom-free) ---
+//
+// `Ident` is the first token whose value is a `String`. Neither the spec nor the
+// roundtrip can use a `String` (not spec-constructible, and `String` equality is
+// not view-determined). The fix, mirroring `view_expr`'s dodge of `Vec`: work with
+// the char-sequence *view* `Seq<char>` in spec, and refine the exec at the `s@`
+// level. `lscan_ident_m` produces the char view of an identifier (the lowercased
+// run, when it is not a keyword); the exec `scan_ident_token_exec` builds the real
+// `Token::Ident(String)` and is verified so its `@` view matches. Axiom-free for
+// ASCII identifiers.
+
+/// Every char is a lowercase ASCII letter.
+pub open spec fn all_lower_letter_chars(cs: Seq<char>) -> bool {
+    forall|i: int| 0 <= i < cs.len() ==> 97 <= (#[trigger] cs[i]) as u32 <= 122
+}
+
+/// Scan an identifier, producing its lowercased char-sequence view — or `None`
+/// when the run classifies as a keyword (handled by `lscan_keyword`) or there is
+/// no identifier at `pos`.
+pub open spec fn lscan_ident_m(input: Seq<u8>, pos: int) -> (Option<Seq<char>>, int) {
+    if 0 <= pos < input.len() && is_ident_start(input[pos]) {
+        let e = scan_ident_end(input, pos);
+        let low = ascii_lower_seq(input.subrange(pos, e));
+        if classify_kw(low) is None {
+            (Some(ascii_chars(low)), e)
+        } else {
+            (None, e)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// A lowercase-letter char run is all lowercase-letter bytes once encoded.
+pub proof fn lemma_ident_bytes_lower(cs: Seq<char>)
+    requires
+        all_lower_letter_chars(cs),
+    ensures
+        all_lower_letters(ascii_bytes(cs)),
+        all_ascii_bytes(ascii_bytes(cs)),
+{
+    assert forall|i: int| 0 <= i < ascii_bytes(cs).len() implies
+        is_lower_letter(#[trigger] ascii_bytes(cs)[i]) && ascii_bytes(cs)[i] < 128 by {
+        let c = cs[i];
+        assert(97 <= (c as u32) <= 122);
+        lemma_char_u8_val(c);
+        assert(ascii_bytes(cs)[i] == (c as u8));
+        assert(97 <= (c as u8) <= 122);
+    }
+}
+
+/// Identifier roundtrip at the char-view level: printing a non-empty
+/// lowercase-letter char run that is not a keyword, then re-scanning under a
+/// non-continuation boundary, recovers exactly that char sequence. Axiom-free.
+pub proof fn lemma_lscan_ident_m(cs: Seq<char>, tail: Seq<u8>)
+    requires
+        cs.len() >= 1,
+        all_lower_letter_chars(cs),
+        classify_kw(ascii_bytes(cs)) is None,
+        tail.len() == 0 || !is_ident_cont(tail[0]),
+    ensures
+        lscan_ident_m(ascii_bytes(cs) + tail, 0) == (Some(cs), cs.len() as int),
+{
+    let d = ascii_bytes(cs);
+    let input = d + tail;
+    lemma_ident_bytes_lower(cs);
+    // d is a well-formed identifier byte run
+    lemma_lower_letters_ident_bytes(d);
+    assert(input[0] == d[0]);
+    assert(is_ident_start(input[0]));
+    lemma_scan_ident_roundtrip(d, tail);
+    assert(scan_ident_end(input, 0) == d.len());
+    assert(input.subrange(0, d.len() as int) =~= d);
+    // lowercasing the (already lowercase) run is the identity
+    lemma_ascii_lower_idem(d);
+    assert(ascii_lower_seq(d) == d);
+    // classify is None ⟹ Ident arm; its char view is cs
+    lemma_ascii_chars_bytes(cs);
+    assert(ascii_chars(d) == cs);
+}
+
+
+/// ASCII-lowercasing preserves ASCII-ness.
+pub proof fn lemma_ascii_lower_seq_ascii(s: Seq<u8>)
+    requires
+        all_ascii_bytes(s),
+    ensures
+        all_ascii_bytes(ascii_lower_seq(s)),
+{
+    assert forall|i: int| 0 <= i < ascii_lower_seq(s).len() implies
+        ascii_lower_seq(s)[i] < 128 by {
+        assert(s[i] < 128);
+        assert(ascii_lower_seq(s)[i] == ascii_lower(s[i]));
+    }
+}
+
+/// Executable identifier-token scanner: builds the real `Token::Ident(String)`,
+/// verified so its `@` char view matches `lscan_ident_m`. `None` when the run is a
+/// keyword or there is no identifier. Requires the identifier run to be ASCII
+/// (the char-per-byte `String` model; UTF-8 idents are a later concern).
+pub fn scan_ident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+        forall|i: int| pos <= i < scan_ident_end(input@, pos as int) ==> (#[trigger] input@[i]) < 128,
+    ensures
+        r.1 == lscan_ident_m(input@, pos as int).1,
+        match (r.0, lscan_ident_m(input@, pos as int).0) {
+            (Some(Token::Ident(s)), Some(cv)) => s@ == cv,
+            (None, None) => true,
+            _ => false,
+        },
+{
+    if pos < input.len() {
+        let b = input[pos];
+        if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
+            let e = scan_ident_exec(input, pos);
+            proof { lemma_scan_ident_end_bounds(input@, pos as int); }
+            let low = to_lower_vec(input, pos, e);
+            proof {
+                lemma_ascii_lower_seq_ascii(input@.subrange(pos as int, e as int));
+                assert(all_ascii_bytes(input@.subrange(pos as int, e as int))) by {
+                    assert forall|i: int| 0 <= i < (e - pos) implies
+                        input@.subrange(pos as int, e as int)[i] < 128 by {
+                        assert(input@.subrange(pos as int, e as int)[i] == input@[pos + i]);
+                    }
+                }
+            }
+            match classify_kw_exec(&low) {
+                Some(_kw) => (None, e),
+                None => {
+                    let s = build_ascii_string(&low, 0, low.len());
+                    (Some(Token::Ident(s)), e)
+                }
+            }
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
 }
 
 
