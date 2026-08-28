@@ -3644,6 +3644,170 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+/// Statement kinds the unified executable parser recovers: everything except
+/// Select and Update (whose exec parsers are not built yet), Explain recursively.
+pub open spec fn full_exec_ok(s: SStmt) -> bool
+    decreases s,
+{
+    match s {
+        SStmt::Begin { .. } => true,
+        SStmt::Commit => true,
+        SStmt::Rollback => true,
+        SStmt::CreateTable { .. } => true,
+        SStmt::DropTable { .. } => true,
+        SStmt::Delete { .. } => true,
+        SStmt::Insert { .. } => true,
+        SStmt::Explain(inner) => full_exec_ok(*inner),
+        _ => false,
+    }
+}
+
+/// Unified executable statement parser, refining `sparse_stmt` at `view_stmt`.
+/// Sound always; complete on the `full_exec_ok` domain (returns `None` only when
+/// `sparse_stmt` yields nothing in that domain).
+#[verifier::rlimit(30000)]
+pub fn parse_stmt_full_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_stmt(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && full_exec_ok(sopt.unwrap())
+                    && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None || !full_exec_ok(sopt.unwrap()),
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_stmt, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    match &toks[pos] {
+        super::Token::Keyword(Keyword::Commit) => (Some(ast::Statement::Commit), pos + 1),
+        super::Token::Keyword(Keyword::Rollback) => (Some(ast::Statement::Rollback), pos + 1),
+        super::Token::Keyword(Keyword::Begin) => parse_begin_exec(toks, pos, fuel),
+        super::Token::Keyword(Keyword::Create) => parse_createtable_exec(toks, pos, fuel),
+        super::Token::Keyword(Keyword::Insert) => parse_insert_exec(toks, pos, fuel),
+        super::Token::Keyword(Keyword::Drop) => {
+            if pos + 1 < toks.len() && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Table)) {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+                if pos + 2 < toks.len() && pos + 3 < toks.len()
+                    && matches!(toks[pos + 2], super::Token::Keyword(Keyword::If))
+                    && matches!(toks[pos + 3], super::Token::Keyword(Keyword::Exists)) {
+                    proof {
+                        token_views_suffix(toks@, pos as int + 2);
+                        token_views_suffix(toks@, pos as int + 3);
+                    }
+                    if pos + 4 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 4); }
+                        match &toks[pos + 4] {
+                            super::Token::Ident(name) => (
+                                Some(ast::Statement::DropTable { name: name.clone(), if_exists: true }),
+                                pos + 5,
+                            ),
+                            _ => (None, pos),
+                        }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 4, toks@.len() as int)); }
+                        (None, pos)
+                    }
+                } else {
+                    if pos + 2 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 2); }
+                        match &toks[pos + 2] {
+                            super::Token::Ident(name) => (
+                                Some(ast::Statement::DropTable { name: name.clone(), if_exists: false }),
+                                pos + 3,
+                            ),
+                            _ => (None, pos),
+                        }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                        (None, pos)
+                    }
+                }
+            } else {
+                if pos + 1 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 1); }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                }
+                (None, pos)
+            }
+        },
+        super::Token::Keyword(Keyword::Delete) => {
+            if pos + 1 < toks.len() && pos + 2 < toks.len()
+                && matches!(toks[pos + 1], super::Token::Keyword(Keyword::From)) {
+                proof {
+                    token_views_suffix(toks@, pos as int + 1);
+                    token_views_suffix(toks@, pos as int + 2);
+                }
+                match &toks[pos + 2] {
+                    super::Token::Ident(table) => {
+                        if pos + 3 < toks.len()
+                            && matches!(toks[pos + 3], super::Token::Keyword(Keyword::Where)) {
+                            proof { token_views_suffix(toks@, pos as int + 3); }
+                            let (eopt, epos) = parse_expr_exec(toks, pos + 4, fuel);
+                            match eopt {
+                                Some(e) => (
+                                    Some(ast::Statement::Delete { table: table.clone(), where_clause: Some(e) }),
+                                    epos,
+                                ),
+                                None => (None, pos),
+                            }
+                        } else {
+                            if pos + 3 < toks.len() {
+                                proof { token_views_suffix(toks@, pos as int + 3); }
+                            } else {
+                                proof { token_views_len(toks@.subrange(pos as int + 3, toks@.len() as int)); }
+                            }
+                            (Some(ast::Statement::Delete { table: table.clone(), where_clause: None }), pos + 3)
+                        }
+                    },
+                    _ => (None, pos),
+                }
+            } else {
+                if pos + 1 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 1); }
+                    if pos + 2 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 2); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                    }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                }
+                (None, pos)
+            }
+        },
+        super::Token::Keyword(Keyword::Explain) => {
+            let (iopt, ipos) = parse_stmt_full_exec(toks, pos + 1, fuel - 1);
+            match iopt {
+                Some(inner) => {
+                    if matches!(inner, ast::Statement::Explain(_)) {
+                        (None, pos)
+                    } else {
+                        (Some(ast::Statement::Explain(Box::new(inner))), ipos)
+                    }
+                },
+                None => (None, pos),
+            }
+        },
+        _ => {
+            reveal_with_fuel(sparse_update, 1);
+            reveal_with_fuel(sparse_select, 1);
+            (None, pos)
+        },
+    }
+}
+
 // -- CreateTable column exec parser ------------------------------------------
 //
 // Refines `sparse_column`. Its optional-clause helpers (`col_parse_pk`,
