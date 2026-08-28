@@ -523,7 +523,8 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
                 && all_printable_se(group_by)
                 && (match having { Some(e) => printable_se(e), None => true })
                 && order_by.len() == 0
-                && limit is None && offset is None,
+                && (match limit { Some(e) => printable_se(e), None => true })
+                && (match offset { Some(e) => printable_se(e), None => true }),
         SStmt::Explain(inner) => !is_sexplain(*inner) && printable_stmt(*inner),
         SStmt::Unsupported => false,
     }
@@ -543,6 +544,8 @@ pub open spec fn sprint_select_body(
     where_clause: Option<SExpr>,
     group_by: Seq<SExpr>,
     having: Option<SExpr>,
+    limit: Option<SExpr>,
+    offset: Option<SExpr>,
 ) -> Seq<TokenView> {
     seq![TokenView::Keyword(Keyword::Select)] + sprint_select_list(select)
         + (if from.len() > 0 {
@@ -564,6 +567,14 @@ pub open spec fn sprint_select_body(
             Some(e) => seq![TokenView::Keyword(Keyword::Having)] + sprint(e),
             None => Seq::empty(),
         })
+        + (match limit {
+            Some(e) => seq![TokenView::Keyword(Keyword::Limit)] + sprint(e),
+            None => Seq::empty(),
+        })
+        + (match offset {
+            Some(e) => seq![TokenView::Keyword(Keyword::Offset)] + sprint(e),
+            None => Seq::empty(),
+        })
 }
 
 /// Fuel measure of a Select's clauses. Opaque for the same reason as
@@ -575,11 +586,15 @@ pub open spec fn sdepth_select_body(
     where_clause: Option<SExpr>,
     group_by: Seq<SExpr>,
     having: Option<SExpr>,
+    limit: Option<SExpr>,
+    offset: Option<SExpr>,
 ) -> nat {
     (1 + select_list_depth(select) + from_list_depth(from)
         + (match where_clause { Some(e) => sdepth(e), None => 0nat })
         + slist_depth(group_by)
-        + (match having { Some(e) => sdepth(e), None => 0nat })) as nat
+        + (match having { Some(e) => sdepth(e), None => 0nat })
+        + (match limit { Some(e) => sdepth(e), None => 0nat })
+        + (match offset { Some(e) => sdepth(e), None => 0nat })) as nat
 }
 
 pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
@@ -655,8 +670,8 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
                 Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
                 None => Seq::empty(),
             }),
-        SStmt::Select { select, from, where_clause, group_by, having, .. } =>
-            sprint_select_body(select, from, where_clause, group_by, having),
+        SStmt::Select { select, from, where_clause, group_by, having, limit, offset, .. } =>
+            sprint_select_body(select, from, where_clause, group_by, having, limit, offset),
         SStmt::Explain(inner) => seq![TokenView::Keyword(Keyword::Explain)] + sprint_stmt(*inner),
         SStmt::Unsupported => Seq::empty(),
     }
@@ -676,8 +691,8 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
                 Some(e) => sdepth(e),
                 None => 0nat,
             })) as nat,
-        SStmt::Select { select, from, where_clause, group_by, having, .. } =>
-            sdepth_select_body(select, from, where_clause, group_by, having),
+        SStmt::Select { select, from, where_clause, group_by, having, limit, offset, .. } =>
+            sdepth_select_body(select, from, where_clause, group_by, having, limit, offset),
         SStmt::Explain(inner) => 1 + sdepth_stmt(*inner),
         _ => 1,
     }
@@ -841,37 +856,39 @@ pub open spec fn sparse_where_group(r2: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// Roundtrip for the WHERE+GROUP+HAVING tail.
+/// Roundtrip for the WHERE+GROUP+HAVING tail, followed by an arbitrary boundary
+/// `tail` (the LIMIT/OFFSET tokens, which open with `LIMIT`/`OFFSET` or end).
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40000)]
 pub proof fn lemma_sparse_where_group_sprint(
     where_clause: Option<SExpr>,
     group_by: Seq<SExpr>,
     having: Option<SExpr>,
+    tail: Seq<TokenView>,
     fuel: nat,
 )
     requires
-        match where_clause { Some(e) => printable_se(e), None => true },
+        match where_clause { Some(e) => printable_se(e) && fuel >= sdepth(e), None => true },
         all_printable_se(group_by),
-        match having { Some(e) => printable_se(e), None => true },
-        match where_clause { Some(e) => fuel >= sdepth(e), None => true },
         fuel >= slist_depth(group_by),
-        match having { Some(e) => fuel >= sdepth(e), None => true },
+        match having { Some(e) => printable_se(e) && fuel >= sdepth(e), None => true },
+        tail.len() == 0
+            || (tail[0] != TokenView::Comma && tail[0] != TokenView::Period
+                && tail[0] != TokenView::OpenParen
+                && tail[0] != TokenView::Keyword(Keyword::Where)
+                && tail[0] != TokenView::Keyword(Keyword::Group)
+                && tail[0] != TokenView::Keyword(Keyword::Having)),
     ensures ({
-        let wherepart = match where_clause {
-            Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
-            None => Seq::<TokenView>::empty(),
-        };
+        let wherepart = kw_expr_part(where_clause, Keyword::Where);
         let grouppart = if group_by.len() > 0 {
             seq![TokenView::Keyword(Keyword::Group), TokenView::Keyword(Keyword::By)]
                 + sprint_args(group_by)
         } else {
             Seq::<TokenView>::empty()
         };
-        let havingpart = match having {
-            Some(e) => seq![TokenView::Keyword(Keyword::Having)] + sprint(e),
-            None => Seq::<TokenView>::empty(),
-        };
-        sparse_where_group(wherepart + grouppart + havingpart, fuel)
-            == (Some((where_clause, group_by, having)), Seq::<TokenView>::empty())
+        let havingpart = kw_expr_part(having, Keyword::Having);
+        sparse_where_group(wherepart + grouppart + havingpart + tail, fuel)
+            == (Some((where_clause, group_by, having)), tail)
     }),
 {
     reveal(sparse_where_group);
@@ -881,31 +898,32 @@ pub proof fn lemma_sparse_where_group_sprint(
     } else {
         Seq::<TokenView>::empty()
     };
-    let wherepart = match where_clause {
-        Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
-        None => Seq::<TokenView>::empty(),
-    };
-    let havingpart = match having {
-        Some(e) => seq![TokenView::Keyword(Keyword::Having)] + sprint(e),
-        None => Seq::<TokenView>::empty(),
-    };
-    // Each optional clause opens with its keyword (or is empty): safe boundaries.
+    let wherepart = kw_expr_part(where_clause, Keyword::Where);
+    let havingpart = kw_expr_part(having, Keyword::Having);
+    assert(wherepart.len() == 0 || wherepart[0] == TokenView::Keyword(Keyword::Where)) by {
+        if where_clause is Some { assert(wherepart[0] == TokenView::Keyword(Keyword::Where)); }
+    }
     assert(havingpart.len() == 0 || havingpart[0] == TokenView::Keyword(Keyword::Having)) by {
         if having is Some { assert(havingpart[0] == TokenView::Keyword(Keyword::Having)); }
     }
     assert(grouppart.len() == 0 || grouppart[0] == TokenView::Keyword(Keyword::Group)) by {
         if group_by.len() > 0 { assert(grouppart[0] == TokenView::Keyword(Keyword::Group)); }
     }
-    let gh = grouppart + havingpart;
+    let ht = havingpart + tail;
+    let gh = grouppart + ht;
+    assert(boundary(ht)) by {
+        if having is Some { assert(ht[0] == TokenView::Keyword(Keyword::Having)); }
+    }
     assert(gh.len() == 0
-        || (gh[0] != TokenView::Comma && gh[0] != TokenView::Period && gh[0] != TokenView::OpenParen)) by {
+        || (gh[0] != TokenView::Comma && gh[0] != TokenView::Period
+            && gh[0] != TokenView::OpenParen)) by {
         if group_by.len() > 0 { assert(gh[0] == TokenView::Keyword(Keyword::Group)); }
-        else { assert(gh =~= havingpart); }
+        else { assert(gh =~= ht); }
     }
     assert(boundary(gh));
     let r2 = wherepart + gh;
-    assert(r2 =~= wherepart + grouppart + havingpart);
-    // WHERE stage — tail is grouppart ++ havingpart.
+    assert(r2 =~= wherepart + grouppart + havingpart + tail);
+    // WHERE stage — tail is grouppart ++ havingpart ++ tail.
     match where_clause {
         Some(e) => {
             assert(r2 =~= seq![TokenView::Keyword(Keyword::Where)] + (sprint(e) + gh));
@@ -921,31 +939,115 @@ pub proof fn lemma_sparse_where_group_sprint(
             }
         },
     }
-    // GROUP stage — leaves rw == gh, and its expr-list tail is havingpart.
+    // GROUP stage — leaves rw == gh, and its expr-list tail is havingpart ++ tail.
     if group_by.len() > 0 {
         assert(gh[0] == TokenView::Keyword(Keyword::Group));
         assert(gh[1] == TokenView::Keyword(Keyword::By));
-        assert(gh.drop_first().drop_first() =~= sprint_args(group_by) + havingpart);
-        assert(havingpart.len() == 0
-            || (havingpart[0] != TokenView::Comma && havingpart[0] != TokenView::Period
-                && havingpart[0] != TokenView::OpenParen));
-        lemma_sparse_expr_list_sprint(group_by, havingpart, fuel);
+        assert(gh.drop_first().drop_first() =~= sprint_args(group_by) + ht);
+        assert(ht.len() == 0
+            || (ht[0] != TokenView::Comma && ht[0] != TokenView::Period
+                && ht[0] != TokenView::OpenParen)) by {
+            if having is Some { assert(ht[0] == TokenView::Keyword(Keyword::Having)); }
+        }
+        lemma_sparse_expr_list_sprint(group_by, ht, fuel);
     } else {
-        assert(gh =~= havingpart);
+        assert(gh =~= ht);
     }
-    // HAVING stage — leaves rh == [].
-    match having {
+    // HAVING stage — leaves rh == tail.
+    assert(having is None ==> (ht.len() == 0 || ht[0] != TokenView::Keyword(Keyword::Having)));
+    lemma_sparse_kw_expr_sprint(having, Keyword::Having, tail, fuel);
+    assert(ht =~= kw_expr_part(having, Keyword::Having) + tail);
+}
+
+/// Parse an optional `KW <expr>` clause (LIMIT / OFFSET).
+pub open spec fn sparse_kw_expr(r: Seq<TokenView>, kw: Keyword, fuel: nat)
+    -> (Option<Option<SExpr>>, Seq<TokenView>) {
+    if r.len() >= 1 && r[0] == TokenView::Keyword(kw) {
+        match sparse(r.drop_first(), fuel) {
+            (Some(e), r2) => (Some(Some(e)), r2),
+            (None, _) => (None, r),
+        }
+    } else {
+        (Some(None), r)
+    }
+}
+
+/// Canonical print of an optional `KW <expr>` clause.
+pub open spec fn kw_expr_part(clause: Option<SExpr>, kw: Keyword) -> Seq<TokenView> {
+    match clause {
+        Some(e) => seq![TokenView::Keyword(kw)] + sprint(e),
+        None => Seq::<TokenView>::empty(),
+    }
+}
+
+/// Roundtrip for one optional `KW <expr>` clause with an arbitrary boundary tail.
+pub proof fn lemma_sparse_kw_expr_sprint(
+    clause: Option<SExpr>,
+    kw: Keyword,
+    tail: Seq<TokenView>,
+    fuel: nat,
+)
+    requires
+        match clause { Some(e) => printable_se(e) && fuel >= sdepth(e), None => true },
+        boundary(tail),
+        clause is None ==> (tail.len() == 0 || tail[0] != TokenView::Keyword(kw)),
+    ensures
+        sparse_kw_expr(kw_expr_part(clause, kw) + tail, kw, fuel) == (Some(clause), tail),
+{
+    let input = kw_expr_part(clause, kw) + tail;
+    match clause {
         Some(e) => {
-            assert(havingpart =~= seq![TokenView::Keyword(Keyword::Having)] + sprint(e));
-            assert(havingpart[0] == TokenView::Keyword(Keyword::Having));
-            assert(havingpart.drop_first() =~= sprint(e));
-            assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
-            lemma_sparse_sprint(e, Seq::<TokenView>::empty(), fuel);
+            assert(input =~= seq![TokenView::Keyword(kw)] + (sprint(e) + tail));
+            assert(input[0] == TokenView::Keyword(kw));
+            assert(input.drop_first() =~= sprint(e) + tail);
+            lemma_sparse_sprint(e, tail, fuel);
         },
-        None => {
-            assert(havingpart =~= Seq::<TokenView>::empty());
-        },
+        None => { assert(input =~= tail); },
     }
+}
+
+/// Parse the `[LIMIT e] [OFFSET e]` tail (2 clauses, kept separate from
+/// `sparse_where_group` so each opaque parser's exec refinement stays tractable).
+#[verifier::opaque]
+pub open spec fn sparse_limit_offset(rh: Seq<TokenView>, fuel: nat)
+    -> (Option<(Option<SExpr>, Option<SExpr>)>, Seq<TokenView>) {
+    match sparse_kw_expr(rh, Keyword::Limit, fuel) {
+        (Some(limit), rl) => {
+            match sparse_kw_expr(rl, Keyword::Offset, fuel) {
+                (Some(offset), ro) => (Some((limit, offset)), ro),
+                (None, _) => (None, rh),
+            }
+        },
+        (None, _) => (None, rh),
+    }
+}
+
+/// Roundtrip for the LIMIT+OFFSET tail.
+pub proof fn lemma_sparse_limit_offset_sprint(
+    limit: Option<SExpr>,
+    offset: Option<SExpr>,
+    fuel: nat,
+)
+    requires
+        match limit { Some(e) => printable_se(e) && fuel >= sdepth(e), None => true },
+        match offset { Some(e) => printable_se(e) && fuel >= sdepth(e), None => true },
+    ensures
+        sparse_limit_offset(kw_expr_part(limit, Keyword::Limit)
+            + kw_expr_part(offset, Keyword::Offset), fuel)
+            == (Some((limit, offset)), Seq::<TokenView>::empty()),
+{
+    reveal(sparse_limit_offset);
+    let limitpart = kw_expr_part(limit, Keyword::Limit);
+    let offsetpart = kw_expr_part(offset, Keyword::Offset);
+    assert(offsetpart.len() == 0 || offsetpart[0] == TokenView::Keyword(Keyword::Offset)) by {
+        if offset is Some { assert(offsetpart[0] == TokenView::Keyword(Keyword::Offset)); }
+    }
+    assert(boundary(offsetpart));
+    lemma_sparse_kw_expr_sprint(offset, Keyword::Offset, Seq::<TokenView>::empty(), fuel);
+    assert(limit is None ==> (offsetpart.len() == 0
+        || offsetpart[0] != TokenView::Keyword(Keyword::Limit)));
+    lemma_sparse_kw_expr_sprint(limit, Keyword::Limit, offsetpart, fuel);
+    assert(offsetpart + Seq::<TokenView>::empty() =~= offsetpart);
 }
 
 /// `SELECT items [FROM froms] [WHERE e] [GROUP BY exprs]`. `input[0]` is `SELECT`.
@@ -961,14 +1063,19 @@ pub open spec fn sparse_select(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
             match from_result {
                 (Some(from), r2) => {
                     match sparse_where_group(r2, fuel) {
-                        (Some((where_clause, group_by, having)), rg) => (
-                            Some(SStmt::Select {
-                                select, from, where_clause,
-                                group_by, having,
-                                order_by: Seq::empty(), limit: None, offset: None,
-                            }),
-                            rg,
-                        ),
+                        (Some((where_clause, group_by, having)), rg) => {
+                            match sparse_limit_offset(rg, fuel) {
+                                (Some((limit, offset)), ro) => (
+                                    Some(SStmt::Select {
+                                        select, from, where_clause,
+                                        group_by, having,
+                                        order_by: Seq::empty(), limit, offset,
+                                    }),
+                                    ro,
+                                ),
+                                (None, _) => (None, input),
+                            }
+                        },
                         (None, _) => (None, input),
                     }
                 },
@@ -1036,6 +1143,133 @@ pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>
             },
             _ => (None, input),
         }
+    }
+}
+
+/// The Select slice of the statement roundtrip, extracted into its own
+/// `spinoff_prover` lemma so the WHERE/GROUP/HAVING + LIMIT/OFFSET composition is
+/// evaluated in a fresh minimal context (too big for the main statement lemma).
+#[verifier::spinoff_prover]
+#[verifier::rlimit(120000)]
+pub proof fn lemma_sparse_select_sprint(s: SStmt, fuel: nat)
+    requires
+        is_sselect(s),
+        printable_stmt(s),
+        fuel >= sdepth_stmt(s),
+    ensures
+        sparse_select(sprint_stmt(s), fuel) == (Some(s), Seq::<TokenView>::empty()),
+{
+    reveal(printable_stmt);
+    let tokens = sprint_stmt(s);
+    match s {
+        SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
+            reveal(sprint_select_body);
+            reveal(sdepth_select_body);
+            let frompart = if from.len() > 0 {
+                seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
+            } else {
+                Seq::<TokenView>::empty()
+            };
+            let wherepart = match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::<TokenView>::empty(),
+            };
+            let grouppart = if group_by.len() > 0 {
+                seq![TokenView::Keyword(Keyword::Group), TokenView::Keyword(Keyword::By)]
+                    + sprint_args(group_by)
+            } else {
+                Seq::<TokenView>::empty()
+            };
+            let havingpart = kw_expr_part(having, Keyword::Having);
+            let limitpart = kw_expr_part(limit, Keyword::Limit);
+            let offsetpart = kw_expr_part(offset, Keyword::Offset);
+            let lo = limitpart + offsetpart;
+            assert(grouppart.len() == 0 || grouppart[0] == TokenView::Keyword(Keyword::Group)) by {
+                if group_by.len() > 0 { assert(grouppart[0] == TokenView::Keyword(Keyword::Group)); }
+            }
+            assert(havingpart.len() == 0 || havingpart[0] == TokenView::Keyword(Keyword::Having)) by {
+                if having is Some { assert(havingpart[0] == TokenView::Keyword(Keyword::Having)); }
+            }
+            assert(limitpart.len() == 0 || limitpart[0] == TokenView::Keyword(Keyword::Limit)) by {
+                if limit is Some { assert(limitpart[0] == TokenView::Keyword(Keyword::Limit)); }
+            }
+            assert(offsetpart.len() == 0 || offsetpart[0] == TokenView::Keyword(Keyword::Offset)) by {
+                if offset is Some { assert(offsetpart[0] == TokenView::Keyword(Keyword::Offset)); }
+            }
+            assert(lo.len() == 0
+                || (lo[0] != TokenView::Comma && lo[0] != TokenView::Period
+                    && lo[0] != TokenView::OpenParen
+                    && lo[0] != TokenView::Keyword(Keyword::Where)
+                    && lo[0] != TokenView::Keyword(Keyword::Group)
+                    && lo[0] != TokenView::Keyword(Keyword::Having))) by {
+                if limit is Some { assert(lo[0] == TokenView::Keyword(Keyword::Limit)); }
+                else { assert(lo =~= offsetpart); }
+            }
+            let wg = wherepart + grouppart + havingpart + lo;
+            let select_tail = frompart + wg;
+            assert(tokens =~= seq![TokenView::Keyword(Keyword::Select)]
+                + sprint_select_list(select) + select_tail);
+            assert(tokens[0] == TokenView::Keyword(Keyword::Select));
+            assert(tokens.drop_first() =~= sprint_select_list(select) + select_tail);
+            assert(wg.len() == 0
+                || (wg[0] != TokenView::Comma && !is_join_kw(wg[0])
+                    && wg[0] != TokenView::Keyword(Keyword::As)
+                    && wg[0] != TokenView::Period && wg[0] != TokenView::OpenParen)) by {
+                match where_clause {
+                    Some(e) => { assert(wg[0] == TokenView::Keyword(Keyword::Where)); },
+                    None => {
+                        assert(wg =~= grouppart + havingpart + lo);
+                        if group_by.len() > 0 { assert(wg[0] == TokenView::Keyword(Keyword::Group)); }
+                        else if having is Some { assert(wg[0] == TokenView::Keyword(Keyword::Having)); }
+                        else if limit is Some { assert(wg[0] == TokenView::Keyword(Keyword::Limit)); }
+                        else if offset is Some { assert(wg[0] == TokenView::Keyword(Keyword::Offset)); }
+                    },
+                }
+            }
+            assert(select_tail.len() == 0
+                || (select_tail[0] != TokenView::Comma
+                    && select_tail[0] != TokenView::Keyword(Keyword::As)
+                    && select_tail[0] != TokenView::Period
+                    && select_tail[0] != TokenView::OpenParen)) by {
+                if from.len() > 0 {
+                    assert(select_tail[0] == TokenView::Keyword(Keyword::From));
+                } else {
+                    assert(select_tail =~= wg);
+                }
+            }
+            lemma_sparse_select_list_sprint(select, select_tail, fuel);
+            if from.len() > 0 {
+                assert(select_tail =~= seq![TokenView::Keyword(Keyword::From)]
+                    + (sprint_from_list(from) + wg));
+                assert(select_tail[0] == TokenView::Keyword(Keyword::From));
+                assert(select_tail.drop_first() =~= sprint_from_list(from) + wg);
+                lemma_sparse_from_list_sprint(from, wg, fuel);
+            } else {
+                assert(select_tail =~= wg);
+                assert(from =~= Seq::<SFrom>::empty());
+            }
+            assert(sdepth_stmt(s)
+                == sdepth_select_body(select, from, where_clause, group_by, having, limit, offset));
+            assert(fuel >= slist_depth(group_by));
+            assert(match where_clause { Some(e) => fuel >= sdepth(e), None => true });
+            assert(match having { Some(e) => fuel >= sdepth(e), None => true });
+            assert(match limit { Some(e) => fuel >= sdepth(e), None => true });
+            assert(match offset { Some(e) => fuel >= sdepth(e), None => true });
+            lemma_sparse_where_group_sprint(where_clause, group_by, having, lo, fuel);
+            assert(wg =~= wherepart + grouppart + havingpart + lo);
+            assert(sparse_where_group(wg, fuel)
+                == (Some((where_clause, group_by, having)), lo));
+            lemma_sparse_limit_offset_sprint(limit, offset, fuel);
+            assert(sparse_limit_offset(lo, fuel)
+                == (Some((limit, offset)), Seq::<TokenView>::empty()));
+            // Thread the LIMIT/OFFSET stage; `order_by` is empty in the printable domain.
+            assert(sparse_where_group(wg, fuel).1 =~= lo);
+            assert(sparse_limit_offset(sparse_where_group(wg, fuel).1, fuel)
+                == (Some((limit, offset)), Seq::<TokenView>::empty()));
+            assert(order_by =~= Seq::<(SExpr, ast::Direction)>::empty());
+            assert(sparse_select(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
+        },
+        _ => { assert(false); },
     }
 }
 
@@ -1256,86 +1490,16 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
             }
             assert(sparse_update(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
         },
-        SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
+        SStmt::Select { .. } => {
+            lemma_sparse_select_sprint(s, fuel);
             reveal(sprint_select_body);
             reveal(sdepth_select_body);
-            let frompart = if from.len() > 0 {
-                seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
-            } else {
-                Seq::<TokenView>::empty()
-            };
-            let wherepart = match where_clause {
-                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
-                None => Seq::<TokenView>::empty(),
-            };
-            let grouppart = if group_by.len() > 0 {
-                seq![TokenView::Keyword(Keyword::Group), TokenView::Keyword(Keyword::By)]
-                    + sprint_args(group_by)
-            } else {
-                Seq::<TokenView>::empty()
-            };
-            let havingpart = match having {
-                Some(e) => seq![TokenView::Keyword(Keyword::Having)] + sprint(e),
-                None => Seq::<TokenView>::empty(),
-            };
-            assert(grouppart.len() == 0 || grouppart[0] == TokenView::Keyword(Keyword::Group)) by {
-                if group_by.len() > 0 { assert(grouppart[0] == TokenView::Keyword(Keyword::Group)); }
-            }
-            assert(havingpart.len() == 0 || havingpart[0] == TokenView::Keyword(Keyword::Having)) by {
-                if having is Some { assert(havingpart[0] == TokenView::Keyword(Keyword::Having)); }
-            }
-            let wg = wherepart + grouppart + havingpart;
-            let select_tail = frompart + wg;
-            assert(tokens =~= seq![TokenView::Keyword(Keyword::Select)]
-                + sprint_select_list(select) + select_tail);
+            assert(sdepth_stmt(s) >= 1);
+            assert(fuel >= 1);
+            assert(tokens.len() >= 1);
             assert(tokens[0] == TokenView::Keyword(Keyword::Select));
-            assert(tokens.drop_first() =~= sprint_select_list(select) + select_tail);
-            assert(wg.len() == 0
-                || (wg[0] != TokenView::Comma && !is_join_kw(wg[0])
-                    && wg[0] != TokenView::Keyword(Keyword::As)
-                    && wg[0] != TokenView::Period && wg[0] != TokenView::OpenParen)) by {
-                match where_clause {
-                    Some(e) => { assert(wg[0] == TokenView::Keyword(Keyword::Where)); },
-                    None => {
-                        assert(wg =~= grouppart + havingpart);
-                        if group_by.len() > 0 { assert(wg[0] == TokenView::Keyword(Keyword::Group)); }
-                        else if having is Some { assert(wg[0] == TokenView::Keyword(Keyword::Having)); }
-                    },
-                }
-            }
-            assert(select_tail.len() == 0
-                || (select_tail[0] != TokenView::Comma
-                    && select_tail[0] != TokenView::Keyword(Keyword::As)
-                    && select_tail[0] != TokenView::Period
-                    && select_tail[0] != TokenView::OpenParen)) by {
-                if from.len() > 0 {
-                    assert(select_tail[0] == TokenView::Keyword(Keyword::From));
-                } else {
-                    assert(select_tail =~= wg);
-                }
-            }
-            lemma_sparse_select_list_sprint(select, select_tail, fuel);
-            if from.len() > 0 {
-                assert(select_tail =~= seq![TokenView::Keyword(Keyword::From)]
-                    + (sprint_from_list(from) + wg));
-                assert(select_tail[0] == TokenView::Keyword(Keyword::From));
-                assert(select_tail.drop_first() =~= sprint_from_list(from) + wg);
-                lemma_sparse_from_list_sprint(from, wg, fuel);
-            } else {
-                assert(select_tail =~= wg);
-                assert(from =~= Seq::<SFrom>::empty());
-            }
-            assert(sdepth_stmt(s)
-                == sdepth_select_body(select, from, where_clause, group_by, having));
-            assert(fuel >= slist_depth(group_by));
-            assert(match where_clause { Some(e) => fuel >= sdepth(e), None => true });
-            assert(match having { Some(e) => fuel >= sdepth(e), None => true });
-            lemma_sparse_where_group_sprint(where_clause, group_by, having, fuel);
-            assert(wg =~= wherepart + grouppart + havingpart);
-            assert(sparse_where_group(wg, fuel)
-                == (Some((where_clause, group_by, having)), Seq::<TokenView>::empty()));
-            assert(order_by =~= Seq::<(SExpr, ast::Direction)>::empty());
             assert(sparse_select(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
+            assert(sparse_stmt(tokens, fuel) == sparse_select(tokens, fuel));
         },
         SStmt::Explain(inner) => {
             lemma_sparse_stmt_sprint(*inner, (fuel - 1) as nat);
@@ -3597,7 +3761,7 @@ pub fn print_select_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
     reveal_with_fuel(token_views, 2);
     reveal(sprint_select_body);
     match s {
-        ast::Statement::Select { select, from, where_clause, group_by, having, .. } => {
+        ast::Statement::Select { select, from, where_clause, group_by, having, limit, offset, .. } => {
             let mut r: Vec<super::Token> = Vec::new();
             r.push(super::Token::Keyword(Keyword::Select));
             proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
@@ -3683,6 +3847,40 @@ pub fn print_select_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
                         token_views_concat(hk, hbo);
                         token_views_concat(after_group, seq![super::Token::Keyword(Keyword::Having)]);
                         assert(hk =~= after_group + seq![super::Token::Keyword(Keyword::Having)]);
+                    }
+                },
+                None => {},
+            }
+            // LIMIT
+            let ghost after_having = r@;
+            match limit {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Limit));
+                    let ghost lk = r@;
+                    let mut lb = print_expr_exec(e);
+                    let ghost lbo = lb@;
+                    r.append(&mut lb);
+                    proof {
+                        token_views_concat(lk, lbo);
+                        token_views_concat(after_having, seq![super::Token::Keyword(Keyword::Limit)]);
+                        assert(lk =~= after_having + seq![super::Token::Keyword(Keyword::Limit)]);
+                    }
+                },
+                None => {},
+            }
+            // OFFSET
+            let ghost after_limit = r@;
+            match offset {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Offset));
+                    let ghost ok = r@;
+                    let mut ob = print_expr_exec(e);
+                    let ghost obo = ob@;
+                    r.append(&mut ob);
+                    proof {
+                        token_views_concat(ok, obo);
+                        token_views_concat(after_limit, seq![super::Token::Keyword(Keyword::Offset)]);
+                        assert(ok =~= after_limit + seq![super::Token::Keyword(Keyword::Offset)]);
                     }
                 },
                 None => {},
@@ -4586,6 +4784,59 @@ pub fn parse_where_group_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+/// Executable parser for the `[LIMIT e] [OFFSET e]` tail, refining the opaque
+/// `sparse_limit_offset` (kept 2-clause so its `reveal` stays tractable).
+pub fn parse_limit_offset_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<(Option<ast::Expression>, Option<ast::Expression>)>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_limit_offset(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some((lm, of)) => sopt is Some
+                    && (match lm { Some(e) => Some(view_expr(e)), None => None::<SExpr> },
+                        match of { Some(e) => Some(view_expr(e)), None => None::<SExpr> })
+                        == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    reveal(sparse_limit_offset);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    let limit: Option<ast::Expression>;
+    let rlpos: usize;
+    if pos < toks.len() && matches!(toks[pos], super::Token::Keyword(Keyword::Limit)) {
+        proof { token_views_suffix(toks@, pos as int); }
+        let (lopt, lpos) = parse_expr_exec(toks, pos + 1, fuel);
+        match lopt {
+            Some(le) => { limit = Some(le); rlpos = lpos; },
+            None => { return (None, pos); },
+        }
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+        }
+        limit = None;
+        rlpos = pos;
+    }
+    proof { token_views_len(toks@.subrange(rlpos as int, toks@.len() as int)); }
+    if rlpos < toks.len() && matches!(toks[rlpos], super::Token::Keyword(Keyword::Offset)) {
+        proof { token_views_suffix(toks@, rlpos as int); }
+        let (oopt, opos) = parse_expr_exec(toks, rlpos + 1, fuel);
+        match oopt {
+            Some(oe) => (Some((limit, Some(oe))), opos),
+            None => (None, pos),
+        }
+    } else {
+        if rlpos < toks.len() {
+            proof { token_views_suffix(toks@, rlpos as int); }
+        }
+        (Some((limit, None)), rlpos)
+    }
+}
+
 #[verifier::rlimit(30000)]
 pub fn parse_select_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     -> (r: (Option<ast::Statement>, usize))
@@ -4630,14 +4881,21 @@ pub fn parse_select_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
             proof { token_views_len(toks@.subrange(r2pos as int, toks@.len() as int)); }
             let (wgopt, wgpos) = parse_where_group_exec(toks, r2pos, fuel);
             match wgopt {
-                Some((wc, gb, hv)) => (
-                    Some(ast::Statement::Select {
-                        select, from, where_clause: wc,
-                        group_by: gb, having: hv,
-                        order_by: Vec::new(), limit: None, offset: None,
-                    }),
-                    wgpos,
-                ),
+                Some((wc, gb, hv)) => {
+                    proof { token_views_len(toks@.subrange(wgpos as int, toks@.len() as int)); }
+                    let (loopt, lopos) = parse_limit_offset_exec(toks, wgpos, fuel);
+                    match loopt {
+                        Some((lm, of)) => (
+                            Some(ast::Statement::Select {
+                                select, from, where_clause: wc,
+                                group_by: gb, having: hv,
+                                order_by: Vec::new(), limit: lm, offset: of,
+                            }),
+                            lopos,
+                        ),
+                        None => (None, pos),
+                    }
+                },
                 None => (None, pos),
             }
         },
