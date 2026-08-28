@@ -77,11 +77,19 @@ refining `sprint_stmt`/`sparse_stmt` at `view_stmt` (133 verified / 0 errors):
   (`sdepth_stmt(s) <= 2*sprint_stmt(s).len()`) plus a from-tree `steps_depth`
   length bound — a mechanical extension, not attempted here.
 
-**Remaining S5 — Update (the one real wall).** `Update` still has no exec
-print/parse. Its `BTreeMap` set needs the executable sorted `iter()` for printing
-and `insert` for parsing, with the roundtrip stated over `Map` view equality (not
-`BTreeMap` `==`). This is the S4 residual and the genuinely hard piece.
-`stmt_injective` for the whole grammar is also outstanding.
+**Remaining S5 — Update (blocked in vstd, root cause pinned).** `Update` still
+has no exec print/parse, and a verified probe (2026-08-28) shows *why*: vstd's
+`BTreeMap` `insert` view postcondition (`m@ == old(m)@.insert(k,v)`) and its
+`iter` spec are both gated on `obeys_cmp::<String>()`, and vstd provides **no
+proof of `obeys_cmp::<String>()`** (the `laws_cmp` lemmas cover primitives, not
+`String`). So both directions are blocked at the library level, not by a proof
+being avoided: `insert` can't establish the built map's view (parse), and `iter`
+can't be used to read the sole entry (print). Unblocking needs a trusted
+`obeys_cmp::<String>()` axiom (a true statement about `String`'s `Ord`, analogous
+to the `float_trust` assumptions — it would grow the audited trust surface by
+one) and then, for print, the prophetic `iter()` reasoning to extract and prove
+the single `(k,v)` equals `dom().choose()`. `stmt_injective` for the whole
+grammar is also outstanding.
 
 **Phase 4 — production cutover** is not started (replace the two
 `std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
