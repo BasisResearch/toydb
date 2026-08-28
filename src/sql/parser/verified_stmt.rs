@@ -3697,6 +3697,177 @@ pub fn parse_table_exec(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<ast
     }
 }
 
+#[verifier::rlimit(15000)]
+pub fn parse_step_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<(ast::JoinType, ast::From, Option<ast::Expression>)>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_step(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some((jt, right, pred)) => sopt is Some
+                    && sopt.unwrap() == (SJoinStep {
+                        join_type: jt,
+                        right: view_from(right),
+                        predicate: match pred { Some(e) => Some(view_expr(e)), None => None },
+                    })
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && pos + 1 < toks.len()
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Join)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+        }
+        let jt = match &toks[pos] {
+            super::Token::Keyword(Keyword::Cross) => Some(ast::JoinType::Cross),
+            super::Token::Keyword(Keyword::Inner) => Some(ast::JoinType::Inner),
+            super::Token::Keyword(Keyword::Left) => Some(ast::JoinType::Left),
+            super::Token::Keyword(Keyword::Right) => Some(ast::JoinType::Right),
+            _ => None,
+        };
+        match jt {
+            Some(jt) => {
+                let (ropt, rpos) = parse_table_exec(toks, pos + 2);
+                match ropt {
+                    Some(right) => match jt {
+                        ast::JoinType::Cross => (Some((jt, right, None)), rpos),
+                        _ => {
+                            if rpos < toks.len() && matches!(toks[rpos], super::Token::Keyword(Keyword::On)) {
+                                proof { token_views_suffix(toks@, rpos as int); }
+                                let (eopt, epos) = parse_expr_exec(toks, rpos + 1, fuel);
+                                match eopt {
+                                    Some(e) => (Some((jt, right, Some(e))), epos),
+                                    None => (None, pos),
+                                }
+                            } else {
+                                if rpos < toks.len() {
+                                    proof { token_views_suffix(toks@, rpos as int); }
+                                } else {
+                                    proof { token_views_len(toks@.subrange(rpos as int, toks@.len() as int)); }
+                                }
+                                (None, pos)
+                            }
+                        },
+                    },
+                    None => (None, pos),
+                }
+            },
+            None => (None, pos),
+        }
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+            } else {
+                proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+            }
+        }
+        (None, pos)
+    }
+}
+
+#[verifier::rlimit(20000)]
+pub fn parse_steps_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize, acc: ast::From)
+    -> (r: (Option<ast::From>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_steps(rem, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(built) => sopt is Some
+                    && view_from(built) == fold_joins(view_from(acc), sopt.unwrap())
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_steps, 1);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    let is_join = pos < toks.len() && matches!(&toks[pos],
+        super::Token::Keyword(Keyword::Cross) | super::Token::Keyword(Keyword::Inner)
+        | super::Token::Keyword(Keyword::Left) | super::Token::Keyword(Keyword::Right));
+    if pos < toks.len() {
+        proof { token_views_suffix(toks@, pos as int); }
+    }
+    if is_join {
+        if fuel == 0 {
+            (None, pos)
+        } else {
+            let (stepopt, spos) = parse_step_exec(toks, pos, fuel);
+            match stepopt {
+                Some((jt, right, pred)) => {
+                    let acc2 = ast::From::Join {
+                        left: Box::new(acc),
+                        right: Box::new(right),
+                        join_type: jt,
+                        predicate: pred,
+                    };
+                    let (moreopt, mpos) = parse_steps_exec(toks, spos, fuel - 1, acc2);
+                    match moreopt {
+                        Some(built) => {
+                            proof {
+                                reveal_with_fuel(fold_joins, 1);
+                                let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+                                let step_m = sparse_step(rem, fuel as nat).0.unwrap();
+                                let more_m = sparse_steps(
+                                    token_views(toks@.subrange(spos as int, toks@.len() as int)),
+                                    (fuel - 1) as nat).0.unwrap();
+                                assert(view_from(acc2) == apply_step(view_from(acc), step_m));
+                                assert(sparse_steps(rem, fuel as nat).0.unwrap() =~= seq![step_m] + more_m);
+                                assert((seq![step_m] + more_m)[0] == step_m);
+                                assert((seq![step_m] + more_m).drop_first() =~= more_m);
+                            }
+                            (Some(built), mpos)
+                        },
+                        None => (None, pos),
+                    }
+                },
+                None => (None, pos),
+            }
+        }
+    } else {
+        (Some(acc), pos)
+    }
+}
+
+#[verifier::rlimit(15000)]
+pub fn parse_from_item_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::From>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_from(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(f) => sopt is Some && view_from(f) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    reveal(sparse_from);
+    let (hopt, hpos) = parse_table_exec(toks, pos);
+    match hopt {
+        Some(head) => {
+            let (fopt, fpos) = parse_steps_exec(toks, hpos, fuel, head);
+            match fopt {
+                Some(folded) => (Some(folded), fpos),
+                None => (None, pos),
+            }
+        },
+        None => (None, pos),
+    }
+}
+
 /// End-to-end executable statement roundtrip for the full_exec_ok domain
 /// (8 of 10 statement kinds plus Explain): printing a printable statement with
 /// the executable printer and parsing the result with the executable parser
