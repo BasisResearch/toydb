@@ -4325,4 +4325,135 @@ pub proof fn lemma_lex_mtok_roundtrip(ms: Seq<MTok>, input: Seq<u8>)
 }
 
 
+// -- L26: quoted identifier scanner (quote-free ASCII, char-view) ---------------
+//
+// A `"..."` quoted identifier, analogous to the L20 string but delimited by `"`
+// (34) and case-PRESERVING (no lowercasing, never a keyword). Same char-view
+// treatment. Quote-free ASCII; the `""` escape is a mechanical extension.
+
+/// First index at or after `pos` holding a double-quote byte `"` (34), or end.
+pub open spec fn scan_to_dquote(input: Seq<u8>, pos: int) -> int
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && input[pos] != 34 {
+        scan_to_dquote(input, pos + 1)
+    } else {
+        pos
+    }
+}
+
+pub proof fn lemma_scan_to_dquote_run(input: Seq<u8>, pos: int, k: int)
+    requires
+        0 <= pos <= k <= input.len(),
+        forall|i: int| pos <= i < k ==> input[i] != 34,
+        k == input.len() || input[k] == 34,
+    ensures
+        scan_to_dquote(input, pos) == k,
+    decreases k - pos,
+{
+    if pos < k {
+        lemma_scan_to_dquote_run(input, pos + 1, k);
+    }
+}
+
+/// Scan a quoted identifier, producing its char-sequence view (case preserved).
+pub open spec fn lscan_qident_m(input: Seq<u8>, pos: int) -> (Option<Seq<char>>, int) {
+    if 0 <= pos < input.len() && input[pos] == 34 {
+        let close = scan_to_dquote(input, pos + 1);
+        if close < input.len() {
+            (Some(ascii_chars(input.subrange(pos + 1, close))), close + 1)
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// A no-dquote ASCII char run encodes to bytes with no dquote byte.
+pub proof fn lemma_qident_bytes_nodquote(cs: Seq<char>)
+    requires
+        all_ascii_chars(cs),
+        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 34,
+    ensures
+        all_ascii_bytes(ascii_bytes(cs)),
+        forall|i: int| 0 <= i < ascii_bytes(cs).len() ==> (#[trigger] ascii_bytes(cs)[i]) != 34,
+{
+    assert forall|i: int| 0 <= i < ascii_bytes(cs).len() implies
+        ascii_bytes(cs)[i] < 128 && ascii_bytes(cs)[i] != 34 by {
+        let c = cs[i];
+        assert((c as u32) < 128);
+        assert((c as u32) != 34);
+        lemma_char_u8_val(c);
+        assert(ascii_bytes(cs)[i] == (c as u8));
+    }
+}
+
+/// Quoted-identifier roundtrip at the char-view level (axiom-free).
+pub proof fn lemma_lscan_qident_m(cs: Seq<char>, tail: Seq<u8>)
+    requires
+        all_ascii_chars(cs),
+        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 34,
+    ensures
+        lscan_qident_m(seq![34u8] + ascii_bytes(cs) + seq![34u8] + tail, 0)
+            == (Some(cs), (cs.len() + 2) as int),
+{
+    let q = seq![34u8];
+    let d = ascii_bytes(cs);
+    let input = q + d + q + tail;
+    lemma_qident_bytes_nodquote(cs);
+    assert(input[0] == 34);
+    assert forall|i: int| 1 <= i < 1 + d.len() implies input[i] != 34 by {
+        assert(input[i] == d[i - 1]);
+    }
+    let close = (1 + d.len()) as int;
+    assert(input[close] == 34) by {
+        assert(input[close] == q[0]);
+    }
+    lemma_scan_to_dquote_run(input, 1, close);
+    assert(close < input.len());
+    assert(input.subrange(1, close) =~= d);
+    lemma_ascii_chars_bytes(cs);
+    assert(ascii_chars(d) == cs);
+}
+
+/// Executable quoted-identifier scanner, building the real `Token::Ident` with a
+/// proven `@` view (case preserved). Requires the body to be ASCII.
+pub fn scan_qident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+        forall|i: int| pos < i < scan_to_dquote(input@, pos + 1) ==> (#[trigger] input@[i]) < 128,
+    ensures
+        r.1 == lscan_qident_m(input@, pos as int).1,
+        match (r.0, lscan_qident_m(input@, pos as int).0) {
+            (Some(Token::Ident(s)), Some(cv)) => s@ == cv,
+            (None, None) => true,
+            _ => false,
+        },
+{
+    if pos < input.len() && input[pos] == 34u8 {
+        let mut i = pos + 1;
+        while i < input.len() && input[i] != 34u8
+            invariant
+                pos + 1 <= i <= input.len(),
+                forall|j: int| pos + 1 <= j < i ==> input@[j] != 34,
+            decreases input.len() - i,
+        {
+            i += 1;
+        }
+        proof {
+            lemma_scan_to_dquote_run(input@, pos as int + 1, i as int);
+        }
+        if i < input.len() {
+            let s = build_ascii_string(input, pos + 1, i);
+            (Some(Token::Ident(s)), i + 1)
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+
 } // verus!
