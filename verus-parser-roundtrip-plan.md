@@ -235,9 +235,16 @@ each entry in `m@`, `remaining.unref().to_set() == m@.kv_pairs()`, `no_duplicate
 and `increasing_seq(remaining.map_values(|kv| *kv.0))` (keys sorted). So the sorted
 entry seq is a *pinned function of `m@`*, even though a pure spec fn can't compute the
 sort. Plan (5 pieces, each a green increment):
-1. **Uniqueness lemma** (pure): two strictly-key-increasing seqs with equal
-   `to_set()` are equal (induction on the min-key head; uses
-   `axiom_increasing_seq_meaning` + the `String` cmp axiom). This is the foundation.
+1. **Uniqueness lemma** (pure) — DONE (2026-08-28, 169 verified). `lemma_sorted_kv_unique`:
+   two strictly-key-increasing seqs with equal `to_set()` are equal (induction on the
+   min-key head). Needed a new trusted `axiom_string_obeys_cmp` (String obeys
+   `laws_cmp::obeys_cmp`, distinct from `key_obeys_cmp_spec` — the `increasing_seq`
+   interpretation uses the former) and `string_cmp_laws` (reflexivity + antisymmetry of
+   `cmp_spec`, unpacked by revealing `obeys_cmp` / `obeys_cmp_ord` /
+   `obeys_partial_cmp_spec_properties` — both sub-preds are opaque). NOTE: a later
+   `view_map(m@) = m@.map_values(view_opt)` headline (Map-view equality, order-free) may
+   let pieces 4-5 avoid the choose-based normal form entirely; the uniqueness lemma still
+   pins iter()'s order to a canonical form and is reusable regardless.
 2. **`update_normal(m@) : Seq<(String, Option<SExpr>)>`** = `choose |S|` sorted-no-dup
    with `S.to_set() == { (k, view_opt(m@[k])) }`; well-defined by (1). Note it's over
    *SExpr* values (view of each), so it depends only on keys + value-views — both
