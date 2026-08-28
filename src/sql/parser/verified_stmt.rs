@@ -53,8 +53,48 @@ pub enum SStmt {
     DropTable { name: String, if_exists: bool },
     Delete { table: String, where_clause: Option<SExpr> },
     Insert { table: String, columns: Option<Seq<String>>, values: Seq<Seq<SExpr>> },
+    Select {
+        select: Seq<(SExpr, Option<String>)>,
+        from: Seq<SFrom>,
+        where_clause: Option<SExpr>,
+        group_by: Seq<SExpr>,
+        having: Option<SExpr>,
+        order_by: Seq<(SExpr, ast::Direction)>,
+        limit: Option<SExpr>,
+        offset: Option<SExpr>,
+    },
     Explain(Box<SStmt>),
     Unsupported,
+}
+
+pub open spec fn view_select_list(items: Seq<(ast::Expression, Option<String>)>) -> Seq<(SExpr, Option<String>)>
+    decreases items,
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![(view_expr(items[0].0), items[0].1)] + view_select_list(items.drop_first())
+    }
+}
+
+pub open spec fn view_froms(froms: Seq<ast::From>) -> Seq<SFrom>
+    decreases froms,
+{
+    if froms.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![view_from(froms[0])] + view_froms(froms.drop_first())
+    }
+}
+
+pub open spec fn view_order_list(items: Seq<(ast::Expression, ast::Direction)>) -> Seq<(SExpr, ast::Direction)>
+    decreases items,
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![(view_expr(items[0].0), items[0].1)] + view_order_list(items.drop_first())
+    }
 }
 
 /// View a `Vec<Vec<Expression>>` row list as `Seq<Seq<SExpr>>`.
@@ -133,6 +173,30 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
                 None => None,
             },
             values: view_rows(values@),
+        },
+        ast::Statement::Select {
+            select, from, where_clause, group_by, having, order_by, limit, offset,
+        } => SStmt::Select {
+            select: view_select_list(select@),
+            from: view_froms(from@),
+            where_clause: match where_clause {
+                Some(e) => Some(view_expr(e)),
+                None => None,
+            },
+            group_by: view_args(group_by@),
+            having: match having {
+                Some(e) => Some(view_expr(e)),
+                None => None,
+            },
+            order_by: view_order_list(order_by@),
+            limit: match limit {
+                Some(e) => Some(view_expr(e)),
+                None => None,
+            },
+            offset: match offset {
+                Some(e) => Some(view_expr(e)),
+                None => None,
+            },
         },
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
@@ -403,6 +467,19 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
                     Some(names) => names.len() >= 1,
                     None => true,
                 }),
+        // This checkpoint handles SELECT list + FROM + WHERE; the remaining
+        // clauses are constrained empty/None until they are wired in.
+        SStmt::Select {
+            select, from, where_clause, group_by, having, order_by, limit, offset,
+        } =>
+            select.len() >= 1 && all_printable_select(select)
+                && all_printable_froms(from)
+                && (match where_clause {
+                    Some(e) => printable_se(e),
+                    None => true,
+                })
+                && group_by.len() == 0 && having is None && order_by.len() == 0
+                && limit is None && offset is None,
         SStmt::Explain(inner) => !is_sexplain(*inner) && printable_stmt(*inner),
         SStmt::Unsupported => false,
     }
@@ -474,6 +551,17 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
             Some(names) => seq![TokenView::OpenParen] + sprint_names(names) + seq![TokenView::CloseParen],
             None => Seq::empty(),
         }) + seq![TokenView::Keyword(Keyword::Values)] + sprint_rows(values),
+        SStmt::Select { select, from, where_clause, .. } =>
+            seq![TokenView::Keyword(Keyword::Select)] + sprint_select_list(select)
+                + (if from.len() > 0 {
+                    seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
+                } else {
+                    Seq::empty()
+                })
+                + (match where_clause {
+                    Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                    None => Seq::empty(),
+                }),
         SStmt::Explain(inner) => seq![TokenView::Keyword(Keyword::Explain)] + sprint_stmt(*inner),
         SStmt::Unsupported => Seq::empty(),
     }
@@ -488,6 +576,12 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
         SStmt::CreateTable { columns, .. } => 1 + slist_depth_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => 1 + sdepth(e),
         SStmt::Insert { columns, values, .. } => insert_fuel(columns, values),
+        SStmt::Select { select, from, where_clause, .. } =>
+            (1 + select_list_depth(select) + from_list_depth(from)
+                + (match where_clause {
+                    Some(e) => sdepth(e),
+                    None => 0nat,
+                })) as nat,
         SStmt::Explain(inner) => 1 + sdepth_stmt(*inner),
         _ => 1,
     }
@@ -604,6 +698,48 @@ pub open spec fn sparse_create(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
+/// `SELECT items [FROM froms] [WHERE e]`. `input[0]` is known to be `SELECT`.
+/// The other clauses are not yet parsed (their fields are fixed empty/None).
+pub open spec fn sparse_select(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>) {
+    match sparse_select_list(input.drop_first(), fuel) {
+        (Some(select), r1) => {
+            let from_result = if r1.len() >= 1 && r1[0] == TokenView::Keyword(Keyword::From) {
+                sparse_from_list(r1.drop_first(), fuel)
+            } else {
+                (Some(Seq::<SFrom>::empty()), r1)
+            };
+            match from_result {
+                (Some(from), r2) => {
+                    if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::Where) {
+                        match sparse(r2.drop_first(), fuel) {
+                            (Some(e), r3) => (
+                                Some(SStmt::Select {
+                                    select, from, where_clause: Some(e),
+                                    group_by: Seq::empty(), having: None,
+                                    order_by: Seq::empty(), limit: None, offset: None,
+                                }),
+                                r3,
+                            ),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (
+                            Some(SStmt::Select {
+                                select, from, where_clause: None,
+                                group_by: Seq::empty(), having: None,
+                                order_by: Seq::empty(), limit: None, offset: None,
+                            }),
+                            r2,
+                        )
+                    }
+                },
+                (None, _) => (None, input),
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
 pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>)
     decreases fuel,
 {
@@ -618,6 +754,7 @@ pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>
             TokenView::Keyword(Keyword::Drop) => sparse_drop(input),
             TokenView::Keyword(Keyword::Delete) => sparse_delete(input, fuel),
             TokenView::Keyword(Keyword::Insert) => sparse_insert(input, fuel),
+            TokenView::Keyword(Keyword::Select) => sparse_select(input, fuel),
             TokenView::Keyword(Keyword::Explain) => {
                 match sparse_stmt(input.drop_first(), (fuel - 1) as nat) {
                     (Some(inner), rest) if !is_sexplain(inner) => (
@@ -809,6 +946,72 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
                     assert(names_tail.drop_first().drop_first() =~= sprint_rows(values));
                 },
             }
+        },
+        SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
+            let frompart = if from.len() > 0 {
+                seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
+            } else {
+                Seq::<TokenView>::empty()
+            };
+            let wherepart = match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::<TokenView>::empty(),
+            };
+            let select_tail = frompart + wherepart;
+            assert(tokens =~= seq![TokenView::Keyword(Keyword::Select)]
+                + sprint_select_list(select) + select_tail);
+            assert(tokens[0] == TokenView::Keyword(Keyword::Select));
+            assert(tokens.drop_first() =~= sprint_select_list(select) + select_tail);
+            assert(select_tail.len() == 0
+                || (select_tail[0] != TokenView::Comma
+                    && select_tail[0] != TokenView::Keyword(Keyword::As)
+                    && select_tail[0] != TokenView::Period
+                    && select_tail[0] != TokenView::OpenParen)) by {
+                if from.len() > 0 {
+                    assert(select_tail[0] == TokenView::Keyword(Keyword::From));
+                } else {
+                    assert(select_tail =~= wherepart);
+                    match where_clause {
+                        Some(e) => { assert(select_tail[0] == TokenView::Keyword(Keyword::Where)); },
+                        None => { assert(select_tail =~= Seq::<TokenView>::empty()); },
+                    }
+                }
+            }
+            lemma_sparse_select_list_sprint(select, select_tail, fuel);
+            if from.len() > 0 {
+                assert(select_tail =~= seq![TokenView::Keyword(Keyword::From)]
+                    + (sprint_from_list(from) + wherepart));
+                assert(select_tail[0] == TokenView::Keyword(Keyword::From));
+                assert(select_tail.drop_first() =~= sprint_from_list(from) + wherepart);
+                assert(wherepart.len() == 0
+                    || (wherepart[0] != TokenView::Comma && !is_join_kw(wherepart[0])
+                        && wherepart[0] != TokenView::Keyword(Keyword::As)
+                        && wherepart[0] != TokenView::Period && wherepart[0] != TokenView::OpenParen)) by {
+                    match where_clause {
+                        Some(e) => { assert(wherepart[0] == TokenView::Keyword(Keyword::Where)); },
+                        None => { assert(wherepart =~= Seq::<TokenView>::empty()); },
+                    }
+                }
+                lemma_sparse_from_list_sprint(from, wherepart, fuel);
+            } else {
+                assert(select_tail =~= wherepart);
+                assert(from =~= Seq::<SFrom>::empty());
+            }
+            match where_clause {
+                Some(e) => {
+                    assert(wherepart =~= seq![TokenView::Keyword(Keyword::Where)] + sprint(e));
+                    assert(wherepart[0] == TokenView::Keyword(Keyword::Where));
+                    assert(wherepart.drop_first() =~= sprint(e));
+                    assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
+                    lemma_sparse_sprint(e, Seq::<TokenView>::empty(), fuel);
+                },
+                None => {
+                    assert(wherepart =~= Seq::<TokenView>::empty());
+                },
+            }
+            assert(group_by =~= Seq::<SExpr>::empty());
+            assert(order_by =~= Seq::<(SExpr, ast::Direction)>::empty());
+            assert(sparse_select(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
         },
         SStmt::Explain(inner) => {
             lemma_sparse_stmt_sprint(*inner, (fuel - 1) as nat);
@@ -1700,6 +1903,7 @@ pub open spec fn sparse_steps(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<S
     }
 }
 
+#[verifier::opaque]
 pub open spec fn sparse_from(input: Seq<TokenView>, fuel: nat) -> (Option<SFrom>, Seq<TokenView>) {
     match sparse_table(input) {
         (Some(head), r) => match sparse_steps(r, fuel) {
@@ -1841,6 +2045,7 @@ pub proof fn lemma_sparse_from_sprint(f: SFrom, tail: Seq<TokenView>, fuel: nat)
     ensures
         sparse_from(sprint_from(f) + tail, fuel) == (Some(f), tail),
 {
+    reveal(sparse_from);
     sprint_decomp(f);
     printable_from_decomp(f);
     fold_decomp(f);
@@ -1859,6 +2064,276 @@ pub proof fn lemma_sparse_from_sprint(f: SFrom, tail: Seq<TokenView>, fuel: nat)
     }
     lemma_sparse_table_sprint(head, head_tail);
     lemma_sparse_steps_sprint(steps, tail, fuel);
+}
+
+// ---- SELECT codec (S3): from-list, select-list, clause soup ----------------
+
+pub open spec fn sprint_from_list(froms: Seq<SFrom>) -> Seq<TokenView>
+    decreases froms,
+{
+    if froms.len() == 0 {
+        Seq::empty()
+    } else if froms.len() == 1 {
+        sprint_from(froms[0])
+    } else {
+        sprint_from(froms[0]) + seq![TokenView::Comma] + sprint_from_list(froms.drop_first())
+    }
+}
+
+pub open spec fn from_list_depth(froms: Seq<SFrom>) -> nat
+    decreases froms,
+{
+    if froms.len() == 0 {
+        1
+    } else {
+        let d = steps_depth(from_steps(froms[0]));
+        let rest = from_list_depth(froms.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+pub open spec fn all_printable_froms(froms: Seq<SFrom>) -> bool
+    decreases froms,
+{
+    if froms.len() == 0 {
+        true
+    } else {
+        printable_from(froms[0]) && all_printable_froms(froms.drop_first())
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn sparse_from_list(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<SFrom>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse_from(input, fuel) {
+            (Some(f), r) => {
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    match sparse_from_list(r.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![f] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![f]), r)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+/// The from-list roundtrip: a comma list of join trees, terminated by a tail
+/// that starts with neither a comma nor a join keyword (a clause keyword or end).
+#[verifier::rlimit(8000)]
+pub proof fn lemma_sparse_from_list_sprint(froms: Seq<SFrom>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_froms(froms),
+        froms.len() >= 1,
+        fuel >= from_list_depth(froms),
+        tail.len() == 0 || (tail[0] != TokenView::Comma && !is_join_kw(tail[0])
+            && tail[0] != TokenView::Keyword(Keyword::As)
+            && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen),
+    ensures
+        sparse_from_list(sprint_from_list(froms) + tail, fuel) == (Some(froms), tail),
+    decreases froms,
+{
+    reveal_with_fuel(sparse_from_list, 2);
+    if froms.len() == 1 {
+        assert(from_tail_ok(tail));
+        lemma_sparse_from_sprint(froms[0], tail, fuel);
+        assert(sprint_from_list(froms) + tail =~= sprint_from(froms[0]) + tail);
+        // after parsing froms[0], leftover is tail; tail[0] != Comma so list stops
+        assert(seq![froms[0]] =~= froms);
+        assert(sparse_from_list(sprint_from_list(froms) + tail, fuel) == (Some(froms), tail));
+    } else {
+        let rest = froms.drop_first();
+        let item_tail = seq![TokenView::Comma] + (sprint_from_list(rest) + tail);
+        assert(from_tail_ok(item_tail)) by {
+            assert(item_tail[0] == TokenView::Comma);
+        }
+        lemma_sparse_from_sprint(froms[0], item_tail, fuel);
+        lemma_sparse_from_list_sprint(rest, tail, (fuel - 1) as nat);
+        assert(sprint_from_list(froms) + tail =~= sprint_from(froms[0]) + item_tail);
+        assert(item_tail[0] == TokenView::Comma);
+        assert(item_tail.drop_first() =~= sprint_from_list(rest) + tail);
+        assert(seq![froms[0]] + rest =~= froms);
+        assert(sparse_from_list(sprint_from_list(froms) + tail, fuel) == (Some(froms), tail));
+    }
+}
+
+// -- select-list (exprs with optional AS alias; `*` may not be aliased) ------
+
+pub open spec fn sprint_select_item(item: (SExpr, Option<String>)) -> Seq<TokenView> {
+    sprint(item.0) + (match item.1 {
+        Some(a) => seq![TokenView::Keyword(Keyword::As), TokenView::Ident(a)],
+        None => Seq::empty(),
+    })
+}
+
+pub open spec fn printable_select_item(item: (SExpr, Option<String>)) -> bool {
+    printable_se(item.0) && (match item.0 {
+        SExpr::All => item.1 is None,
+        _ => true,
+    })
+}
+
+pub open spec fn sprint_select_list(items: Seq<(SExpr, Option<String>)>) -> Seq<TokenView>
+    decreases items,
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else if items.len() == 1 {
+        sprint_select_item(items[0])
+    } else {
+        sprint_select_item(items[0]) + seq![TokenView::Comma] + sprint_select_list(items.drop_first())
+    }
+}
+
+pub open spec fn select_item_depth(item: (SExpr, Option<String>)) -> nat {
+    sdepth(item.0)
+}
+
+pub open spec fn select_list_depth(items: Seq<(SExpr, Option<String>)>) -> nat
+    decreases items,
+{
+    if items.len() == 0 {
+        1
+    } else {
+        let d = select_item_depth(items[0]);
+        let rest = select_list_depth(items.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+pub open spec fn all_printable_select(items: Seq<(SExpr, Option<String>)>) -> bool
+    decreases items,
+{
+    if items.len() == 0 {
+        true
+    } else {
+        printable_select_item(items[0]) && all_printable_select(items.drop_first())
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn sparse_select_item(input: Seq<TokenView>, fuel: nat) -> (Option<(SExpr, Option<String>)>, Seq<TokenView>) {
+    match sparse(input, fuel) {
+        (Some(e), r) => {
+            if r.len() >= 2 && r[0] == TokenView::Keyword(Keyword::As) {
+                match r[1] {
+                    TokenView::Ident(a) => (Some((e, Some(a))), r.drop_first().drop_first()),
+                    _ => (None, input),
+                }
+            } else {
+                (Some((e, None)), r)
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// A select item ends at a token that is not `AS` (else a bare expr grabs an
+/// alias), `.` or `(` (expr boundary).
+pub open spec fn select_tail_ok(tail: Seq<TokenView>) -> bool {
+    tail.len() == 0
+        || (tail[0] != TokenView::Keyword(Keyword::As)
+            && tail[0] != TokenView::Period
+            && tail[0] != TokenView::OpenParen)
+}
+
+pub proof fn lemma_sparse_select_item_sprint(item: (SExpr, Option<String>), tail: Seq<TokenView>, fuel: nat)
+    requires
+        printable_select_item(item),
+        fuel >= select_item_depth(item),
+        select_tail_ok(tail),
+    ensures
+        sparse_select_item(sprint_select_item(item) + tail, fuel) == (Some(item), tail),
+{
+    reveal(sparse_select_item);
+    let e = item.0;
+    match item.1 {
+        None => {
+            assert(sprint_select_item(item) =~= sprint(e));
+            assert(sprint_select_item(item) + tail =~= sprint(e) + tail);
+            lemma_sparse_sprint(e, tail, fuel);
+            // r == tail, tail[0] != As so no alias
+            assert(sparse_select_item(sprint_select_item(item) + tail, fuel) == (Some((e, None::<String>)), tail));
+            assert((e, None::<String>) == item);
+        },
+        Some(a) => {
+            let alias_tail = seq![TokenView::Keyword(Keyword::As), TokenView::Ident(a)] + tail;
+            assert(sprint_select_item(item) + tail =~= sprint(e) + alias_tail);
+            assert(alias_tail[0] == TokenView::Keyword(Keyword::As));
+            assert(alias_tail[0] != TokenView::Period && alias_tail[0] != TokenView::OpenParen);
+            lemma_sparse_sprint(e, alias_tail, fuel);
+            assert(alias_tail[1] == TokenView::Ident(a));
+            assert(alias_tail.drop_first().drop_first() =~= tail);
+            assert(sparse_select_item(sprint_select_item(item) + tail, fuel) == (Some((e, Some(a))), tail));
+            assert((e, Some(a)) == item);
+        },
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn sparse_select_list(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<(SExpr, Option<String>)>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse_select_item(input, fuel) {
+            (Some(item), r) => {
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    match sparse_select_list(r.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![item] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![item]), r)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+#[verifier::rlimit(4000)]
+pub proof fn lemma_sparse_select_list_sprint(items: Seq<(SExpr, Option<String>)>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_select(items),
+        items.len() >= 1,
+        fuel >= select_list_depth(items),
+        tail.len() == 0 || (tail[0] != TokenView::Comma
+            && tail[0] != TokenView::Keyword(Keyword::As)
+            && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen),
+    ensures
+        sparse_select_list(sprint_select_list(items) + tail, fuel) == (Some(items), tail),
+    decreases items,
+{
+    reveal_with_fuel(sparse_select_list, 2);
+    if items.len() == 1 {
+        assert(select_tail_ok(tail));
+        lemma_sparse_select_item_sprint(items[0], tail, fuel);
+        assert(sprint_select_list(items) + tail =~= sprint_select_item(items[0]) + tail);
+        assert(seq![items[0]] =~= items);
+        assert(sparse_select_list(sprint_select_list(items) + tail, fuel) == (Some(items), tail));
+    } else {
+        let rest = items.drop_first();
+        let item_tail = seq![TokenView::Comma] + (sprint_select_list(rest) + tail);
+        assert(select_tail_ok(item_tail)) by {
+            assert(item_tail[0] == TokenView::Comma);
+        }
+        lemma_sparse_select_item_sprint(items[0], item_tail, fuel);
+        lemma_sparse_select_list_sprint(rest, tail, (fuel - 1) as nat);
+        assert(sprint_select_list(items) + tail =~= sprint_select_item(items[0]) + item_tail);
+        assert(item_tail[0] == TokenView::Comma);
+        assert(item_tail.drop_first() =~= sprint_select_list(rest) + tail);
+        assert(seq![items[0]] + rest =~= items);
+        assert(sparse_select_list(sprint_select_list(items) + tail, fuel) == (Some(items), tail));
+    }
 }
 
 /// The canonical mirror statement printer roundtrips at self-supplied fuel.
