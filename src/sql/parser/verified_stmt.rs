@@ -3075,6 +3075,86 @@ pub fn parse_names_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+#[verifier::rlimit(20000)]
+pub fn parse_rows_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<Vec<ast::Expression>>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_rows(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(vv) => sopt is Some && view_rows(vv@) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_rows, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    if !matches!(toks[pos], super::Token::OpenParen) {
+        return (None, pos);
+    }
+    let (ropt, rpos) = parse_args_exec(toks, pos + 1, fuel);
+    match ropt {
+        Some(row) => {
+            if rpos < toks.len() && matches!(toks[rpos], super::Token::CloseParen) {
+                proof { token_views_suffix(toks@, rpos as int); }
+                if rpos + 1 < toks.len() && matches!(toks[rpos + 1], super::Token::Comma) {
+                    proof { token_views_suffix(toks@, rpos as int + 1); }
+                    let (mopt, mpos) = parse_rows_exec(toks, rpos + 2, fuel - 1);
+                    match mopt {
+                        Some(mut more) => {
+                            let mut v: Vec<Vec<ast::Expression>> = Vec::new();
+                            v.push(row);
+                            let ghost first = v@;
+                            let ghost more_old = more@;
+                            v.append(&mut more);
+                            proof {
+                                assert(v@ =~= first + more_old);
+                                view_rows_step(v@);
+                                assert(v@.drop_first() =~= more_old);
+                                assert(view_rows(more_old) == sparse_rows(
+                                    token_views(toks@.subrange(rpos as int + 2, toks@.len() as int)),
+                                    (fuel - 1) as nat).0.unwrap());
+                            }
+                            (Some(v), mpos)
+                        },
+                        None => (None, pos),
+                    }
+                } else {
+                    if rpos + 1 < toks.len() {
+                        proof { token_views_suffix(toks@, rpos as int + 1); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(rpos as int + 1, toks@.len() as int)); }
+                    }
+                    let mut v: Vec<Vec<ast::Expression>> = Vec::new();
+                    v.push(row);
+                    proof {
+                        view_rows_step(v@);
+                        assert(v@.drop_first() =~= Seq::<Vec<ast::Expression>>::empty());
+                    }
+                    (Some(v), rpos + 1)
+                }
+            } else {
+                if rpos < toks.len() {
+                    proof { token_views_suffix(toks@, rpos as int); }
+                } else {
+                    proof { token_views_len(toks@.subrange(rpos as int, toks@.len() as int)); }
+                }
+                (None, pos)
+            }
+        },
+        None => (None, pos),
+    }
+}
+
 /// The non-recursive list-free statements the executable parser recovers
 /// (Explain is excluded to keep the parser recursion-free).
 pub open spec fn flat_exec_ok(s: SStmt) -> bool {
