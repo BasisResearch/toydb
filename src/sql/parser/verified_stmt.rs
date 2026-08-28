@@ -29,10 +29,13 @@ use vstd::prelude::*;
 use super::verified_production::TokenView;
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, parse_expr_exec,
-    print_expr_exec, printable_se, sdepth, sdepth_le_len, slist_depth, sparse, sparse_args, sprint,
-    sprint_args, token_views_len, token_views_suffix, view_args, view_expr, SExpr,
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, parse_args_exec,
+    parse_expr_exec, print_args_slice, print_expr_exec, printable_se, sdepth, sdepth_le_len,
+    slist_depth, sparse, sparse_args, sprint, sprint_args, token_views_len, token_views_suffix,
+    view_args, view_expr, SExpr,
 };
+#[allow(unused_imports)]
+use super::verified_production::{token_view, token_views, token_views_concat};
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
 #[allow(unused_imports)]
@@ -2773,6 +2776,146 @@ pub fn print_stmt_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
             proof { assert(false); }
             r
         },
+    }
+}
+
+// -- Insert executable codec -------------------------------------------------
+
+pub proof fn view_rows_step(rows: Seq<Vec<ast::Expression>>)
+    requires rows.len() > 0,
+    ensures
+        view_rows(rows).len() == rows.len(),
+        view_rows(rows)[0] == view_args(rows[0]@),
+        view_rows(rows).drop_first() == view_rows(rows.drop_first()),
+    decreases rows.len(),
+{
+    assert(view_rows(rows) =~= seq![view_args(rows[0]@)] + view_rows(rows.drop_first()));
+    view_rows_len(rows);
+}
+
+pub proof fn view_rows_len(rows: Seq<Vec<ast::Expression>>)
+    ensures view_rows(rows).len() == rows.len(),
+    decreases rows.len(),
+{
+    if rows.len() > 0 {
+        view_rows_len(rows.drop_first());
+    }
+}
+
+#[verifier::rlimit(4000)]
+pub fn print_names_slice(names: &[String]) -> (r: Vec<super::Token>)
+    ensures token_views(r@) == sprint_names(names@),
+    decreases names.len(),
+{
+    reveal_with_fuel(token_views, 1);
+    if names.len() == 0 {
+        let r: Vec<super::Token> = Vec::new();
+        proof {
+            assert(names@ =~= Seq::<String>::empty());
+            assert(sprint_names(names@) =~= Seq::<TokenView>::empty());
+        }
+        r
+    } else if names.len() == 1 {
+        let mut r: Vec<super::Token> = Vec::new();
+        r.push(super::Token::Ident(names[0].clone()));
+        proof {
+            reveal_with_fuel(token_views, 2);
+            assert(r@.drop_first() =~= Seq::<super::Token>::empty());
+            assert(token_view(r@[0]) == TokenView::Ident(names@[0]));
+            assert(token_views(r@) =~= seq![TokenView::Ident(names@[0])]);
+            assert(sprint_names(names@) =~= seq![TokenView::Ident(names@[0])]);
+        }
+        r
+    } else {
+        let mut r: Vec<super::Token> = Vec::new();
+        r.push(super::Token::Ident(names[0].clone()));
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(names, 1, names.len());
+        proof { assert(rest@ =~= names@.drop_first()); }
+        let mut more = print_names_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(token_views, 3);
+            assert(r@ =~= head + more_old);
+            token_views_concat(head, more_old);
+            assert(head.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+            assert(token_views(head) =~= seq![TokenView::Ident(names@[0]), TokenView::Comma]);
+            assert(sprint_names(names@) =~= seq![TokenView::Ident(names@[0]), TokenView::Comma]
+                + sprint_names(names@.drop_first()));
+        }
+        r
+    }
+}
+
+pub fn print_row_exec(row: &[ast::Expression]) -> (r: Vec<super::Token>)
+    requires all_printable_se(view_args(row@)),
+    ensures token_views(r@) == sprint_row(view_args(row@)),
+{
+    reveal_with_fuel(token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    let ghost open = r@;
+    let mut body = print_args_slice(row);
+    let ghost body_old = body@;
+    r.append(&mut body);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(open.drop_first() =~= Seq::<super::Token>::empty());
+        assert(r@ =~= open + body_old + seq![super::Token::CloseParen]);
+        token_views_concat(open + body_old, seq![super::Token::CloseParen]);
+        token_views_concat(open, body_old);
+        assert(token_views(open) =~= seq![TokenView::OpenParen]);
+        assert(token_views(seq![super::Token::CloseParen]) =~= seq![TokenView::CloseParen]);
+        assert(sprint_row(view_args(row@)) =~= seq![TokenView::OpenParen]
+            + sprint_args(view_args(row@)) + seq![TokenView::CloseParen]);
+    }
+    r
+}
+
+#[verifier::rlimit(4000)]
+pub fn print_rows_slice(rows: &[Vec<ast::Expression>]) -> (r: Vec<super::Token>)
+    requires rows.len() >= 1, all_printable_rows(view_rows(rows@)),
+    ensures token_views(r@) == sprint_rows(view_rows(rows@)),
+    decreases rows.len(),
+{
+    reveal_with_fuel(token_views, 1);
+    if rows.len() == 1 {
+        proof {
+            view_rows_step(rows@);
+            assert(view_rows(rows@.drop_first()) =~= Seq::<Seq<SExpr>>::empty());
+            assert(all_printable_se(view_args(rows@[0]@)));
+            assert(sprint_rows(view_rows(rows@)) == sprint_row(view_rows(rows@)[0]));
+        }
+        print_row_exec(rows[0].as_slice())
+    } else {
+        proof {
+            view_rows_step(rows@);
+            assert(all_printable_se(view_args(rows@[0]@)));
+            assert(all_printable_rows(view_rows(rows@.drop_first())));
+        }
+        let mut r = print_row_exec(rows[0].as_slice());
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(rows, 1, rows.len());
+        proof { assert(rest@ =~= rows@.drop_first()); }
+        let mut more = print_rows_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            token_views_concat(head, more_old);
+            token_views_concat(p0, seq![super::Token::Comma]);
+            assert(token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+            assert(sprint_rows(view_rows(rows@)) =~= sprint_row(view_rows(rows@)[0])
+                + seq![TokenView::Comma] + sprint_rows(view_rows(rows@).drop_first()));
+            view_rows_step(rows@);
+        }
+        r
     }
 }
 
