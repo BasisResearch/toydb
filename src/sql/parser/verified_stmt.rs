@@ -2901,6 +2901,140 @@ pub proof fn lemma_sparse_expr_list_sprint(items: Seq<SExpr>, tail: Seq<TokenVie
     }
 }
 
+// -- ORDER BY: (expr, direction) comma-list terminated by a boundary ---------
+//
+// Each item prints as `<expr> ASC|DESC`. The direction is always emitted (even
+// when the source omitted it and defaulted to ASC), so the printed form is
+// self-delimiting and the roundtrip is exact. Items are comma-separated and the
+// list is terminated by a clause keyword or end of input, like `sparse_expr_list`.
+
+pub open spec fn sprint_direction(d: ast::Direction) -> TokenView {
+    match d {
+        ast::Direction::Ascending => TokenView::Keyword(Keyword::Asc),
+        ast::Direction::Descending => TokenView::Keyword(Keyword::Desc),
+    }
+}
+
+pub open spec fn sprint_order_item(item: (SExpr, ast::Direction)) -> Seq<TokenView> {
+    sprint(item.0) + seq![sprint_direction(item.1)]
+}
+
+pub open spec fn sprint_order_list(items: Seq<(SExpr, ast::Direction)>) -> Seq<TokenView>
+    decreases items,
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else if items.len() == 1 {
+        sprint_order_item(items[0])
+    } else {
+        sprint_order_item(items[0]) + seq![TokenView::Comma]
+            + sprint_order_list(items.drop_first())
+    }
+}
+
+pub open spec fn all_printable_order(items: Seq<(SExpr, ast::Direction)>) -> bool
+    decreases items,
+{
+    if items.len() == 0 {
+        true
+    } else {
+        printable_se(items[0].0) && all_printable_order(items.drop_first())
+    }
+}
+
+pub open spec fn order_list_depth(items: Seq<(SExpr, ast::Direction)>) -> nat
+    decreases items,
+{
+    if items.len() == 0 {
+        1
+    } else {
+        let d = sdepth(items[0].0);
+        let rest = order_list_depth(items.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn sparse_order_list(input: Seq<TokenView>, fuel: nat)
+    -> (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse(input, fuel) {
+            (Some(e), r) => {
+                if r.len() >= 1 && (r[0] == TokenView::Keyword(Keyword::Asc)
+                    || r[0] == TokenView::Keyword(Keyword::Desc)) {
+                    let d = if r[0] == TokenView::Keyword(Keyword::Asc) {
+                        ast::Direction::Ascending
+                    } else {
+                        ast::Direction::Descending
+                    };
+                    let r1 = r.drop_first();
+                    if r1.len() >= 1 && r1[0] == TokenView::Comma {
+                        match sparse_order_list(r1.drop_first(), (fuel - 1) as nat) {
+                            (Some(more), r2) => (Some(seq![(e, d)] + more), r2),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (Some(seq![(e, d)]), r1)
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+#[verifier::rlimit(8000)]
+pub proof fn lemma_sparse_order_list_sprint(
+    items: Seq<(SExpr, ast::Direction)>,
+    tail: Seq<TokenView>,
+    fuel: nat,
+)
+    requires
+        all_printable_order(items),
+        items.len() >= 1,
+        fuel >= order_list_depth(items),
+        tail.len() == 0 || (tail[0] != TokenView::Comma
+            && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen),
+    ensures
+        sparse_order_list(sprint_order_list(items) + tail, fuel) == (Some(items), tail),
+    decreases items,
+{
+    reveal_with_fuel(sparse_order_list, 2);
+    let e = items[0].0;
+    let d = items[0].1;
+    let dir_tok = sprint_direction(d);
+    assert((e, d) == items[0]);
+    if items.len() == 1 {
+        let etail = seq![dir_tok] + tail;
+        assert(boundary(etail)) by { assert(etail[0] == dir_tok); }
+        lemma_sparse_sprint(e, etail, fuel);
+        assert(sprint_order_list(items) + tail =~= sprint(e) + etail);
+        assert(etail.drop_first() =~= tail);
+        assert(seq![(e, d)] =~= items);
+    } else {
+        let rest = items.drop_first();
+        let ctail = seq![TokenView::Comma] + (sprint_order_list(rest) + tail);
+        let etail = seq![dir_tok] + ctail;
+        assert(boundary(etail)) by { assert(etail[0] == dir_tok); }
+        lemma_sparse_sprint(e, etail, fuel);
+        lemma_sparse_order_list_sprint(rest, tail, (fuel - 1) as nat);
+        assert(sprint_order_list(items) =~= sprint_order_item(items[0])
+            + seq![TokenView::Comma] + sprint_order_list(rest));
+        assert(sprint_order_item(items[0]) =~= sprint(e) + seq![dir_tok]);
+        assert(sprint_order_list(items) + tail =~= sprint(e) + etail);
+        assert(etail.drop_first() =~= ctail);
+        assert(ctail[0] == TokenView::Comma);
+        assert(ctail.drop_first() =~= sprint_order_list(rest) + tail);
+        assert(seq![(e, d)] + rest =~= items);
+    }
+}
+
 // -- select-list (exprs with optional AS alias; `*` may not be aliased) ------
 
 pub open spec fn sprint_select_item(item: (SExpr, Option<String>)) -> Seq<TokenView> {
