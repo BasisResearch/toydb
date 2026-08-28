@@ -29,7 +29,10 @@
 //! Trust surface is unchanged: the only axioms are the `float_trust` boundary
 //! reused through `literal_views` / `parse_literal_views`.
 
-#![allow(dead_code)]
+// `roundtrip_exec`'s `e`/`consumed` and similar bindings are used only in ghost
+// positions, which the non-Verus build erases; the module is verification
+// scaffolding.
+#![allow(dead_code, unused_variables)]
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use vstd::prelude::*;
@@ -1213,4 +1216,423 @@ pub fn parse_args_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+// ---- executable printer ----------------------------------------------------
+
+/// Exec single-token literal printer refining `literal_views`.
+pub fn print_lit_exec(l: &ast::Literal) -> (r: Vec<super::Token>)
+    requires verified_production::printable_literal(*l),
+    ensures verified_production::token_views(r@) == verified_production::literal_views(*l).unwrap(),
+{
+    reveal(verified_production::literal_views);
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    match l {
+        ast::Literal::Null => r.push(super::Token::Keyword(Keyword::Null)),
+        ast::Literal::Boolean(true) => r.push(super::Token::Keyword(Keyword::True)),
+        ast::Literal::Boolean(false) => r.push(super::Token::Keyword(Keyword::False)),
+        ast::Literal::Integer(n) => r.push(super::Token::Number(super::verified_integer::print_i64(*n))),
+        ast::Literal::Float(x) => r.push(super::Token::Number(float_trust::format_f64(*x))),
+        ast::Literal::String(s) => r.push(super::Token::String(s.clone())),
+    }
+    proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+    r
+}
+
+/// Assemble `( <op> inner )`, tracking the token view of the whole.
+pub fn wrap_unary(op_tok: super::Token, inner: Vec<super::Token>) -> (r: Vec<super::Token>)
+    ensures verified_production::token_views(r@)
+        == seq![TokenView::OpenParen, verified_production::token_view(op_tok)]
+            + verified_production::token_views(inner@)
+            + seq![TokenView::CloseParen],
+{
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    r.push(op_tok);
+    let ghost head = r@;
+    let mut inner = inner;
+    let ghost inner_old = inner@;
+    r.append(&mut inner);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(r@ =~= head + inner_old + seq![super::Token::CloseParen]);
+        assert(head.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+        verified_production::token_views_concat(head + inner_old, seq![super::Token::CloseParen]);
+        verified_production::token_views_concat(head, inner_old);
+        assert(verified_production::token_views(head)
+            =~= seq![TokenView::OpenParen, verified_production::token_view(op_tok)]);
+    }
+    r
+}
+
+/// Assemble `( left <op> right )`, tracking the token view of the whole.
+pub fn wrap_binary(op_tok: super::Token, left: Vec<super::Token>, right: Vec<super::Token>)
+    -> (r: Vec<super::Token>)
+    ensures verified_production::token_views(r@)
+        == seq![TokenView::OpenParen] + verified_production::token_views(left@)
+            + seq![verified_production::token_view(op_tok)]
+            + verified_production::token_views(right@)
+            + seq![TokenView::CloseParen],
+{
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    let ghost open = r@;
+    let mut left = left;
+    let ghost left_old = left@;
+    r.append(&mut left);
+    r.push(op_tok);
+    let ghost mid = r@;
+    let mut right = right;
+    let ghost right_old = right@;
+    r.append(&mut right);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(open.drop_first() =~= Seq::<super::Token>::empty());
+        assert(mid =~= open + left_old + seq![op_tok]);
+        assert(r@ =~= mid + right_old + seq![super::Token::CloseParen]);
+        verified_production::token_views_concat(mid + right_old, seq![super::Token::CloseParen]);
+        verified_production::token_views_concat(mid, right_old);
+        verified_production::token_views_concat(open + left_old, seq![op_tok]);
+        verified_production::token_views_concat(open, left_old);
+        assert(verified_production::token_views(open) =~= seq![TokenView::OpenParen]);
+        assert(verified_production::token_views(seq![op_tok])
+            =~= seq![verified_production::token_view(op_tok)]);
+        assert(verified_production::token_views(seq![super::Token::CloseParen])
+            =~= seq![TokenView::CloseParen]);
+    }
+    r
+}
+
+/// Assemble `( inner ! )`.
+pub fn wrap_factorial(inner: Vec<super::Token>) -> (r: Vec<super::Token>)
+    ensures verified_production::token_views(r@)
+        == seq![TokenView::OpenParen] + verified_production::token_views(inner@)
+            + seq![TokenView::Exclamation, TokenView::CloseParen],
+{
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    let ghost open = r@;
+    let mut inner = inner;
+    let ghost inner_old = inner@;
+    r.append(&mut inner);
+    r.push(super::Token::Exclamation);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(open.drop_first() =~= Seq::<super::Token>::empty());
+        assert(r@ =~= open + inner_old + seq![super::Token::Exclamation, super::Token::CloseParen]);
+        verified_production::token_views_concat(
+            open + inner_old, seq![super::Token::Exclamation, super::Token::CloseParen]);
+        verified_production::token_views_concat(open, inner_old);
+        assert(verified_production::token_views(open) =~= seq![TokenView::OpenParen]);
+        assert(verified_production::token_views(
+            seq![super::Token::Exclamation, super::Token::CloseParen])
+            =~= seq![TokenView::Exclamation, TokenView::CloseParen]);
+    }
+    r
+}
+
+/// Assemble `( inner IS <lit> )`, where `is_tok` is `NULL` or `NAN`.
+pub fn wrap_is(inner: Vec<super::Token>, is_tok: super::Token) -> (r: Vec<super::Token>)
+    ensures verified_production::token_views(r@)
+        == seq![TokenView::OpenParen] + verified_production::token_views(inner@)
+            + seq![TokenView::Keyword(Keyword::Is), verified_production::token_view(is_tok),
+                   TokenView::CloseParen],
+{
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    let ghost open = r@;
+    let mut inner = inner;
+    let ghost inner_old = inner@;
+    r.append(&mut inner);
+    r.push(super::Token::Keyword(Keyword::Is));
+    r.push(is_tok);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(open.drop_first() =~= Seq::<super::Token>::empty());
+        assert(r@ =~= open + inner_old
+            + seq![super::Token::Keyword(Keyword::Is), is_tok, super::Token::CloseParen]);
+        verified_production::token_views_concat(open + inner_old,
+            seq![super::Token::Keyword(Keyword::Is), is_tok, super::Token::CloseParen]);
+        verified_production::token_views_concat(open, inner_old);
+        assert(verified_production::token_views(open) =~= seq![TokenView::OpenParen]);
+        assert(seq![super::Token::Keyword(Keyword::Is), is_tok, super::Token::CloseParen]
+            .drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+        assert(verified_production::token_views(
+            seq![super::Token::Keyword(Keyword::Is), is_tok, super::Token::CloseParen])
+            =~= seq![TokenView::Keyword(Keyword::Is), verified_production::token_view(is_tok),
+                     TokenView::CloseParen]);
+    }
+    r
+}
+
+/// `view_args` preserves length.
+pub proof fn view_args_len(s: Seq<ast::Expression>)
+    ensures view_args(s).len() == s.len(),
+    decreases s.len(),
+{
+    if s.len() > 0 {
+        view_args_len(s.drop_first());
+    }
+}
+
+/// Head/tail unfolding of `view_args`.
+pub proof fn view_args_step(s: Seq<ast::Expression>)
+    requires s.len() > 0,
+    ensures
+        view_args(s).len() > 0,
+        view_args(s)[0] == view_expr(s[0]),
+        view_args(s).drop_first() == view_args(s.drop_first()),
+{
+    assert(view_args(s) =~= seq![view_expr(s[0])] + view_args(s.drop_first()));
+}
+
+/// Executable comma-list printer refining `sprint_args`.
+#[verifier::rlimit(4000)]
+pub fn print_args_slice(s: &[ast::Expression], fuel: usize) -> (r: Vec<super::Token>)
+    requires all_printable_se(view_args(s@)), fuel >= slist_depth(view_args(s@)),
+    ensures verified_production::token_views(r@) == sprint_args(view_args(s@)),
+    decreases fuel,
+{
+    reveal_with_fuel(verified_production::token_views, 1);
+    if s.len() == 0 {
+        let r: Vec<super::Token> = Vec::new();
+        proof { assert(view_args(s@) =~= Seq::<SExpr>::empty()); }
+        r
+    } else if s.len() == 1 {
+        proof {
+            view_args_step(s@);
+            sdepth_positive(view_expr(s@[0]));
+            assert(view_args(s@.drop_first()) =~= Seq::<SExpr>::empty());
+            assert(all_printable_se(view_args(s@)));
+            assert(sprint_args(view_args(s@)) == sprint(view_args(s@)[0]));
+        }
+        print_expr_exec(&s[0], fuel - 1)
+    } else {
+        proof {
+            view_args_len(s@);
+            view_args_step(s@);
+            sdepth_positive(view_expr(s@[0]));
+        }
+        let mut r = print_expr_exec(&s[0], fuel - 1);
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(s, 1, s.len());
+        proof { assert(rest@ =~= s@.drop_first()); }
+        let mut more = print_args_slice(rest, fuel - 1);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(verified_production::token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            verified_production::token_views_concat(head, more_old);
+            verified_production::token_views_concat(p0, seq![super::Token::Comma]);
+            assert(seq![super::Token::Comma].drop_first() =~= Seq::<super::Token>::empty());
+            assert(verified_production::token_views(seq![super::Token::Comma])
+                =~= seq![TokenView::Comma]);
+            assert(sprint_args(view_args(s@))
+                =~= sprint(view_args(s@)[0]) + seq![TokenView::Comma]
+                    + sprint_args(view_args(s@).drop_first()));
+        }
+        r
+    }
+}
+
+/// Executable expression printer refining `sprint` at the `view_expr` level.
+#[verifier::rlimit(8000)]
+pub fn print_expr_exec(e: &ast::Expression, fuel: usize) -> (r: Vec<super::Token>)
+    requires printable_se(view_expr(*e)), fuel >= sdepth(view_expr(*e)),
+    ensures verified_production::token_views(r@) == sprint(view_expr(*e)),
+    decreases fuel,
+{
+    reveal(printable_se);
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    match e {
+        ast::Expression::All => {
+            r.push(super::Token::Asterisk);
+            proof {
+                assert(r@.drop_first() =~= Seq::<super::Token>::empty());
+                assert(verified_production::token_views(r@) == sprint(view_expr(*e)));
+            }
+            r
+        },
+        ast::Expression::Column(table, column) => match table {
+            Some(t) => {
+                r.push(super::Token::Ident(t.clone()));
+                r.push(super::Token::Period);
+                r.push(super::Token::Ident(column.clone()));
+                proof {
+                    reveal_with_fuel(verified_production::token_views, 4);
+                    assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    assert(*e == ast::Expression::Column(Some(*t), *column));
+                    assert(verified_production::token_views(r@)
+                        =~= seq![TokenView::Ident(*t), TokenView::Period, TokenView::Ident(*column)]);
+                    assert(sprint(view_expr(*e))
+                        =~= seq![TokenView::Ident(*t), TokenView::Period, TokenView::Ident(*column)]);
+                }
+                r
+            },
+            None => {
+                r.push(super::Token::Ident(column.clone()));
+                proof {
+                    reveal_with_fuel(verified_production::token_views, 2);
+                    assert(r@.drop_first() =~= Seq::<super::Token>::empty());
+                    assert(*e == ast::Expression::Column(None::<String>, *column));
+                    assert(verified_production::token_views(r@) =~= seq![TokenView::Ident(*column)]);
+                    assert(sprint(view_expr(*e)) =~= seq![TokenView::Ident(*column)]);
+                }
+                r
+            },
+        },
+        ast::Expression::Literal(l) => {
+            let out = print_lit_exec(l);
+            proof { assert(verified_production::token_views(out@) == sprint(view_expr(*e))); }
+            out
+        },
+        ast::Expression::Function(name, args) => {
+            let arg_slice = args.as_slice();
+            let mut body = print_args_slice(arg_slice, fuel - 1);
+            r.push(super::Token::Ident(name.clone()));
+            r.push(super::Token::OpenParen);
+            let ghost head = r@;
+            let ghost body_old = body@;
+            r.append(&mut body);
+            r.push(super::Token::CloseParen);
+            proof {
+                assert(head.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                assert(r@ =~= head + body_old + seq![super::Token::CloseParen]);
+                verified_production::token_views_concat(head + body_old, seq![super::Token::CloseParen]);
+                verified_production::token_views_concat(head, body_old);
+                assert(head.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                assert(verified_production::token_views(seq![super::Token::CloseParen])
+                    =~= seq![TokenView::CloseParen]);
+                assert(arg_slice@ =~= args@);
+                assert(verified_production::token_views(r@) == sprint(view_expr(*e)));
+            }
+            r
+        },
+        ast::Expression::Operator(op) => { let out = match op {
+            ast::Operator::Not(inner) => wrap_unary(super::Token::Keyword(Keyword::Not),
+                print_expr_exec(&**inner, fuel - 1)),
+            ast::Operator::Identity(inner) => wrap_unary(super::Token::Plus,
+                print_expr_exec(&**inner, fuel - 1)),
+            ast::Operator::Negate(inner) => wrap_unary(super::Token::Minus,
+                print_expr_exec(&**inner, fuel - 1)),
+            ast::Operator::Factorial(inner) =>
+                wrap_factorial(print_expr_exec(&**inner, fuel - 1)),
+            ast::Operator::Is(inner, lit) => {
+                let inner_v = print_expr_exec(&**inner, fuel - 1);
+                let is_tok = match lit {
+                    ast::Literal::Null => super::Token::Keyword(Keyword::Null),
+                    _ => super::Token::Keyword(Keyword::NaN),
+                };
+                wrap_is(inner_v, is_tok)
+            },
+            ast::Operator::And(l, rr) => wrap_binary(super::Token::Keyword(Keyword::And),
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Or(l, rr) => wrap_binary(super::Token::Keyword(Keyword::Or),
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Equal(l, rr) => wrap_binary(super::Token::Equal,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::GreaterThan(l, rr) => wrap_binary(super::Token::GreaterThan,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::GreaterThanOrEqual(l, rr) => wrap_binary(super::Token::GreaterThanOrEqual,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::LessThan(l, rr) => wrap_binary(super::Token::LessThan,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::LessThanOrEqual(l, rr) => wrap_binary(super::Token::LessThanOrEqual,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::NotEqual(l, rr) => wrap_binary(super::Token::NotEqual,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Add(l, rr) => wrap_binary(super::Token::Plus,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Divide(l, rr) => wrap_binary(super::Token::Slash,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Exponentiate(l, rr) => wrap_binary(super::Token::Caret,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Multiply(l, rr) => wrap_binary(super::Token::Asterisk,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Remainder(l, rr) => wrap_binary(super::Token::Percent,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Subtract(l, rr) => wrap_binary(super::Token::Minus,
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+            ast::Operator::Like(l, rr) => wrap_binary(super::Token::Keyword(Keyword::Like),
+                print_expr_exec(&**l, fuel - 1), print_expr_exec(&**rr, fuel - 1)),
+        };
+        proof { assert(verified_production::token_views(out@) == sprint(view_expr(*e))); }
+        out },
+    }
+}
+
+// ---- headline: executable parse recovers the structural view ---------------
+
+/// End-to-end headline over the full production expression grammar: if `toks`
+/// is the canonical print of a printable expression `e`, running the executable
+/// parser on it recovers `e` up to its structural view — over real `Vec`
+/// function arguments and `Box` operator children, axiom-free apart from
+/// `float_trust`. This is `verified_function_list::roundtrip_demo` lifted to the
+/// entire grammar (`All`, `Column`, every `Literal`, all 15 `Operator`s, and
+/// nested `Function`s).
+pub fn roundtrip_exec(e: &ast::Expression, toks: &Vec<super::Token>) -> (out: ast::Expression)
+    requires
+        printable_se(view_expr(*e)),
+        verified_production::token_views(toks@) == sprint(view_expr(*e)),
+    ensures
+        view_expr(out) == view_expr(*e),
+{
+    let ghost se = view_expr(*e);
+    let fuel = toks.len();
+    proof {
+        sdepth_le_len(se);
+        token_views_len(toks@);
+        // fuel == toks.len() == token_views(toks@).len() == sprint(se).len() >= sdepth(se)
+        lemma_sparse_sprint(se, Seq::<TokenView>::empty(), fuel as nat);
+        assert(sprint(se) + Seq::<TokenView>::empty() =~= sprint(se));
+        assert(toks@.subrange(0int, toks@.len() as int) =~= toks@);
+    }
+    let (res, consumed) = parse_expr_exec(toks, 0, fuel);
+    match res {
+        Some(out) => out,
+        None => {
+            proof { assert(false); }
+            ast::Expression::All
+        },
+    }
+}
+
+/// Fully self-contained end-to-end roundtrip: printing a printable expression
+/// with the executable printer and parsing the result with the executable
+/// parser recovers the expression up to its structural view. `fuel` is any
+/// bound on the expression's mirror depth (e.g. its printed token count).
+pub fn print_parse_roundtrip_exec(e: &ast::Expression, fuel: usize) -> (out: ast::Expression)
+    requires
+        printable_se(view_expr(*e)),
+        fuel >= sdepth(view_expr(*e)),
+    ensures
+        view_expr(out) == view_expr(*e),
+{
+    let toks = print_expr_exec(e, fuel);
+    roundtrip_exec(e, &toks)
+}
+
+/// Structural injectivity of the canonical printer on the printable domain: two
+/// printable expressions with the same canonical print have the same structural
+/// view. Corollary of `mirror_injective` through the `view_expr` bridge.
+pub proof fn roundtrip_injective(left: ast::Expression, right: ast::Expression)
+    requires
+        printable_se(view_expr(left)),
+        printable_se(view_expr(right)),
+        sprint(view_expr(left)) == sprint(view_expr(right)),
+    ensures
+        view_expr(left) == view_expr(right),
+{
+    mirror_injective(view_expr(left), view_expr(right));
+}
+
 } // verus!
+
