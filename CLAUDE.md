@@ -37,3 +37,31 @@ omits `--repo`. The same guard also backs the opencode plugin
 Codex and humans — the same rules apply to every agent (see `AGENTS.md`). If
 it blocks you, rename the branch (`git branch -m <initials>/<topic>`) and
 retry — do not try to bypass the hook.
+
+## Marking a branch as a failed attempt
+
+Some branches are experiments that do not work out. When the user says an
+attempt/branch/approach **failed**, should be **abandoned / given up on**, or
+asks to **record why it did not work**, mark the branch on the Verus
+dashboard so the failure is kept, filterable, and analysable later (what went
+wrong; what tooling change would have prevented it):
+
+```
+python3 .claude/hooks/mark_branch.py failed --category <tag> --agent <claude|codex|opencode> "<short reason>"
+```
+
+- `<short reason>`: 1–3 sentences. It does **not** need to be precise or
+  complete — state the symptom (what Verus/the tool said) and your best guess
+  at the cause. Something loose beats nothing.
+- `<tag>`: one of `python3 .claude/hooks/mark_branch.py categories`
+  (`verus-timeout`, `spec-too-strong`, `spec-wrong`, `missing-lemma`,
+  `verus-unsupported`, `tooling-bug`, `scope-too-big`, `agent-stuck`,
+  `abandoned`, `other`); free-form is accepted if none fits.
+- Shortcuts: Claude Code `/mark-failed [tag] reason`, opencode
+  `/mark-failed [tag] reason`. Codex and humans run the script directly.
+- Exit code 2 means the upload failed (no `VERUS_INGEST_TOKEN`, network); the
+  mark is appended to `~/.verus-trace/branch_marks.jsonl` — tell the user.
+- To undo: `python3 .claude/hooks/mark_branch.py clear "<why>"`.
+- Never rename, delete or force-push the branch to "mark" it, and do not
+  commit anything as part of marking: the dashboard joins telemetry on the
+  branch name and the mark is recorded server-side.

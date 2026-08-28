@@ -30,5 +30,9 @@ args = ["stdio"]
 # The Stop hook self-provisions `core.hooksPath .githooks` in the clone; to
 # activate them before the first session ends, run once:
 #     git config core.hooksPath .githooks
+# Failed attempts: Codex reads AGENTS.md, which tells it to run
+#     python3 .claude/hooks/mark_branch.py failed --category <tag> --agent codex "<reason>"
+# when the user declares a branch a failed attempt. VERUS_INGEST_TOKEN must be
+# in Codex's environment for the upload (same token as the Stop hook).
 [[hooks.Stop]]
 command = ["python3", "/ABSOLUTE/PATH/TO/toydb/.codex/hooks/verus_stop.py"]
