@@ -3041,6 +3041,163 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+// -- CreateTable column exec printer (per-segment helpers avoid a solver blowup)
+
+pub fn print_col_pk(c: &ast::Column) -> (r: Vec<super::Token>)
+    ensures token_views(r@) == col_pk_toks(view_column(*c)),
+{
+    reveal_with_fuel(token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    if c.primary_key {
+        r.push(super::Token::Keyword(Keyword::Primary));
+        r.push(super::Token::Keyword(Keyword::Key));
+        proof { assert(r@.drop_first().drop_first() =~= Seq::<super::Token>::empty()); }
+    } else {
+        proof { assert(r@ =~= Seq::<super::Token>::empty()); }
+    }
+    r
+}
+
+pub fn print_col_null(c: &ast::Column) -> (r: Vec<super::Token>)
+    ensures token_views(r@) == col_null_toks(view_column(*c)),
+{
+    reveal_with_fuel(token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    match c.nullable {
+        Some(true) => {
+            r.push(super::Token::Keyword(Keyword::Null));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+        },
+        Some(false) => {
+            r.push(super::Token::Keyword(Keyword::Not));
+            r.push(super::Token::Keyword(Keyword::Null));
+            proof { assert(r@.drop_first().drop_first() =~= Seq::<super::Token>::empty()); }
+        },
+        None => {
+            proof { assert(r@ =~= Seq::<super::Token>::empty()); }
+        },
+    }
+    r
+}
+
+pub fn print_col_flag(present: bool, kw: Keyword, ghost_toks: Ghost<Seq<TokenView>>) -> (r: Vec<super::Token>)
+    requires ghost_toks@ == (if present { seq![TokenView::Keyword(kw)] } else { Seq::<TokenView>::empty() }),
+    ensures token_views(r@) == ghost_toks@,
+{
+    reveal_with_fuel(token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    if present {
+        r.push(super::Token::Keyword(kw));
+        proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+    } else {
+        proof { assert(r@ =~= Seq::<super::Token>::empty()); }
+    }
+    r
+}
+
+pub fn print_col_ref(c: &ast::Column) -> (r: Vec<super::Token>)
+    ensures token_views(r@) == col_ref_toks(view_column(*c)),
+{
+    reveal_with_fuel(token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    match &c.references {
+        Some(t) => {
+            r.push(super::Token::Keyword(Keyword::References));
+            r.push(super::Token::Ident(t.clone()));
+            proof { assert(r@.drop_first().drop_first() =~= Seq::<super::Token>::empty()); }
+        },
+        None => {
+            proof { assert(r@ =~= Seq::<super::Token>::empty()); }
+        },
+    }
+    r
+}
+
+pub fn print_col_default(c: &ast::Column) -> (r: Vec<super::Token>)
+    requires printable_column(view_column(*c)),
+    ensures token_views(r@) == col_default_toks(view_column(*c)),
+{
+    reveal(printable_column);
+    reveal_with_fuel(token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    match &c.default {
+        Some(e) => {
+            r.push(super::Token::Keyword(Keyword::Default));
+            let ghost dk = r@;
+            let mut body = print_expr_exec(e);
+            let ghost body_old = body@;
+            r.append(&mut body);
+            proof {
+                assert(r@ =~= dk + body_old);
+                token_views_concat(dk, body_old);
+                assert(dk.drop_first() =~= Seq::<super::Token>::empty());
+                assert(token_views(dk) =~= seq![TokenView::Keyword(Keyword::Default)]);
+            }
+        },
+        None => {
+            proof { assert(r@ =~= Seq::<super::Token>::empty()); }
+        },
+    }
+    r
+}
+
+#[verifier::rlimit(8000)]
+pub fn print_column_exec(c: &ast::Column) -> (r: Vec<super::Token>)
+    requires printable_column(view_column(*c)),
+    ensures token_views(r@) == sprint_column(view_column(*c)),
+{
+    reveal_with_fuel(token_views, 3);
+    let ghost vc = view_column(*c);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::Ident(c.name.clone()));
+    match c.datatype {
+        DataType::Boolean => r.push(super::Token::Keyword(Keyword::Boolean)),
+        DataType::Integer => r.push(super::Token::Keyword(Keyword::Integer)),
+        DataType::Float => r.push(super::Token::Keyword(Keyword::Float)),
+        DataType::String => r.push(super::Token::Keyword(Keyword::String)),
+    }
+    proof {
+        assert(r@.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+        assert(token_views(r@) =~= seq![TokenView::Ident(vc.name), datatype_kw(vc.datatype)]);
+    }
+    let ghost p0 = r@;
+    let mut s1 = print_col_pk(c);
+    let ghost s1o = s1@;
+    r.append(&mut s1);
+    proof { token_views_concat(p0, s1o); }
+    let ghost p1 = r@;
+    let mut s2 = print_col_null(c);
+    let ghost s2o = s2@;
+    r.append(&mut s2);
+    proof { token_views_concat(p1, s2o); }
+    let ghost p2 = r@;
+    let mut s3 = print_col_flag(c.unique, Keyword::Unique, Ghost(col_unique_toks(vc)));
+    let ghost s3o = s3@;
+    r.append(&mut s3);
+    proof { token_views_concat(p2, s3o); }
+    let ghost p3 = r@;
+    let mut s4 = print_col_flag(c.index, Keyword::Index, Ghost(col_index_toks(vc)));
+    let ghost s4o = s4@;
+    r.append(&mut s4);
+    proof { token_views_concat(p3, s4o); }
+    let ghost p4 = r@;
+    let mut s5 = print_col_ref(c);
+    let ghost s5o = s5@;
+    r.append(&mut s5);
+    proof { token_views_concat(p4, s5o); }
+    let ghost p5 = r@;
+    let mut s6 = print_col_default(c);
+    let ghost s6o = s6@;
+    r.append(&mut s6);
+    proof {
+        token_views_concat(p5, s6o);
+        assert(sprint_column(vc) =~= seq![TokenView::Ident(vc.name), datatype_kw(vc.datatype)]
+            + col_pk_toks(vc) + col_null_toks(vc) + col_unique_toks(vc) + col_index_toks(vc)
+            + col_ref_toks(vc) + col_default_toks(vc));
+    }
+    r
+}
+
 /// Executable BEGIN printer. Only two optional clauses (READ ONLY prefix,
 /// AS OF SYSTEM TIME suffix), so no per-segment helper is needed.
 #[verifier::rlimit(8000)]
