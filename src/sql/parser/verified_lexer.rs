@@ -3435,4 +3435,144 @@ pub fn scan_ident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>,
 }
 
 
+// -- L20: quoted string literal scanner (quote-free ASCII, char-view) -----------
+//
+// `String` is the second String-payload token. Same char-view treatment as L19.
+// A string literal is self-delimiting (a closing `'`), so unlike identifiers it
+// needs no tail boundary. This brick covers quote-free ASCII strings; the `''`
+// escape for an embedded quote is a mechanical extension of the same shape.
+
+/// First index at or after `pos` holding a quote byte `'` (39), or end of input.
+pub open spec fn scan_to_quote(input: Seq<u8>, pos: int) -> int
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && input[pos] != 39 {
+        scan_to_quote(input, pos + 1)
+    } else {
+        pos
+    }
+}
+
+/// Maximal-run characterization for `scan_to_quote` (mirrors the digit/ident runs).
+pub proof fn lemma_scan_to_quote_run(input: Seq<u8>, pos: int, k: int)
+    requires
+        0 <= pos <= k <= input.len(),
+        forall|i: int| pos <= i < k ==> input[i] != 39,
+        k == input.len() || input[k] == 39,
+    ensures
+        scan_to_quote(input, pos) == k,
+    decreases k - pos,
+{
+    if pos < k {
+        lemma_scan_to_quote_run(input, pos + 1, k);
+    }
+}
+
+/// Scan a quoted string, producing its char-sequence view. `None` if there is no
+/// opening quote or the string is unterminated.
+pub open spec fn lscan_string_m(input: Seq<u8>, pos: int) -> (Option<Seq<char>>, int) {
+    if 0 <= pos < input.len() && input[pos] == 39 {
+        let close = scan_to_quote(input, pos + 1);
+        if close < input.len() {
+            (Some(ascii_chars(input.subrange(pos + 1, close))), close + 1)
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// A no-quote ASCII char run encodes to bytes with no quote byte.
+pub proof fn lemma_string_bytes_noquote(cs: Seq<char>)
+    requires
+        all_ascii_chars(cs),
+        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 39,
+    ensures
+        all_ascii_bytes(ascii_bytes(cs)),
+        forall|i: int| 0 <= i < ascii_bytes(cs).len() ==> (#[trigger] ascii_bytes(cs)[i]) != 39,
+{
+    assert forall|i: int| 0 <= i < ascii_bytes(cs).len() implies
+        ascii_bytes(cs)[i] < 128 && ascii_bytes(cs)[i] != 39 by {
+        let c = cs[i];
+        assert((c as u32) < 128);
+        assert((c as u32) != 39);
+        lemma_char_u8_val(c);
+        assert(ascii_bytes(cs)[i] == (c as u8));
+    }
+}
+
+/// Quoted-string roundtrip at the char-view level: printing `'` + a quote-free
+/// ASCII char run + `'` and re-scanning recovers exactly that char sequence
+/// (self-delimiting, so any tail follows). Axiom-free.
+pub proof fn lemma_lscan_string_m(cs: Seq<char>, tail: Seq<u8>)
+    requires
+        all_ascii_chars(cs),
+        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 39,
+    ensures
+        lscan_string_m(seq![39u8] + ascii_bytes(cs) + seq![39u8] + tail, 0)
+            == (Some(cs), (cs.len() + 2) as int),
+{
+    let q = seq![39u8];
+    let d = ascii_bytes(cs);
+    let input = q + d + q + tail;
+    lemma_string_bytes_noquote(cs);
+    assert(input[0] == 39);
+    // inner run [1, 1+d.len()) has no quote, closing quote at 1+d.len()
+    assert forall|i: int| 1 <= i < 1 + d.len() implies input[i] != 39 by {
+        assert(input[i] == d[i - 1]);
+    }
+    let close = (1 + d.len()) as int;
+    assert(input[close] == 39) by {
+        assert(input[close] == q[0]);
+    }
+    lemma_scan_to_quote_run(input, 1, close);
+    assert(scan_to_quote(input, 1) == close);
+    assert(close < input.len());
+    assert(input.subrange(1, close) =~= d);
+    lemma_ascii_chars_bytes(cs);
+    assert(ascii_chars(d) == cs);
+}
+
+/// Executable quoted-string scanner: builds the real `Token::String(String)`,
+/// verified so its `@` char view matches `lscan_string_m`. Requires the string
+/// body to be ASCII. Reads to the first closing quote (no `''` escape yet).
+pub fn scan_string_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+        forall|i: int| pos < i < scan_to_quote(input@, pos + 1) ==> (#[trigger] input@[i]) < 128,
+    ensures
+        r.1 == lscan_string_m(input@, pos as int).1,
+        match (r.0, lscan_string_m(input@, pos as int).0) {
+            (Some(Token::String(s)), Some(cv)) => s@ == cv,
+            (None, None) => true,
+            _ => false,
+        },
+{
+    if pos < input.len() && input[pos] == 39u8 {
+        // scan to closing quote
+        let mut i = pos + 1;
+        while i < input.len() && input[i] != 39u8
+            invariant
+                pos + 1 <= i <= input.len(),
+                forall|j: int| pos + 1 <= j < i ==> input@[j] != 39,
+            decreases input.len() - i,
+        {
+            i += 1;
+        }
+        proof {
+            lemma_scan_to_quote_run(input@, pos as int + 1, i as int);
+        }
+        if i < input.len() {
+            let s = build_ascii_string(input, pos + 1, i);
+            (Some(Token::String(s)), i + 1)
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+
 } // verus!
