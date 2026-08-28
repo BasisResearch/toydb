@@ -3644,6 +3644,59 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+// -- Select FROM join-tree exec parser ---------------------------------------
+
+pub fn parse_table_exec(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<ast::From>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_table(input);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(t) => sopt is Some && view_from(t) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos >= toks.len() {
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    match &toks[pos] {
+        super::Token::Ident(name) => {
+            if pos + 1 < toks.len() && pos + 2 < toks.len()
+                && matches!(toks[pos + 1], super::Token::Keyword(Keyword::As)) {
+                proof {
+                    token_views_suffix(toks@, pos as int + 1);
+                    token_views_suffix(toks@, pos as int + 2);
+                }
+                match &toks[pos + 2] {
+                    super::Token::Ident(alias) => (
+                        Some(ast::From::Table { name: name.clone(), alias: Some(alias.clone()) }),
+                        pos + 3,
+                    ),
+                    _ => (None, pos),
+                }
+            } else {
+                if pos + 1 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 1); }
+                    if pos + 2 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 2); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                    }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                }
+                (Some(ast::From::Table { name: name.clone(), alias: None }), pos + 1)
+            }
+        },
+        _ => (None, pos),
+    }
+}
+
 /// End-to-end executable statement roundtrip for the full_exec_ok domain
 /// (8 of 10 statement kinds plus Explain): printing a printable statement with
 /// the executable printer and parsing the result with the executable parser
