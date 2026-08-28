@@ -10,6 +10,7 @@ pub mod unicode_trust;
 pub mod verified;
 pub mod verified_expression;
 pub mod verified_function_list;
+pub mod verified_idempotence;
 pub mod verified_integer;
 pub mod verified_lexer;
 pub mod verified_lists;

@@ -33,6 +33,7 @@ VERIFY_MODULES=(
   sql::parser::verified_expression
   sql::parser::verified_lexer
   sql::parser::verified_function_list
+  sql::parser::verified_idempotence
   sql::parser::verified_integer
   sql::parser::verified_lists
   sql::parser::verified_production
