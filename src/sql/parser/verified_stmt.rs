@@ -3012,6 +3012,69 @@ pub fn print_insert_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
     }
 }
 
+#[verifier::rlimit(8000)]
+pub fn parse_names_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<String>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_names(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(v) => sopt is Some && v@ == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_names, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    match &toks[pos] {
+        super::Token::Ident(name) => {
+            if pos + 1 >= toks.len() {
+                proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+                (None, pos)
+            } else {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+                match &toks[pos + 1] {
+                    super::Token::CloseParen => {
+                        let mut v: Vec<String> = Vec::new();
+                        v.push(name.clone());
+                        proof { assert(v@.drop_first() =~= Seq::<String>::empty()); }
+                        (Some(v), pos + 1)
+                    },
+                    super::Token::Comma => {
+                        let (mopt, mpos) = parse_names_exec(toks, pos + 2, fuel - 1);
+                        match mopt {
+                            Some(mut more) => {
+                                let mut v: Vec<String> = Vec::new();
+                                v.push(name.clone());
+                                let ghost first = v@;
+                                let ghost more_old = more@;
+                                v.append(&mut more);
+                                proof {
+                                    assert(v@ =~= first + more_old);
+                                    assert(first.drop_first() =~= Seq::<String>::empty());
+                                }
+                                (Some(v), mpos)
+                            },
+                            None => (None, pos),
+                        }
+                    },
+                    _ => (None, pos),
+                }
+            }
+        },
+        _ => (None, pos),
+    }
+}
+
 /// The non-recursive list-free statements the executable parser recovers
 /// (Explain is excluded to keep the parser recursion-free).
 pub open spec fn flat_exec_ok(s: SStmt) -> bool {
