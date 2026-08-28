@@ -746,4 +746,471 @@ pub proof fn slist_depth_le_len(args: Seq<SExpr>)
     }
 }
 
+// ============================================================================
+// E3: executable parser over real `ast::Expression`, refining `sparse`.
+//
+// The exec parser reads a `Vec<Token>` (production tokens) by an explicit
+// cursor `pos` and builds real `ast::Expression` values with `Box` children
+// and `Vec` arguments. Its ghost input is `token_views` of the remaining
+// tokens; it is verified to refine `sparse` at the `view_expr` level.
+// ============================================================================
+
+/// `token_views` preserves length.
+pub proof fn token_views_len(s: Seq<super::Token>)
+    ensures verified_production::token_views(s).len() == s.len(),
+    decreases s.len(),
+{
+    reveal_with_fuel(verified_production::token_views, 1);
+    if s.len() > 0 {
+        token_views_len(s.drop_first());
+    }
+}
+
+/// The view of a suffix: its head is the view of the token at `pos`, and its
+/// tail is the view of the next suffix. This is the single bridge the exec
+/// parser uses to step the cursor.
+pub proof fn token_views_suffix(s: Seq<super::Token>, pos: int)
+    requires 0 <= pos < s.len(),
+    ensures
+        verified_production::token_views(s.subrange(pos, s.len() as int)).len() > 0,
+        verified_production::token_views(s.subrange(pos, s.len() as int))[0]
+            == verified_production::token_view(s[pos]),
+        verified_production::token_views(s.subrange(pos, s.len() as int)).drop_first()
+            == verified_production::token_views(s.subrange(pos + 1, s.len() as int)),
+{
+    let sub = s.subrange(pos, s.len() as int);
+    reveal_with_fuel(verified_production::token_views, 1);
+    token_views_len(sub);
+    assert(sub[0] == s[pos]);
+    assert(sub.drop_first() =~= s.subrange(pos + 1, s.len() as int));
+}
+
+/// Exec digit check refining `verified_integer::all_digits`.
+pub fn all_digits_exec(bytes: &[u8]) -> (r: bool)
+    ensures r == super::verified_integer::all_digits(bytes@),
+    decreases bytes.len(),
+{
+    if bytes.len() == 0 {
+        true
+    } else {
+        let b = bytes[bytes.len() - 1];
+        if 48u8 <= b && b <= 57u8 {
+            let prefix = vstd::slice::slice_subrange(bytes, 0, bytes.len() - 1);
+            assert(prefix@ =~= bytes@.drop_last());
+            all_digits_exec(prefix)
+        } else {
+            false
+        }
+    }
+}
+
+/// Exec single-token literal parser refining `parse_literal_views` on the
+/// one-element view sequence.
+pub fn parse_literal_exec(tok: &super::Token) -> (r: Option<ast::Literal>)
+    ensures r == verified_production::parse_literal_views(
+        seq![verified_production::token_view(*tok)],
+    ),
+{
+    reveal(verified_production::parse_literal_views);
+    let ghost tv = seq![verified_production::token_view(*tok)];
+    match tok {
+        super::Token::Keyword(Keyword::Null) => Some(ast::Literal::Null),
+        super::Token::Keyword(Keyword::True) => Some(ast::Literal::Boolean(true)),
+        super::Token::Keyword(Keyword::False) => Some(ast::Literal::Boolean(false)),
+        super::Token::Number(bytes) => {
+            if all_digits_exec(bytes.as_slice()) {
+                match super::verified_integer::parse_i64(bytes.as_slice()) {
+                    Some(value) => Some(ast::Literal::Integer(value)),
+                    None => None,
+                }
+            } else {
+                match float_trust::parse_f64(bytes.as_slice()) {
+                    Some(value) => Some(ast::Literal::Float(value)),
+                    None => None,
+                }
+            }
+        },
+        super::Token::String(value) => Some(ast::Literal::String(value.clone())),
+        _ => None,
+    }
+}
+
+/// Exec prefix-operator detection refining `prefix_operator`.
+pub fn prefix_op_exec(tok: &super::Token) -> (r: Option<UnaryTag>)
+    ensures r == verified_expression::prefix_operator(verified_production::token_view(*tok)),
+{
+    match tok {
+        super::Token::Plus => Some(UnaryTag::Identity),
+        super::Token::Minus => Some(UnaryTag::Negate),
+        super::Token::Keyword(Keyword::Not) => Some(UnaryTag::Not),
+        _ => None,
+    }
+}
+
+/// Exec binary-operator detection refining `binary_from_token`.
+pub fn binary_tag_exec(tok: &super::Token) -> (r: Option<BinaryTag>)
+    ensures r == verified_expression::binary_from_token(verified_production::token_view(*tok)),
+{
+    match tok {
+        super::Token::Keyword(Keyword::And) => Some(BinaryTag::And),
+        super::Token::Keyword(Keyword::Or) => Some(BinaryTag::Or),
+        super::Token::Equal => Some(BinaryTag::Equal),
+        super::Token::GreaterThan => Some(BinaryTag::GreaterThan),
+        super::Token::GreaterThanOrEqual => Some(BinaryTag::GreaterThanOrEqual),
+        super::Token::LessThan => Some(BinaryTag::LessThan),
+        super::Token::LessThanOrEqual => Some(BinaryTag::LessThanOrEqual),
+        super::Token::NotEqual => Some(BinaryTag::NotEqual),
+        super::Token::Plus => Some(BinaryTag::Add),
+        super::Token::Slash => Some(BinaryTag::Divide),
+        super::Token::Caret => Some(BinaryTag::Exponentiate),
+        super::Token::Asterisk => Some(BinaryTag::Multiply),
+        super::Token::Percent => Some(BinaryTag::Remainder),
+        super::Token::Minus => Some(BinaryTag::Subtract),
+        super::Token::Keyword(Keyword::Like) => Some(BinaryTag::Like),
+        _ => None,
+    }
+}
+
+/// Build the `ast::Operator` for a unary tag, matching the mirror's `Unary`.
+pub fn build_unary(tag: UnaryTag, inner: ast::Expression) -> (r: ast::Expression)
+    ensures view_expr(r) == SExpr::Unary(tag, Box::new(view_expr(inner))),
+{
+    match tag {
+        UnaryTag::Identity => ast::Expression::Operator(ast::Operator::Identity(Box::new(inner))),
+        UnaryTag::Negate => ast::Expression::Operator(ast::Operator::Negate(Box::new(inner))),
+        UnaryTag::Not => ast::Expression::Operator(ast::Operator::Not(Box::new(inner))),
+    }
+}
+
+/// Build the `ast::Operator` for a binary tag, matching the mirror's `Binary`.
+pub fn build_binary(tag: BinaryTag, left: ast::Expression, right: ast::Expression) -> (r: ast::Expression)
+    ensures view_expr(r) == SExpr::Binary(tag, Box::new(view_expr(left)), Box::new(view_expr(right))),
+{
+    match tag {
+        BinaryTag::And => ast::Expression::Operator(ast::Operator::And(Box::new(left), Box::new(right))),
+        BinaryTag::Or => ast::Expression::Operator(ast::Operator::Or(Box::new(left), Box::new(right))),
+        BinaryTag::Equal => ast::Expression::Operator(ast::Operator::Equal(Box::new(left), Box::new(right))),
+        BinaryTag::GreaterThan => ast::Expression::Operator(ast::Operator::GreaterThan(Box::new(left), Box::new(right))),
+        BinaryTag::GreaterThanOrEqual => ast::Expression::Operator(ast::Operator::GreaterThanOrEqual(Box::new(left), Box::new(right))),
+        BinaryTag::LessThan => ast::Expression::Operator(ast::Operator::LessThan(Box::new(left), Box::new(right))),
+        BinaryTag::LessThanOrEqual => ast::Expression::Operator(ast::Operator::LessThanOrEqual(Box::new(left), Box::new(right))),
+        BinaryTag::NotEqual => ast::Expression::Operator(ast::Operator::NotEqual(Box::new(left), Box::new(right))),
+        BinaryTag::Add => ast::Expression::Operator(ast::Operator::Add(Box::new(left), Box::new(right))),
+        BinaryTag::Divide => ast::Expression::Operator(ast::Operator::Divide(Box::new(left), Box::new(right))),
+        BinaryTag::Exponentiate => ast::Expression::Operator(ast::Operator::Exponentiate(Box::new(left), Box::new(right))),
+        BinaryTag::Multiply => ast::Expression::Operator(ast::Operator::Multiply(Box::new(left), Box::new(right))),
+        BinaryTag::Remainder => ast::Expression::Operator(ast::Operator::Remainder(Box::new(left), Box::new(right))),
+        BinaryTag::Subtract => ast::Expression::Operator(ast::Operator::Subtract(Box::new(left), Box::new(right))),
+        BinaryTag::Like => ast::Expression::Operator(ast::Operator::Like(Box::new(left), Box::new(right))),
+    }
+}
+
+// ---- the executable parser -------------------------------------------------
+
+/// Executable expression parser over `Vec<Token>`, refining `sparse` at the
+/// `view_expr` level: whatever `sparse` does on the token views, this builds the
+/// corresponding real `ast::Expression` (with `Box` children and `Vec` args).
+#[verifier::rlimit(8000)]
+pub fn parse_expr_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Expression>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(e) => sopt is Some
+                    && view_expr(e) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse, 1);
+    reveal_with_fuel(sparse_operator, 1);
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof {
+            token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        }
+        assert(fuel == 0 || input.len() == 0);
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    // input[0] == token_view(toks@[pos]); input.drop_first() == views from pos+1
+    match &toks[pos] {
+        super::Token::Asterisk => {
+            (Some(ast::Expression::All), pos + 1)
+        },
+        super::Token::OpenParen => {
+            if pos + 1 >= toks.len() {
+                proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+                (None, pos)
+            } else {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+                // input[1] == token_view(toks@[pos+1])
+                let head = &toks[pos + 1];
+                match prefix_op_exec(head) {
+                    Some(tag) => {
+                        let (iopt, ipos) = parse_expr_exec(toks, pos + 2, fuel - 1);
+                        match iopt {
+                            Some(inner) => {
+                                if ipos < toks.len() && matches!(toks[ipos], super::Token::CloseParen) {
+                                    proof { token_views_suffix(toks@, ipos as int); }
+                                    (Some(build_unary(tag, inner)), ipos + 1)
+                                } else {
+                                    if ipos < toks.len() {
+                                        proof { token_views_suffix(toks@, ipos as int); }
+                                    } else {
+                                        proof { token_views_len(toks@.subrange(ipos as int, toks@.len() as int)); }
+                                    }
+                                    (None, pos)
+                                }
+                            },
+                            None => (None, pos),
+                        }
+                    },
+                    None => {
+                        let (lopt, lpos) = parse_expr_exec(toks, pos + 1, fuel - 1);
+                        match lopt {
+                            Some(left) => {
+                                if lpos >= toks.len() {
+                                    proof { token_views_len(toks@.subrange(lpos as int, toks@.len() as int)); }
+                                    (None, pos)
+                                } else {
+                                    proof { token_views_suffix(toks@, lpos as int); }
+                                    match &toks[lpos] {
+                                        super::Token::Exclamation => {
+                                            if lpos + 1 < toks.len()
+                                                && matches!(toks[lpos + 1], super::Token::CloseParen) {
+                                                proof { token_views_suffix(toks@, lpos as int + 1); }
+                                                (
+                                                    Some(ast::Expression::Operator(
+                                                        ast::Operator::Factorial(Box::new(left)))),
+                                                    lpos + 2,
+                                                )
+                                            } else {
+                                                if lpos + 1 < toks.len() {
+                                                    proof { token_views_suffix(toks@, lpos as int + 1); }
+                                                } else {
+                                                    proof { token_views_len(toks@.subrange(lpos as int + 1, toks@.len() as int)); }
+                                                }
+                                                (None, pos)
+                                            }
+                                        },
+                                        super::Token::Keyword(Keyword::Is) => {
+                                            if lpos + 1 < toks.len() && lpos + 2 < toks.len()
+                                                && matches!(toks[lpos + 2], super::Token::CloseParen) {
+                                                proof {
+                                                    token_views_suffix(toks@, lpos as int + 1);
+                                                    token_views_suffix(toks@, lpos as int + 2);
+                                                }
+                                                match &toks[lpos + 1] {
+                                                    super::Token::Keyword(Keyword::Null) => (
+                                                        Some(ast::Expression::Operator(ast::Operator::Is(
+                                                            Box::new(left), ast::Literal::Null))),
+                                                        lpos + 3,
+                                                    ),
+                                                    super::Token::Keyword(Keyword::NaN) => (
+                                                        Some(ast::Expression::Operator(ast::Operator::Is(
+                                                            Box::new(left),
+                                                            ast::Literal::Float(float_trust::canonical_nan())))),
+                                                        lpos + 3,
+                                                    ),
+                                                    _ => (None, pos),
+                                                }
+                                            } else {
+                                                proof {
+                                                    if lpos + 1 < toks.len() {
+                                                        token_views_suffix(toks@, lpos as int + 1);
+                                                    }
+                                                    if lpos + 2 < toks.len() {
+                                                        token_views_suffix(toks@, lpos as int + 2);
+                                                    } else {
+                                                        token_views_len(toks@.subrange(lpos as int + 2, toks@.len() as int));
+                                                    }
+                                                }
+                                                (None, pos)
+                                            }
+                                        },
+                                        other => {
+                                            match binary_tag_exec(other) {
+                                                Some(tag) => {
+                                                    let (ropt, rpos) = parse_expr_exec(toks, lpos + 1, fuel - 1);
+                                                    match ropt {
+                                                        Some(right) => {
+                                                            if rpos < toks.len()
+                                                                && matches!(toks[rpos], super::Token::CloseParen) {
+                                                                proof { token_views_suffix(toks@, rpos as int); }
+                                                                (Some(build_binary(tag, left, right)), rpos + 1)
+                                                            } else {
+                                                                if rpos < toks.len() {
+                                                                    proof { token_views_suffix(toks@, rpos as int); }
+                                                                } else {
+                                                                    proof { token_views_len(toks@.subrange(rpos as int, toks@.len() as int)); }
+                                                                }
+                                                                (None, pos)
+                                                            }
+                                                        },
+                                                        None => (None, pos),
+                                                    }
+                                                },
+                                                None => (None, pos),
+                                            }
+                                        },
+                                    }
+                                }
+                            },
+                            None => (None, pos),
+                        }
+                    },
+                }
+            }
+        },
+        super::Token::Ident(name) => {
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+            }
+            if pos + 1 < toks.len() && matches!(toks[pos + 1], super::Token::OpenParen) {
+                let (aopt, apos) = parse_args_exec(toks, pos + 2, fuel - 1);
+                match aopt {
+                    Some(args) => {
+                        if apos < toks.len() && matches!(toks[apos], super::Token::CloseParen) {
+                            proof { token_views_suffix(toks@, apos as int); }
+                            (Some(ast::Expression::Function(name.clone(), args)), apos + 1)
+                        } else {
+                            if apos < toks.len() {
+                                proof { token_views_suffix(toks@, apos as int); }
+                            } else {
+                                proof { token_views_len(toks@.subrange(apos as int, toks@.len() as int)); }
+                            }
+                            (None, pos)
+                        }
+                    },
+                    None => (None, pos),
+                }
+            } else if pos + 1 < toks.len() && pos + 2 < toks.len()
+                && matches!(toks[pos + 1], super::Token::Period) {
+                proof { token_views_suffix(toks@, pos as int + 2); }
+                match &toks[pos + 2] {
+                    super::Token::Ident(column) => (
+                        Some(ast::Expression::Column(Some(name.clone()), column.clone())),
+                        pos + 3,
+                    ),
+                    _ => (None, pos),
+                }
+            } else {
+                (Some(ast::Expression::Column(None, name.clone())), pos + 1)
+            }
+        },
+        super::Token::Number(_) => {
+            match parse_literal_exec(&toks[pos]) {
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
+                None => (None, pos),
+            }
+        },
+        super::Token::String(_) => {
+            match parse_literal_exec(&toks[pos]) {
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
+                None => (None, pos),
+            }
+        },
+        super::Token::Keyword(Keyword::Null)
+        | super::Token::Keyword(Keyword::True)
+        | super::Token::Keyword(Keyword::False) => {
+            match parse_literal_exec(&toks[pos]) {
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
+                None => (None, pos),
+            }
+        },
+        _ => (None, pos),
+    }
+}
+
+/// Executable comma-list parser, refining `sparse_args` at the `view_args`
+/// level: builds a real `Vec<ast::Expression>` matching the mirror sequence.
+#[verifier::rlimit(8000)]
+pub fn parse_args_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<ast::Expression>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_args(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(v) => sopt is Some
+                    && view_args(v@) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_args, 1);
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 || pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        assert(fuel == 0 || input.len() == 0);
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    if matches!(toks[pos], super::Token::CloseParen) {
+        let v: Vec<ast::Expression> = Vec::new();
+        proof { assert(view_args(v@) =~= Seq::<SExpr>::empty()); }
+        return (Some(v), pos);
+    }
+    let (eopt, epos) = parse_expr_exec(toks, pos, fuel - 1);
+    match eopt {
+        Some(e) => {
+            if epos >= toks.len() {
+                proof { token_views_len(toks@.subrange(epos as int, toks@.len() as int)); }
+                (None, pos)
+            } else {
+                proof { token_views_suffix(toks@, epos as int); }
+                match &toks[epos] {
+                    super::Token::CloseParen => {
+                        let mut v: Vec<ast::Expression> = Vec::new();
+                        v.push(e);
+                        proof {
+                            assert(v@ =~= seq![e]);
+                            assert(view_args(v@) =~= seq![view_expr(e)]) by {
+                                assert(v@.len() == 1);
+                                assert(v@[0] == e);
+                                assert(v@.drop_first() =~= Seq::<ast::Expression>::empty());
+                                assert(view_args(Seq::<ast::Expression>::empty()) == Seq::<SExpr>::empty());
+                            }
+                        }
+                        (Some(v), epos)
+                    },
+                    super::Token::Comma => {
+                        let (mopt, mpos) = parse_args_exec(toks, epos + 1, fuel - 1);
+                        match mopt {
+                            Some(mut more) => {
+                                let mut v: Vec<ast::Expression> = Vec::new();
+                                v.push(e);
+                                let ghost more_old = more@;
+                                v.append(&mut more);
+                                proof {
+                                    assert(v@ =~= seq![e] + more_old);
+                                    assert(view_args(v@) =~= seq![view_expr(e)] + view_args(more_old)) by {
+                                        assert(v@[0] == e);
+                                        assert(v@.drop_first() =~= more_old);
+                                    }
+                                }
+                                (Some(v), mpos)
+                            },
+                            None => (None, pos),
+                        }
+                    },
+                    _ => (None, pos),
+                }
+            }
+        },
+        None => (None, pos),
+    }
+}
+
 } // verus!
