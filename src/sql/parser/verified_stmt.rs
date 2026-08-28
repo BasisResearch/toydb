@@ -29,7 +29,8 @@ use vstd::prelude::*;
 use super::verified_production::TokenView;
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    boundary, lemma_sparse_sprint, printable_se, sdepth, sparse, sprint, view_expr, SExpr,
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, printable_se, sdepth,
+    slist_depth, sparse, sparse_args, sprint, sprint_args, view_args, view_expr, SExpr,
 };
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
@@ -51,8 +52,20 @@ pub enum SStmt {
     CreateTable { name: String, columns: Seq<SColumn> },
     DropTable { name: String, if_exists: bool },
     Delete { table: String, where_clause: Option<SExpr> },
+    Insert { table: String, columns: Option<Seq<String>>, values: Seq<Seq<SExpr>> },
     Explain(Box<SStmt>),
     Unsupported,
+}
+
+/// View a `Vec<Vec<Expression>>` row list as `Seq<Seq<SExpr>>`.
+pub open spec fn view_rows(rows: Seq<Vec<ast::Expression>>) -> Seq<Seq<SExpr>>
+    decreases rows,
+{
+    if rows.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![view_args(rows[0]@)] + view_rows(rows.drop_first())
+    }
 }
 
 /// Mirror of `ast::Column`: identical except the `default` expression becomes an
@@ -112,6 +125,14 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
                 Some(e) => Some(view_expr(e)),
                 None => None,
             },
+        },
+        ast::Statement::Insert { table, columns, values } => SStmt::Insert {
+            table,
+            columns: match columns {
+                Some(cols) => Some(cols@),
+                None => None,
+            },
+            values: view_rows(values@),
         },
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
@@ -376,6 +397,12 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
         SStmt::CreateTable { columns, .. } => columns.len() >= 1 && all_printable_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => printable_se(e),
         SStmt::Delete { where_clause: None, .. } => true,
+        SStmt::Insert { columns, values, .. } =>
+            values.len() >= 1 && all_printable_rows(values)
+                && (match columns {
+                    Some(names) => names.len() >= 1,
+                    None => true,
+                }),
         SStmt::Explain(inner) => !is_sexplain(*inner) && printable_stmt(*inner),
         SStmt::Unsupported => false,
     }
@@ -439,6 +466,14 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
             TokenView::Ident(table),
             TokenView::Keyword(Keyword::Where),
         ] + sprint(e),
+        SStmt::Insert { table, columns, values } => seq![
+            TokenView::Keyword(Keyword::Insert),
+            TokenView::Keyword(Keyword::Into),
+            TokenView::Ident(table),
+        ] + (match columns {
+            Some(names) => seq![TokenView::OpenParen] + sprint_names(names) + seq![TokenView::CloseParen],
+            None => Seq::empty(),
+        }) + seq![TokenView::Keyword(Keyword::Values)] + sprint_rows(values),
         SStmt::Explain(inner) => seq![TokenView::Keyword(Keyword::Explain)] + sprint_stmt(*inner),
         SStmt::Unsupported => Seq::empty(),
     }
@@ -452,6 +487,7 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
     match s {
         SStmt::CreateTable { columns, .. } => 1 + slist_depth_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => 1 + sdepth(e),
+        SStmt::Insert { columns, values, .. } => insert_fuel(columns, values),
         SStmt::Explain(inner) => 1 + sdepth_stmt(*inner),
         _ => 1,
     }
@@ -581,6 +617,7 @@ pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>
             TokenView::Keyword(Keyword::Create) => sparse_create(input, fuel),
             TokenView::Keyword(Keyword::Drop) => sparse_drop(input),
             TokenView::Keyword(Keyword::Delete) => sparse_delete(input, fuel),
+            TokenView::Keyword(Keyword::Insert) => sparse_insert(input, fuel),
             TokenView::Keyword(Keyword::Explain) => {
                 match sparse_stmt(input.drop_first(), (fuel - 1) as nat) {
                     (Some(inner), rest) if !is_sexplain(inner) => (
@@ -731,6 +768,45 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
                     assert(tokens[3] == TokenView::Keyword(Keyword::Where));
                     assert(tokens.drop_first().drop_first().drop_first().drop_first() =~= sprint(e));
                     assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
+                },
+            }
+        },
+        SStmt::Insert { table, columns, values } => {
+            lemma_sparse_rows_sprint(values, fuel);
+            let head = seq![
+                TokenView::Keyword(Keyword::Insert),
+                TokenView::Keyword(Keyword::Into),
+                TokenView::Ident(table),
+            ];
+            match columns {
+                None => {
+                    let after_head = seq![TokenView::Keyword(Keyword::Values)] + sprint_rows(values);
+                    assert(tokens =~= head + after_head);
+                    assert(tokens[0] == TokenView::Keyword(Keyword::Insert));
+                    assert(tokens[1] == TokenView::Keyword(Keyword::Into));
+                    assert(tokens[2] == TokenView::Ident(table));
+                    assert(tokens.drop_first().drop_first().drop_first() =~= after_head);
+                    assert(after_head[0] == TokenView::Keyword(Keyword::Values));
+                    assert(after_head[0] != TokenView::OpenParen);
+                    assert(after_head.drop_first() =~= sprint_rows(values));
+                },
+                Some(names) => {
+                    let names_tail = seq![
+                        TokenView::CloseParen,
+                        TokenView::Keyword(Keyword::Values),
+                    ] + sprint_rows(values);
+                    lemma_sparse_names_sprint(names, names_tail, fuel);
+                    let after_head = seq![TokenView::OpenParen] + sprint_names(names) + names_tail;
+                    assert(tokens =~= head + after_head);
+                    assert(tokens[0] == TokenView::Keyword(Keyword::Insert));
+                    assert(tokens[1] == TokenView::Keyword(Keyword::Into));
+                    assert(tokens[2] == TokenView::Ident(table));
+                    assert(tokens.drop_first().drop_first().drop_first() =~= after_head);
+                    assert(after_head[0] == TokenView::OpenParen);
+                    assert(after_head.drop_first() =~= sprint_names(names) + names_tail);
+                    assert(names_tail[0] == TokenView::CloseParen);
+                    assert(names_tail.drop_first() =~= seq![TokenView::Keyword(Keyword::Values)] + sprint_rows(values));
+                    assert(names_tail.drop_first().drop_first() =~= sprint_rows(values));
                 },
             }
         },
@@ -987,6 +1063,236 @@ pub proof fn lemma_sparse_columns_sprint(cols: Seq<SColumn>, tail: Seq<TokenView
         assert(sprint_columns(cols) + tail =~= sprint_column(cols[0]) + col_tail);
         assert(col_tail.drop_first() =~= sprint_columns(rest_cols) + tail);
         assert(seq![cols[0]] + rest_cols =~= cols);
+    }
+}
+
+// ---- Insert codec (S3): name list + nested rows list -----------------------
+
+pub open spec fn sprint_names(names: Seq<String>) -> Seq<TokenView>
+    decreases names,
+{
+    if names.len() == 0 {
+        Seq::empty()
+    } else if names.len() == 1 {
+        seq![TokenView::Ident(names[0])]
+    } else {
+        seq![TokenView::Ident(names[0]), TokenView::Comma] + sprint_names(names.drop_first())
+    }
+}
+
+pub open spec fn names_fuel(names: Seq<String>) -> nat {
+    (names.len() + 1) as nat
+}
+
+pub open spec fn sparse_names(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<String>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 || input.len() == 0 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                let rest = input.drop_first();
+                if rest.len() == 0 {
+                    (None, input)
+                } else if rest[0] == TokenView::CloseParen {
+                    (Some(seq![name]), rest)
+                } else if rest[0] == TokenView::Comma {
+                    match sparse_names(rest.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![name] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+pub open spec fn sprint_row(row: Seq<SExpr>) -> Seq<TokenView> {
+    seq![TokenView::OpenParen] + sprint_args(row) + seq![TokenView::CloseParen]
+}
+
+pub open spec fn sprint_rows(rows: Seq<Seq<SExpr>>) -> Seq<TokenView>
+    decreases rows,
+{
+    if rows.len() == 0 {
+        Seq::empty()
+    } else if rows.len() == 1 {
+        sprint_row(rows[0])
+    } else {
+        sprint_row(rows[0]) + seq![TokenView::Comma] + sprint_rows(rows.drop_first())
+    }
+}
+
+pub open spec fn slist_depth_rows(rows: Seq<Seq<SExpr>>) -> nat
+    decreases rows,
+{
+    if rows.len() == 0 {
+        1
+    } else {
+        let d = slist_depth(rows[0]);
+        let rest = slist_depth_rows(rows.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+pub open spec fn all_printable_rows(rows: Seq<Seq<SExpr>>) -> bool
+    decreases rows,
+{
+    if rows.len() == 0 {
+        true
+    } else {
+        all_printable_se(rows[0]) && all_printable_rows(rows.drop_first())
+    }
+}
+
+pub open spec fn sparse_rows(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<Seq<SExpr>>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 || input.len() == 0 || input[0] != TokenView::OpenParen {
+        (None, input)
+    } else {
+        match sparse_args(input.drop_first(), fuel) {
+            (Some(row), r) => {
+                if r.len() > 0 && r[0] == TokenView::CloseParen {
+                    let r2 = r.drop_first();
+                    if r2.len() > 0 && r2[0] == TokenView::Comma {
+                        match sparse_rows(r2.drop_first(), (fuel - 1) as nat) {
+                            (Some(more), r3) => (Some(seq![row] + more), r3),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (Some(seq![row]), r2)
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+pub open spec fn insert_fuel(columns: Option<Seq<String>>, values: Seq<Seq<SExpr>>) -> nat {
+    (1 + (match columns {
+        Some(names) => names_fuel(names),
+        None => 0nat,
+    }) + slist_depth_rows(values)) as nat
+}
+
+pub proof fn lemma_sparse_names_sprint(names: Seq<String>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        names.len() >= 1,
+        fuel >= names_fuel(names),
+        tail.len() > 0,
+        tail[0] == TokenView::CloseParen,
+    ensures
+        sparse_names(sprint_names(names) + tail, fuel) == (Some(names), tail),
+    decreases names,
+{
+    reveal_with_fuel(sparse_names, 2);
+    if names.len() == 1 {
+        let input = sprint_names(names) + tail;
+        assert(input =~= seq![TokenView::Ident(names[0])] + tail);
+        assert(input[0] == TokenView::Ident(names[0]));
+        assert(input.drop_first() =~= tail);
+        assert(input.drop_first()[0] == TokenView::CloseParen);
+        assert(sparse_names(input, fuel) == (Some(seq![names[0]]), tail));
+        assert(seq![names[0]] =~= names);
+    } else {
+        let input = sprint_names(names) + tail;
+        let rest_names = names.drop_first();
+        let comma_tail = seq![TokenView::Comma] + sprint_names(rest_names) + tail;
+        lemma_sparse_names_sprint(rest_names, tail, (fuel - 1) as nat);
+        assert(input =~= seq![TokenView::Ident(names[0])] + comma_tail);
+        assert(input[0] == TokenView::Ident(names[0]));
+        assert(input.drop_first() =~= comma_tail);
+        assert(comma_tail[0] == TokenView::Comma);
+        assert(comma_tail.drop_first() =~= sprint_names(rest_names) + tail);
+        assert(sparse_names(input, fuel) == (Some(seq![names[0]] + rest_names), tail));
+        assert(seq![names[0]] + rest_names =~= names);
+    }
+}
+
+/// Two-level list roundtrip: a comma list of parenthesised expression rows.
+#[verifier::rlimit(4000)]
+pub proof fn lemma_sparse_rows_sprint(rows: Seq<Seq<SExpr>>, fuel: nat)
+    requires
+        all_printable_rows(rows),
+        rows.len() >= 1,
+        fuel >= slist_depth_rows(rows),
+    ensures
+        sparse_rows(sprint_rows(rows), fuel) == (Some(rows), Seq::<TokenView>::empty()),
+    decreases rows,
+{
+    reveal_with_fuel(sparse_rows, 1);
+    if rows.len() == 1 {
+        lemma_sparse_args_sprint(rows[0], seq![TokenView::CloseParen], fuel);
+        assert(sprint_rows(rows) =~= seq![TokenView::OpenParen]
+            + (sprint_args(rows[0]) + seq![TokenView::CloseParen]));
+        assert(sprint_rows(rows).drop_first() =~= sprint_args(rows[0]) + seq![TokenView::CloseParen]);
+        assert(seq![rows[0]] =~= rows);
+    } else {
+        let rest = rows.drop_first();
+        let args_tail = seq![TokenView::CloseParen, TokenView::Comma] + sprint_rows(rest);
+        lemma_sparse_args_sprint(rows[0], args_tail, fuel);
+        lemma_sparse_rows_sprint(rest, (fuel - 1) as nat);
+        assert(sprint_rows(rows) =~= seq![TokenView::OpenParen] + (sprint_args(rows[0]) + args_tail));
+        assert(sprint_rows(rows).drop_first() =~= sprint_args(rows[0]) + args_tail);
+        assert(args_tail[0] == TokenView::CloseParen);
+        assert(args_tail.drop_first() =~= seq![TokenView::Comma] + sprint_rows(rest));
+        assert(args_tail.drop_first().drop_first() =~= sprint_rows(rest));
+        assert(seq![rows[0]] + rest =~= rows);
+    }
+}
+
+/// `INSERT INTO table [(names)] VALUES rows`. `input[0]` is known to be `INSERT`.
+pub open spec fn sparse_insert(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>) {
+    if input.len() >= 3 && input[1] == TokenView::Keyword(Keyword::Into) {
+        match input[2] {
+            TokenView::Ident(table) => {
+                let rest = input.drop_first().drop_first().drop_first();
+                if rest.len() >= 1 && rest[0] == TokenView::OpenParen {
+                    match sparse_names(rest.drop_first(), fuel) {
+                        (Some(names), r) => {
+                            if r.len() > 0 && r[0] == TokenView::CloseParen {
+                                let r2 = r.drop_first();
+                                if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::Values) {
+                                    match sparse_rows(r2.drop_first(), fuel) {
+                                        (Some(rows), r3) => (
+                                            Some(SStmt::Insert { table, columns: Some(names), values: rows }),
+                                            r3,
+                                        ),
+                                        (None, _) => (None, input),
+                                    }
+                                } else {
+                                    (None, input)
+                                }
+                            } else {
+                                (None, input)
+                            }
+                        },
+                        (None, _) => (None, input),
+                    }
+                } else if rest.len() >= 1 && rest[0] == TokenView::Keyword(Keyword::Values) {
+                    match sparse_rows(rest.drop_first(), fuel) {
+                        (Some(rows), r3) => (
+                            Some(SStmt::Insert { table, columns: None, values: rows }),
+                            r3,
+                        ),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            _ => (None, input),
+        }
+    } else {
+        (None, input)
     }
 }
 
