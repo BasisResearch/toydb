@@ -35,6 +35,8 @@ use super::verified_roundtrip::{
     view_args, view_args_len, view_expr, SExpr,
 };
 #[allow(unused_imports)]
+use vstd::std_specs::cmp::{OrdSpec, PartialOrdSpec};
+#[allow(unused_imports)]
 use super::verified_production::{token_view, token_views, token_views_concat};
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
@@ -4619,6 +4621,197 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
 pub proof fn axiom_string_key_obeys_cmp()
     ensures vstd::std_specs::btree::key_obeys_cmp_spec::<String>(),
 {
+}
+
+// -- Multi-assignment Update foundation: sorted-seq uniqueness ----------------
+//
+// `iter()` pins its remaining seq to be strictly key-increasing (`increasing_seq`)
+// and to cover exactly `m@.kv_pairs()`. That makes the sorted entry seq a *pinned
+// function of `m@`* even though no pure spec fn can compute the sort. The
+// uniqueness lemma below is what turns "pinned" into a usable normal form: two
+// strictly-key-increasing seqs with the same element set are equal.
+
+/// `String`'s `Ord` obeys the full total-order cmp laws (antisymmetry,
+/// transitivity, `Equal <==> ==`). Trusted like [[axiom_string_key_obeys_cmp]]
+/// (same "String Ord is lawful" boundary); needed to interpret `increasing_seq`
+/// over `String` keys, which uses `laws_cmp::obeys_cmp`, not `key_obeys_cmp_spec`.
+#[verifier::external_body]
+pub proof fn axiom_string_obeys_cmp()
+    ensures vstd::laws_cmp::obeys_cmp::<String>(),
+{
+}
+
+pub open spec fn kv_keys(s: Seq<(String, Option<SExpr>)>) -> Seq<String> {
+    s.map_values(|kv: (String, Option<SExpr>)| kv.0)
+}
+
+pub proof fn kv_keys_index(s: Seq<(String, Option<SExpr>)>)
+    ensures
+        kv_keys(s).len() == s.len(),
+        forall|i: int| 0 <= i < s.len() ==> #[trigger] kv_keys(s)[i] == s[i].0,
+{
+}
+
+/// The `cmp_spec` order over `String` keys, unpacked from the trusted axiom:
+/// `increasing_seq(kv_keys(s))` means every earlier key is strictly `Less` than
+/// every later key.
+pub proof fn increasing_keys_lt(s: Seq<(String, Option<SExpr>)>, i: int, j: int)
+    requires
+        vstd::std_specs::btree::increasing_seq(kv_keys(s)),
+        0 <= i < j < s.len(),
+    ensures s[i].0.cmp_spec(&s[j].0) == core::cmp::Ordering::Less,
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+    kv_keys_index(s);
+    assert(kv_keys(s)[i].cmp_spec(&kv_keys(s)[j]) == core::cmp::Ordering::Less);
+}
+
+/// Reflexivity and antisymmetry of `String::cmp_spec`, unpacked from the trusted
+/// `obeys_cmp` axiom (via the `partial_cmp` order laws + the `partial_cmp ==
+/// Some(cmp)` bridge). These are the only order facts the uniqueness proof needs.
+pub proof fn string_cmp_laws(a: String, b: String)
+    ensures
+        a.cmp_spec(&a) == core::cmp::Ordering::Equal,
+        (a.cmp_spec(&b) == core::cmp::Ordering::Less)
+            == (b.cmp_spec(&a) == core::cmp::Ordering::Greater),
+{
+    axiom_string_obeys_cmp();
+    reveal(vstd::laws_cmp::obeys_cmp);
+    reveal(vstd::laws_cmp::obeys_cmp_ord);
+    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+    assert(a.partial_cmp_spec(&b) == Some(a.cmp_spec(&b)));
+    assert(b.partial_cmp_spec(&a) == Some(b.cmp_spec(&a)));
+    assert(a.partial_cmp_spec(&a) == Some(a.cmp_spec(&a)));
+}
+
+/// A strictly-key-increasing sequence of `(key, value)` pairs is uniquely
+/// determined by its element set. Foundation of the multi-assignment Update
+/// bridge (piece 1 of 5 — see plan).
+pub proof fn lemma_sorted_kv_unique(
+    s1: Seq<(String, Option<SExpr>)>,
+    s2: Seq<(String, Option<SExpr>)>,
+)
+    requires
+        vstd::std_specs::btree::increasing_seq(kv_keys(s1)),
+        vstd::std_specs::btree::increasing_seq(kv_keys(s2)),
+        s1.to_set() == s2.to_set(),
+    ensures s1 == s2,
+    decreases s1.len(),
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::seq_lib::group_seq_lib_default;
+    s1.to_set_ensures();
+    s2.to_set_ensures();
+    assert(vstd::laws_cmp::obeys_partial_cmp_spec_properties::<String>()) by {
+        reveal(vstd::laws_cmp::obeys_cmp);
+    }
+    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+    if s1.len() == 0 {
+        assert(s2.len() == 0) by {
+            if s2.len() > 0 {
+                assert(s2.to_set().contains(s2[0]));
+                assert(s1.to_set().contains(s2[0]));
+                assert(s1.contains(s2[0]));
+            }
+        }
+        assert(s1 =~= s2);
+    } else {
+        // s1[0] and s2[0] are both the minimum-key element; show they are equal.
+        assert(s1.to_set().contains(s1[0]));
+        assert(s2.to_set().contains(s1[0]));
+        assert(s1.contains(s2[0])) by { assert(s2.to_set().contains(s2[0])); }
+        assert(s2.contains(s1[0]));
+        let j = choose|j: int| 0 <= j < s2.len() && s2[j] == s1[0];
+        let i = choose|i: int| 0 <= i < s1.len() && s1[i] == s2[0];
+        assert(s2[j] == s1[0]);
+        assert(s1[i] == s2[0]);
+        string_cmp_laws(s1[0].0, s2[0].0);
+        string_cmp_laws(s2[0].0, s1[0].0);
+        // s1[0] and s2[0] are both minimum-key: neither j nor i can exceed 0.
+        assert(j == 0) by {
+            if j > 0 {
+                increasing_keys_lt(s2, 0, j);          // key(s2[0]) < key(s2[j]) == key(s1[0])
+                if i == 0 {
+                    // s2[0] == s1[0] ⟹ key(s2[0]) == key(s1[0]) ⟹ cmp is Equal, not Less.
+                } else {
+                    increasing_keys_lt(s1, 0, i);       // key(s1[0]) < key(s2[0])
+                    string_cmp_laws(s1[0].0, s2[0].0);  // antisym ⟹ key(s2[0]) > key(s1[0])
+                }
+            }
+        }
+        assert(s1[0] == s2[0]);
+        // Peel the shared head; the tails have equal element sets.
+        let t1 = s1.drop_first();
+        let t2 = s2.drop_first();
+        assert(vstd::std_specs::btree::increasing_seq(kv_keys(t1))) by {
+            axiom_string_obeys_cmp();
+            broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+            kv_keys_index(t1);
+            kv_keys_index(s1);
+            assert forall|p: int, q: int| 0 <= p < q < kv_keys(t1).len()
+                implies #[trigger] kv_keys(t1)[p].cmp_spec(&kv_keys(t1)[q])
+                    == core::cmp::Ordering::Less by {
+                increasing_keys_lt(s1, p + 1, q + 1);
+                assert(t1[p] == s1[p + 1]);
+                assert(t1[q] == s1[q + 1]);
+            }
+        }
+        assert(vstd::std_specs::btree::increasing_seq(kv_keys(t2))) by {
+            axiom_string_obeys_cmp();
+            broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+            kv_keys_index(t2);
+            kv_keys_index(s2);
+            assert forall|p: int, q: int| 0 <= p < q < kv_keys(t2).len()
+                implies #[trigger] kv_keys(t2)[p].cmp_spec(&kv_keys(t2)[q])
+                    == core::cmp::Ordering::Less by {
+                increasing_keys_lt(s2, p + 1, q + 1);
+                assert(t2[p] == s2[p + 1]);
+                assert(t2[q] == s2[q + 1]);
+            }
+        }
+        t1.to_set_ensures();
+        t2.to_set_ensures();
+        assert(t1.to_set() =~= t2.to_set()) by {
+            assert forall|x: (String, Option<SExpr>)| t1.to_set().contains(x)
+                implies t2.to_set().contains(x) by {
+                assert(t1.contains(x));
+                assert(s1.to_set().contains(x));
+                assert(s2.to_set().contains(x));
+                assert(s2.contains(x));
+                // x is in the tail of s1, so x != s1[0] == s2[0] (strict keys ⟹
+                // the head key is strictly below every tail key).
+                let n = choose|n: int| 0 <= n < t1.len() && t1[n] == x;
+                assert(t1[n] == s1[n + 1]);
+                increasing_keys_lt(s1, 0, n + 1);
+                string_cmp_laws(s1[0].0, s1[0].0);
+                assert(x != s2[0]);
+                let k = choose|k: int| 0 <= k < s2.len() && s2[k] == x;
+                assert(k != 0);
+                assert(t2[k - 1] == s2[k]);
+                assert(t2.contains(x));
+            }
+            assert forall|x: (String, Option<SExpr>)| t2.to_set().contains(x)
+                implies t1.to_set().contains(x) by {
+                assert(t2.contains(x));
+                assert(s2.to_set().contains(x));
+                assert(s1.to_set().contains(x));
+                assert(s1.contains(x));
+                let n = choose|n: int| 0 <= n < t2.len() && t2[n] == x;
+                assert(t2[n] == s2[n + 1]);
+                increasing_keys_lt(s2, 0, n + 1);
+                string_cmp_laws(s2[0].0, s2[0].0);
+                assert(x != s1[0]);
+                let k = choose|k: int| 0 <= k < s1.len() && s1[k] == x;
+                assert(k != 0);
+                assert(t1[k - 1] == s1[k]);
+                assert(t1.contains(x));
+            }
+        }
+        lemma_sorted_kv_unique(t1, t2);
+        assert(s1 =~= seq![s1[0]] + t1);
+        assert(s2 =~= seq![s2[0]] + t2);
+    }
 }
 
 /// Build a one-entry `BTreeMap` with a known view.
