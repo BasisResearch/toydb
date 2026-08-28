@@ -197,8 +197,30 @@ extract a big statement-kind's roundtrip into its own spinoff'd lemma; (4) threa
 `tail` param through clause lemmas so tails compose; (5) dispatch gotcha —
 `sparse_stmt` needs `fuel >= 1` (reveal `sdepth_select_body`) to pick the Select arm.
 
-**Remaining for the parser cutover:** `ORDER BY` (an expr+ASC/DESC-direction list —
-same recipe, add a direction codec), the join *types* in the FROM tree, and
+**ALL SIX Select clauses landed (2026-08-28, 165 verified).** `ORDER BY` completes
+the Select grammar, mirror + exec, both directions:
+- Direction + order-list codec (`sprint_order_list` / `sparse_order_list` +
+  `lemma_sparse_order_list_sprint`): a boundary-terminated comma-list of
+  `(expr, direction)`; the direction is *always* printed (ASC/DESC), so the printed
+  form is self-delimiting and the roundtrip is exact regardless of the source default.
+- A ≤3-clause opaque `sparse_order_clause` (ORDER BY only) + its lemma, threaded into
+  `sparse_select` / `lemma_sparse_select_sprint` between WHERE/GROUP/HAVING and
+  LIMIT/OFFSET via the boundary `tail`: where_group leaves `orderlo`, ORDER BY leaves
+  `lo`, LIMIT/OFFSET finishes. No change needed to the where_group lemma (Order is not
+  Where/Group/Having).
+- exec: `print_order_list_slice` / `parse_order_list_exec` / `parse_order_clause_exec`.
+
+**New scaling lever — the head/tail exec split.** Adding ORDER BY made
+`print_select_exec` an 8-clause inline assembly, which crashed the solver with
+`expected rlimit-count` (module-scale SMT context). `spinoff_prover` did *not* fix it
+(the single function's `token_views` assembly is intrinsically large). The fix:
+split the exec printer into `print_select_head_exec` (SELECT..HAVING) and
+`print_select_tail_exec` (ORDER BY/LIMIT/OFFSET), each proving its own explicit
+concatenation; `print_select_exec` then just `token_views_concat`s the two halves
+under one `reveal(sprint_select_body)`. Generalises recipe rule (1) from opaque
+*parsers* to *any* exec function that assembles many clauses.
+
+**Remaining for the parser cutover:** the join *types* in the FROM tree, and
 multi-assignment `Update` (the sorted-`iter()` bridge). Then the byte-cursor lexer
 (from scratch) and the ast-equivalence argument for the actual swap.
 
