@@ -2919,6 +2919,99 @@ pub fn print_rows_slice(rows: &[Vec<ast::Expression>]) -> (r: Vec<super::Token>)
     }
 }
 
+pub open spec fn is_sinsert(s: SStmt) -> bool {
+    match s {
+        SStmt::Insert { .. } => true,
+        _ => false,
+    }
+}
+
+#[verifier::rlimit(8000)]
+pub fn print_insert_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires
+        printable_stmt(view_stmt(*s)),
+        is_sinsert(view_stmt(*s)),
+    ensures
+        token_views(r@) == sprint_stmt(view_stmt(*s)),
+{
+    reveal(printable_stmt);
+    reveal_with_fuel(token_views, 5);
+    match s {
+        ast::Statement::Insert { table, columns, values } => match columns {
+            None => {
+                let mut r: Vec<super::Token> = Vec::new();
+                r.push(super::Token::Keyword(Keyword::Insert));
+                r.push(super::Token::Keyword(Keyword::Into));
+                r.push(super::Token::Ident(table.clone()));
+                r.push(super::Token::Keyword(Keyword::Values));
+                let ghost head = r@;
+                let mut rows = print_rows_slice(values.as_slice());
+                let ghost rows_old = rows@;
+                r.append(&mut rows);
+                proof {
+                    view_rows_len(values@);
+                    assert(r@ =~= head + rows_old);
+                    token_views_concat(head, rows_old);
+                    assert(head.drop_first().drop_first().drop_first().drop_first()
+                        =~= Seq::<super::Token>::empty());
+                    assert(token_views(head) =~= seq![
+                        TokenView::Keyword(Keyword::Insert),
+                        TokenView::Keyword(Keyword::Into),
+                        TokenView::Ident(*table),
+                        TokenView::Keyword(Keyword::Values),
+                    ]);
+                }
+                r
+            },
+            Some(cols) => {
+                let mut r: Vec<super::Token> = Vec::new();
+                r.push(super::Token::Keyword(Keyword::Insert));
+                r.push(super::Token::Keyword(Keyword::Into));
+                r.push(super::Token::Ident(table.clone()));
+                r.push(super::Token::OpenParen);
+                let ghost head = r@;
+                let mut names = print_names_slice(cols.as_slice());
+                let ghost names_old = names@;
+                r.append(&mut names);
+                r.push(super::Token::CloseParen);
+                r.push(super::Token::Keyword(Keyword::Values));
+                let ghost mid = r@;
+                let mut rows = print_rows_slice(values.as_slice());
+                let ghost rows_old = rows@;
+                r.append(&mut rows);
+                proof {
+                    view_rows_len(values@);
+                    assert(r@ =~= mid + rows_old);
+                    token_views_concat(mid, rows_old);
+                    assert(mid =~= head + names_old
+                        + seq![super::Token::CloseParen, super::Token::Keyword(Keyword::Values)]);
+                    token_views_concat(head + names_old,
+                        seq![super::Token::CloseParen, super::Token::Keyword(Keyword::Values)]);
+                    token_views_concat(head, names_old);
+                    assert(head.drop_first().drop_first().drop_first().drop_first()
+                        =~= Seq::<super::Token>::empty());
+                    assert(token_views(head) =~= seq![
+                        TokenView::Keyword(Keyword::Insert),
+                        TokenView::Keyword(Keyword::Into),
+                        TokenView::Ident(*table),
+                        TokenView::OpenParen,
+                    ]);
+                    assert(seq![super::Token::CloseParen, super::Token::Keyword(Keyword::Values)]
+                        .drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    assert(token_views(seq![super::Token::CloseParen,
+                        super::Token::Keyword(Keyword::Values)])
+                        =~= seq![TokenView::CloseParen, TokenView::Keyword(Keyword::Values)]);
+                }
+                r
+            },
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
 /// The non-recursive list-free statements the executable parser recovers
 /// (Explain is excluded to keep the parser recursion-free).
 pub open spec fn flat_exec_ok(s: SStmt) -> bool {
