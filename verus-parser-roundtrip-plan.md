@@ -347,16 +347,35 @@ all symbols** end to end, both directions, culminating in a runnable executable
   `lex_all_seq`; then the executable `lex_all_exec` fuel-free loop refining
   `lex_from`, and the end-to-end `lemma_lex_all_exec_roundtrip`.
 
-**Remaining lexer work — the `String` trust bridge (the cutover blocker).** The
-only token classes left are **`Ident` (plain, non-keyword) and `String`** (quoted
-`'...'`/`"..."` with `''`/`""` escapes), which carry `String` payloads. The
-grammar carries these opaque, but the *lexer must build a `String` from bytes*,
-which needs a minimal audited byte↔`String` (UTF-8) trust bridge — the one
-planned trust-surface expansion (like `float_trust`). Plain idents also involve
-unicode lowercasing (production uses `char::to_lowercase`; the ASCII case is
-axiom-free, non-ASCII needs the `unicode_trust` model). Whitespace is currently
-ASCII (`is_ws`) vs production's unicode `is_whitespace` — a small gap. After the
-`String` bridge: ast-equivalence + the `parser.rs`/`lexer.rs` cutover.
+**ALL FIVE token scanners done, axiom-free (2026-08-28, L18-L20, 106 verified).**
+The `String`-payload classes turned out to need NO trust bridge for ASCII. The
+obstacles — `String` is not spec-constructible, and `String` equality is not
+view-determined (`a@ == b@` does not give `a == b`) — are the same ones the
+expression grammar hit with `Vec`, and the same fix applies: work with the
+char-sequence **view** `Seq<char>` in spec, and refine the exec at the `s@` level.
+- **L18** — String-bridge primitives: `ascii_bytes`/`ascii_chars` (char-per-byte,
+  proven mutually inverse for ASCII via Verus's native `char`<->`u8` cast, which
+  must be isolated in a tiny helper lemma to dodge trigger interference);
+  `build_ascii_string` builds a `String` from bytes via `String::push` with a
+  proven `@` view.
+- **L19** — identifier token: `lscan_ident_m` produces the lowercased char view
+  (`None` when the run is a keyword); `lemma_lscan_ident_m` proves the char-view
+  roundtrip; `scan_ident_token_exec` builds the real `Token::Ident` verified so
+  its `@` matches. Axiom-free.
+- **L20** — quoted string: self-delimiting (closing `'`), `scan_to_quote` +
+  `lscan_string_m` + `lemma_lscan_string_m` + `scan_string_token_exec`. Quote-free
+  ASCII; the `''` escape is a mechanical extension. Axiom-free.
+
+**Remaining lexer work — unify + faithfulness.** Every token class now has a
+verified scanner; what is left is (1) **integrate** them into one whole-input
+roundtrip over a spec-constructible mirror token `MTok` (byte-determined variants
+plus `MIdent`/`MString` carrying `Seq<char>`) — a mechanical rebuild of L15/L16/L17
+over `MTok`, reusing the locality and roundtrip sub-lemmas — and a unified exec
+`Vec<u8> -> Vec<Token>` covering all kinds; (2) **quoted identifiers** (`"..."`)
+and the `''`/`""` escapes; (3) **unicode** — idents/whitespace use `is_ws`/ASCII
+lowercasing vs production's `char::is_whitespace`/`to_lowercase` (ASCII is
+axiom-free; non-ASCII needs the `unicode_trust` model). Then ast-equivalence + the
+`parser.rs`/`lexer.rs` cutover.
 
 **Production lexer STARTED (2026-08-28, `verified_lexer.rs`, in verify.sh — 18 modules).**
 Same discipline as the grammar: smallest self-contained verified bricks, produces the
