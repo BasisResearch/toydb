@@ -2344,4 +2344,199 @@ pub proof fn lemma_lscan_token(tv: TokenView, tail: Seq<u8>)
     }
 }
 
+// -- L16: whole-input token-LIST roundtrip -------------------------------------
+//
+// The lexer headline for the byte-determined classes: printing a token list with
+// single-space separators and re-lexing recovers the list exactly. A space is a
+// universal separator — it satisfies every token's boundary (num_tail_ok, the
+// keyword non-continuation boundary, and op_tail_ok) — so no per-adjacency
+// canonicalisation is needed for these classes. The scanner `lex_all_seq` strips
+// leading whitespace (as a seq slice) *before* each single-token scan, so every
+// scan runs at position 0 and reuses `lemma_lscan_token` directly; the only
+// non-trivial locality fact is a one-byte `skip_ws` shift. Axiom-free.
+
+/// Every token in the list is byte-determined and printable.
+pub open spec fn all_printable_tv(ts: Seq<TokenView>) -> bool {
+    forall|i: int| 0 <= i < ts.len() ==> printable_tv(#[trigger] ts[i])
+}
+
+/// Print a token list: each token's bytes followed by a single space separator.
+pub open spec fn lex_print_list(ts: Seq<TokenView>) -> Seq<u8>
+    decreases ts.len(),
+{
+    if ts.len() == 0 {
+        Seq::empty()
+    } else {
+        lex_print_tv(ts[0]) + seq![32u8] + lex_print_list(ts.drop_first())
+    }
+}
+
+/// Drop the leading whitespace run of a byte sequence (a seq slice at `skip_ws`).
+pub open spec fn skip_ws_seq(input: Seq<u8>) -> Seq<u8> {
+    input.subrange(skip_ws(input, 0), input.len() as int)
+}
+
+/// A printable byte-determined token prints to a non-empty run whose first byte
+/// is never whitespace (so a preceding `skip_ws` lands exactly on it).
+pub proof fn lemma_lex_print_tv_head(tv: TokenView)
+    requires
+        printable_tv(tv),
+    ensures
+        lex_print_tv(tv).len() >= 1,
+        !is_ws(lex_print_tv(tv)[0]),
+{
+    match tv {
+        TokenView::Number(v) => {
+            assert(is_digit(v[0]));
+        }
+        TokenView::Keyword(kw) => {
+            lemma_kw_text_shape(kw);
+            assert(is_lower_letter(kw_text(kw)[0]));
+        }
+        TokenView::Ident(_) => { assert(false); }
+        TokenView::String(_) => { assert(false); }
+        _ => {
+            lemma_sym_token_props(tv);
+        }
+    }
+}
+
+/// A single space is a valid tail boundary for every byte-determined token.
+pub proof fn lemma_space_token_tail_ok(tv: TokenView, rest: Seq<u8>)
+    requires
+        printable_tv(tv),
+    ensures
+        token_tail_ok(tv, seq![32u8] + rest),
+{
+    let tail = seq![32u8] + rest;
+    assert(tail[0] == 32);
+    match tv {
+        TokenView::Number(_) => {}
+        TokenView::Keyword(_) => {}
+        TokenView::Ident(_) => { assert(false); }
+        TokenView::String(_) => { assert(false); }
+        _ => {
+            // op_tail_ok(sym_token_of(tv), tail): 32 extends no operator.
+        }
+    }
+}
+
+/// `skip_ws` shifted by a whitespace prefix byte: scanning `[c] ++ y` from `j+1`
+/// is one past scanning `y` from `j`.
+pub proof fn lemma_skip_ws_shift_ws(c: u8, y: Seq<u8>, j: int)
+    requires
+        is_ws(c),
+        0 <= j <= y.len(),
+    ensures
+        skip_ws(seq![c] + y, j + 1) == 1 + skip_ws(y, j),
+    decreases y.len() - j,
+{
+    let input = seq![c] + y;
+    if j < y.len() {
+        assert(input[j + 1] == y[j]);
+        if is_ws(y[j]) {
+            lemma_skip_ws_shift_ws(c, y, j + 1);
+        }
+    }
+}
+
+/// Stripping leading whitespace ignores a leading whitespace byte.
+pub proof fn lemma_skip_ws_seq_prepend_ws(c: u8, y: Seq<u8>)
+    requires
+        is_ws(c),
+    ensures
+        skip_ws_seq(seq![c] + y) == skip_ws_seq(y),
+{
+    let input = seq![c] + y;
+    assert(input[0] == c);
+    lemma_skip_ws_shift_ws(c, y, 0);
+    // skip_ws(input, 0) == skip_ws(input, 1) == 1 + skip_ws(y, 0)
+    assert(skip_ws(input, 0) == 1 + skip_ws(y, 0));
+    let a = skip_ws(y, 0);
+    lemma_skip_ws_bounds(y, 0);
+    assert(input.subrange(1 + a, input.len() as int) =~= y.subrange(a, y.len() as int));
+}
+
+/// Scan a whole input into a token list: strip leading whitespace, scan one
+/// token at position 0, recurse on the remainder. `fuel` bounds the token count.
+pub open spec fn lex_all_seq(input: Seq<u8>, fuel: nat) -> Seq<TokenView>
+    decreases fuel,
+{
+    if fuel == 0 {
+        Seq::empty()
+    } else {
+        let stripped = skip_ws_seq(input);
+        if stripped.len() == 0 {
+            Seq::empty()
+        } else {
+            let r = lscan_token(stripped, 0);
+            match r.0 {
+                Some(tv) => seq![tv] + lex_all_seq(stripped.subrange(r.1, stripped.len() as int), (fuel - 1) as nat),
+                None => Seq::empty(),
+            }
+        }
+    }
+}
+
+/// `lex_all_seq` depends on its input only through `skip_ws_seq`.
+pub proof fn lemma_lex_all_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
+    requires
+        skip_ws_seq(a) == skip_ws_seq(b),
+    ensures
+        lex_all_seq(a, fuel) == lex_all_seq(b, fuel),
+{
+    if fuel != 0 {
+        assert(lex_all_seq(a, fuel) == lex_all_seq(b, fuel));
+    }
+}
+
+/// Whole-input token-list roundtrip (byte-determined classes). Printing a
+/// printable token list and re-lexing recovers it, given enough fuel.
+pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_tv(ts),
+        fuel >= ts.len(),
+    ensures
+        lex_all_seq(lex_print_list(ts), fuel) == ts,
+    decreases ts.len(),
+{
+    if ts.len() == 0 {
+        assert(lex_print_list(ts) =~= Seq::<u8>::empty());
+        assert(skip_ws_seq(lex_print_list(ts)) =~= Seq::<u8>::empty());
+    } else {
+        let t = ts[0];
+        let rest = ts.drop_first();
+        assert(printable_tv(t));
+        assert(all_printable_tv(rest)) by {
+            assert forall|i: int| 0 <= i < rest.len() implies printable_tv(#[trigger] rest[i]) by {
+                assert(rest[i] == ts[i + 1]);
+            }
+        }
+        let input = lex_print_list(ts);
+        let tail = seq![32u8] + lex_print_list(rest);
+        assert(input == lex_print_tv(t) + seq![32u8] + lex_print_list(rest));
+        assert(input == lex_print_tv(t) + tail) by {
+            assert((lex_print_tv(t) + seq![32u8]) + lex_print_list(rest)
+                =~= lex_print_tv(t) + (seq![32u8] + lex_print_list(rest)));
+        }
+        lemma_lex_print_tv_head(t);
+        // strip leading ws: none, so stripped == input
+        assert(input[0] == lex_print_tv(t)[0]);
+        assert(!is_ws(input[0]));
+        lemma_skip_ws_nonws(input, 0);
+        assert(skip_ws_seq(input) =~= input);
+        // scan the first token
+        lemma_space_token_tail_ok(t, lex_print_list(rest));
+        lemma_lscan_token(t, tail);
+        let e = lex_print_tv(t).len() as int;
+        assert(lscan_token(input, 0) == (Some(t), e));
+        // remainder is the space + printed rest
+        assert(input.subrange(e, input.len() as int) =~= tail);
+        // recurse: lex_all_seq(tail, fuel-1) == lex_all_seq(lex_print_list(rest), fuel-1)
+        lemma_skip_ws_seq_prepend_ws(32u8, lex_print_list(rest));
+        lemma_lex_all_seq_congr(tail, lex_print_list(rest), (fuel - 1) as nat);
+        lemma_lex_all_seq_roundtrip(rest, (fuel - 1) as nat);
+    }
+}
+
 } // verus!
