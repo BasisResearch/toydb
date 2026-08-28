@@ -19,7 +19,7 @@ use super::Token;
 #[allow(unused_imports)]
 use super::Keyword;
 #[allow(unused_imports)]
-use super::verified_production::{token_view, TokenView};
+use super::verified_production::{token_view, token_views, token_views_concat, TokenView};
 
 verus! {
 
@@ -3032,6 +3032,143 @@ pub proof fn lemma_lex_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
             }
         }
     }
+}
+
+
+/// A recognised token advances strictly past its start (so the exec loop makes
+/// progress and terminates).
+pub proof fn lemma_lscan_token_progress(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+        skip_ws(input, pos) < input.len(),
+        lscan_token(input, pos).0 is Some,
+    ensures
+        lscan_token(input, pos).1 > pos,
+{
+    lemma_skip_ws_bounds(input, pos);
+    let p = skip_ws(input, pos);
+    let b = input[p];
+    if is_digit(b) {
+        lemma_scan_num_full_bounds(input, p);
+    } else if is_ident_start(b) {
+        assert(is_ident_cont(input[p]));
+        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
+        lemma_scan_ident_end_bounds(input, p + 1);
+    }
+}
+
+/// Executable whole-input lexer: tokenize `input` into a `Vec<Token>`, refining
+/// `lex_from` (hence, via the bridge, `lex_all_seq`). Stops at the first
+/// non-token byte or plain identifier (deferred `String` bridge), so it is sound
+/// but incomplete — exact for inputs of numbers, keywords and symbols.
+pub fn lex_all_exec(input: &Vec<u8>) -> (r: Vec<Token>)
+    ensures
+        token_views(r@) == lex_from(input@, 0, (input.len() + 1) as nat),
+{
+    let mut acc: Vec<Token> = Vec::new();
+    let mut pos: usize = 0;
+    let ghost fuel0: nat = (input.len() + 1) as nat;
+    let ghost rf: nat = fuel0;
+    assert(token_views(acc@) == Seq::<TokenView>::empty()) by {
+        assert(acc@ =~= Seq::<Token>::empty());
+    }
+    while pos < input.len()
+        invariant
+            pos <= input.len(),
+            acc.len() <= pos,
+            fuel0 == input.len() + 1,
+            rf == fuel0 - acc.len(),
+            token_views(acc@) + lex_from(input@, pos as int, rf) == lex_from(input@, 0, fuel0),
+        decreases input.len() - pos,
+    {
+        let p = skip_ws_exec(input, pos);
+        if p >= input.len() {
+            assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
+            return acc;
+        }
+        let (ot, e) = lscan_token_exec(input, pos);
+        match ot {
+            Some(t) => {
+                let ghost old_acc = acc@;
+                let ghost old_pos = pos as int;
+                let ghost old_rf = rf;
+                proof {
+                    lemma_lscan_token_progress(input@, pos as int);
+                    lemma_lscan_token_bounds(input@, pos as int);
+                    // unfold lex_from once at pos (rf >= 1, p < len, token is Some)
+                    assert(rf >= 1);
+                    assert(skip_ws(input@, pos as int) < input@.len());
+                    assert(lscan_token(input@, pos as int) == (Some(token_view(t)), e as int));
+                    assert(lex_from(input@, old_pos, old_rf)
+                        == seq![token_view(t)] + lex_from(input@, e as int, (old_rf - 1) as nat));
+                    token_views_concat(old_acc, seq![t]);
+                    assert(token_views(seq![t]) == seq![token_view(t)]) by {
+                        reveal_with_fuel(token_views, 2);
+                        assert(seq![t].drop_first() =~= Seq::<Token>::empty());
+                    }
+                }
+                acc.push(t);
+                pos = e;
+                proof {
+                    rf = (old_rf - 1) as nat;
+                    assert(acc@ == old_acc + seq![t]);
+                    assert(token_views(acc@) == token_views(old_acc) + seq![token_view(t)]);
+                    // chain: reassociate and fold the lex_from unfold back in
+                    assert(token_views(acc@) + lex_from(input@, pos as int, rf)
+                        == token_views(old_acc)
+                           + (seq![token_view(t)] + lex_from(input@, pos as int, rf)));
+                    assert(token_views(old_acc)
+                           + (seq![token_view(t)] + lex_from(input@, pos as int, rf))
+                        == token_views(old_acc) + lex_from(input@, old_pos, old_rf));
+                }
+            }
+            None => {
+                assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
+                return acc;
+            }
+        }
+    }
+    assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
+    acc
+}
+
+/// The printed list is at least as long as the token count (each token prints a
+/// non-empty run plus a separator), so `input.len()+1` is always enough fuel.
+pub proof fn lemma_lex_print_list_len_ge(ts: Seq<TokenView>)
+    requires
+        all_printable_tv(ts),
+    ensures
+        lex_print_list(ts).len() >= ts.len(),
+    decreases ts.len(),
+{
+    if ts.len() != 0 {
+        let rest = ts.drop_first();
+        assert(all_printable_tv(rest)) by {
+            assert forall|i: int| 0 <= i < rest.len() implies printable_tv(#[trigger] rest[i]) by {
+                assert(rest[i] == ts[i + 1]);
+            }
+        }
+        assert(printable_tv(ts[0]));
+        lemma_lex_print_tv_head(ts[0]);
+        lemma_lex_print_list_len_ge(rest);
+    }
+}
+
+/// End-to-end executable lexer roundtrip: tokenizing the printed form of a
+/// printable byte-determined token list recovers the list. Combines the exec
+/// loop, the position/slice bridge, and the L16 roundtrip.
+pub proof fn lemma_lex_all_exec_roundtrip(ts: Seq<TokenView>, input: Seq<u8>)
+    requires
+        all_printable_tv(ts),
+        input == lex_print_list(ts),
+    ensures
+        lex_from(input, 0, (input.len() + 1) as nat) == ts,
+{
+    lemma_lex_from_eq_seq(input, 0, (input.len() + 1) as nat);
+    assert(input.subrange(0, input.len() as int) =~= input);
+    lemma_lex_print_list_len_ge(ts);
+    assert(ts.len() <= input.len() + 1);
+    lemma_lex_all_seq_roundtrip(ts, (input.len() + 1) as nat);
 }
 
 
