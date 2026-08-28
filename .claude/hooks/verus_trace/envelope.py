@@ -33,7 +33,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 REPO_SLUG = "BasisResearch/toydb"
-DEFAULT_INGEST_URL = "https://verus.kirancodes.me/verus/ingest/session"
+DEFAULT_INGEST_URL = "https://verus.basis.ai/verus/ingest/session"
 
 # Env flags:
 #   VERUS_INGEST_URL      override the ingest endpoint
