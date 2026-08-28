@@ -1087,4 +1087,163 @@ pub proof fn lemma_scan_num_dec_roundtrip(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
     assert(scan_digits_end(input, f0) == fend);
 }
 
+// -- L12: full number token-value scanner (integer[.decimal][exponent]) --------
+//
+// Completes the number scanner to the production shape `digits[.digits][(e|E)
+// [+|-]digits]`, matching `lexer.rs::scan_number_bytes`'s cursor progression, and
+// packages it as a `Number` token-value scanner. Rust's `Display` for `f64` never
+// emits scientific notation, so the *printer* only ever produces the integer or
+// `digits.digits` forms; the exponent phase is therefore not needed for the
+// roundtrip, only to lex arbitrary production input faithfully. Accordingly the
+// two roundtrip lemmas below cover exactly the printed forms (integer, decimal),
+// under one unified number boundary predicate `num_tail_ok`.
+
+/// Exponent marker byte: `e` or `E`.
+pub open spec fn is_exp(b: u8) -> bool {
+    b == 101 || b == 69
+}
+
+/// Exponent sign byte: `+` or `-`.
+pub open spec fn is_num_sign(b: u8) -> bool {
+    b == 43 || b == 45
+}
+
+/// End of a full number scan starting at a digit: integer run, optional `.`
+/// fraction, optional `(e|E)[+|-]digits` exponent. Mirrors `scan_number_bytes`.
+pub open spec fn scan_num_full_end(input: Seq<u8>, pos: int) -> int {
+    let p = scan_num_dec_end(input, pos);
+    if 0 <= p < input.len() && is_exp(input[p]) {
+        let q0 = p + 1;
+        let q = if 0 <= q0 < input.len() && is_num_sign(input[q0]) { q0 + 1 } else { q0 };
+        scan_digits_end(input, q)
+    } else {
+        p
+    }
+}
+
+/// A tail that does not extend a printed number: not a digit (would join the
+/// run), not `.` (would start a fraction), not `e`/`E` (would start an exponent).
+/// This is the maximal-munch boundary for numbers, the analogue of `op_tail_ok`.
+pub open spec fn num_tail_ok(tail: Seq<u8>) -> bool {
+    tail.len() == 0 || (!is_digit(tail[0]) && tail[0] != 46 && !is_exp(tail[0]))
+}
+
+/// Scan a full number, producing the `Number` token value carrying the raw bytes.
+pub open spec fn lscan_num_full(input: Seq<u8>, pos: int) -> (Option<TokenView>, int) {
+    if 0 <= pos < input.len() && is_digit(input[pos]) {
+        let e = scan_num_full_end(input, pos);
+        (Some(TokenView::Number(input.subrange(pos, e))), e)
+    } else {
+        (None, pos)
+    }
+}
+
+/// Bounds: the full number scan advances at least past the first digit and stays
+/// in range (given the start is a digit).
+pub proof fn lemma_scan_num_full_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos < input.len(),
+        is_digit(input[pos]),
+    ensures
+        pos < scan_num_full_end(input, pos) <= input.len(),
+{
+    // First byte is a digit, so the integer run advances at least one past `pos`.
+    assert(scan_digits_end(input, pos) == scan_digits_end(input, pos + 1));
+    lemma_scan_digits_end_bounds(input, pos + 1);
+    let d1 = scan_digits_end(input, pos);
+    assert(pos < d1 <= input.len());
+    // Decimal end `p` is either `d1` or a further digit run, both past `pos`.
+    if 0 <= d1 < input.len() && input[d1] == 46 {
+        lemma_scan_digits_end_bounds(input, d1 + 1);
+    }
+    let p = scan_num_dec_end(input, pos);
+    assert(pos < p <= input.len());
+    // Exponent end (if any) is a still-further digit run.
+    if 0 <= p < input.len() && is_exp(input[p]) {
+        let q0 = p + 1;
+        let q = if 0 <= q0 < input.len() && is_num_sign(input[q0]) { q0 + 1 } else { q0 };
+        lemma_scan_digits_end_bounds(input, q);
+    }
+}
+
+/// Integer printed form re-scans exactly: a non-empty digit run followed by a
+/// number boundary (no digit / `.` / exponent) scans to itself, no fraction or
+/// exponent consumed.
+pub proof fn lemma_lscan_num_full_int(d: Seq<u8>, tail: Seq<u8>)
+    requires
+        d.len() >= 1,
+        all_digits(d),
+        num_tail_ok(tail),
+    ensures
+        lscan_num_full(d + tail, 0) == (Some(TokenView::Number(d)), d.len() as int),
+{
+    let input = d + tail;
+    assert(input[0] == d[0]);
+    assert(is_digit(input[0]));
+    // Integer run stops at d.len(); no `.` follows, so the decimal end is d.len().
+    lemma_scan_digits_roundtrip(d, tail);
+    assert(scan_digits_end(input, 0) == d.len());
+    if tail.len() != 0 {
+        assert(input[d.len() as int] == tail[0]);
+    }
+    assert(scan_num_dec_end(input, 0) == d.len());
+    // No exponent follows either.
+    assert(scan_num_full_end(input, 0) == d.len());
+    assert(input.subrange(0, d.len() as int) =~= d);
+}
+
+/// Decimal printed form re-scans exactly: `a.b` followed by a number boundary
+/// scans to itself, no exponent consumed.
+pub proof fn lemma_lscan_num_full_dec(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
+    requires
+        a.len() >= 1,
+        all_digits(a),
+        b.len() >= 1,
+        all_digits(b),
+        num_tail_ok(tail),
+    ensures
+        lscan_num_full(a + seq![46u8] + b + tail, 0)
+            == (Some(TokenView::Number(a + seq![46u8] + b)), (a.len() + 1 + b.len()) as int),
+{
+    let dot = seq![46u8];
+    let input = a + dot + b + tail;
+    let v = a + dot + b;
+    assert(input[0] == a[0]);
+    assert(is_digit(input[0]));
+    lemma_scan_num_dec_roundtrip(a, b, tail);
+    let p = (a.len() + 1 + b.len()) as int;
+    assert(scan_num_dec_end(input, 0) == p);
+    // `input[p]` is the boundary byte (or out of range), never an exponent.
+    assert(v.len() == p);
+    if tail.len() != 0 {
+        assert(input[p] == tail[0]);
+    }
+    assert(scan_num_full_end(input, 0) == p);
+    assert(input.subrange(0, p) =~= v);
+}
+
+/// Executable full number scanner, refining `scan_num_full_end`.
+pub fn scan_num_full_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
+    requires
+        pos <= input.len(),
+    ensures
+        r == scan_num_full_end(input@, pos as int),
+{
+    let d1 = scan_digits_exec(input, pos);
+    let mut p = d1;
+    if p < input.len() && input[p] == 46u8 {
+        p = scan_digits_exec(input, p + 1);
+    }
+    assert(p == scan_num_dec_end(input@, pos as int));
+    if p < input.len() && (input[p] == 101u8 || input[p] == 69u8) {
+        let mut q = p + 1;
+        if q < input.len() && (input[q] == 43u8 || input[q] == 45u8) {
+            q = q + 1;
+        }
+        scan_digits_exec(input, q)
+    } else {
+        p
+    }
+}
+
 } // verus!
