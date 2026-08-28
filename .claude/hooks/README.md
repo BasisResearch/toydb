@@ -23,6 +23,7 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
                              prefixed branch names, no commits/pushes to main
     verus_gate.py            SessionStart: fail-closed MCP probe + drift warning
     verus_stop.py            Stop: fail-soft transcript capture + upload
+    mark_branch.py           CLI: mark a branch as a FAILED ATTEMPT (all agents)
     verus_trace/             shared, agent-agnostic Python package (stdlib only)
       envelope.py            build envelope, gather git fields, merge server
                              records, compute totals, POST (bearer auth)
@@ -30,13 +31,16 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
       codex_adapter.py       Codex rollout JSONL -> envelope
       opencode_adapter.py    opencode SQLite session -> envelope
       mcp_probe.py           probe the Verus `version` tool over HTTP or stdio
-    tests/                   fixtures + `test_adapters.py`
+      branch_mark.py         build + POST a branch outcome mark (failed/cleared)
+    tests/                   fixtures + `test_adapters.py`, `test_branch_mark.py`
+  skills/mark-failed/        Claude Code `/mark-failed` skill -> mark_branch.py
 .codex/
   config.toml                user-merge fragment: [mcp_servers.verus] + Stop hook
   hooks/verus_stop.py        Codex Stop-hook entry point
 .opencode/
   plugin/verus-telemetry.js  session-start gate + session-end capture
   plugin/verus_runner.py     Python entry the plugin shells out to
+  command/mark-failed.md     opencode `/mark-failed` command -> mark_branch.py
 .mcp.json                    Claude Code TEAM DEFAULT: dev hot-reload HTTP server
 .mcp.prod.json               Claude Code PINNED: stdio launcher for box/CI/non-dev
 opencode.json                opencode: registers the Verus MCP server (mcp block)
@@ -162,6 +166,38 @@ Codex is best-effort until it ships a session-start hook; the committed
 `gate_violation=true` when the Verus tools were not actually available, so an
 ungated Codex run is *recorded and visible* on the dashboard (excluded from the
 default comparison) rather than silently counted.
+
+## Failed attempts (branch marks)
+
+Not every branch succeeds. `mark_branch.py` records a branch as a **failed
+attempt** on the dashboard (`POST /verus/ingest/branch_mark`) with a short,
+deliberately loose reason and a category tag, so failures stay around and can
+be filtered and analysed later to improve the tooling. It reuses
+`verus_trace.envelope` for the git fields, so a mark joins the branch's
+session telemetry on branch name. The dashboard then badges the branch,
+offers an `outcome=ok|failed` filter, and lists marks on its **Failed
+attempts** tab.
+
+```sh
+python3 .claude/hooks/mark_branch.py failed --category verus-timeout "Z3 blows up on the roundtrip lemma"
+python3 .claude/hooks/mark_branch.py clear "retrying with a weaker spec"
+python3 .claude/hooks/mark_branch.py categories
+```
+
+| Agent   | How it is triggered                                                |
+|---------|--------------------------------------------------------------------|
+| Claude  | `/mark-failed [tag] reason` skill (`.claude/skills/mark-failed/`) or CLAUDE.md instructions |
+| opencode| `/mark-failed [tag] reason` command (`.opencode/command/`) or AGENTS.md |
+| Codex   | AGENTS.md instructions -> runs the script directly                 |
+| Humans  | run the script directly                                            |
+
+Unlike session capture this is an explicit action, so it is **not**
+fail-soft: exit 0 uploaded, 1 usage error, 2 upload failed (the mark is
+still appended to `~/.verus-trace/branch_marks.jsonl`, override with
+`VERUS_MARK_LOG`). The endpoint is derived from `VERUS_INGEST_URL` (or set
+`VERUS_MARK_URL`); `VERUS_INGEST_DRY_RUN=1` prints instead of posting;
+`VERUS_MARK_AGENT` overrides agent auto-detection. Marking `main` is
+refused; marks never rename or delete the branch.
 
 ## Environment
 
