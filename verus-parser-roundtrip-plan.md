@@ -134,6 +134,25 @@ Verified by reading the code (2026-08-28): the exec parsers accept a strict
 so no sound single-implementation cutover is available without this work, and any
 partial swap regresses `tests/scripts/queries` (which uses `GROUP BY`/`ORDER BY`).
 
+**Landed toward item 1 (2026-08-28):** `sparse_expr_list` + its roundtrip lemma —
+a boundary-terminated bare-expr comma-list parser (unlike the CloseParen-terminated
+`sparse_args`), the reusable codec for `GROUP BY`/`ORDER BY`. Committed, 144
+verified. Marked opaque so its unfolding axiom doesn't bloat the column lemma.
+
+**Blocker found — module-scale SMT wall (2026-08-28).** The full `GROUP BY`
+integration was built and the *mirror* verified (sprint/sparse/printable/sdepth +
+`sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`, 143
+verified), but it was reverted because it tips `slist_depth_columns_le_len` — an
+unrelated, pre-existing, resource-fragile CreateTable lemma — from green into
+"postcondition not satisfied", and this does **not** respond to `rlimit` (tried
+8000→100000). `verified_stmt.rs` is ~5000 lines; adding more grammar grows the
+global SMT context past what that lemma can discharge. So the *real* first step of
+item 1 is structural: **split `verified_stmt.rs` into modules** (or opaque-harden
+the column codec so its lemma's context stays small) *before* adding the five
+Select clauses. The `GROUP BY` mirror is a solved problem modulo that split; the
+exec side additionally needs `parse_expr_list_exec` (refining the opaque
+`sparse_expr_list`) and a where+group exec helper refining `sparse_where_group`.
+
 The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
 force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
 DEFAULT/embedded-expr emitted last so its tail is always a terminator; fold
