@@ -168,7 +168,7 @@ default comparison) rather than silently counted.
 - `VERUS_INGEST_TOKEN` — bearer token for `POST /verus/ingest/session` (required
   for a live upload). Held on contributor machines; keep it out of the repo.
 - `VERUS_INGEST_URL` — override the endpoint (default
-  `https://verus.kirancodes.me/verus/ingest/session`).
+  `https://verus.basis.ai/verus/ingest/session`).
 - `VERUS_INGEST_DRY_RUN=1` — build and print the envelope, do not POST. Use for
   local testing without a token.
 - `VERUS_MCP_LOG_DIR` — server-side trace dir (default
