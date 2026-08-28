@@ -283,13 +283,21 @@ This is the glue that equates `parse(print(m))`'s `seq_to_map(S)` with `view_map
      None => [Default] }` binding (matching the exec match), never a `view_opt(*v)`
      projection; `lemma_sprint_assign_view` (value-match on `o`) bridges that form to
      `sprint_assign((k, view_opt(o)))`. Borrows the value, no clone.
-   - **Remaining: the `iter()` accumulation loop only.** Call `print_assign_exec` per
-     `it.next()` entry, prepending `Comma` after the first (invariant stepped by
-     `sprint_set_list_snoc`), ghost seq `S ++ remaining(it) == full`. Then bridge each
-     entry via `lemma_sprint_assign_view` and close with
-     `lemma_seq_to_map_enumerates` + `lemma_sparse_set_list_sprint` + `parse_set_map_exec`,
-     and relax the single-assignment restriction in the Update statement print/parse.
-     Every supporting lemma is now proven; only the prophetic loop itself remains.
+   - **Print `iter()` loop** — DONE (2026-08-28, 181 verified). `print_set_map_exec`: the
+     prophetic accumulation loop, the hardest exec pattern in the project. Verified.
+     Techniques that landed it: a counted `while count < m.len()` (NOT a bare `loop`) so
+     the exit `consumed.len() == full.len()` is provable and `decreases m_len - count` is
+     non-prophetic (`it.remaining().len()` is prophetic — cannot be a decreases measure);
+     next() is Some every iteration so the None arm is dead (`assert(false)`);
+     `lemma_all_printable_assigns_snoc` for the printable invariant step; coverage closed
+     by `lemma_seq_to_map_enumerates` + `lemma_increasing_keys_distinct`;
+     `spinoff_prover` on `lemma_seq_to_map_enumerates` (module-scale regression as the
+     file grew).
+   - **Remaining: statement wiring only.** All exec building blocks (print loop + parse
+     builder + all lemmas) are verified. Left: relax the single-assignment restriction in
+     the Update statement print/parse and state the multi-Update roundtrip headline at the
+     order-free `view_map` level (multi-assignment maps are outside `view_stmt`'s domain,
+     so it is a separate headline, not a `view_stmt` refinement).
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
