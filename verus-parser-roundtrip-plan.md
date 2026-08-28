@@ -36,20 +36,34 @@ the same style as the expression layer, with an `SStmt::Unsupported` catch-all s
     each is one more optional clause (an expr, an expr-list, or an
     expr+Direction list) over the machinery already proven — no new obstacle.
 
-**S4 — Update (blocked / needs a decision).** `Update.set` is a
-`BTreeMap<String, Option<Expression>>`. vstd models `BTreeMap` with an *unordered*
-`Map` view, and there is no cheap spec-level `String` ordering or sorted
-enumeration to canonicalise it to a `Seq` inside a `spec fn view_stmt`. Per the
-original plan's fallback, the verified `Update` domain should be restricted to a
-sorted-key normal form (or the roundtrip stated only at the executable level over
-`BTreeMap::iter`'s sorted order, which needs `BTreeMap` equality reasoning). This
-is the one genuine wall; it is not solved yet.
+- **S4 — Update (mirror done; multi-assignment view bridge is the residual).**
+  The SET-list mirror roundtrip needs no `BTreeMap`: `SStmt::Update` carries
+  `set: Seq<(String, Option<SExpr>)>` and the assignment codec (`k = expr` /
+  `k = DEFAULT`, value parsed expr-first with a `DEFAULT` fallback so no
+  `sprint(e)[0] != DEFAULT` fact is needed) roundtrips like any comma list.
+  `view_stmt` bridges the production `BTreeMap` for the **single-assignment**
+  case (`dom().len()==1`) via `dom().choose()` — no ordering. **Residual:**
+  multi-assignment maps still map to `Unsupported`; the general bridge needs the
+  *executable* sorted `iter()` (vstd's `increasing_seq`) and a view-level
+  headline over `Map` equality (which vstd supports, unlike `BTreeMap` `==`).
 
-**S5 — executable statement layer + headline** and **Phase 4 — production
-cutover** are not started. S5 mirrors E3/E4: `parse_stmt_exec`/`print_stmt_exec`
-building real `ast::Statement`, refining `sparse_stmt`/`sprint_stmt` at the
-`view_stmt` level, reusing `parse_expr_exec`/`print_expr_exec` for every embedded
-expression. The list-free statements (S1) are the natural first exec slice.
+All 10 statement kinds now have verified **mirror** roundtrips
+(`lemma_sparse_stmt_sprint`, 72 verified / 0 errors).
+
+**S5 — executable statement layer + headline (partial).** `print_stmt_exec`
+builds a real `Vec<Token>` for the list-free statements (Commit / Rollback /
+DropTable / Delete-with-WHERE / Explain), proved
+`token_views(r@) == sprint_stmt(view_stmt(*s))`, delegating to `print_expr_exec`.
+**Remaining S5:** the executable *parser* (`parse_stmt_exec` refining
+`sparse_stmt` at `view_stmt`, with the `Explain` recursion and the non-list-free
+keyword cases), the end-to-end headline `print_parse_roundtrip_stmt`, and the
+executable printer/parser for the container statements (their exec list
+codecs — columns, rows, from-trees, select-list, set-list). This is a large but
+mechanical extension of the `parse_expr_exec`/`print_expr_exec` pattern.
+
+**Phase 4 — production cutover** is not started (replace the two
+`std::iter::Peekable`s, swap `parse.rs`'s recursive descent for the verified
+executable parsers, run the SQL suite green, retire the spec-parser proofs).
 
 The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
 force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
