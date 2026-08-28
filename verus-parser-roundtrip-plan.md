@@ -259,13 +259,19 @@ so no `update_normal`, no `total_ordering`, no `find_unique_minimal`, no `view_s
 change. The uniqueness lemma (1) stays as correct infrastructure (it pins iter()'s
 order) but is not on the critical path.
 3. ~~view_stmt extension~~ — replaced by the `view_map` headline above.
-4. **Print exec**: loop `it.next()` accumulating a ghost seq; invariant ties emitted
-   tokens to `sprint_set_list(view of consumed entries)` (borrow values, never clone —
-   dodges the `Option<Expression>::clone` non-`==` issue). The substantial piece.
-5. **Parse exec**: read the assignments back (existing `lemma_sparse_set_list_sprint`),
-   fold `insert` into a fresh `BTreeMap`; prove `view_map(built@) == view_map(m@)`
-   (same keys, view-equal values — order-free, so no piece-1 needed). Est. multi-session:
-   pieces 4-5 are `iter()`/insert loop proofs, the real remaining core.
+4. **Parse-side map builder** — DONE (2026-08-28, 173 verified). `parse_set_map_exec`:
+   recursive parser that reads `k = v, ...` and folds `insert` in one pass (moves parsed
+   values, never clones), refining `sparse_set_list` with
+   `view_map(m@) == seq_to_map(sparse_set_list(input).0.unwrap())`. Discharged via
+   `lemma_view_map_insert` / `lemma_view_map_empty` + the BTreeMap insert view. Added
+   `seq_to_map` (head inserted last). NOTE: parse turned out to be the *easier* half —
+   it never touches `iter()`, just recursion + insert.
+5. **Print exec** (remaining): loop `it.next()` accumulating a ghost seq `S`; invariant
+   ties emitted tokens to `sprint_set_list(view of consumed)` (borrow values). Then a
+   coverage lemma `seq_to_map(S) == view_map(m@)` (S enumerates m@'s pairs, unique keys)
+   closes the roundtrip: parse(print(m)) = `seq_to_map(S)` = `view_map(m@)`. The `iter()`
+   loop is the last substantial multi-Update piece; then wire it into the Update
+   statement print/parse (relax the single-assignment restriction).
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
