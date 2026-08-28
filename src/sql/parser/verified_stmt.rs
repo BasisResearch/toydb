@@ -3868,6 +3868,253 @@ pub fn parse_from_item_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+#[verifier::rlimit(20000)]
+pub fn parse_from_list_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<ast::From>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_from_list(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(vv) => sopt is Some && view_froms(vv@) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_from_list, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    let (fopt, fpos) = parse_from_item_exec(toks, pos, fuel);
+    match fopt {
+        Some(f) => {
+            if fpos < toks.len() && matches!(toks[fpos], super::Token::Comma) {
+                proof { token_views_suffix(toks@, fpos as int); }
+                let (mopt, mpos) = parse_from_list_exec(toks, fpos + 1, fuel - 1);
+                match mopt {
+                    Some(mut more) => {
+                        let mut v: Vec<ast::From> = Vec::new();
+                        v.push(f);
+                        let ghost first = v@;
+                        let ghost more_old = more@;
+                        v.append(&mut more);
+                        proof {
+                            assert(v@ =~= first + more_old);
+                            view_froms_step(v@);
+                            assert(v@.drop_first() =~= more_old);
+                        }
+                        (Some(v), mpos)
+                    },
+                    None => (None, pos),
+                }
+            } else {
+                if fpos < toks.len() {
+                    proof { token_views_suffix(toks@, fpos as int); }
+                } else {
+                    proof { token_views_len(toks@.subrange(fpos as int, toks@.len() as int)); }
+                }
+                let mut v: Vec<ast::From> = Vec::new();
+                v.push(f);
+                proof {
+                    view_froms_step(v@);
+                    assert(v@.drop_first() =~= Seq::<ast::From>::empty());
+                }
+                (Some(v), fpos)
+            }
+        },
+        None => (None, pos),
+    }
+}
+
+#[verifier::rlimit(15000)]
+pub fn parse_select_item_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<(ast::Expression, Option<String>)>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_select_item(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some((e, alias)) => sopt is Some && sopt.unwrap() == (view_expr(e), alias)
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    reveal(sparse_select_item);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    let (eopt, epos) = parse_expr_exec(toks, pos, fuel);
+    match eopt {
+        Some(e) => {
+            proof { token_views_len(toks@.subrange(epos as int, toks@.len() as int)); }
+            if epos < toks.len() && epos + 1 < toks.len()
+                && matches!(toks[epos], super::Token::Keyword(Keyword::As)) {
+                proof {
+                    token_views_suffix(toks@, epos as int);
+                    token_views_suffix(toks@, epos as int + 1);
+                }
+                match &toks[epos + 1] {
+                    super::Token::Ident(a) => (Some((e, Some(a.clone()))), epos + 2),
+                    _ => (None, pos),
+                }
+            } else {
+                if epos < toks.len() {
+                    proof { token_views_suffix(toks@, epos as int); }
+                    if epos + 1 < toks.len() {
+                        proof { token_views_suffix(toks@, epos as int + 1); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(epos as int + 1, toks@.len() as int)); }
+                    }
+                } else {
+                    proof { token_views_len(toks@.subrange(epos as int, toks@.len() as int)); }
+                }
+                (Some((e, None)), epos)
+            }
+        },
+        None => (None, pos),
+    }
+}
+
+#[verifier::rlimit(20000)]
+pub fn parse_select_list_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<(ast::Expression, Option<String>)>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_select_list(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(vv) => sopt is Some && view_select_list(vv@) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_select_list, 1);
+    if fuel == 0 {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    let (iopt, ipos) = parse_select_item_exec(toks, pos, fuel);
+    match iopt {
+        Some(item) => {
+            proof { token_views_len(toks@.subrange(ipos as int, toks@.len() as int)); }
+            if ipos < toks.len() && matches!(toks[ipos], super::Token::Comma) {
+                proof { token_views_suffix(toks@, ipos as int); }
+                let (mopt, mpos) = parse_select_list_exec(toks, ipos + 1, fuel - 1);
+                match mopt {
+                    Some(mut more) => {
+                        let mut v: Vec<(ast::Expression, Option<String>)> = Vec::new();
+                        v.push(item);
+                        let ghost first = v@;
+                        let ghost more_old = more@;
+                        v.append(&mut more);
+                        proof {
+                            assert(v@ =~= first + more_old);
+                            view_select_list_step(v@);
+                            assert(v@.drop_first() =~= more_old);
+                        }
+                        (Some(v), mpos)
+                    },
+                    None => (None, pos),
+                }
+            } else {
+                if ipos < toks.len() {
+                    proof { token_views_suffix(toks@, ipos as int); }
+                }
+                let mut v: Vec<(ast::Expression, Option<String>)> = Vec::new();
+                v.push(item);
+                proof {
+                    view_select_list_step(v@);
+                    assert(v@.drop_first() =~= Seq::<(ast::Expression, Option<String>)>::empty());
+                }
+                (Some(v), ipos)
+            }
+        },
+        None => (None, pos),
+    }
+}
+
+#[verifier::rlimit(30000)]
+pub fn parse_select_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos < toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_select(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof {
+        token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        token_views_suffix(toks@, pos as int);
+    }
+    let (slopt, r1pos) = parse_select_list_exec(toks, pos + 1, fuel);
+    match slopt {
+        Some(select) => {
+            proof { token_views_len(toks@.subrange(r1pos as int, toks@.len() as int)); }
+            let from: Vec<ast::From>;
+            let r2pos: usize;
+            if r1pos < toks.len() && matches!(toks[r1pos], super::Token::Keyword(Keyword::From)) {
+                proof { token_views_suffix(toks@, r1pos as int); }
+                let (fopt, fpos) = parse_from_list_exec(toks, r1pos + 1, fuel);
+                match fopt {
+                    Some(fv) => { from = fv; r2pos = fpos; },
+                    None => { return (None, pos); },
+                }
+            } else {
+                if r1pos < toks.len() {
+                    proof { token_views_suffix(toks@, r1pos as int); }
+                }
+                from = Vec::new();
+                proof { assert(view_froms(from@) =~= Seq::<SFrom>::empty()); }
+                r2pos = r1pos;
+            }
+            proof { token_views_len(toks@.subrange(r2pos as int, toks@.len() as int)); }
+            if r2pos < toks.len() && matches!(toks[r2pos], super::Token::Keyword(Keyword::Where)) {
+                proof { token_views_suffix(toks@, r2pos as int); }
+                let (eopt, epos) = parse_expr_exec(toks, r2pos + 1, fuel);
+                match eopt {
+                    Some(e) => (
+                        Some(ast::Statement::Select {
+                            select, from, where_clause: Some(e),
+                            group_by: Vec::new(), having: None,
+                            order_by: Vec::new(), limit: None, offset: None,
+                        }),
+                        epos,
+                    ),
+                    None => (None, pos),
+                }
+            } else {
+                if r2pos < toks.len() {
+                    proof { token_views_suffix(toks@, r2pos as int); }
+                }
+                (
+                    Some(ast::Statement::Select {
+                        select, from, where_clause: None,
+                        group_by: Vec::new(), having: None,
+                        order_by: Vec::new(), limit: None, offset: None,
+                    }),
+                    r2pos,
+                )
+            }
+        },
+        None => (None, pos),
+    }
+}
+
 /// End-to-end executable statement roundtrip for the full_exec_ok domain
 /// (8 of 10 statement kinds plus Explain): printing a printable statement with
 /// the executable printer and parsing the result with the executable parser
@@ -3918,6 +4165,7 @@ pub proof fn sdepth_column_le_len(c: SColumn)
     }
 }
 
+#[verifier::rlimit(8000)]
 pub proof fn slist_depth_columns_le_len(cols: Seq<SColumn>)
     requires all_printable_columns(cols),
     ensures slist_depth_columns(cols) <= sprint_columns(cols).len() + 1,
