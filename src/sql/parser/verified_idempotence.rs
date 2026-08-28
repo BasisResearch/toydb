@@ -15,13 +15,22 @@
 //! composing three phases:
 //!
 //! - **Phase 1 — parse image is printable.** `parse(toks) = Some(a)` implies
-//!   `printable(a)`: a successful parse only ever yields an AST the canonical
-//!   printer accepts. This is the one *new* obligation; it is a structural
-//!   induction over the parser whose only non-structural leaf is the literal
-//!   scanner (`parse_literal_views` yields a non-negative integer or a finite,
-//!   non-negative float). It is stated below as the target that would make the
-//!   Phase-3 headlines *unconditional*; today the headlines carry `printable`
-//!   as a hypothesis, which Phase 1 discharges.
+//!   `printable(a)`. Every *structural* case holds: columns, `*`, functions,
+//!   and the operator forms build printable nodes whenever their children are
+//!   printable, and the integer/keyword/string literal leaves land in the
+//!   printable set (`parse_literal_views` yields a non-negative integer or a
+//!   `Null`/`Boolean`/`String`). Phase 1 is therefore true on the finite-float
+//!   fragment — but *not universally*. A number token such as `1e400` lexes and
+//!   parses to `Literal::Float(inf)`, which `printable_literal` rejects (it
+//!   demands `is_finite`), because Rust prints `inf` as the text `"inf"`, which
+//!   re-lexes as an identifier rather than a number. So the parser can emit an
+//!   AST that does not roundtrip, and idempotence genuinely fails there. This
+//!   is the same load-bearing finite guard the float-trust decision rests on
+//!   (`x.is_finite()` is not decoration). Consequently the `printable`
+//!   hypothesis on the Phase-3 headlines below is *necessary*, not a temporary
+//!   crutch: it carves out exactly the inputs whose parse the printer can
+//!   reproduce. Discharging it for a given input reduces to showing the parsed
+//!   literals are finite and in range.
 //!
 //! - **Phase 2 — printer right-inverts on the printable image.**
 //!   `printable(a) ==> parse(print(a)) = (Some(a), [])`. This is exactly the
@@ -65,10 +74,12 @@ verus! {
 
 // ---- Phase 3 headlines: idempotence, given the Phase 1 printability side-condition ----
 //
-// These carry `printable` as a hypothesis. Phase 1 (`lemma_*_parse_printable`
-// below, stated but not yet proved) would discharge it, making the headlines
-// hold for *every* successful parse. The composition itself — Phase 2 turning
-// `print(a)` back into `(Some(a), [])` — is proved here.
+// These carry `printable` as a hypothesis. Per Phase 1 (module docs), that
+// hypothesis is necessary: the parser can produce non-printable infinite-float
+// ASTs (from overflow number tokens like `1e400`) that do not roundtrip, so the
+// headlines hold exactly on the finite-float fragment `printable` carves out.
+// The composition itself — Phase 2 turning `print(a)` back into `(Some(a), [])`
+// — is proved here.
 
 /// Expression idempotence, full-consume form. When `toks` parses to `e` with no
 /// leftover, re-parsing `print(e)` reproduces that parse exactly:
