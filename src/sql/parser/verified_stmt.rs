@@ -2919,6 +2919,121 @@ pub fn print_rows_slice(rows: &[Vec<ast::Expression>]) -> (r: Vec<super::Token>)
     }
 }
 
+pub proof fn view_columns_len(cols: Seq<ast::Column>)
+    ensures view_columns(cols).len() == cols.len(),
+    decreases cols.len(),
+{
+    if cols.len() > 0 {
+        view_columns_len(cols.drop_first());
+    }
+}
+
+pub proof fn view_columns_step(cols: Seq<ast::Column>)
+    requires cols.len() > 0,
+    ensures
+        view_columns(cols).len() == cols.len(),
+        view_columns(cols)[0] == view_column(cols[0]),
+        view_columns(cols).drop_first() == view_columns(cols.drop_first()),
+{
+    assert(view_columns(cols) =~= seq![view_column(cols[0])] + view_columns(cols.drop_first()));
+    view_columns_len(cols);
+}
+
+#[verifier::rlimit(4000)]
+pub fn print_columns_slice(cols: &[ast::Column]) -> (r: Vec<super::Token>)
+    requires cols.len() >= 1, all_printable_columns(view_columns(cols@)),
+    ensures token_views(r@) == sprint_columns(view_columns(cols@)),
+    decreases cols.len(),
+{
+    reveal_with_fuel(token_views, 1);
+    if cols.len() == 1 {
+        proof {
+            view_columns_step(cols@);
+            assert(view_columns(cols@.drop_first()) =~= Seq::<SColumn>::empty());
+            assert(printable_column(view_column(cols@[0])));
+            assert(sprint_columns(view_columns(cols@)) == sprint_column(view_columns(cols@)[0]));
+        }
+        print_column_exec(&cols[0])
+    } else {
+        proof {
+            view_columns_step(cols@);
+            assert(printable_column(view_column(cols@[0])));
+            assert(all_printable_columns(view_columns(cols@.drop_first())));
+        }
+        let mut r = print_column_exec(&cols[0]);
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(cols, 1, cols.len());
+        proof { assert(rest@ =~= cols@.drop_first()); }
+        let mut more = print_columns_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            token_views_concat(head, more_old);
+            token_views_concat(p0, seq![super::Token::Comma]);
+            assert(token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+            view_columns_step(cols@);
+            assert(sprint_columns(view_columns(cols@)) =~= sprint_column(view_columns(cols@)[0])
+                + seq![TokenView::Comma] + sprint_columns(view_columns(cols@).drop_first()));
+        }
+        r
+    }
+}
+
+pub open spec fn is_screate(s: SStmt) -> bool {
+    match s {
+        SStmt::CreateTable { .. } => true,
+        _ => false,
+    }
+}
+
+#[verifier::rlimit(8000)]
+pub fn print_createtable_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires printable_stmt(view_stmt(*s)), is_screate(view_stmt(*s)),
+    ensures token_views(r@) == sprint_stmt(view_stmt(*s)),
+{
+    reveal(printable_stmt);
+    reveal_with_fuel(token_views, 5);
+    match s {
+        ast::Statement::CreateTable { name, columns } => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Create));
+            r.push(super::Token::Keyword(Keyword::Table));
+            r.push(super::Token::Ident(name.clone()));
+            r.push(super::Token::OpenParen);
+            let ghost head = r@;
+            let mut body = print_columns_slice(columns.as_slice());
+            let ghost body_old = body@;
+            r.append(&mut body);
+            r.push(super::Token::CloseParen);
+            proof {
+                view_columns_len(columns@);
+                assert(r@ =~= head + body_old + seq![super::Token::CloseParen]);
+                token_views_concat(head + body_old, seq![super::Token::CloseParen]);
+                token_views_concat(head, body_old);
+                assert(head.drop_first().drop_first().drop_first().drop_first()
+                    =~= Seq::<super::Token>::empty());
+                assert(token_views(head) =~= seq![
+                    TokenView::Keyword(Keyword::Create),
+                    TokenView::Keyword(Keyword::Table),
+                    TokenView::Ident(*name),
+                    TokenView::OpenParen,
+                ]);
+                assert(token_views(seq![super::Token::CloseParen]) =~= seq![TokenView::CloseParen]);
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
 pub open spec fn is_sinsert(s: SStmt) -> bool {
     match s {
         SStmt::Insert { .. } => true,
