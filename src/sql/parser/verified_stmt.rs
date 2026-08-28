@@ -4814,6 +4814,45 @@ pub proof fn lemma_sorted_kv_unique(
     }
 }
 
+// -- Multi-assignment Update: order-free Map-view headline foundation ---------
+//
+// The roundtrip headline is stated at the SExpr-view Map level (`view_map`), which
+// is order-independent: it needs no sorted normal form (so no `total_ordering` /
+// `find_unique_minimal`), and no Expression-level `==` (only value *views* match).
+// `lemma_view_map_insert` is what the parse side folds over as it rebuilds the map.
+
+pub open spec fn view_opt(v: Option<ast::Expression>) -> Option<SExpr> {
+    match v {
+        Some(e) => Some(view_expr(e)),
+        None => None,
+    }
+}
+
+pub open spec fn view_map(m: vstd::map::Map<String, Option<ast::Expression>>)
+    -> vstd::map::Map<String, Option<SExpr>> {
+    m.map_values(|v: Option<ast::Expression>| view_opt(v))
+}
+
+pub proof fn lemma_view_map_empty()
+    ensures
+        view_map(vstd::map::Map::empty())
+            == vstd::map::Map::<String, Option<SExpr>>::empty(),
+{
+    assert(view_map(vstd::map::Map::empty())
+        =~= vstd::map::Map::<String, Option<SExpr>>::empty());
+}
+
+pub proof fn lemma_view_map_insert(
+    m: vstd::map::Map<String, Option<ast::Expression>>,
+    k: String,
+    v: Option<ast::Expression>,
+)
+    ensures
+        view_map(m.insert(k, v)) == view_map(m).insert(k, view_opt(v)),
+{
+    assert(view_map(m.insert(k, v)) =~= view_map(m).insert(k, view_opt(v)));
+}
+
 /// Build a one-entry `BTreeMap` with a known view.
 pub fn build_one_entry_map(k: String, v: Option<ast::Expression>)
     -> (m: std::collections::BTreeMap<String, Option<ast::Expression>>)

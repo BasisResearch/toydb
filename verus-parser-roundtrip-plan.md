@@ -249,15 +249,23 @@ sort. Plan (5 pieces, each a green increment):
    with `S.to_set() == { (k, view_opt(m@[k])) }`; well-defined by (1). Note it's over
    *SExpr* values (view of each), so it depends only on keys + value-views — both
    preserved by any view-level roundtrip, which is why no Expression `==` is needed.
-3. **Extend `view_stmt`** multi-`Update` arm from `Unsupported` to
-   `SStmt::Update { set: update_normal(set@), .. }`; the existing Seq-based
-   `sprint_set_list`/`sparse_set_list` + `lemma_sparse_set_list_sprint` then apply.
-4. **Print exec**: loop `it.next()` accumulating a ghost seq; invariant ties it to
-   `remaining` (borrow values, never clone — dodges the `Option<Expression>::clone`
-   non-`==` issue), emit `sprint_assign` per entry; the collected seq `== update_normal`
-   by (1). 5. **Parse exec**: fold `insert` over the parsed seq into a fresh `BTreeMap`;
-   the built `m'@` has the same `kv_pairs` (view-level) so `update_normal(m'@) ==
-   update_normal(m@)`, giving the `view_stmt`-level headline. Est. multi-session.
+**Design refinement (2026-08-28): pieces 2-3 are AVOIDABLE.** Proving `total_ordering`
+for the `String` `leq` (needed by `find_unique_minimal`) drags in `eq_spec <==> ==`
+plumbing (`obeys_eq_spec`, `x@ == y@ <==> x == y` for `String`) — a deep chain. But
+the roundtrip headline doesn't need a *sorted* normal form: state it as order-free
+Map-view equality `view_map(m@) == view_map(m'@)` where
+`view_map(m) = m.map_values(|v| view_opt(v))`. `view_map` is a plain spec fn (no sort),
+so no `update_normal`, no `total_ordering`, no `find_unique_minimal`, no `view_stmt`
+change. The uniqueness lemma (1) stays as correct infrastructure (it pins iter()'s
+order) but is not on the critical path.
+3. ~~view_stmt extension~~ — replaced by the `view_map` headline above.
+4. **Print exec**: loop `it.next()` accumulating a ghost seq; invariant ties emitted
+   tokens to `sprint_set_list(view of consumed entries)` (borrow values, never clone —
+   dodges the `Option<Expression>::clone` non-`==` issue). The substantial piece.
+5. **Parse exec**: read the assignments back (existing `lemma_sparse_set_list_sprint`),
+   fold `insert` into a fresh `BTreeMap`; prove `view_map(built@) == view_map(m@)`
+   (same keys, view-equal values — order-free, so no piece-1 needed). Est. multi-session:
+   pieces 4-5 are `iter()`/insert loop proofs, the real remaining core.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
