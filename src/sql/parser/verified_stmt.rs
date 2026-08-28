@@ -33,6 +33,8 @@ use super::verified_roundtrip::{
 };
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
+#[allow(unused_imports)]
+use crate::sql::types::DataType;
 
 verus! {
 
@@ -46,10 +48,51 @@ pub enum SStmt {
     Begin { read_only: bool, as_of: Option<u64> },
     Commit,
     Rollback,
+    CreateTable { name: String, columns: Seq<SColumn> },
     DropTable { name: String, if_exists: bool },
     Delete { table: String, where_clause: Option<SExpr> },
     Explain(Box<SStmt>),
     Unsupported,
+}
+
+/// Mirror of `ast::Column`: identical except the `default` expression becomes an
+/// `SExpr`. `datatype` is carried directly (`DataType` is `Copy` and has an
+/// external type spec).
+pub struct SColumn {
+    pub name: String,
+    pub datatype: DataType,
+    pub primary_key: bool,
+    pub nullable: Option<bool>,
+    pub default: Option<SExpr>,
+    pub unique: bool,
+    pub index: bool,
+    pub references: Option<String>,
+}
+
+pub open spec fn view_column(c: ast::Column) -> SColumn {
+    SColumn {
+        name: c.name,
+        datatype: c.datatype,
+        primary_key: c.primary_key,
+        nullable: c.nullable,
+        default: match c.default {
+            Some(e) => Some(view_expr(e)),
+            None => None,
+        },
+        unique: c.unique,
+        index: c.index,
+        references: c.references,
+    }
+}
+
+pub open spec fn view_columns(cols: Seq<ast::Column>) -> Seq<SColumn>
+    decreases cols,
+{
+    if cols.len() == 0 {
+        Seq::empty()
+    } else {
+        seq![view_column(cols[0])] + view_columns(cols.drop_first())
+    }
 }
 
 /// Structural view of a production statement as a mirror statement.
@@ -60,6 +103,8 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
         ast::Statement::Begin { read_only, as_of } => SStmt::Begin { read_only, as_of },
         ast::Statement::Commit => SStmt::Commit,
         ast::Statement::Rollback => SStmt::Rollback,
+        ast::Statement::CreateTable { name, columns } =>
+            SStmt::CreateTable { name, columns: view_columns(columns@) },
         ast::Statement::DropTable { name, if_exists } => SStmt::DropTable { name, if_exists },
         ast::Statement::Delete { table, where_clause } => SStmt::Delete {
             table,
@@ -70,6 +115,241 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
         },
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
+    }
+}
+
+// ---- column codec (S2) -----------------------------------------------------
+
+pub open spec fn datatype_kw(d: DataType) -> TokenView {
+    match d {
+        DataType::Boolean => TokenView::Keyword(Keyword::Boolean),
+        DataType::Integer => TokenView::Keyword(Keyword::Integer),
+        DataType::Float => TokenView::Keyword(Keyword::Float),
+        DataType::String => TokenView::Keyword(Keyword::String),
+    }
+}
+
+pub open spec fn parse_datatype_kw(t: TokenView) -> Option<DataType> {
+    match t {
+        TokenView::Keyword(Keyword::Boolean) => Some(DataType::Boolean),
+        TokenView::Keyword(Keyword::Integer) => Some(DataType::Integer),
+        TokenView::Keyword(Keyword::Float) => Some(DataType::Float),
+        TokenView::Keyword(Keyword::String) => Some(DataType::String),
+        _ => None,
+    }
+}
+
+pub open spec fn printable_column(c: SColumn) -> bool {
+    match c.default {
+        Some(e) => printable_se(e),
+        None => true,
+    }
+}
+
+pub open spec fn all_printable_columns(cols: Seq<SColumn>) -> bool
+    decreases cols,
+{
+    if cols.len() == 0 {
+        true
+    } else {
+        printable_column(cols[0]) && all_printable_columns(cols.drop_first())
+    }
+}
+
+/// The optional-clause tokens, in canonical order. DEFAULT is emitted last so
+/// the embedded expression's tail is always the column terminator (comma or
+/// close-paren), making its boundary trivial.
+pub open spec fn col_pk_toks(c: SColumn) -> Seq<TokenView> {
+    if c.primary_key {
+        seq![TokenView::Keyword(Keyword::Primary), TokenView::Keyword(Keyword::Key)]
+    } else {
+        Seq::empty()
+    }
+}
+
+pub open spec fn col_null_toks(c: SColumn) -> Seq<TokenView> {
+    match c.nullable {
+        Some(true) => seq![TokenView::Keyword(Keyword::Null)],
+        Some(false) => seq![TokenView::Keyword(Keyword::Not), TokenView::Keyword(Keyword::Null)],
+        None => Seq::empty(),
+    }
+}
+
+pub open spec fn col_unique_toks(c: SColumn) -> Seq<TokenView> {
+    if c.unique { seq![TokenView::Keyword(Keyword::Unique)] } else { Seq::empty() }
+}
+
+pub open spec fn col_index_toks(c: SColumn) -> Seq<TokenView> {
+    if c.index { seq![TokenView::Keyword(Keyword::Index)] } else { Seq::empty() }
+}
+
+pub open spec fn col_ref_toks(c: SColumn) -> Seq<TokenView> {
+    match c.references {
+        Some(t) => seq![TokenView::Keyword(Keyword::References), TokenView::Ident(t)],
+        None => Seq::empty(),
+    }
+}
+
+pub open spec fn col_default_toks(c: SColumn) -> Seq<TokenView> {
+    match c.default {
+        Some(e) => seq![TokenView::Keyword(Keyword::Default)] + sprint(e),
+        None => Seq::empty(),
+    }
+}
+
+pub open spec fn sprint_column(c: SColumn) -> Seq<TokenView> {
+    seq![TokenView::Ident(c.name), datatype_kw(c.datatype)]
+        + col_pk_toks(c) + col_null_toks(c) + col_unique_toks(c) + col_index_toks(c)
+        + col_ref_toks(c) + col_default_toks(c)
+}
+
+pub open spec fn sprint_columns(cols: Seq<SColumn>) -> Seq<TokenView>
+    decreases cols,
+{
+    if cols.len() == 0 {
+        Seq::empty()
+    } else if cols.len() == 1 {
+        sprint_column(cols[0])
+    } else {
+        sprint_column(cols[0]) + seq![TokenView::Comma] + sprint_columns(cols.drop_first())
+    }
+}
+
+pub open spec fn sdepth_column(c: SColumn) -> nat {
+    match c.default {
+        Some(e) => 1 + sdepth(e),
+        None => 1,
+    }
+}
+
+pub open spec fn slist_depth_columns(cols: Seq<SColumn>) -> nat
+    decreases cols,
+{
+    if cols.len() == 0 {
+        1
+    } else {
+        let d = sdepth_column(cols[0]);
+        let rest = slist_depth_columns(cols.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+// -- optional-clause parse helpers (each with a trivial roundtrip) -----------
+
+/// Consume an optional single-keyword flag. Returns whether it was present and
+/// the remaining tokens. Opaque: reasoned about only through `peel_flag`, so the
+/// column roundtrip composes cheap per-clause facts instead of inlining the
+/// whole optional chain into one solver query.
+#[verifier::opaque]
+pub open spec fn opt_flag(input: Seq<TokenView>, kw: Keyword) -> (bool, Seq<TokenView>) {
+    if input.len() >= 1 && input[0] == TokenView::Keyword(kw) {
+        (true, input.drop_first())
+    } else {
+        (false, input)
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn col_parse_null(input: Seq<TokenView>) -> (Option<bool>, Seq<TokenView>) {
+    if input.len() >= 2
+        && input[0] == TokenView::Keyword(Keyword::Not)
+        && input[1] == TokenView::Keyword(Keyword::Null) {
+        (Some(false), input.drop_first().drop_first())
+    } else if input.len() >= 1 && input[0] == TokenView::Keyword(Keyword::Null) {
+        (Some(true), input.drop_first())
+    } else {
+        (None, input)
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn col_parse_pk(input: Seq<TokenView>) -> (bool, Seq<TokenView>) {
+    if input.len() >= 2
+        && input[0] == TokenView::Keyword(Keyword::Primary)
+        && input[1] == TokenView::Keyword(Keyword::Key) {
+        (true, input.drop_first().drop_first())
+    } else {
+        (false, input)
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn col_parse_ref(input: Seq<TokenView>) -> (Option<String>, Seq<TokenView>) {
+    if input.len() >= 2 && input[0] == TokenView::Keyword(Keyword::References) {
+        match input[1] {
+            TokenView::Ident(t) => (Some(t), input.drop_first().drop_first()),
+            _ => (None, input),
+        }
+    } else {
+        (None, input)
+    }
+}
+
+/// Parse one column. `input[0]` should be the column-name identifier.
+pub open spec fn sparse_column(input: Seq<TokenView>, fuel: nat) -> (Option<SColumn>, Seq<TokenView>) {
+    if input.len() < 2 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => match parse_datatype_kw(input[1]) {
+                Some(datatype) => {
+                    let r0 = input.drop_first().drop_first();
+                    let (primary_key, r1) = col_parse_pk(r0);
+                    let (nullable, r2) = col_parse_null(r1);
+                    let (unique, r3) = opt_flag(r2, Keyword::Unique);
+                    let (index, r4) = opt_flag(r3, Keyword::Index);
+                    let (references, r5) = col_parse_ref(r4);
+                    if r5.len() >= 1 && r5[0] == TokenView::Keyword(Keyword::Default) {
+                        match sparse(r5.drop_first(), fuel) {
+                            (Some(e), r6) => (
+                                Some(SColumn {
+                                    name, datatype, primary_key, nullable,
+                                    default: Some(e), unique, index, references,
+                                }),
+                                r6,
+                            ),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (
+                            Some(SColumn {
+                                name, datatype, primary_key, nullable,
+                                default: None, unique, index, references,
+                            }),
+                            r5,
+                        )
+                    }
+                },
+                None => (None, input),
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+pub open spec fn sparse_columns(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<SColumn>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse_column(input, fuel) {
+            (Some(c), rest) => {
+                if rest.len() == 0 {
+                    (None, input)
+                } else if rest[0] == TokenView::CloseParen {
+                    (Some(seq![c]), rest)
+                } else if rest[0] == TokenView::Comma {
+                    match sparse_columns(rest.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), rest2) => (Some(seq![c] + more), rest2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            (None, _) => (None, input),
+        }
     }
 }
 
@@ -93,6 +373,7 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
         SStmt::Commit => true,
         SStmt::Rollback => true,
         SStmt::DropTable { .. } => true,
+        SStmt::CreateTable { columns, .. } => columns.len() >= 1 && all_printable_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => printable_se(e),
         SStmt::Delete { where_clause: None, .. } => true,
         SStmt::Explain(inner) => !is_sexplain(*inner) && printable_stmt(*inner),
@@ -129,6 +410,12 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
         },
         SStmt::Commit => seq![TokenView::Keyword(Keyword::Commit)],
         SStmt::Rollback => seq![TokenView::Keyword(Keyword::Rollback)],
+        SStmt::CreateTable { name, columns } => seq![
+            TokenView::Keyword(Keyword::Create),
+            TokenView::Keyword(Keyword::Table),
+            TokenView::Ident(name),
+            TokenView::OpenParen,
+        ] + sprint_columns(columns) + seq![TokenView::CloseParen],
         SStmt::DropTable { name, if_exists: false } => seq![
             TokenView::Keyword(Keyword::Drop),
             TokenView::Keyword(Keyword::Table),
@@ -163,6 +450,7 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
     decreases s,
 {
     match s {
+        SStmt::CreateTable { columns, .. } => 1 + slist_depth_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => 1 + sdepth(e),
         SStmt::Explain(inner) => 1 + sdepth_stmt(*inner),
         _ => 1,
@@ -257,6 +545,29 @@ pub open spec fn sparse_delete(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
+/// `CREATE TABLE name ( columns )`. `input[0]` is known to be `CREATE`.
+pub open spec fn sparse_create(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>) {
+    if input.len() >= 4
+        && input[1] == TokenView::Keyword(Keyword::Table)
+        && input[3] == TokenView::OpenParen {
+        match input[2] {
+            TokenView::Ident(name) => match sparse_columns(
+                input.drop_first().drop_first().drop_first().drop_first(),
+                fuel,
+            ) {
+                (Some(cols), rest) if rest.len() > 0 && rest[0] == TokenView::CloseParen => (
+                    Some(SStmt::CreateTable { name, columns: cols }),
+                    rest.drop_first(),
+                ),
+                _ => (None, input),
+            },
+            _ => (None, input),
+        }
+    } else {
+        (None, input)
+    }
+}
+
 pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>)
     decreases fuel,
 {
@@ -267,6 +578,7 @@ pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>
             TokenView::Keyword(Keyword::Commit) => (Some(SStmt::Commit), input.drop_first()),
             TokenView::Keyword(Keyword::Rollback) => (Some(SStmt::Rollback), input.drop_first()),
             TokenView::Keyword(Keyword::Begin) => sparse_begin(input),
+            TokenView::Keyword(Keyword::Create) => sparse_create(input, fuel),
             TokenView::Keyword(Keyword::Drop) => sparse_drop(input),
             TokenView::Keyword(Keyword::Delete) => sparse_delete(input, fuel),
             TokenView::Keyword(Keyword::Explain) => {
@@ -359,6 +671,25 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
                 },
             }
         },
+        SStmt::CreateTable { name, columns } => {
+            let inner_tail = seq![TokenView::CloseParen];
+            lemma_sparse_columns_sprint(columns, inner_tail, fuel);
+            let head = seq![
+                TokenView::Keyword(Keyword::Create),
+                TokenView::Keyword(Keyword::Table),
+                TokenView::Ident(name),
+                TokenView::OpenParen,
+            ];
+            assert(tokens =~= head + sprint_columns(columns) + inner_tail);
+            assert(tokens[0] == TokenView::Keyword(Keyword::Create));
+            assert(tokens[1] == TokenView::Keyword(Keyword::Table));
+            assert(tokens[2] == TokenView::Ident(name));
+            assert(tokens[3] == TokenView::OpenParen);
+            assert(tokens.drop_first().drop_first().drop_first().drop_first()
+                =~= sprint_columns(columns) + inner_tail);
+            assert(inner_tail[0] == TokenView::CloseParen);
+            assert(inner_tail.drop_first() =~= Seq::<TokenView>::empty());
+        },
         SStmt::DropTable { name, if_exists } => {
             if if_exists {
                 assert(tokens[0] == TokenView::Keyword(Keyword::Drop));
@@ -411,6 +742,251 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
         SStmt::Unsupported => {
             assert(false);
         },
+    }
+}
+
+// ---- column roundtrip (S2) -------------------------------------------------
+
+pub proof fn datatype_kw_roundtrip(d: DataType)
+    ensures parse_datatype_kw(datatype_kw(d)) == Some(d),
+{
+    match d {
+        DataType::Boolean => {},
+        DataType::Integer => {},
+        DataType::Float => {},
+        DataType::String => {},
+    }
+}
+
+// -- per-clause peel lemmas (each a cheap, isolated fact) --------------------
+
+pub proof fn peel_unique(c: SColumn, rest: Seq<TokenView>)
+    requires rest.len() == 0 || rest[0] != TokenView::Keyword(Keyword::Unique),
+    ensures opt_flag(col_unique_toks(c) + rest, Keyword::Unique) == (c.unique, rest),
+{
+    reveal(opt_flag);
+    let toks = col_unique_toks(c) + rest;
+    if c.unique {
+        assert(toks[0] == TokenView::Keyword(Keyword::Unique));
+        assert(toks.drop_first() =~= rest);
+    } else {
+        assert(toks =~= rest);
+    }
+}
+
+pub proof fn peel_index(c: SColumn, rest: Seq<TokenView>)
+    requires rest.len() == 0 || rest[0] != TokenView::Keyword(Keyword::Index),
+    ensures opt_flag(col_index_toks(c) + rest, Keyword::Index) == (c.index, rest),
+{
+    reveal(opt_flag);
+    let toks = col_index_toks(c) + rest;
+    if c.index {
+        assert(toks[0] == TokenView::Keyword(Keyword::Index));
+        assert(toks.drop_first() =~= rest);
+    } else {
+        assert(toks =~= rest);
+    }
+}
+
+pub proof fn peel_pk(c: SColumn, rest: Seq<TokenView>)
+    requires rest.len() == 0 || rest[0] != TokenView::Keyword(Keyword::Primary),
+    ensures col_parse_pk(col_pk_toks(c) + rest) == (c.primary_key, rest),
+{
+    reveal(col_parse_pk);
+    let toks = col_pk_toks(c) + rest;
+    if c.primary_key {
+        assert(toks[0] == TokenView::Keyword(Keyword::Primary));
+        assert(toks[1] == TokenView::Keyword(Keyword::Key));
+        assert(toks.drop_first().drop_first() =~= rest);
+    } else {
+        assert(toks =~= rest);
+    }
+}
+
+pub proof fn peel_null(c: SColumn, rest: Seq<TokenView>)
+    requires
+        rest.len() == 0
+            || (rest[0] != TokenView::Keyword(Keyword::Not)
+                && rest[0] != TokenView::Keyword(Keyword::Null)),
+    ensures col_parse_null(col_null_toks(c) + rest) == (c.nullable, rest),
+{
+    reveal(col_parse_null);
+    let toks = col_null_toks(c) + rest;
+    match c.nullable {
+        Some(true) => {
+            assert(toks[0] == TokenView::Keyword(Keyword::Null));
+            assert(toks[0] != TokenView::Keyword(Keyword::Not));
+            assert(toks.drop_first() =~= rest);
+        },
+        Some(false) => {
+            assert(toks[0] == TokenView::Keyword(Keyword::Not));
+            assert(toks[1] == TokenView::Keyword(Keyword::Null));
+            assert(toks.drop_first().drop_first() =~= rest);
+        },
+        None => {
+            assert(toks =~= rest);
+        },
+    }
+}
+
+pub proof fn peel_ref(c: SColumn, rest: Seq<TokenView>)
+    requires rest.len() == 0 || rest[0] != TokenView::Keyword(Keyword::References),
+    ensures col_parse_ref(col_ref_toks(c) + rest) == (c.references, rest),
+{
+    reveal(col_parse_ref);
+    let toks = col_ref_toks(c) + rest;
+    match c.references {
+        Some(t) => {
+            assert(toks[0] == TokenView::Keyword(Keyword::References));
+            assert(toks[1] == TokenView::Ident(t));
+            assert(toks.drop_first().drop_first() =~= rest);
+        },
+        None => {
+            assert(toks =~= rest);
+        },
+    }
+}
+
+/// Parsing the canonical print of one printable column, followed by a
+/// column-terminator tail (comma or close-paren), recovers the column exactly.
+#[verifier::rlimit(8000)]
+pub proof fn lemma_sparse_column_sprint(c: SColumn, tail: Seq<TokenView>, fuel: nat)
+    requires
+        printable_column(c),
+        fuel >= sdepth_column(c),
+        tail.len() > 0,
+        tail[0] == TokenView::Comma || tail[0] == TokenView::CloseParen,
+    ensures
+        sparse_column(sprint_column(c) + tail, fuel) == (Some(c), tail),
+{
+    datatype_kw_roundtrip(c.datatype);
+    let pk = col_pk_toks(c);
+    let nul = col_null_toks(c);
+    let uniq = col_unique_toks(c);
+    let idx = col_index_toks(c);
+    let rf = col_ref_toks(c);
+    let df = col_default_toks(c);
+    // Suffixes, bottom-up.
+    let sd = df + tail;
+    let sr = rf + sd;
+    let sx = idx + sr;
+    let su = uniq + sx;
+    let sn = nul + su;
+    let s0 = pk + sn;
+    // Full printed column + tail decomposes at the (name, datatype) prefix.
+    let full = sprint_column(c) + tail;
+    assert(full =~= seq![TokenView::Ident(c.name), datatype_kw(c.datatype)] + s0);
+    assert(full[0] == TokenView::Ident(c.name));
+    assert(full[1] == datatype_kw(c.datatype));
+    assert(full.drop_first().drop_first() =~= s0);
+
+    // Head facts for each suffix (used to reject absent clauses).
+    // sd: head is DEFAULT (present) or tail[0] (absent); len >= 1.
+    assert(sd.len() >= 1 && sd[0] != TokenView::Keyword(Keyword::References)) by {
+        match c.default {
+            Some(e) => { assert(sd =~= seq![TokenView::Keyword(Keyword::Default)] + sprint(e) + tail); },
+            None => { assert(sd =~= tail); },
+        }
+    }
+    // sr: head is REFERENCES (present) else head(sd).
+    assert(sr.len() >= 1
+        && sr[0] != TokenView::Keyword(Keyword::Index)
+        && sr[0] != TokenView::Keyword(Keyword::Unique)) by {
+        match c.references {
+            Some(t) => { assert(sr =~= seq![TokenView::Keyword(Keyword::References), TokenView::Ident(t)] + sd); },
+            None => { assert(sr =~= sd); },
+        }
+    }
+    // sx: head is INDEX (present) else head(sr).
+    assert(sx.len() >= 1 && sx[0] != TokenView::Keyword(Keyword::Unique)) by {
+        if c.index {
+            assert(sx =~= seq![TokenView::Keyword(Keyword::Index)] + sr);
+        } else {
+            assert(sx =~= sr);
+        }
+    }
+    // su: head is UNIQUE (present) else head(sx); never NOT or NULL.
+    assert(su.len() >= 1
+        && su[0] != TokenView::Keyword(Keyword::Not)
+        && su[0] != TokenView::Keyword(Keyword::Null)) by {
+        if c.unique {
+            assert(su =~= seq![TokenView::Keyword(Keyword::Unique)] + sx);
+        } else {
+            assert(su =~= sx);
+        }
+    }
+    // sn: head via nullability, else head(su); never PRIMARY.
+    assert(sn.len() >= 1 && sn[0] != TokenView::Keyword(Keyword::Primary)) by {
+        match c.nullable {
+            Some(true) => { assert(sn =~= seq![TokenView::Keyword(Keyword::Null)] + su); },
+            Some(false) => { assert(sn =~= seq![TokenView::Keyword(Keyword::Not), TokenView::Keyword(Keyword::Null)] + su); },
+            None => { assert(sn =~= su); },
+        }
+    }
+
+    // Peel each optional clause off `s0`, using the head facts to reject the
+    // absent ones. Each peel is a cheap, isolated fact about an opaque helper;
+    // `sparse_column` then composes them without inlining the whole chain.
+    peel_pk(c, sn);
+    peel_null(c, su);
+    peel_unique(c, sx);
+    peel_index(c, sr);
+    peel_ref(c, sd);
+    // Restate each peel at exactly the argument `sparse_column` uses internally
+    // (r0 == s0, then r1 == sn, ...), so the chain resolves in the postcondition.
+    assert(col_parse_pk(s0) == (c.primary_key, sn));
+    assert(col_parse_null(sn) == (c.nullable, su));
+    assert(opt_flag(su, Keyword::Unique) == (c.unique, sx));
+    assert(opt_flag(sx, Keyword::Index) == (c.index, sr));
+    assert(col_parse_ref(sr) == (c.references, sd));
+    // Default (last): its embedded expression's tail is exactly the column
+    // terminator, so its boundary is trivially satisfied.
+    match c.default {
+        Some(e) => {
+            assert(printable_se(e));
+            assert(fuel >= sdepth(e));
+            assert(sd =~= seq![TokenView::Keyword(Keyword::Default)] + sprint(e) + tail);
+            assert(sd[0] == TokenView::Keyword(Keyword::Default));
+            assert(sd.drop_first() =~= sprint(e) + tail);
+            lemma_sparse_sprint(e, tail, fuel);
+            assert(sparse(sd.drop_first(), fuel) == (Some(e), tail));
+        },
+        None => {
+            assert(sd =~= tail);
+            assert(sd.len() >= 1);
+            assert(sd[0] != TokenView::Keyword(Keyword::Default));
+        },
+    }
+    assert(sparse_column(full, fuel) == (Some(c), tail));
+}
+
+/// Comma-list companion: parsing the canonical print of a printable column
+/// sequence, closed by a `)`-led tail, recovers the sequence exactly.
+pub proof fn lemma_sparse_columns_sprint(cols: Seq<SColumn>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_columns(cols),
+        cols.len() >= 1,
+        fuel >= slist_depth_columns(cols),
+        tail.len() > 0,
+        tail[0] == TokenView::CloseParen,
+    ensures
+        sparse_columns(sprint_columns(cols) + tail, fuel) == (Some(cols), tail),
+    decreases cols,
+{
+    reveal_with_fuel(sparse_columns, 1);
+    if cols.len() == 1 {
+        lemma_sparse_column_sprint(cols[0], tail, fuel);
+        assert(sprint_columns(cols) + tail =~= sprint_column(cols[0]) + tail);
+        assert(seq![cols[0]] =~= cols);
+    } else {
+        let rest_cols = cols.drop_first();
+        let col_tail = seq![TokenView::Comma] + sprint_columns(rest_cols) + tail;
+        assert(col_tail[0] == TokenView::Comma);
+        lemma_sparse_column_sprint(cols[0], col_tail, fuel);
+        lemma_sparse_columns_sprint(rest_cols, tail, (fuel - 1) as nat);
+        assert(sprint_columns(cols) + tail =~= sprint_column(cols[0]) + col_tail);
+        assert(col_tail.drop_first() =~= sprint_columns(rest_cols) + tail);
+        assert(seq![cols[0]] + rest_cols =~= cols);
     }
 }
 
