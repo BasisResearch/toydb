@@ -29,8 +29,9 @@ use vstd::prelude::*;
 use super::verified_production::TokenView;
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, printable_se, sdepth,
-    slist_depth, sparse, sparse_args, sprint, sprint_args, view_args, view_expr, SExpr,
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, print_expr_exec,
+    printable_se, sdepth, slist_depth, sparse, sparse_args, sprint, sprint_args, view_args,
+    view_expr, SExpr,
 };
 #[allow(unused_imports)]
 use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
@@ -2357,6 +2358,126 @@ pub proof fn mirror_injective_stmt(left: SStmt, right: SStmt)
         };
         lemma_sparse_stmt_sprint(left, fuel);
         lemma_sparse_stmt_sprint(right, fuel);
+    }
+}
+
+// ---- S5: executable statement layer (list-free slice) ----------------------
+//
+// `print_stmt_exec` / `parse_stmt_exec` build and consume a real
+// `ast::Statement`, refining `sprint_stmt` / `sparse_stmt` at the `view_stmt`
+// level, delegating every embedded expression to `print_expr_exec` /
+// `parse_expr_exec` from `verified_roundtrip`. This slice covers the list-free
+// statements without the `Begin` number payload: Commit, Rollback, DropTable,
+// Delete (optional WHERE), and Explain (recursively). Extending to the
+// container statements is future work.
+
+pub open spec fn exec_ok(s: SStmt) -> bool
+    decreases s,
+{
+    match s {
+        SStmt::Commit => true,
+        SStmt::Rollback => true,
+        SStmt::DropTable { .. } => true,
+        SStmt::Delete { .. } => true,
+        SStmt::Explain(inner) => exec_ok(*inner),
+        _ => false,
+    }
+}
+
+#[verifier::rlimit(8000)]
+pub fn print_stmt_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires
+        printable_stmt(view_stmt(*s)),
+        exec_ok(view_stmt(*s)),
+    ensures
+        verified_production::token_views(r@) == sprint_stmt(view_stmt(*s)),
+    decreases s,
+{
+    reveal(printable_stmt);
+    reveal(exec_ok);
+    reveal_with_fuel(verified_production::token_views, 6);
+    let mut r: Vec<super::Token> = Vec::new();
+    match s {
+        ast::Statement::Commit => {
+            r.push(super::Token::Keyword(Keyword::Commit));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            r
+        },
+        ast::Statement::Rollback => {
+            r.push(super::Token::Keyword(Keyword::Rollback));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            r
+        },
+        ast::Statement::DropTable { name, if_exists } => {
+            r.push(super::Token::Keyword(Keyword::Drop));
+            r.push(super::Token::Keyword(Keyword::Table));
+            if *if_exists {
+                r.push(super::Token::Keyword(Keyword::If));
+                r.push(super::Token::Keyword(Keyword::Exists));
+            }
+            r.push(super::Token::Ident(name.clone()));
+            proof {
+                if *if_exists {
+                    assert(r@.drop_first().drop_first().drop_first().drop_first().drop_first()
+                        =~= Seq::<super::Token>::empty());
+                } else {
+                    assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                }
+            }
+            r
+        },
+        ast::Statement::Delete { table, where_clause } => {
+            r.push(super::Token::Keyword(Keyword::Delete));
+            r.push(super::Token::Keyword(Keyword::From));
+            r.push(super::Token::Ident(table.clone()));
+            match where_clause {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Where));
+                    let ghost head = r@;
+                    let mut body = print_expr_exec(e);
+                    let ghost body_old = body@;
+                    r.append(&mut body);
+                    proof {
+                        assert(r@ =~= head + body_old);
+                        verified_production::token_views_concat(head, body_old);
+                        assert(head.drop_first().drop_first().drop_first().drop_first()
+                            =~= Seq::<super::Token>::empty());
+                        assert(verified_production::token_views(head) =~= seq![
+                            TokenView::Keyword(Keyword::Delete),
+                            TokenView::Keyword(Keyword::From),
+                            TokenView::Ident(*table),
+                            TokenView::Keyword(Keyword::Where),
+                        ]);
+                    }
+                    r
+                },
+                None => {
+                    proof {
+                        assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    }
+                    r
+                },
+            }
+        },
+        ast::Statement::Explain(inner) => {
+            r.push(super::Token::Keyword(Keyword::Explain));
+            let ghost head = r@;
+            let mut body = print_stmt_exec(inner);
+            let ghost body_old = body@;
+            r.append(&mut body);
+            proof {
+                assert(r@ =~= head + body_old);
+                verified_production::token_views_concat(head, body_old);
+                assert(head.drop_first() =~= Seq::<super::Token>::empty());
+                assert(verified_production::token_views(head)
+                    =~= seq![TokenView::Keyword(Keyword::Explain)]);
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            r
+        },
     }
 }
 
