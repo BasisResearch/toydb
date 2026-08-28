@@ -3155,6 +3155,118 @@ pub fn parse_rows_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+/// Executable INSERT parser, refining `sparse_insert` at the `view_stmt` level.
+#[verifier::rlimit(20000)]
+pub fn parse_insert_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_insert(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if pos >= toks.len() {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    proof { token_views_suffix(toks@, pos as int); }
+    if pos + 1 < toks.len() && pos + 2 < toks.len()
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Into)) {
+        proof {
+            token_views_suffix(toks@, pos as int + 1);
+            token_views_suffix(toks@, pos as int + 2);
+        }
+        match &toks[pos + 2] {
+            super::Token::Ident(table) => {
+                if pos + 3 < toks.len() && matches!(toks[pos + 3], super::Token::OpenParen) {
+                    proof { token_views_suffix(toks@, pos as int + 3); }
+                    let (nopt, npos) = parse_names_exec(toks, pos + 4, fuel);
+                    match nopt {
+                        Some(names) => {
+                            if npos < toks.len() && matches!(toks[npos], super::Token::CloseParen) {
+                                proof { token_views_suffix(toks@, npos as int); }
+                                if npos + 1 < toks.len()
+                                    && matches!(toks[npos + 1], super::Token::Keyword(Keyword::Values)) {
+                                    proof { token_views_suffix(toks@, npos as int + 1); }
+                                    let (vopt, vpos) = parse_rows_exec(toks, npos + 2, fuel);
+                                    match vopt {
+                                        Some(values) => (
+                                            Some(ast::Statement::Insert {
+                                                table: table.clone(),
+                                                columns: Some(names),
+                                                values,
+                                            }),
+                                            vpos,
+                                        ),
+                                        None => (None, pos),
+                                    }
+                                } else {
+                                    if npos + 1 < toks.len() {
+                                        proof { token_views_suffix(toks@, npos as int + 1); }
+                                    } else {
+                                        proof { token_views_len(toks@.subrange(npos as int + 1, toks@.len() as int)); }
+                                    }
+                                    (None, pos)
+                                }
+                            } else {
+                                if npos < toks.len() {
+                                    proof { token_views_suffix(toks@, npos as int); }
+                                } else {
+                                    proof { token_views_len(toks@.subrange(npos as int, toks@.len() as int)); }
+                                }
+                                (None, pos)
+                            }
+                        },
+                        None => (None, pos),
+                    }
+                } else if pos + 3 < toks.len()
+                    && matches!(toks[pos + 3], super::Token::Keyword(Keyword::Values)) {
+                    proof { token_views_suffix(toks@, pos as int + 3); }
+                    let (vopt, vpos) = parse_rows_exec(toks, pos + 4, fuel);
+                    match vopt {
+                        Some(values) => (
+                            Some(ast::Statement::Insert {
+                                table: table.clone(),
+                                columns: None,
+                                values,
+                            }),
+                            vpos,
+                        ),
+                        None => (None, pos),
+                    }
+                } else {
+                    if pos + 3 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 3); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 3, toks@.len() as int)); }
+                    }
+                    (None, pos)
+                }
+            },
+            _ => (None, pos),
+        }
+    } else {
+        if pos + 1 < toks.len() {
+            proof { token_views_suffix(toks@, pos as int + 1); }
+            if pos + 2 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 2); }
+            } else {
+                proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+            }
+        } else {
+            proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+        }
+        (None, pos)
+    }
+}
+
 /// The non-recursive list-free statements the executable parser recovers
 /// (Explain is excluded to keep the parser recursion-free).
 pub open spec fn flat_exec_ok(s: SStmt) -> bool {
