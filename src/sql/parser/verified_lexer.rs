@@ -898,4 +898,96 @@ pub fn lex_all_ends_exec(input: &Vec<u8>, start: usize) -> (r: Vec<usize>)
     r
 }
 
+// -- L9: symbol token scanner (punctuation + operators, token values) ---------
+//
+// L0/L1 proved byte-level roundtrips; this unifies them into a single scanner
+// that produces the actual `Token` value for any symbol (punctuation or
+// operator), with one combined roundtrip. It is the first token-*value*-producing
+// scanner — the shape the whole token-list roundtrip needs (payload tokens,
+// numbers/strings/identifiers, come later).
+
+/// Canonical byte print of a symbol token (punctuation or operator).
+pub open spec fn lex_print_sym(t: Token) -> Seq<u8> {
+    if is_op(t) {
+        lex_print_op(t)
+    } else {
+        lex_print1(t)
+    }
+}
+
+/// Scan one symbol token: operators (maximal munch) on the `< > !` leads,
+/// otherwise munch-free punctuation.
+pub open spec fn lscan_sym(input: Seq<u8>, pos: int) -> (Option<Token>, int) {
+    if 0 <= pos < input.len() {
+        let b = input[pos];
+        if b == 60 || b == 62 || b == 33 {
+            lscan_op(input, pos)
+        } else {
+            match scan_punct1(b) {
+                Some(t) => (Some(t), pos + 1),
+                None => (None, pos),
+            }
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// Combined symbol roundtrip: scanning the print of any symbol token recovers it
+/// and advances by its byte length, under the operator boundary (vacuous for
+/// punctuation and the two-char operators).
+pub proof fn lemma_lscan_sym(t: Token, tail: Seq<u8>)
+    requires
+        is_punct1(t) || is_op(t),
+        op_tail_ok(t, tail),
+    ensures
+        lscan_sym(lex_print_sym(t) + tail, 0) == (Some(t), lex_print_sym(t).len() as int),
+{
+    let input = lex_print_sym(t) + tail;
+    if is_op(t) {
+        assert(lex_print_sym(t) == lex_print_op(t));
+        // The operator lead byte is one of `< > !` (60/62/33).
+        assert(input[0] == 60 || input[0] == 62 || input[0] == 33) by {
+            match t {
+                Token::LessThan => assert(input[0] == 60),
+                Token::LessThanOrEqual => assert(input[0] == 60),
+                Token::LessOrGreaterThan => assert(input[0] == 60),
+                Token::GreaterThan => assert(input[0] == 62),
+                Token::GreaterThanOrEqual => assert(input[0] == 62),
+                Token::Exclamation => assert(input[0] == 33),
+                Token::NotEqual => assert(input[0] == 33),
+                _ => assert(false),
+            }
+        }
+        lemma_lscan_op(t, tail);
+    } else {
+        assert(is_punct1(t));
+        assert(lex_print_sym(t) == lex_print1(t));
+        assert(input[0] == punct1_byte(t));
+        // Punctuation bytes are never an operator lead (`< > !`).
+        assert(input[0] != 60 && input[0] != 62 && input[0] != 33);
+        assert(scan_punct1(punct1_byte(t)) == Some(t));
+    }
+}
+
+/// Executable symbol scanner, refining `lscan_sym`.
+pub fn scan_sym_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+    ensures
+        r.0 == lscan_sym(input@, pos as int).0,
+        r.1 == lscan_sym(input@, pos as int).1,
+{
+    if pos < input.len() {
+        let b = input[pos];
+        if b == 60u8 || b == 62u8 || b == 33u8 {
+            scan_op_exec(input, pos)
+        } else {
+            scan_punct1_exec(input, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
 } // verus!
