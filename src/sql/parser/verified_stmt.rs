@@ -4867,6 +4867,62 @@ pub open spec fn seq_to_map(s: Seq<(String, Option<SExpr>)>)
     }
 }
 
+/// If a sequence enumerates a finite map's entries with unique keys, the map it
+/// builds is exactly that map. The glue that will close the print roundtrip:
+/// `parse(print(m))` yields `seq_to_map(S)` for `S` = the (sorted, unique-key,
+/// covering) `iter()` enumeration of `m`, and this lemma equates that with `m`.
+pub proof fn lemma_seq_to_map_enumerates(
+    s: Seq<(String, Option<SExpr>)>,
+    m: vstd::map::Map<String, Option<SExpr>>,
+)
+    requires
+        m.dom().finite(),
+        forall|i: int| 0 <= i < s.len()
+            ==> #[trigger] m.dom().contains(s[i].0) && m[s[i].0] == s[i].1,
+        forall|k: String| m.dom().contains(k)
+            ==> exists|i: int| 0 <= i < s.len() && (#[trigger] s[i]).0 == k,
+        forall|i: int, j: int| 0 <= i < j < s.len() ==> s[i].0 != s[j].0,
+    ensures
+        seq_to_map(s) == m,
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        assert(m.dom() =~= vstd::set::Set::<String>::empty()) by {
+            assert forall|k: String| !m.dom().contains(k) by {
+                if m.dom().contains(k) {
+                    let i = choose|i: int| 0 <= i < s.len() && s[i].0 == k;
+                }
+            }
+        }
+        assert(seq_to_map(s) =~= m);
+    } else {
+        let head = s[0];
+        let rest = s.drop_first();
+        let m2 = m.remove(head.0);
+        assert(m.dom().contains(head.0) && m[head.0] == head.1);
+        assert forall|i: int| 0 <= i < rest.len()
+            implies #[trigger] m2.dom().contains(rest[i].0) && m2[rest[i].0] == rest[i].1 by {
+            assert(rest[i] == s[i + 1]);
+            assert(s[0].0 != s[i + 1].0);
+        }
+        assert forall|k: String| m2.dom().contains(k)
+            implies exists|i: int| 0 <= i < rest.len() && (#[trigger] rest[i]).0 == k by {
+            assert(m.dom().contains(k));
+            let j = choose|j: int| 0 <= j < s.len() && s[j].0 == k;
+            assert(j != 0);
+            assert(rest[j - 1] == s[j]);
+        }
+        assert forall|i: int, j: int| 0 <= i < j < rest.len()
+            implies rest[i].0 != rest[j].0 by {
+            assert(rest[i] == s[i + 1]);
+            assert(rest[j] == s[j + 1]);
+        }
+        lemma_seq_to_map_enumerates(rest, m2);
+        assert(m2.insert(head.0, head.1) =~= m);
+        assert(seq_to_map(s) == seq_to_map(rest).insert(head.0, head.1));
+    }
+}
+
 /// Build a one-entry `BTreeMap` with a known view.
 pub fn build_one_entry_map(k: String, v: Option<ast::Expression>)
     -> (m: std::collections::BTreeMap<String, Option<ast::Expression>>)
