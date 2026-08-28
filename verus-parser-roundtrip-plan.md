@@ -165,19 +165,30 @@ extension (5-tuple `sparse_where_group`, threading each clause's tail as the
 subsequent clauses) *verified its own lemma* but re-tipped `lemma_sparse_column_sprint`
 into the "expected rlimit-count" solver crash — that lemma `reveal`s the 6-clause
 `sprint_column`, and the added module bulk crossed the crash threshold (unresponsive
-to rlimit). Investigated the fix and ruled one out: making the `col_*_toks` clause helpers
-opaque does **not** shrink `lemma_sparse_column_sprint`'s query, because that lemma
-uses all six directly and reasons about their contents (the absent-clause head
-facts), so it must `reveal` all six regardless — opacity only trims *other* proofs'
-background. The lemma is inherently heavy (6 optional clauses) and now sits right at
-the "expected rlimit-count" crash threshold; any further grammar tips it. So the
-genuine next step is **structural: split `verified_stmt.rs`** — move the
-column/CreateTable codec (and ideally each statement kind) into its own module so
-the heavy column lemmas verify against a much smaller global background. Once split,
-the reverted LIMIT/OFFSET diff (5-tuple `sparse_where_group` via the shared
-`sparse_kw_expr` helper + `lemma_sparse_kw_expr_sprint`, threading each clause's tail
-as the subsequent clauses) replays straightforwardly, and the remaining Select
-clauses + ORDER BY follow the same recipe.
+to rlimit). **The scaling fix is `#[verifier::spinoff_prover]`, not opacity or a module split
+(2026-08-28).** Ruled out col_*_toks opacity (the column lemma `reveal`s all six
+regardless, so it doesn't shrink that lemma's query). The real fix for a heavy
+lemma hitting the "expected rlimit-count" crash is `#[verifier::spinoff_prover]`,
+which verifies it in a fresh solver instance with a minimal context — committed on
+`lemma_sparse_column_sprint` (no module split needed). With that, the **entire
+LIMIT/OFFSET *mirror* side verifies for all five clauses**: 5-tuple
+`sparse_where_group` via the shared `sparse_kw_expr`/`kw_expr_part` helpers +
+`lemma_sparse_kw_expr_sprint`, the 5-clause `lemma_sparse_where_group_sprint`
+(spinoff), and — key move — the Select case of `lemma_sparse_stmt_sprint` extracted
+into a spinoff'd `lemma_sparse_select_sprint` (the 5-clause `sparse_select`
+composition is too big to evaluate in the main statement lemma's shared context).
+
+**Residual (2026-08-28): the LIMIT/OFFSET *exec* parser.** `parse_where_group_exec`
+refines the 5-level opaque `sparse_where_group`, which needs one `reveal` +
+threading through all five nested stages — inherently too big, and `spinoff_prover`
+does *not* help (the query size is intrinsic, not context). The fix is to **split
+the opaque tail parser** into `sparse_where_group` (WHERE/GROUP/HAVING, 3-tuple) +
+`sparse_limit_offset` (LIMIT/OFFSET, 2-tuple), each with its own exec parser
+refining a *smaller* opaque function so each `reveal` stays tractable; alternatively
+add a `parse_kw_expr_exec` helper refining `sparse_kw_expr` per clause. Do this,
+then LIMIT/OFFSET lands; the remaining Select clauses + ORDER BY follow the recipe.
+General rule discovered: keep each opaque parser to ≤3 clauses so its refinement's
+one-shot `reveal` doesn't crash the solver, and `spinoff_prover` the heavy lemmas.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
