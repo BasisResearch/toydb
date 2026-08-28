@@ -6584,6 +6584,75 @@ pub fn set_map_roundtrip_exec(
     }
 }
 
+/// Full multi-assignment statement roundtrip for `UPDATE table SET <assignments>`:
+/// parsing the printed statement recovers the same table and a set-map with the same
+/// `view_map`. Wraps the verified set-list roundtrip with the `UPDATE table SET` framing.
+#[verifier::rlimit(50000)]
+pub fn update_set_roundtrip_exec(
+    table: &String,
+    set: &std::collections::BTreeMap<String, Option<ast::Expression>>,
+) -> (r: (String, std::collections::BTreeMap<String, Option<ast::Expression>>))
+    requires
+        set@.dom().len() >= 1,
+        forall|k: String| #[trigger] set@.dom().contains(k) ==> (match set@[k] {
+            Some(e) => printable_se(view_expr(e)),
+            None => true,
+        }),
+    ensures
+        r.0 == *table,
+        view_map(r.1@) == view_map(set@),
+{
+    reveal_with_fuel(token_views, 4);
+    let mut toks: Vec<super::Token> = Vec::new();
+    toks.push(super::Token::Keyword(Keyword::Update));
+    toks.push(super::Token::Ident(table.clone()));
+    toks.push(super::Token::Keyword(Keyword::Set));
+    let ghost prefix = toks@;
+    proof {
+        assert(token_views(prefix) =~= seq![
+            TokenView::Keyword(Keyword::Update),
+            TokenView::Ident(*table),
+            TokenView::Keyword(Keyword::Set),
+        ]);
+    }
+    let (mut sl, s_ghost) = print_set_map_exec(set);
+    let ghost s = s_ghost@;
+    let ghost slo = sl@;
+    toks.append(&mut sl);
+    proof {
+        token_views_concat(prefix, slo);
+        assert(toks@ =~= prefix + slo);
+        assert(toks@.subrange(3, toks@.len() as int) =~= slo);
+        token_views_len(slo);
+        token_views_suffix(toks@, 3);
+        assert(token_views(toks@.subrange(3, toks@.len() as int)) == sprint_set_list(s));
+    }
+    let fuel = toks.len();
+    proof {
+        token_views_len(toks@);
+        set_list_depth_le_len_ne(s);
+        assert(fuel as nat >= set_list_depth(s));
+        lemma_sparse_set_list_sprint(s, Seq::<TokenView>::empty(), fuel as nat);
+        assert(sprint_set_list(s) + Seq::<TokenView>::empty() =~= sprint_set_list(s));
+        assert(sparse_set_list(sprint_set_list(s), fuel as nat)
+            == (Some(s), Seq::<TokenView>::empty()));
+    }
+    let (mopt, p) = parse_set_map_exec(&toks, 3, fuel);
+    match mopt {
+        Some(mm) => {
+            proof {
+                assert(view_map(mm@) == seq_to_map(s));
+                assert(seq_to_map(s) == view_map(set@));
+            }
+            (table.clone(), mm)
+        },
+        None => {
+            proof { assert(false); }
+            (table.clone(), std::collections::BTreeMap::new())
+        },
+    }
+}
+
 /// Executable parser for a single-assignment `UPDATE`, refining `sparse_update`.
 /// A trailing comma (multi-assignment) is outside `view_stmt`'s domain, so this
 /// returns `None` there (the relaxed `None` disjunct).
