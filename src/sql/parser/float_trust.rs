@@ -18,6 +18,7 @@ pub const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 pub uninterp spec fn spec_format(x: f64) -> Seq<u8>;
 pub uninterp spec fn spec_parse(s: Seq<u8>) -> Option<f64>;
 pub uninterp spec fn spec_canonical_nan() -> f64;
+pub uninterp spec fn spec_infinity() -> f64;
 
 /// Models the production f64 formatter and parser without exposing their
 /// implementation to the verified parser.
@@ -93,9 +94,14 @@ pub fn canonical_nan() -> (r: f64)
 
 /// Constructs positive infinity, the value the production parser builds for the
 /// `INFINITY` keyword. Non-finite, so outside the finite-roundtrip domain; the
-/// precedence parser only needs to construct it.
+/// precedence parser only needs to construct it. The `spec_infinity()` ensures
+/// pins its ghost value so the spec-level precedence parser can model the
+/// `INFINITY` atom (which is outside the canonical printable domain, but the
+/// exec parser still accepts it and the refinement must account for it).
 #[verifier::external_body]
-pub fn infinity() -> (r: f64) {
+pub fn infinity() -> (r: f64)
+    ensures r == spec_infinity(),
+{
     f64::INFINITY
 }
 
