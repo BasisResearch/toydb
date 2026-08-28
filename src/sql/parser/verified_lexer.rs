@@ -17,6 +17,8 @@ use vstd::prelude::*;
 #[allow(unused_imports)]
 use super::Token;
 #[allow(unused_imports)]
+use super::Keyword;
+#[allow(unused_imports)]
 use super::verified_production::TokenView;
 
 verus! {
@@ -1245,5 +1247,388 @@ pub fn scan_num_full_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
         p
     }
 }
+
+// -- L13: keyword classification table -----------------------------------------
+//
+// The production lexer scans an identifier run, lowercases it, and classifies it
+// as a keyword (via `Keyword::try_from`) or else a plain `Ident`. This brick
+// carries the keyword table at the byte level: `kw_text` (the canonical lowercase
+// bytes), `classify_kw` (byte-run -> keyword, mirroring `try_from`), the table
+// round-trip `lemma_classify_kw_text` (classifying a keyword's own text recovers
+// it — the table is injective), and the executable `classify_kw_exec`. The
+// classifier decides on length + indexed bytes (`byte_at`), never whole-`Seq`
+// equality, which Verus does not resolve automatically. Case-folding of the
+// printed (uppercase `Display`) form into this lowercase key, and the plain-Ident
+// arm, come with the dispatcher brick.
+
+/// Canonical lowercase keyword bytes — the classification key (what the
+/// production lexer matches after lowercasing an identifier run).
+pub open spec fn kw_text(k: Keyword) -> Seq<u8> {
+    match k {
+        Keyword::As => seq![97u8, 115u8],
+        Keyword::Asc => seq![97u8, 115u8, 99u8],
+        Keyword::And => seq![97u8, 110u8, 100u8],
+        Keyword::Begin => seq![98u8, 101u8, 103u8, 105u8, 110u8],
+        Keyword::Bool => seq![98u8, 111u8, 111u8, 108u8],
+        Keyword::Boolean => seq![98u8, 111u8, 111u8, 108u8, 101u8, 97u8, 110u8],
+        Keyword::By => seq![98u8, 121u8],
+        Keyword::Commit => seq![99u8, 111u8, 109u8, 109u8, 105u8, 116u8],
+        Keyword::Create => seq![99u8, 114u8, 101u8, 97u8, 116u8, 101u8],
+        Keyword::Cross => seq![99u8, 114u8, 111u8, 115u8, 115u8],
+        Keyword::Default => seq![100u8, 101u8, 102u8, 97u8, 117u8, 108u8, 116u8],
+        Keyword::Delete => seq![100u8, 101u8, 108u8, 101u8, 116u8, 101u8],
+        Keyword::Desc => seq![100u8, 101u8, 115u8, 99u8],
+        Keyword::Double => seq![100u8, 111u8, 117u8, 98u8, 108u8, 101u8],
+        Keyword::Drop => seq![100u8, 114u8, 111u8, 112u8],
+        Keyword::Exists => seq![101u8, 120u8, 105u8, 115u8, 116u8, 115u8],
+        Keyword::Explain => seq![101u8, 120u8, 112u8, 108u8, 97u8, 105u8, 110u8],
+        Keyword::False => seq![102u8, 97u8, 108u8, 115u8, 101u8],
+        Keyword::Float => seq![102u8, 108u8, 111u8, 97u8, 116u8],
+        Keyword::From => seq![102u8, 114u8, 111u8, 109u8],
+        Keyword::Group => seq![103u8, 114u8, 111u8, 117u8, 112u8],
+        Keyword::Having => seq![104u8, 97u8, 118u8, 105u8, 110u8, 103u8],
+        Keyword::If => seq![105u8, 102u8],
+        Keyword::Index => seq![105u8, 110u8, 100u8, 101u8, 120u8],
+        Keyword::Infinity => seq![105u8, 110u8, 102u8, 105u8, 110u8, 105u8, 116u8, 121u8],
+        Keyword::Inner => seq![105u8, 110u8, 110u8, 101u8, 114u8],
+        Keyword::Insert => seq![105u8, 110u8, 115u8, 101u8, 114u8, 116u8],
+        Keyword::Int => seq![105u8, 110u8, 116u8],
+        Keyword::Integer => seq![105u8, 110u8, 116u8, 101u8, 103u8, 101u8, 114u8],
+        Keyword::Into => seq![105u8, 110u8, 116u8, 111u8],
+        Keyword::Is => seq![105u8, 115u8],
+        Keyword::Join => seq![106u8, 111u8, 105u8, 110u8],
+        Keyword::Key => seq![107u8, 101u8, 121u8],
+        Keyword::Left => seq![108u8, 101u8, 102u8, 116u8],
+        Keyword::Like => seq![108u8, 105u8, 107u8, 101u8],
+        Keyword::Limit => seq![108u8, 105u8, 109u8, 105u8, 116u8],
+        Keyword::NaN => seq![110u8, 97u8, 110u8],
+        Keyword::Not => seq![110u8, 111u8, 116u8],
+        Keyword::Null => seq![110u8, 117u8, 108u8, 108u8],
+        Keyword::Of => seq![111u8, 102u8],
+        Keyword::Offset => seq![111u8, 102u8, 102u8, 115u8, 101u8, 116u8],
+        Keyword::On => seq![111u8, 110u8],
+        Keyword::Only => seq![111u8, 110u8, 108u8, 121u8],
+        Keyword::Or => seq![111u8, 114u8],
+        Keyword::Order => seq![111u8, 114u8, 100u8, 101u8, 114u8],
+        Keyword::Outer => seq![111u8, 117u8, 116u8, 101u8, 114u8],
+        Keyword::Primary => seq![112u8, 114u8, 105u8, 109u8, 97u8, 114u8, 121u8],
+        Keyword::Read => seq![114u8, 101u8, 97u8, 100u8],
+        Keyword::References => seq![114u8, 101u8, 102u8, 101u8, 114u8, 101u8, 110u8, 99u8, 101u8, 115u8],
+        Keyword::Right => seq![114u8, 105u8, 103u8, 104u8, 116u8],
+        Keyword::Rollback => seq![114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8],
+        Keyword::Select => seq![115u8, 101u8, 108u8, 101u8, 99u8, 116u8],
+        Keyword::Set => seq![115u8, 101u8, 116u8],
+        Keyword::String => seq![115u8, 116u8, 114u8, 105u8, 110u8, 103u8],
+        Keyword::System => seq![115u8, 121u8, 115u8, 116u8, 101u8, 109u8],
+        Keyword::Table => seq![116u8, 97u8, 98u8, 108u8, 101u8],
+        Keyword::Text => seq![116u8, 101u8, 120u8, 116u8],
+        Keyword::Time => seq![116u8, 105u8, 109u8, 101u8],
+        Keyword::Transaction => seq![116u8, 114u8, 97u8, 110u8, 115u8, 97u8, 99u8, 116u8, 105u8, 111u8, 110u8],
+        Keyword::True => seq![116u8, 114u8, 117u8, 101u8],
+        Keyword::Unique => seq![117u8, 110u8, 105u8, 113u8, 117u8, 101u8],
+        Keyword::Update => seq![117u8, 112u8, 100u8, 97u8, 116u8, 101u8],
+        Keyword::Values => seq![118u8, 97u8, 108u8, 117u8, 101u8, 115u8],
+        Keyword::Varchar => seq![118u8, 97u8, 114u8, 99u8, 104u8, 97u8, 114u8],
+        Keyword::Where => seq![119u8, 104u8, 101u8, 114u8, 101u8],
+        Keyword::Write => seq![119u8, 114u8, 105u8, 116u8, 101u8],
+    }
+}
+
+/// Byte at index, or an out-of-range sentinel (256) past the end. Lets the
+/// classifier decide on integer comparisons (length + indexed bytes) rather
+/// than whole-`Seq` equality, which Verus does not resolve automatically.
+pub open spec fn byte_at(s: Seq<u8>, i: int) -> int {
+    if 0 <= i < s.len() { s[i] as int } else { 256 }
+}
+
+/// Classify a (lowercase) identifier byte-run as a keyword, or `None` for a
+/// plain identifier. Mirrors `Keyword::try_from(&str)` exactly.
+pub open spec fn classify_kw(s: Seq<u8>) -> Option<Keyword> {
+    if s.len() == 2 && byte_at(s, 0) == 97 && byte_at(s, 1) == 115 { Some(Keyword::As) }
+    else if s.len() == 3 && byte_at(s, 0) == 97 && byte_at(s, 1) == 115 && byte_at(s, 2) == 99 { Some(Keyword::Asc) }
+    else if s.len() == 3 && byte_at(s, 0) == 97 && byte_at(s, 1) == 110 && byte_at(s, 2) == 100 { Some(Keyword::And) }
+    else if s.len() == 5 && byte_at(s, 0) == 98 && byte_at(s, 1) == 101 && byte_at(s, 2) == 103 && byte_at(s, 3) == 105 && byte_at(s, 4) == 110 { Some(Keyword::Begin) }
+    else if s.len() == 4 && byte_at(s, 0) == 98 && byte_at(s, 1) == 111 && byte_at(s, 2) == 111 && byte_at(s, 3) == 108 { Some(Keyword::Bool) }
+    else if s.len() == 7 && byte_at(s, 0) == 98 && byte_at(s, 1) == 111 && byte_at(s, 2) == 111 && byte_at(s, 3) == 108 && byte_at(s, 4) == 101 && byte_at(s, 5) == 97 && byte_at(s, 6) == 110 { Some(Keyword::Boolean) }
+    else if s.len() == 2 && byte_at(s, 0) == 98 && byte_at(s, 1) == 121 { Some(Keyword::By) }
+    else if s.len() == 6 && byte_at(s, 0) == 99 && byte_at(s, 1) == 111 && byte_at(s, 2) == 109 && byte_at(s, 3) == 109 && byte_at(s, 4) == 105 && byte_at(s, 5) == 116 { Some(Keyword::Commit) }
+    else if s.len() == 6 && byte_at(s, 0) == 99 && byte_at(s, 1) == 114 && byte_at(s, 2) == 101 && byte_at(s, 3) == 97 && byte_at(s, 4) == 116 && byte_at(s, 5) == 101 { Some(Keyword::Create) }
+    else if s.len() == 5 && byte_at(s, 0) == 99 && byte_at(s, 1) == 114 && byte_at(s, 2) == 111 && byte_at(s, 3) == 115 && byte_at(s, 4) == 115 { Some(Keyword::Cross) }
+    else if s.len() == 7 && byte_at(s, 0) == 100 && byte_at(s, 1) == 101 && byte_at(s, 2) == 102 && byte_at(s, 3) == 97 && byte_at(s, 4) == 117 && byte_at(s, 5) == 108 && byte_at(s, 6) == 116 { Some(Keyword::Default) }
+    else if s.len() == 6 && byte_at(s, 0) == 100 && byte_at(s, 1) == 101 && byte_at(s, 2) == 108 && byte_at(s, 3) == 101 && byte_at(s, 4) == 116 && byte_at(s, 5) == 101 { Some(Keyword::Delete) }
+    else if s.len() == 4 && byte_at(s, 0) == 100 && byte_at(s, 1) == 101 && byte_at(s, 2) == 115 && byte_at(s, 3) == 99 { Some(Keyword::Desc) }
+    else if s.len() == 6 && byte_at(s, 0) == 100 && byte_at(s, 1) == 111 && byte_at(s, 2) == 117 && byte_at(s, 3) == 98 && byte_at(s, 4) == 108 && byte_at(s, 5) == 101 { Some(Keyword::Double) }
+    else if s.len() == 4 && byte_at(s, 0) == 100 && byte_at(s, 1) == 114 && byte_at(s, 2) == 111 && byte_at(s, 3) == 112 { Some(Keyword::Drop) }
+    else if s.len() == 6 && byte_at(s, 0) == 101 && byte_at(s, 1) == 120 && byte_at(s, 2) == 105 && byte_at(s, 3) == 115 && byte_at(s, 4) == 116 && byte_at(s, 5) == 115 { Some(Keyword::Exists) }
+    else if s.len() == 7 && byte_at(s, 0) == 101 && byte_at(s, 1) == 120 && byte_at(s, 2) == 112 && byte_at(s, 3) == 108 && byte_at(s, 4) == 97 && byte_at(s, 5) == 105 && byte_at(s, 6) == 110 { Some(Keyword::Explain) }
+    else if s.len() == 5 && byte_at(s, 0) == 102 && byte_at(s, 1) == 97 && byte_at(s, 2) == 108 && byte_at(s, 3) == 115 && byte_at(s, 4) == 101 { Some(Keyword::False) }
+    else if s.len() == 5 && byte_at(s, 0) == 102 && byte_at(s, 1) == 108 && byte_at(s, 2) == 111 && byte_at(s, 3) == 97 && byte_at(s, 4) == 116 { Some(Keyword::Float) }
+    else if s.len() == 4 && byte_at(s, 0) == 102 && byte_at(s, 1) == 114 && byte_at(s, 2) == 111 && byte_at(s, 3) == 109 { Some(Keyword::From) }
+    else if s.len() == 5 && byte_at(s, 0) == 103 && byte_at(s, 1) == 114 && byte_at(s, 2) == 111 && byte_at(s, 3) == 117 && byte_at(s, 4) == 112 { Some(Keyword::Group) }
+    else if s.len() == 6 && byte_at(s, 0) == 104 && byte_at(s, 1) == 97 && byte_at(s, 2) == 118 && byte_at(s, 3) == 105 && byte_at(s, 4) == 110 && byte_at(s, 5) == 103 { Some(Keyword::Having) }
+    else if s.len() == 2 && byte_at(s, 0) == 105 && byte_at(s, 1) == 102 { Some(Keyword::If) }
+    else if s.len() == 5 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 100 && byte_at(s, 3) == 101 && byte_at(s, 4) == 120 { Some(Keyword::Index) }
+    else if s.len() == 8 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 102 && byte_at(s, 3) == 105 && byte_at(s, 4) == 110 && byte_at(s, 5) == 105 && byte_at(s, 6) == 116 && byte_at(s, 7) == 121 { Some(Keyword::Infinity) }
+    else if s.len() == 5 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 110 && byte_at(s, 3) == 101 && byte_at(s, 4) == 114 { Some(Keyword::Inner) }
+    else if s.len() == 6 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 115 && byte_at(s, 3) == 101 && byte_at(s, 4) == 114 && byte_at(s, 5) == 116 { Some(Keyword::Insert) }
+    else if s.len() == 3 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 116 { Some(Keyword::Int) }
+    else if s.len() == 7 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 116 && byte_at(s, 3) == 101 && byte_at(s, 4) == 103 && byte_at(s, 5) == 101 && byte_at(s, 6) == 114 { Some(Keyword::Integer) }
+    else if s.len() == 4 && byte_at(s, 0) == 105 && byte_at(s, 1) == 110 && byte_at(s, 2) == 116 && byte_at(s, 3) == 111 { Some(Keyword::Into) }
+    else if s.len() == 2 && byte_at(s, 0) == 105 && byte_at(s, 1) == 115 { Some(Keyword::Is) }
+    else if s.len() == 4 && byte_at(s, 0) == 106 && byte_at(s, 1) == 111 && byte_at(s, 2) == 105 && byte_at(s, 3) == 110 { Some(Keyword::Join) }
+    else if s.len() == 3 && byte_at(s, 0) == 107 && byte_at(s, 1) == 101 && byte_at(s, 2) == 121 { Some(Keyword::Key) }
+    else if s.len() == 4 && byte_at(s, 0) == 108 && byte_at(s, 1) == 101 && byte_at(s, 2) == 102 && byte_at(s, 3) == 116 { Some(Keyword::Left) }
+    else if s.len() == 4 && byte_at(s, 0) == 108 && byte_at(s, 1) == 105 && byte_at(s, 2) == 107 && byte_at(s, 3) == 101 { Some(Keyword::Like) }
+    else if s.len() == 5 && byte_at(s, 0) == 108 && byte_at(s, 1) == 105 && byte_at(s, 2) == 109 && byte_at(s, 3) == 105 && byte_at(s, 4) == 116 { Some(Keyword::Limit) }
+    else if s.len() == 3 && byte_at(s, 0) == 110 && byte_at(s, 1) == 97 && byte_at(s, 2) == 110 { Some(Keyword::NaN) }
+    else if s.len() == 3 && byte_at(s, 0) == 110 && byte_at(s, 1) == 111 && byte_at(s, 2) == 116 { Some(Keyword::Not) }
+    else if s.len() == 4 && byte_at(s, 0) == 110 && byte_at(s, 1) == 117 && byte_at(s, 2) == 108 && byte_at(s, 3) == 108 { Some(Keyword::Null) }
+    else if s.len() == 2 && byte_at(s, 0) == 111 && byte_at(s, 1) == 102 { Some(Keyword::Of) }
+    else if s.len() == 6 && byte_at(s, 0) == 111 && byte_at(s, 1) == 102 && byte_at(s, 2) == 102 && byte_at(s, 3) == 115 && byte_at(s, 4) == 101 && byte_at(s, 5) == 116 { Some(Keyword::Offset) }
+    else if s.len() == 2 && byte_at(s, 0) == 111 && byte_at(s, 1) == 110 { Some(Keyword::On) }
+    else if s.len() == 4 && byte_at(s, 0) == 111 && byte_at(s, 1) == 110 && byte_at(s, 2) == 108 && byte_at(s, 3) == 121 { Some(Keyword::Only) }
+    else if s.len() == 2 && byte_at(s, 0) == 111 && byte_at(s, 1) == 114 { Some(Keyword::Or) }
+    else if s.len() == 5 && byte_at(s, 0) == 111 && byte_at(s, 1) == 114 && byte_at(s, 2) == 100 && byte_at(s, 3) == 101 && byte_at(s, 4) == 114 { Some(Keyword::Order) }
+    else if s.len() == 5 && byte_at(s, 0) == 111 && byte_at(s, 1) == 117 && byte_at(s, 2) == 116 && byte_at(s, 3) == 101 && byte_at(s, 4) == 114 { Some(Keyword::Outer) }
+    else if s.len() == 7 && byte_at(s, 0) == 112 && byte_at(s, 1) == 114 && byte_at(s, 2) == 105 && byte_at(s, 3) == 109 && byte_at(s, 4) == 97 && byte_at(s, 5) == 114 && byte_at(s, 6) == 121 { Some(Keyword::Primary) }
+    else if s.len() == 4 && byte_at(s, 0) == 114 && byte_at(s, 1) == 101 && byte_at(s, 2) == 97 && byte_at(s, 3) == 100 { Some(Keyword::Read) }
+    else if s.len() == 10 && byte_at(s, 0) == 114 && byte_at(s, 1) == 101 && byte_at(s, 2) == 102 && byte_at(s, 3) == 101 && byte_at(s, 4) == 114 && byte_at(s, 5) == 101 && byte_at(s, 6) == 110 && byte_at(s, 7) == 99 && byte_at(s, 8) == 101 && byte_at(s, 9) == 115 { Some(Keyword::References) }
+    else if s.len() == 5 && byte_at(s, 0) == 114 && byte_at(s, 1) == 105 && byte_at(s, 2) == 103 && byte_at(s, 3) == 104 && byte_at(s, 4) == 116 { Some(Keyword::Right) }
+    else if s.len() == 8 && byte_at(s, 0) == 114 && byte_at(s, 1) == 111 && byte_at(s, 2) == 108 && byte_at(s, 3) == 108 && byte_at(s, 4) == 98 && byte_at(s, 5) == 97 && byte_at(s, 6) == 99 && byte_at(s, 7) == 107 { Some(Keyword::Rollback) }
+    else if s.len() == 6 && byte_at(s, 0) == 115 && byte_at(s, 1) == 101 && byte_at(s, 2) == 108 && byte_at(s, 3) == 101 && byte_at(s, 4) == 99 && byte_at(s, 5) == 116 { Some(Keyword::Select) }
+    else if s.len() == 3 && byte_at(s, 0) == 115 && byte_at(s, 1) == 101 && byte_at(s, 2) == 116 { Some(Keyword::Set) }
+    else if s.len() == 6 && byte_at(s, 0) == 115 && byte_at(s, 1) == 116 && byte_at(s, 2) == 114 && byte_at(s, 3) == 105 && byte_at(s, 4) == 110 && byte_at(s, 5) == 103 { Some(Keyword::String) }
+    else if s.len() == 6 && byte_at(s, 0) == 115 && byte_at(s, 1) == 121 && byte_at(s, 2) == 115 && byte_at(s, 3) == 116 && byte_at(s, 4) == 101 && byte_at(s, 5) == 109 { Some(Keyword::System) }
+    else if s.len() == 5 && byte_at(s, 0) == 116 && byte_at(s, 1) == 97 && byte_at(s, 2) == 98 && byte_at(s, 3) == 108 && byte_at(s, 4) == 101 { Some(Keyword::Table) }
+    else if s.len() == 4 && byte_at(s, 0) == 116 && byte_at(s, 1) == 101 && byte_at(s, 2) == 120 && byte_at(s, 3) == 116 { Some(Keyword::Text) }
+    else if s.len() == 4 && byte_at(s, 0) == 116 && byte_at(s, 1) == 105 && byte_at(s, 2) == 109 && byte_at(s, 3) == 101 { Some(Keyword::Time) }
+    else if s.len() == 11 && byte_at(s, 0) == 116 && byte_at(s, 1) == 114 && byte_at(s, 2) == 97 && byte_at(s, 3) == 110 && byte_at(s, 4) == 115 && byte_at(s, 5) == 97 && byte_at(s, 6) == 99 && byte_at(s, 7) == 116 && byte_at(s, 8) == 105 && byte_at(s, 9) == 111 && byte_at(s, 10) == 110 { Some(Keyword::Transaction) }
+    else if s.len() == 4 && byte_at(s, 0) == 116 && byte_at(s, 1) == 114 && byte_at(s, 2) == 117 && byte_at(s, 3) == 101 { Some(Keyword::True) }
+    else if s.len() == 6 && byte_at(s, 0) == 117 && byte_at(s, 1) == 110 && byte_at(s, 2) == 105 && byte_at(s, 3) == 113 && byte_at(s, 4) == 117 && byte_at(s, 5) == 101 { Some(Keyword::Unique) }
+    else if s.len() == 6 && byte_at(s, 0) == 117 && byte_at(s, 1) == 112 && byte_at(s, 2) == 100 && byte_at(s, 3) == 97 && byte_at(s, 4) == 116 && byte_at(s, 5) == 101 { Some(Keyword::Update) }
+    else if s.len() == 6 && byte_at(s, 0) == 118 && byte_at(s, 1) == 97 && byte_at(s, 2) == 108 && byte_at(s, 3) == 117 && byte_at(s, 4) == 101 && byte_at(s, 5) == 115 { Some(Keyword::Values) }
+    else if s.len() == 7 && byte_at(s, 0) == 118 && byte_at(s, 1) == 97 && byte_at(s, 2) == 114 && byte_at(s, 3) == 99 && byte_at(s, 4) == 104 && byte_at(s, 5) == 97 && byte_at(s, 6) == 114 { Some(Keyword::Varchar) }
+    else if s.len() == 5 && byte_at(s, 0) == 119 && byte_at(s, 1) == 104 && byte_at(s, 2) == 101 && byte_at(s, 3) == 114 && byte_at(s, 4) == 101 { Some(Keyword::Where) }
+    else if s.len() == 5 && byte_at(s, 0) == 119 && byte_at(s, 1) == 114 && byte_at(s, 2) == 105 && byte_at(s, 3) == 116 && byte_at(s, 4) == 101 { Some(Keyword::Write) }
+    else { None }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g0(k: Keyword)
+    requires k == Keyword::As || k == Keyword::Asc || k == Keyword::And || k == Keyword::Begin || k == Keyword::Bool || k == Keyword::Boolean || k == Keyword::By || k == Keyword::Commit || k == Keyword::Create || k == Keyword::Cross || k == Keyword::Default,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::As => assert(classify_kw(kw_text(Keyword::As)) == Some(Keyword::As)),
+        Keyword::Asc => assert(classify_kw(kw_text(Keyword::Asc)) == Some(Keyword::Asc)),
+        Keyword::And => assert(classify_kw(kw_text(Keyword::And)) == Some(Keyword::And)),
+        Keyword::Begin => assert(classify_kw(kw_text(Keyword::Begin)) == Some(Keyword::Begin)),
+        Keyword::Bool => assert(classify_kw(kw_text(Keyword::Bool)) == Some(Keyword::Bool)),
+        Keyword::Boolean => assert(classify_kw(kw_text(Keyword::Boolean)) == Some(Keyword::Boolean)),
+        Keyword::By => assert(classify_kw(kw_text(Keyword::By)) == Some(Keyword::By)),
+        Keyword::Commit => assert(classify_kw(kw_text(Keyword::Commit)) == Some(Keyword::Commit)),
+        Keyword::Create => assert(classify_kw(kw_text(Keyword::Create)) == Some(Keyword::Create)),
+        Keyword::Cross => assert(classify_kw(kw_text(Keyword::Cross)) == Some(Keyword::Cross)),
+        Keyword::Default => assert(classify_kw(kw_text(Keyword::Default)) == Some(Keyword::Default)),
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g1(k: Keyword)
+    requires k == Keyword::Delete || k == Keyword::Desc || k == Keyword::Double || k == Keyword::Drop || k == Keyword::Exists || k == Keyword::Explain || k == Keyword::False || k == Keyword::Float || k == Keyword::From || k == Keyword::Group || k == Keyword::Having,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::Delete => assert(classify_kw(kw_text(Keyword::Delete)) == Some(Keyword::Delete)),
+        Keyword::Desc => assert(classify_kw(kw_text(Keyword::Desc)) == Some(Keyword::Desc)),
+        Keyword::Double => assert(classify_kw(kw_text(Keyword::Double)) == Some(Keyword::Double)),
+        Keyword::Drop => assert(classify_kw(kw_text(Keyword::Drop)) == Some(Keyword::Drop)),
+        Keyword::Exists => assert(classify_kw(kw_text(Keyword::Exists)) == Some(Keyword::Exists)),
+        Keyword::Explain => assert(classify_kw(kw_text(Keyword::Explain)) == Some(Keyword::Explain)),
+        Keyword::False => assert(classify_kw(kw_text(Keyword::False)) == Some(Keyword::False)),
+        Keyword::Float => assert(classify_kw(kw_text(Keyword::Float)) == Some(Keyword::Float)),
+        Keyword::From => assert(classify_kw(kw_text(Keyword::From)) == Some(Keyword::From)),
+        Keyword::Group => assert(classify_kw(kw_text(Keyword::Group)) == Some(Keyword::Group)),
+        Keyword::Having => assert(classify_kw(kw_text(Keyword::Having)) == Some(Keyword::Having)),
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g2(k: Keyword)
+    requires k == Keyword::If || k == Keyword::Index || k == Keyword::Infinity || k == Keyword::Inner || k == Keyword::Insert || k == Keyword::Int || k == Keyword::Integer || k == Keyword::Into || k == Keyword::Is || k == Keyword::Join || k == Keyword::Key,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::If => assert(classify_kw(kw_text(Keyword::If)) == Some(Keyword::If)),
+        Keyword::Index => assert(classify_kw(kw_text(Keyword::Index)) == Some(Keyword::Index)),
+        Keyword::Infinity => assert(classify_kw(kw_text(Keyword::Infinity)) == Some(Keyword::Infinity)),
+        Keyword::Inner => assert(classify_kw(kw_text(Keyword::Inner)) == Some(Keyword::Inner)),
+        Keyword::Insert => assert(classify_kw(kw_text(Keyword::Insert)) == Some(Keyword::Insert)),
+        Keyword::Int => assert(classify_kw(kw_text(Keyword::Int)) == Some(Keyword::Int)),
+        Keyword::Integer => assert(classify_kw(kw_text(Keyword::Integer)) == Some(Keyword::Integer)),
+        Keyword::Into => assert(classify_kw(kw_text(Keyword::Into)) == Some(Keyword::Into)),
+        Keyword::Is => assert(classify_kw(kw_text(Keyword::Is)) == Some(Keyword::Is)),
+        Keyword::Join => assert(classify_kw(kw_text(Keyword::Join)) == Some(Keyword::Join)),
+        Keyword::Key => assert(classify_kw(kw_text(Keyword::Key)) == Some(Keyword::Key)),
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g3(k: Keyword)
+    requires k == Keyword::Left || k == Keyword::Like || k == Keyword::Limit || k == Keyword::NaN || k == Keyword::Not || k == Keyword::Null || k == Keyword::Of || k == Keyword::Offset || k == Keyword::On || k == Keyword::Only || k == Keyword::Or,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::Left => assert(classify_kw(kw_text(Keyword::Left)) == Some(Keyword::Left)),
+        Keyword::Like => assert(classify_kw(kw_text(Keyword::Like)) == Some(Keyword::Like)),
+        Keyword::Limit => assert(classify_kw(kw_text(Keyword::Limit)) == Some(Keyword::Limit)),
+        Keyword::NaN => assert(classify_kw(kw_text(Keyword::NaN)) == Some(Keyword::NaN)),
+        Keyword::Not => assert(classify_kw(kw_text(Keyword::Not)) == Some(Keyword::Not)),
+        Keyword::Null => assert(classify_kw(kw_text(Keyword::Null)) == Some(Keyword::Null)),
+        Keyword::Of => assert(classify_kw(kw_text(Keyword::Of)) == Some(Keyword::Of)),
+        Keyword::Offset => assert(classify_kw(kw_text(Keyword::Offset)) == Some(Keyword::Offset)),
+        Keyword::On => assert(classify_kw(kw_text(Keyword::On)) == Some(Keyword::On)),
+        Keyword::Only => assert(classify_kw(kw_text(Keyword::Only)) == Some(Keyword::Only)),
+        Keyword::Or => assert(classify_kw(kw_text(Keyword::Or)) == Some(Keyword::Or)),
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g4(k: Keyword)
+    requires k == Keyword::Order || k == Keyword::Outer || k == Keyword::Primary || k == Keyword::Read || k == Keyword::References || k == Keyword::Right || k == Keyword::Rollback || k == Keyword::Select || k == Keyword::Set || k == Keyword::String || k == Keyword::System,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::Order => assert(classify_kw(kw_text(Keyword::Order)) == Some(Keyword::Order)),
+        Keyword::Outer => assert(classify_kw(kw_text(Keyword::Outer)) == Some(Keyword::Outer)),
+        Keyword::Primary => assert(classify_kw(kw_text(Keyword::Primary)) == Some(Keyword::Primary)),
+        Keyword::Read => assert(classify_kw(kw_text(Keyword::Read)) == Some(Keyword::Read)),
+        Keyword::References => assert(classify_kw(kw_text(Keyword::References)) == Some(Keyword::References)),
+        Keyword::Right => assert(classify_kw(kw_text(Keyword::Right)) == Some(Keyword::Right)),
+        Keyword::Rollback => assert(classify_kw(kw_text(Keyword::Rollback)) == Some(Keyword::Rollback)),
+        Keyword::Select => assert(classify_kw(kw_text(Keyword::Select)) == Some(Keyword::Select)),
+        Keyword::Set => assert(classify_kw(kw_text(Keyword::Set)) == Some(Keyword::Set)),
+        Keyword::String => assert(classify_kw(kw_text(Keyword::String)) == Some(Keyword::String)),
+        Keyword::System => assert(classify_kw(kw_text(Keyword::System)) == Some(Keyword::System)),
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_classify_kw_text_g5(k: Keyword)
+    requires k == Keyword::Table || k == Keyword::Text || k == Keyword::Time || k == Keyword::Transaction || k == Keyword::True || k == Keyword::Unique || k == Keyword::Update || k == Keyword::Values || k == Keyword::Varchar || k == Keyword::Where || k == Keyword::Write,
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::Table => assert(classify_kw(kw_text(Keyword::Table)) == Some(Keyword::Table)),
+        Keyword::Text => assert(classify_kw(kw_text(Keyword::Text)) == Some(Keyword::Text)),
+        Keyword::Time => assert(classify_kw(kw_text(Keyword::Time)) == Some(Keyword::Time)),
+        Keyword::Transaction => assert(classify_kw(kw_text(Keyword::Transaction)) == Some(Keyword::Transaction)),
+        Keyword::True => assert(classify_kw(kw_text(Keyword::True)) == Some(Keyword::True)),
+        Keyword::Unique => assert(classify_kw(kw_text(Keyword::Unique)) == Some(Keyword::Unique)),
+        Keyword::Update => assert(classify_kw(kw_text(Keyword::Update)) == Some(Keyword::Update)),
+        Keyword::Values => assert(classify_kw(kw_text(Keyword::Values)) == Some(Keyword::Values)),
+        Keyword::Varchar => assert(classify_kw(kw_text(Keyword::Varchar)) == Some(Keyword::Varchar)),
+        Keyword::Where => assert(classify_kw(kw_text(Keyword::Where)) == Some(Keyword::Where)),
+        Keyword::Write => assert(classify_kw(kw_text(Keyword::Write)) == Some(Keyword::Write)),
+        _ => {},
+    }
+}
+
+/// The keyword table round-trips: classifying a keyword's own text recovers
+/// it (the table is injective on its domain). Split into grouped helpers so
+/// each SMT query stays under the resource limit.
+pub proof fn lemma_classify_kw_text(k: Keyword)
+    ensures classify_kw(kw_text(k)) == Some(k),
+{
+    match k {
+        Keyword::As | Keyword::Asc | Keyword::And | Keyword::Begin | Keyword::Bool | Keyword::Boolean | Keyword::By | Keyword::Commit | Keyword::Create | Keyword::Cross | Keyword::Default => lemma_classify_kw_text_g0(k),
+        Keyword::Delete | Keyword::Desc | Keyword::Double | Keyword::Drop | Keyword::Exists | Keyword::Explain | Keyword::False | Keyword::Float | Keyword::From | Keyword::Group | Keyword::Having => lemma_classify_kw_text_g1(k),
+        Keyword::If | Keyword::Index | Keyword::Infinity | Keyword::Inner | Keyword::Insert | Keyword::Int | Keyword::Integer | Keyword::Into | Keyword::Is | Keyword::Join | Keyword::Key => lemma_classify_kw_text_g2(k),
+        Keyword::Left | Keyword::Like | Keyword::Limit | Keyword::NaN | Keyword::Not | Keyword::Null | Keyword::Of | Keyword::Offset | Keyword::On | Keyword::Only | Keyword::Or => lemma_classify_kw_text_g3(k),
+        Keyword::Order | Keyword::Outer | Keyword::Primary | Keyword::Read | Keyword::References | Keyword::Right | Keyword::Rollback | Keyword::Select | Keyword::Set | Keyword::String | Keyword::System => lemma_classify_kw_text_g4(k),
+        Keyword::Table | Keyword::Text | Keyword::Time | Keyword::Transaction | Keyword::True | Keyword::Unique | Keyword::Update | Keyword::Values | Keyword::Varchar | Keyword::Where | Keyword::Write => lemma_classify_kw_text_g5(k),
+    }
+}
+
+/// Executable keyword classifier, refining `classify_kw`. Length-guarded byte
+/// comparisons (short-circuit `&&` keeps every index in bounds).
+#[verifier::spinoff_prover]
+pub fn classify_kw_exec(s: &Vec<u8>) -> (r: Option<Keyword>)
+    ensures r == classify_kw(s@),
+{
+    if s.len() == 2 && s[0] == 97u8 && s[1] == 115u8 { return Some(Keyword::As); }
+    if s.len() == 3 && s[0] == 97u8 && s[1] == 115u8 && s[2] == 99u8 { return Some(Keyword::Asc); }
+    if s.len() == 3 && s[0] == 97u8 && s[1] == 110u8 && s[2] == 100u8 { return Some(Keyword::And); }
+    if s.len() == 5 && s[0] == 98u8 && s[1] == 101u8 && s[2] == 103u8 && s[3] == 105u8 && s[4] == 110u8 { return Some(Keyword::Begin); }
+    if s.len() == 4 && s[0] == 98u8 && s[1] == 111u8 && s[2] == 111u8 && s[3] == 108u8 { return Some(Keyword::Bool); }
+    if s.len() == 7 && s[0] == 98u8 && s[1] == 111u8 && s[2] == 111u8 && s[3] == 108u8 && s[4] == 101u8 && s[5] == 97u8 && s[6] == 110u8 { return Some(Keyword::Boolean); }
+    if s.len() == 2 && s[0] == 98u8 && s[1] == 121u8 { return Some(Keyword::By); }
+    if s.len() == 6 && s[0] == 99u8 && s[1] == 111u8 && s[2] == 109u8 && s[3] == 109u8 && s[4] == 105u8 && s[5] == 116u8 { return Some(Keyword::Commit); }
+    if s.len() == 6 && s[0] == 99u8 && s[1] == 114u8 && s[2] == 101u8 && s[3] == 97u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Create); }
+    if s.len() == 5 && s[0] == 99u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 115u8 && s[4] == 115u8 { return Some(Keyword::Cross); }
+    if s.len() == 7 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 97u8 && s[4] == 117u8 && s[5] == 108u8 && s[6] == 116u8 { return Some(Keyword::Default); }
+    if s.len() == 6 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 108u8 && s[3] == 101u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Delete); }
+    if s.len() == 4 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 115u8 && s[3] == 99u8 { return Some(Keyword::Desc); }
+    if s.len() == 6 && s[0] == 100u8 && s[1] == 111u8 && s[2] == 117u8 && s[3] == 98u8 && s[4] == 108u8 && s[5] == 101u8 { return Some(Keyword::Double); }
+    if s.len() == 4 && s[0] == 100u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 112u8 { return Some(Keyword::Drop); }
+    if s.len() == 6 && s[0] == 101u8 && s[1] == 120u8 && s[2] == 105u8 && s[3] == 115u8 && s[4] == 116u8 && s[5] == 115u8 { return Some(Keyword::Exists); }
+    if s.len() == 7 && s[0] == 101u8 && s[1] == 120u8 && s[2] == 112u8 && s[3] == 108u8 && s[4] == 97u8 && s[5] == 105u8 && s[6] == 110u8 { return Some(Keyword::Explain); }
+    if s.len() == 5 && s[0] == 102u8 && s[1] == 97u8 && s[2] == 108u8 && s[3] == 115u8 && s[4] == 101u8 { return Some(Keyword::False); }
+    if s.len() == 5 && s[0] == 102u8 && s[1] == 108u8 && s[2] == 111u8 && s[3] == 97u8 && s[4] == 116u8 { return Some(Keyword::Float); }
+    if s.len() == 4 && s[0] == 102u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 109u8 { return Some(Keyword::From); }
+    if s.len() == 5 && s[0] == 103u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 117u8 && s[4] == 112u8 { return Some(Keyword::Group); }
+    if s.len() == 6 && s[0] == 104u8 && s[1] == 97u8 && s[2] == 118u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 103u8 { return Some(Keyword::Having); }
+    if s.len() == 2 && s[0] == 105u8 && s[1] == 102u8 { return Some(Keyword::If); }
+    if s.len() == 5 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 100u8 && s[3] == 101u8 && s[4] == 120u8 { return Some(Keyword::Index); }
+    if s.len() == 8 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 102u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 105u8 && s[6] == 116u8 && s[7] == 121u8 { return Some(Keyword::Infinity); }
+    if s.len() == 5 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 110u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Inner); }
+    if s.len() == 6 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 115u8 && s[3] == 101u8 && s[4] == 114u8 && s[5] == 116u8 { return Some(Keyword::Insert); }
+    if s.len() == 3 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 { return Some(Keyword::Int); }
+    if s.len() == 7 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 && s[3] == 101u8 && s[4] == 103u8 && s[5] == 101u8 && s[6] == 114u8 { return Some(Keyword::Integer); }
+    if s.len() == 4 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 && s[3] == 111u8 { return Some(Keyword::Into); }
+    if s.len() == 2 && s[0] == 105u8 && s[1] == 115u8 { return Some(Keyword::Is); }
+    if s.len() == 4 && s[0] == 106u8 && s[1] == 111u8 && s[2] == 105u8 && s[3] == 110u8 { return Some(Keyword::Join); }
+    if s.len() == 3 && s[0] == 107u8 && s[1] == 101u8 && s[2] == 121u8 { return Some(Keyword::Key); }
+    if s.len() == 4 && s[0] == 108u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 116u8 { return Some(Keyword::Left); }
+    if s.len() == 4 && s[0] == 108u8 && s[1] == 105u8 && s[2] == 107u8 && s[3] == 101u8 { return Some(Keyword::Like); }
+    if s.len() == 5 && s[0] == 108u8 && s[1] == 105u8 && s[2] == 109u8 && s[3] == 105u8 && s[4] == 116u8 { return Some(Keyword::Limit); }
+    if s.len() == 3 && s[0] == 110u8 && s[1] == 97u8 && s[2] == 110u8 { return Some(Keyword::NaN); }
+    if s.len() == 3 && s[0] == 110u8 && s[1] == 111u8 && s[2] == 116u8 { return Some(Keyword::Not); }
+    if s.len() == 4 && s[0] == 110u8 && s[1] == 117u8 && s[2] == 108u8 && s[3] == 108u8 { return Some(Keyword::Null); }
+    if s.len() == 2 && s[0] == 111u8 && s[1] == 102u8 { return Some(Keyword::Of); }
+    if s.len() == 6 && s[0] == 111u8 && s[1] == 102u8 && s[2] == 102u8 && s[3] == 115u8 && s[4] == 101u8 && s[5] == 116u8 { return Some(Keyword::Offset); }
+    if s.len() == 2 && s[0] == 111u8 && s[1] == 110u8 { return Some(Keyword::On); }
+    if s.len() == 4 && s[0] == 111u8 && s[1] == 110u8 && s[2] == 108u8 && s[3] == 121u8 { return Some(Keyword::Only); }
+    if s.len() == 2 && s[0] == 111u8 && s[1] == 114u8 { return Some(Keyword::Or); }
+    if s.len() == 5 && s[0] == 111u8 && s[1] == 114u8 && s[2] == 100u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Order); }
+    if s.len() == 5 && s[0] == 111u8 && s[1] == 117u8 && s[2] == 116u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Outer); }
+    if s.len() == 7 && s[0] == 112u8 && s[1] == 114u8 && s[2] == 105u8 && s[3] == 109u8 && s[4] == 97u8 && s[5] == 114u8 && s[6] == 121u8 { return Some(Keyword::Primary); }
+    if s.len() == 4 && s[0] == 114u8 && s[1] == 101u8 && s[2] == 97u8 && s[3] == 100u8 { return Some(Keyword::Read); }
+    if s.len() == 10 && s[0] == 114u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 101u8 && s[4] == 114u8 && s[5] == 101u8 && s[6] == 110u8 && s[7] == 99u8 && s[8] == 101u8 && s[9] == 115u8 { return Some(Keyword::References); }
+    if s.len() == 5 && s[0] == 114u8 && s[1] == 105u8 && s[2] == 103u8 && s[3] == 104u8 && s[4] == 116u8 { return Some(Keyword::Right); }
+    if s.len() == 8 && s[0] == 114u8 && s[1] == 111u8 && s[2] == 108u8 && s[3] == 108u8 && s[4] == 98u8 && s[5] == 97u8 && s[6] == 99u8 && s[7] == 107u8 { return Some(Keyword::Rollback); }
+    if s.len() == 6 && s[0] == 115u8 && s[1] == 101u8 && s[2] == 108u8 && s[3] == 101u8 && s[4] == 99u8 && s[5] == 116u8 { return Some(Keyword::Select); }
+    if s.len() == 3 && s[0] == 115u8 && s[1] == 101u8 && s[2] == 116u8 { return Some(Keyword::Set); }
+    if s.len() == 6 && s[0] == 115u8 && s[1] == 116u8 && s[2] == 114u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 103u8 { return Some(Keyword::String); }
+    if s.len() == 6 && s[0] == 115u8 && s[1] == 121u8 && s[2] == 115u8 && s[3] == 116u8 && s[4] == 101u8 && s[5] == 109u8 { return Some(Keyword::System); }
+    if s.len() == 5 && s[0] == 116u8 && s[1] == 97u8 && s[2] == 98u8 && s[3] == 108u8 && s[4] == 101u8 { return Some(Keyword::Table); }
+    if s.len() == 4 && s[0] == 116u8 && s[1] == 101u8 && s[2] == 120u8 && s[3] == 116u8 { return Some(Keyword::Text); }
+    if s.len() == 4 && s[0] == 116u8 && s[1] == 105u8 && s[2] == 109u8 && s[3] == 101u8 { return Some(Keyword::Time); }
+    if s.len() == 11 && s[0] == 116u8 && s[1] == 114u8 && s[2] == 97u8 && s[3] == 110u8 && s[4] == 115u8 && s[5] == 97u8 && s[6] == 99u8 && s[7] == 116u8 && s[8] == 105u8 && s[9] == 111u8 && s[10] == 110u8 { return Some(Keyword::Transaction); }
+    if s.len() == 4 && s[0] == 116u8 && s[1] == 114u8 && s[2] == 117u8 && s[3] == 101u8 { return Some(Keyword::True); }
+    if s.len() == 6 && s[0] == 117u8 && s[1] == 110u8 && s[2] == 105u8 && s[3] == 113u8 && s[4] == 117u8 && s[5] == 101u8 { return Some(Keyword::Unique); }
+    if s.len() == 6 && s[0] == 117u8 && s[1] == 112u8 && s[2] == 100u8 && s[3] == 97u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Update); }
+    if s.len() == 6 && s[0] == 118u8 && s[1] == 97u8 && s[2] == 108u8 && s[3] == 117u8 && s[4] == 101u8 && s[5] == 115u8 { return Some(Keyword::Values); }
+    if s.len() == 7 && s[0] == 118u8 && s[1] == 97u8 && s[2] == 114u8 && s[3] == 99u8 && s[4] == 104u8 && s[5] == 97u8 && s[6] == 114u8 { return Some(Keyword::Varchar); }
+    if s.len() == 5 && s[0] == 119u8 && s[1] == 104u8 && s[2] == 101u8 && s[3] == 114u8 && s[4] == 101u8 { return Some(Keyword::Where); }
+    if s.len() == 5 && s[0] == 119u8 && s[1] == 114u8 && s[2] == 105u8 && s[3] == 116u8 && s[4] == 101u8 { return Some(Keyword::Write); }
+    None
+}
+
 
 } // verus!
