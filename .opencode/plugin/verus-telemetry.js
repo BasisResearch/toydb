@@ -22,7 +22,7 @@
 // logic is shared with the other adapters. The plugin resolves the repo root
 // from its own location and runs the scripts from the checked-out toyDB.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,13 +34,62 @@ const PKG_DIR = join(REPO_ROOT, ".claude", "hooks");
 const RUNNER = join(REPO_ROOT, ".opencode", "plugin", "verus_runner.py");
 const BRANCH_GUARD = join(PKG_DIR, "branch_guard.py");
 
+// session.idle fires after every turn, so a synchronous capture would block the
+// event loop on each one while the ingest endpoint responds. Coalesce bursts
+// per session behind a short debounce, then fire the capture as a detached,
+// non-blocking child. Capture is idempotent (upsert by session_id), so
+// dropping intermediate idles loses nothing.
+const CAPTURE_DEBOUNCE_MS = 2000;
+const CAPTURE_TIMEOUT_MS = 60000;
+const captureTimers = new Map();
+
 function runPython(args, extraEnv) {
   const env = { ...process.env, PYTHONPATH: PKG_DIR, ...(extraEnv || {}) };
   return spawnSync("python3", [RUNNER, ...args], {
     env,
     encoding: "utf-8",
-    timeout: 60000,
+    timeout: CAPTURE_TIMEOUT_MS,
   });
+}
+
+// Fire-and-forget capture: spawn asynchronously, ignore all stdio, and unref so
+// the child never keeps opencode alive or blocks its event loop. A self-kill
+// timer bounds a hung upload; every failure path is swallowed.
+function spawnCapture(args) {
+  try {
+    const child = spawn("python3", [RUNNER, ...args], {
+      env: { ...process.env, PYTHONPATH: PKG_DIR },
+      stdio: "ignore",
+    });
+    child.on("error", () => {});
+    const killer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch (_err) {
+        // already gone
+      }
+    }, CAPTURE_TIMEOUT_MS);
+    if (typeof killer.unref === "function") killer.unref();
+    child.on("exit", () => clearTimeout(killer));
+    child.unref();
+  } catch (_err) {
+    // Never break the user's session on a telemetry error.
+  }
+}
+
+function scheduleCapture(sessionId, directory) {
+  const key = sessionId || "";
+  const existing = captureTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    captureTimers.delete(key);
+    const args = ["capture"];
+    if (sessionId) args.push(sessionId);
+    if (directory) args.push("--directory", directory);
+    spawnCapture(args);
+  }, CAPTURE_DEBOUNCE_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  captureTimers.set(key, timer);
 }
 
 export const VerusTelemetry = async ({ project, directory }) => {
@@ -87,10 +136,7 @@ export const VerusTelemetry = async ({ project, directory }) => {
         if (event.type === "session.idle") {
           const sessionId =
             event.properties && event.properties.sessionID;
-          const args = ["capture"];
-          if (sessionId) args.push(sessionId);
-          if (directory) args.push("--directory", directory);
-          runPython(args);
+          scheduleCapture(sessionId, directory);
         }
       } catch (_err) {
         // Never break the user's session on a telemetry error.

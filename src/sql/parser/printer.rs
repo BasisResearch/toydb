@@ -989,7 +989,7 @@ fn print_from(from: &ast::From) -> Option<Vec<Token>> {
 
 #[cfg(test)]
 mod tests {
-    use super::print_expr;
+    use super::{Token, print_expr};
     use crate::sql::parser::Parser;
     use crate::sql::parser::ast::{Expression, Literal, Operator};
     use proptest::prelude::*;
@@ -1000,6 +1000,28 @@ mod tests {
 
     fn column(name: &str) -> Expression {
         Expression::Column(None, name.into())
+    }
+
+    /// Serialises canonical tokens to SQL source text, quoting and escaping so
+    /// the lexer reproduces each token exactly.
+    ///
+    /// `Token`'s `Display` is lossy for `Ident` and `String` — it writes the raw
+    /// payload with no quoting, so re-lexing a keyword-named, mixed-case, empty,
+    /// or quote-containing identifier (or a `'`-containing string) would diverge.
+    /// Always double-quoting identifiers and single-quoting strings sidesteps all
+    /// of that, so `print -> render -> lex -> parse` is a faithful roundtrip
+    /// rather than the token-level `print -> parse_tokens` shortcut. Tokens are
+    /// space-separated, which never merges adjacent tokens and is valid anywhere.
+    fn render_tokens(tokens: &[Token]) -> String {
+        tokens
+            .iter()
+            .map(|token| match token {
+                Token::Ident(name) => format!("\"{}\"", name.replace('"', "\"\"")),
+                Token::String(value) => format!("'{}'", value.replace('\'', "''")),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn roundtrip(expression: Expression) {
@@ -1258,6 +1280,26 @@ mod tests {
             prop_assert_eq!(Parser::parse_statement_tokens(&tokens), Ok(statement));
         }
 
+        // Source-level counterparts to the two token-level roundtrips above:
+        // render the tokens to SQL text and re-lex, so the lexer's case folding,
+        // keyword recognition, and quote handling are exercised — the divergences
+        // a token-only roundtrip cannot see.
+        #[test]
+        fn parser_inverts_the_printer_through_sql_source(expression in expressions()) {
+            let tokens = print_expr(&expression)
+                .expect("the strategy only generates parser-producible expressions");
+            let sql = render_tokens(&tokens);
+            prop_assert_eq!(Parser::parse_expr(&sql), Ok(expression), "diverged for {:?}", sql);
+        }
+
+        #[test]
+        fn parser_inverts_the_statement_printer_through_sql_source(statement in statements()) {
+            let tokens = super::print_statement(&statement)
+                .expect("the strategy only generates parser-producible statements");
+            let sql = render_tokens(&tokens);
+            prop_assert_eq!(Parser::parse(&sql), Ok(statement), "diverged for {:?}", sql);
+        }
+
         #[test]
         fn canonical_expression_printer_is_injective(
             left in expressions(),
@@ -1282,6 +1324,31 @@ mod tests {
             if left_tokens == right_tokens {
                 prop_assert_eq!(left, right);
             }
+        }
+    }
+
+    #[test]
+    fn source_roundtrip_handles_tricky_identifiers_and_strings() {
+        // The exact cases the token-level roundtrip waves through but a real
+        // re-lex would catch: keyword-named, mixed-case, empty, and qualified
+        // keyword identifiers, plus quote-containing and empty strings.
+        for expression in [
+            column("select"),
+            column("MixedCase"),
+            column(""),
+            Expression::Column(Some("Order".into()), "By".into()),
+            Expression::Function("count".into(), vec![column("x")]),
+            Expression::Literal(Literal::String("a'b".into())),
+            Expression::Literal(Literal::String("has \" quote".into())),
+            Expression::Literal(Literal::String(String::new())),
+        ] {
+            let tokens = print_expr(&expression).expect("expression should be printable");
+            let sql = render_tokens(&tokens);
+            assert_eq!(
+                Parser::parse_expr(&sql),
+                Ok(expression),
+                "source roundtrip diverged for {sql:?}"
+            );
         }
     }
 
