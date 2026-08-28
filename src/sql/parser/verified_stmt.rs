@@ -3496,6 +3496,147 @@ pub fn parse_begin_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+#[verifier::rlimit(20000)]
+pub fn parse_columns_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<ast::Column>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_columns(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(vv) => sopt is Some && view_columns(vv@) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_columns, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    if fuel == 0 {
+        proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+        return (None, pos);
+    }
+    let (copt, cpos) = parse_column_exec(toks, pos, fuel);
+    match copt {
+        Some(col) => {
+            if cpos >= toks.len() {
+                proof { token_views_len(toks@.subrange(cpos as int, toks@.len() as int)); }
+                (None, pos)
+            } else {
+                proof { token_views_suffix(toks@, cpos as int); }
+                match &toks[cpos] {
+                    super::Token::CloseParen => {
+                        let mut v: Vec<ast::Column> = Vec::new();
+                        v.push(col);
+                        proof {
+                            view_columns_step(v@);
+                            assert(v@.drop_first() =~= Seq::<ast::Column>::empty());
+                        }
+                        (Some(v), cpos)
+                    },
+                    super::Token::Comma => {
+                        let (mopt, mpos) = parse_columns_exec(toks, cpos + 1, fuel - 1);
+                        match mopt {
+                            Some(mut more) => {
+                                let mut v: Vec<ast::Column> = Vec::new();
+                                v.push(col);
+                                let ghost first = v@;
+                                let ghost more_old = more@;
+                                v.append(&mut more);
+                                proof {
+                                    assert(v@ =~= first + more_old);
+                                    view_columns_step(v@);
+                                    assert(v@.drop_first() =~= more_old);
+                                }
+                                (Some(v), mpos)
+                            },
+                            None => (None, pos),
+                        }
+                    },
+                    _ => (None, pos),
+                }
+            }
+        },
+        None => (None, pos),
+    }
+}
+
+#[verifier::rlimit(20000)]
+pub fn parse_createtable_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_create(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && pos + 1 < toks.len() && pos + 2 < toks.len() && pos + 3 < toks.len()
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Table))
+        && matches!(toks[pos + 3], super::Token::OpenParen) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+            token_views_suffix(toks@, pos as int + 2);
+            token_views_suffix(toks@, pos as int + 3);
+        }
+        match &toks[pos + 2] {
+            super::Token::Ident(name) => {
+                let (copt, cpos) = parse_columns_exec(toks, pos + 4, fuel);
+                match copt {
+                    Some(cols) => {
+                        if cpos < toks.len() && matches!(toks[cpos], super::Token::CloseParen) {
+                            proof { token_views_suffix(toks@, cpos as int); }
+                            (
+                                Some(ast::Statement::CreateTable { name: name.clone(), columns: cols }),
+                                cpos + 1,
+                            )
+                        } else {
+                            if cpos < toks.len() {
+                                proof { token_views_suffix(toks@, cpos as int); }
+                            } else {
+                                proof { token_views_len(toks@.subrange(cpos as int, toks@.len() as int)); }
+                            }
+                            (None, pos)
+                        }
+                    },
+                    None => (None, pos),
+                }
+            },
+            _ => (None, pos),
+        }
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+                if pos + 2 < toks.len() {
+                    proof { token_views_suffix(toks@, pos as int + 2); }
+                    if pos + 3 < toks.len() {
+                        proof { token_views_suffix(toks@, pos as int + 3); }
+                    } else {
+                        proof { token_views_len(toks@.subrange(pos as int + 3, toks@.len() as int)); }
+                    }
+                } else {
+                    proof { token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int)); }
+                }
+            } else {
+                proof { token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int)); }
+            }
+        }
+        (None, pos)
+    }
+}
+
 pub open spec fn is_sbegin(s: SStmt) -> bool {
     match s {
         SStmt::Begin { .. } => true,
