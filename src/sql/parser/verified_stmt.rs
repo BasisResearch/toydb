@@ -54,6 +54,7 @@ pub enum SStmt {
     DropTable { name: String, if_exists: bool },
     Delete { table: String, where_clause: Option<SExpr> },
     Insert { table: String, columns: Option<Seq<String>>, values: Seq<Seq<SExpr>> },
+    Update { table: String, set: Seq<(String, Option<SExpr>)>, where_clause: Option<SExpr> },
     Select {
         select: Seq<(SExpr, Option<String>)>,
         from: Seq<SFrom>,
@@ -198,6 +199,30 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
                 Some(e) => Some(view_expr(e)),
                 None => None,
             },
+        },
+        // S4: `Update.set` is a `BTreeMap`, whose spec view is an *unordered*
+        // `Map` — a pure `spec fn` cannot canonicalise it to the sorted mirror
+        // sequence in general (see plan). The single-assignment case needs no
+        // ordering: the sole (key, value) is recovered with `dom().choose()`.
+        // Multi-assignment maps map to `Unsupported` until the executable,
+        // sorted-`iter()` bridge lands.
+        ast::Statement::Update { table, set, where_clause } => {
+            if set@.dom().len() == 1 {
+                let k = set@.dom().choose();
+                SStmt::Update {
+                    table,
+                    set: seq![(k, match set@[k] {
+                        Some(e) => Some(view_expr(e)),
+                        None => None,
+                    })],
+                    where_clause: match where_clause {
+                        Some(e) => Some(view_expr(e)),
+                        None => None,
+                    },
+                }
+            } else {
+                SStmt::Unsupported
+            }
         },
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
@@ -468,6 +493,12 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
                     Some(names) => names.len() >= 1,
                     None => true,
                 }),
+        SStmt::Update { set, where_clause, .. } =>
+            set.len() >= 1 && all_printable_assigns(set)
+                && (match where_clause {
+                    Some(e) => printable_se(e),
+                    None => true,
+                }),
         // This checkpoint handles SELECT list + FROM + WHERE; the remaining
         // clauses are constrained empty/None until they are wired in.
         SStmt::Select {
@@ -552,6 +583,15 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
             Some(names) => seq![TokenView::OpenParen] + sprint_names(names) + seq![TokenView::CloseParen],
             None => Seq::empty(),
         }) + seq![TokenView::Keyword(Keyword::Values)] + sprint_rows(values),
+        SStmt::Update { table, set, where_clause } => seq![
+            TokenView::Keyword(Keyword::Update),
+            TokenView::Ident(table),
+            TokenView::Keyword(Keyword::Set),
+        ] + sprint_set_list(set)
+            + (match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::empty(),
+            }),
         SStmt::Select { select, from, where_clause, .. } =>
             seq![TokenView::Keyword(Keyword::Select)] + sprint_select_list(select)
                 + (if from.len() > 0 {
@@ -577,6 +617,11 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
         SStmt::CreateTable { columns, .. } => 1 + slist_depth_columns(columns),
         SStmt::Delete { where_clause: Some(e), .. } => 1 + sdepth(e),
         SStmt::Insert { columns, values, .. } => insert_fuel(columns, values),
+        SStmt::Update { set, where_clause, .. } =>
+            (1 + set_list_depth(set) + (match where_clause {
+                Some(e) => sdepth(e),
+                None => 0nat,
+            })) as nat,
         SStmt::Select { select, from, where_clause, .. } =>
             (1 + select_list_depth(select) + from_list_depth(from)
                 + (match where_clause {
@@ -741,6 +786,36 @@ pub open spec fn sparse_select(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
+/// `UPDATE table SET assignments [WHERE e]`. `input[0]` is known to be `UPDATE`.
+pub open spec fn sparse_update(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>) {
+    if input.len() >= 3 && input[2] == TokenView::Keyword(Keyword::Set) {
+        match input[1] {
+            TokenView::Ident(table) => match sparse_set_list(
+                input.drop_first().drop_first().drop_first(),
+                fuel,
+            ) {
+                (Some(set), r) => {
+                    if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Where) {
+                        match sparse(r.drop_first(), fuel) {
+                            (Some(e), r2) => (
+                                Some(SStmt::Update { table, set, where_clause: Some(e) }),
+                                r2,
+                            ),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (Some(SStmt::Update { table, set, where_clause: None }), r)
+                    }
+                },
+                (None, _) => (None, input),
+            },
+            _ => (None, input),
+        }
+    } else {
+        (None, input)
+    }
+}
+
 pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>, Seq<TokenView>)
     decreases fuel,
 {
@@ -755,6 +830,7 @@ pub open spec fn sparse_stmt(input: Seq<TokenView>, fuel: nat) -> (Option<SStmt>
             TokenView::Keyword(Keyword::Drop) => sparse_drop(input),
             TokenView::Keyword(Keyword::Delete) => sparse_delete(input, fuel),
             TokenView::Keyword(Keyword::Insert) => sparse_insert(input, fuel),
+            TokenView::Keyword(Keyword::Update) => sparse_update(input, fuel),
             TokenView::Keyword(Keyword::Select) => sparse_select(input, fuel),
             TokenView::Keyword(Keyword::Explain) => {
                 match sparse_stmt(input.drop_first(), (fuel - 1) as nat) {
@@ -947,6 +1023,45 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
                     assert(names_tail.drop_first().drop_first() =~= sprint_rows(values));
                 },
             }
+        },
+        SStmt::Update { table, set, where_clause } => {
+            let wherepart = match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::<TokenView>::empty(),
+            };
+            let head = seq![
+                TokenView::Keyword(Keyword::Update),
+                TokenView::Ident(table),
+                TokenView::Keyword(Keyword::Set),
+            ];
+            assert(tokens =~= head + sprint_set_list(set) + wherepart);
+            assert(tokens[0] == TokenView::Keyword(Keyword::Update));
+            assert(tokens[1] == TokenView::Ident(table));
+            assert(tokens[2] == TokenView::Keyword(Keyword::Set));
+            assert(tokens.drop_first().drop_first().drop_first() =~= sprint_set_list(set) + wherepart);
+            assert(wherepart.len() == 0
+                || (wherepart[0] != TokenView::Comma
+                    && wherepart[0] != TokenView::Period
+                    && wherepart[0] != TokenView::OpenParen)) by {
+                match where_clause {
+                    Some(e) => { assert(wherepart[0] == TokenView::Keyword(Keyword::Where)); },
+                    None => { assert(wherepart =~= Seq::<TokenView>::empty()); },
+                }
+            }
+            lemma_sparse_set_list_sprint(set, wherepart, fuel);
+            match where_clause {
+                Some(e) => {
+                    assert(wherepart =~= seq![TokenView::Keyword(Keyword::Where)] + sprint(e));
+                    assert(wherepart[0] == TokenView::Keyword(Keyword::Where));
+                    assert(wherepart.drop_first() =~= sprint(e));
+                    assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
+                    lemma_sparse_sprint(e, Seq::<TokenView>::empty(), fuel);
+                },
+                None => {
+                    assert(wherepart =~= Seq::<TokenView>::empty());
+                },
+            }
+            assert(sparse_update(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
             let frompart = if from.len() > 0 {
@@ -2162,6 +2277,186 @@ pub proof fn lemma_sparse_from_list_sprint(froms: Seq<SFrom>, tail: Seq<TokenVie
         assert(item_tail.drop_first() =~= sprint_from_list(rest) + tail);
         assert(seq![froms[0]] + rest =~= froms);
         assert(sparse_from_list(sprint_from_list(froms) + tail, fuel) == (Some(froms), tail));
+    }
+}
+
+// -- UPDATE SET list (S4): `k = expr` or `k = DEFAULT`, comma-separated -------
+
+pub open spec fn sprint_assign(a: (String, Option<SExpr>)) -> Seq<TokenView> {
+    seq![TokenView::Ident(a.0), TokenView::Equal] + (match a.1 {
+        Some(e) => sprint(e),
+        None => seq![TokenView::Keyword(Keyword::Default)],
+    })
+}
+
+pub open spec fn printable_assign(a: (String, Option<SExpr>)) -> bool {
+    match a.1 {
+        Some(e) => printable_se(e),
+        None => true,
+    }
+}
+
+pub open spec fn assign_depth(a: (String, Option<SExpr>)) -> nat {
+    match a.1 {
+        Some(e) => sdepth(e),
+        None => 1,
+    }
+}
+
+pub open spec fn sprint_set_list(items: Seq<(String, Option<SExpr>)>) -> Seq<TokenView>
+    decreases items,
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else if items.len() == 1 {
+        sprint_assign(items[0])
+    } else {
+        sprint_assign(items[0]) + seq![TokenView::Comma] + sprint_set_list(items.drop_first())
+    }
+}
+
+pub open spec fn set_list_depth(items: Seq<(String, Option<SExpr>)>) -> nat
+    decreases items,
+{
+    if items.len() == 0 {
+        1
+    } else {
+        let d = assign_depth(items[0]);
+        let rest = set_list_depth(items.drop_first());
+        1 + (if d >= rest { d } else { rest })
+    }
+}
+
+pub open spec fn all_printable_assigns(items: Seq<(String, Option<SExpr>)>) -> bool
+    decreases items,
+{
+    if items.len() == 0 {
+        true
+    } else {
+        printable_assign(items[0]) && all_printable_assigns(items.drop_first())
+    }
+}
+
+/// Parse `k = expr` or `k = DEFAULT`. The expr is tried first; `DEFAULT` is a
+/// keyword that never starts an expression, so `sparse` fails on it and the
+/// `DEFAULT` fallback fires — no `sprint(e)[0] != DEFAULT` fact is needed.
+#[verifier::opaque]
+pub open spec fn sparse_assign(input: Seq<TokenView>, fuel: nat) -> (Option<(String, Option<SExpr>)>, Seq<TokenView>) {
+    if input.len() >= 2 && input[1] == TokenView::Equal {
+        match input[0] {
+            TokenView::Ident(k) => {
+                let rest = input.drop_first().drop_first();
+                match sparse(rest, fuel) {
+                    (Some(e), r) => (Some((k, Some(e))), r),
+                    (None, _) => {
+                        if rest.len() >= 1 && rest[0] == TokenView::Keyword(Keyword::Default) {
+                            (Some((k, None)), rest.drop_first())
+                        } else {
+                            (None, input)
+                        }
+                    },
+                }
+            },
+            _ => (None, input),
+        }
+    } else {
+        (None, input)
+    }
+}
+
+pub open spec fn assign_tail_ok(tail: Seq<TokenView>) -> bool {
+    tail.len() == 0 || (tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen)
+}
+
+pub proof fn lemma_sparse_assign_sprint(a: (String, Option<SExpr>), tail: Seq<TokenView>, fuel: nat)
+    requires
+        printable_assign(a),
+        fuel >= assign_depth(a),
+        assign_tail_ok(tail),
+    ensures
+        sparse_assign(sprint_assign(a) + tail, fuel) == (Some(a), tail),
+{
+    reveal(sparse_assign);
+    let input = sprint_assign(a) + tail;
+    assert(input[0] == TokenView::Ident(a.0));
+    assert(input[1] == TokenView::Equal);
+    let rest = input.drop_first().drop_first();
+    match a.1 {
+        Some(e) => {
+            assert(rest =~= sprint(e) + tail);
+            assert(boundary(tail));
+            lemma_sparse_sprint(e, tail, fuel);
+            assert(sparse_assign(input, fuel) == (Some((a.0, Some(e))), tail));
+            assert((a.0, Some(e)) == a);
+        },
+        None => {
+            assert(rest =~= seq![TokenView::Keyword(Keyword::Default)] + tail);
+            assert(rest[0] == TokenView::Keyword(Keyword::Default));
+            assert(sparse(rest, fuel).0 is None) by {
+                reveal_with_fuel(sparse, 1);
+            }
+            assert(rest.drop_first() =~= tail);
+            assert(sparse_assign(input, fuel) == (Some((a.0, None::<SExpr>)), tail));
+            assert((a.0, None::<SExpr>) == a);
+        },
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn sparse_set_list(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<(String, Option<SExpr>)>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse_assign(input, fuel) {
+            (Some(a), r) => {
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    match sparse_set_list(r.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![a] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![a]), r)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+#[verifier::rlimit(4000)]
+pub proof fn lemma_sparse_set_list_sprint(items: Seq<(String, Option<SExpr>)>, tail: Seq<TokenView>, fuel: nat)
+    requires
+        all_printable_assigns(items),
+        items.len() >= 1,
+        fuel >= set_list_depth(items),
+        tail.len() == 0 || (tail[0] != TokenView::Comma
+            && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen),
+    ensures
+        sparse_set_list(sprint_set_list(items) + tail, fuel) == (Some(items), tail),
+    decreases items,
+{
+    reveal_with_fuel(sparse_set_list, 2);
+    if items.len() == 1 {
+        assert(assign_tail_ok(tail));
+        lemma_sparse_assign_sprint(items[0], tail, fuel);
+        assert(sprint_set_list(items) + tail =~= sprint_assign(items[0]) + tail);
+        assert(seq![items[0]] =~= items);
+        assert(sparse_set_list(sprint_set_list(items) + tail, fuel) == (Some(items), tail));
+    } else {
+        let rest = items.drop_first();
+        let item_tail = seq![TokenView::Comma] + (sprint_set_list(rest) + tail);
+        assert(assign_tail_ok(item_tail)) by {
+            assert(item_tail[0] == TokenView::Comma);
+        }
+        lemma_sparse_assign_sprint(items[0], item_tail, fuel);
+        lemma_sparse_set_list_sprint(rest, tail, (fuel - 1) as nat);
+        assert(sprint_set_list(items) + tail =~= sprint_assign(items[0]) + item_tail);
+        assert(item_tail[0] == TokenView::Comma);
+        assert(item_tail.drop_first() =~= sprint_set_list(rest) + tail);
+        assert(seq![items[0]] + rest =~= items);
+        assert(sparse_set_list(sprint_set_list(items) + tail, fuel) == (Some(items), tail));
     }
 }
 
