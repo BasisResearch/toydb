@@ -1,5 +1,23 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
+Status: **LEXER + TOKEN-STREAM CUTOVER LANDED (2026-08-28)** — the production
+`Lexer`/`Parser` now run on the verified surface and the full suite is green.
+`Token::Number` is `Vec<u8>`; `Lexer::scan_symbol` routes through the verified
+`verified_lexer::scan_symbol_bytes` and numbers through `scan_number_bytes`;
+identifiers/keywords fold case via the `unicode_trust` model; literals parse via
+`verified_integer` / `float_trust`. The `Peekable<Chars>` byte cursor and the
+`Peekable<Lexer>` lookahead are both gone: the lexer holds an explicit byte
+cursor and `Parser` is a `StreamingParser<S: PeekStream>` over `stream::TokenStream`.
+The recursive-descent parser is retained (it accepts the full concrete syntax the
+domain-restricted verified `parse_stmt_full_exec` cannot). Three gates green:
+`cargo build` clean (0 warnings), `cargo test` full suite (308 lib + `queries`/
+`isolation`/`anomalies` goldenscript), and `verify.sh` **557 verified, 0 errors**.
+Build fix that unblocked the normal (non-Verus) build: verified modules import
+ghost `spec`/`proof` items (`vstd::std_specs::*`, `token_view`, `sprint`, …) at
+module scope; a plain `cargo build` strips those, so the ghost-only `use`s are now
+gated behind `#[cfg(verus_keep_ghost)]` (registered in `Cargo.toml` `[lints.rust]`)
+while exec fns / enums stay ungated.
+
 Status: **E0-E4 complete; statement roundtrip S0-S5 complete (2026-08-28)**
 — the full expression-grammar roundtrip is verified end to end; the statement
 *mirror* roundtrip is verified for all 10 `ast::Statement` kinds (S0-S4); and the

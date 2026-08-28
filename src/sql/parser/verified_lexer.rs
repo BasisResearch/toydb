@@ -19,7 +19,13 @@ use super::Token;
 #[allow(unused_imports)]
 use super::Keyword;
 #[allow(unused_imports)]
-use super::verified_production::{token_view, token_views, token_views_concat, TokenView};
+use super::verified_production::TokenView;
+// `token_view`/`token_views` are `spec fn` and `token_views_concat` is a `proof fn`;
+// under a plain (non-Verus) `cargo build` these ghost items are stripped, so the
+// import only resolves when Verus keeps ghost code.
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::verified_production::{token_view, token_views, token_views_concat};
 
 verus! {
 
@@ -4452,6 +4458,71 @@ pub fn scan_qident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>
         }
     } else {
         (None, pos)
+    }
+}
+
+
+// -- L27: production wiring — verified &[u8] symbol scanner ---------------------
+//
+// A sound single-implementation cutover step (like `scan_number_bytes`): the
+// production `Lexer::scan_symbol` routes through this verified scanner. Symbols
+// are ASCII and UTF-8 is self-synchronising (a non-symbol multibyte char has all
+// bytes >= 128, never colliding with an ASCII symbol byte), so byte-level scanning
+// matches the production char-level behaviour exactly, unicode input included.
+// Takes `&[u8]` (from `str::as_bytes`), refining `lscan_sym`.
+
+pub fn scan_symbol_bytes(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+    ensures
+        r.0 == lscan_sym(input@, pos as int).0,
+        r.1 == lscan_sym(input@, pos as int).1,
+{
+    if pos >= input.len() {
+        return (None, pos);
+    }
+    let b = input[pos];
+    let has1 = pos + 1 < input.len();
+    if b == 60u8 {
+        if has1 && input[pos + 1] == 61u8 {
+            (Some(Token::LessThanOrEqual), pos + 2)
+        } else if has1 && input[pos + 1] == 62u8 {
+            (Some(Token::LessOrGreaterThan), pos + 2)
+        } else {
+            (Some(Token::LessThan), pos + 1)
+        }
+    } else if b == 62u8 {
+        if has1 && input[pos + 1] == 61u8 {
+            (Some(Token::GreaterThanOrEqual), pos + 2)
+        } else {
+            (Some(Token::GreaterThan), pos + 1)
+        }
+    } else if b == 33u8 {
+        if has1 && input[pos + 1] == 61u8 {
+            (Some(Token::NotEqual), pos + 2)
+        } else {
+            (Some(Token::Exclamation), pos + 1)
+        }
+    } else {
+        let t: Option<Token> =
+            if b == 46u8 { Some(Token::Period) }
+            else if b == 61u8 { Some(Token::Equal) }
+            else if b == 43u8 { Some(Token::Plus) }
+            else if b == 45u8 { Some(Token::Minus) }
+            else if b == 42u8 { Some(Token::Asterisk) }
+            else if b == 47u8 { Some(Token::Slash) }
+            else if b == 94u8 { Some(Token::Caret) }
+            else if b == 37u8 { Some(Token::Percent) }
+            else if b == 63u8 { Some(Token::Question) }
+            else if b == 44u8 { Some(Token::Comma) }
+            else if b == 59u8 { Some(Token::Semicolon) }
+            else if b == 40u8 { Some(Token::OpenParen) }
+            else if b == 41u8 { Some(Token::CloseParen) }
+            else { None };
+        match t {
+            Some(tok) => (Some(tok), pos + 1),
+            None => (None, pos),
+        }
     }
 }
 

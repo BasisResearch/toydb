@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Basis Research
 #
-# Verus telemetry (Component 2) — Codex configuration fragment.
+# Verus telemetry (Component 2) — Codex project-scoped configuration.
 #
-# Codex config is USER-LEVEL (~/.codex/config.toml), not per-repo, so Codex will
-# not read this file from the toyDB checkout automatically. Merge the blocks
-# below into your ~/.codex/config.toml once per machine. The Stop hook SCRIPT is
-# committed in the repo at .codex/hooks/verus_stop.py so a fresh clone carries
-# the capture logic; only this config wiring is a one-time user merge.
+# Codex (>= 0.150) loads this file as a project config layer when the project
+# is trusted (~/.codex/config.toml: projects."<clone-path>".trust_level =
+# "trusted"). No user-level merge is needed; a fresh trusted clone is wired.
 #
-# On first run Codex trust-reviews the hook command.
+# Hooks from this file require a one-time trust review (/hooks in the CLI), or
+# launching with --dangerously-bypass-hook-trust.
 
 # --- Verus MCP server (gating: makes the server present by default) ----------
 # Codex exposes no pre-run event, so it cannot hard-gate before running. Making
@@ -20,10 +19,18 @@
 command = "verus-tools-mcp"
 args = ["stdio"]
 
+[mcp_servers.verus.tools.version]
+approval_mode = "approve"
+
+[mcp_servers.verus.tools.verify]
+approval_mode = "approve"
+
 # --- Stop hook (capture) ------------------------------------------------------
-# Point the command at the committed script inside your toyDB checkout. Replace
-# /ABSOLUTE/PATH/TO/toydb with your clone location. VERUS_INGEST_TOKEN must be in
-# the hook's environment for a live upload; set VERUS_INGEST_DRY_RUN=1 to test.
+# Fail-soft session-trace capture at every turn end. The command resolves the
+# clone's git root (hook commands run with the session cwd as their working
+# directory), so it works in any clone without editing this file.
+# VERUS_INGEST_TOKEN must be in the hook's environment for a live upload; set
+# VERUS_INGEST_DRY_RUN=1 to test.
 #
 # Branch discipline (see AGENTS.md): Codex has no pre-tool event, so its
 # enforcement is the committed git hooks (.githooks/ pre-commit + pre-push).
@@ -31,4 +38,8 @@ args = ["stdio"]
 # activate them before the first session ends, run once:
 #     git config core.hooksPath .githooks
 [[hooks.Stop]]
-command = ["python3", "/ABSOLUTE/PATH/TO/toydb/.codex/hooks/verus_stop.py"]
+[[hooks.Stop.hooks]]
+type = "command"
+command = '/usr/bin/python3 "$(git rev-parse --show-toplevel)/.codex/hooks/verus_stop.py"'
+timeout = 60
+statusMessage = "Uploading Verus session trace"

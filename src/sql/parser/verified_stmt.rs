@@ -27,17 +27,27 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)]
 use super::verified_production::TokenView;
+// Executable helpers + the `SExpr` mirror enum: needed under a plain `cargo build`.
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, parse_args_exec,
-    parse_expr_exec, print_args_slice, print_expr_exec, printable_se, sdepth, sdepth_le_len,
-    slist_depth, sparse, sparse_args, sprint, sprint_args, token_views_len, token_views_suffix,
-    view_args, view_args_len, view_expr, SExpr,
+    parse_args_exec, parse_expr_exec, print_args_slice, print_expr_exec, SExpr,
 };
+// Ghost (spec/proof) helpers: stripped under a plain `cargo build`, so gate the
+// imports behind `verus_keep_ghost` to keep the non-Verus build resolving.
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::verified_roundtrip::{
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, printable_se, sdepth,
+    sdepth_le_len, slist_depth, sparse, sparse_args, sprint, sprint_args, token_views_len,
+    token_views_suffix, view_args, view_args_len, view_expr,
+};
+#[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use vstd::std_specs::cmp::{OrdSpec, PartialOrdSpec};
+#[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use vstd::std_specs::iter::IteratorSpec;
+#[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_production::{token_view, token_views, token_views_concat};
 #[allow(unused_imports)]
@@ -6849,7 +6859,7 @@ pub fn parse_update_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
                                 reveal_with_fuel(sparse_set_list, 1);
                                 assert(sparse_set_list(after_set, fuel as nat) == (Some(seq![a_m]), r_m));
                             }
-                            let mut m = build_one_entry_map(k, ve);
+                            let m = build_one_entry_map(k, ve);
                             proof {
                                 // view_stmt(Update{table, m, ..}).set == seq![a_m]
                                 assert(m@.dom() =~= set![k]);

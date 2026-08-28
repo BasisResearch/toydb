@@ -9,3 +9,7 @@
 # Verus telemetry: Python bytecode caches
 **/__pycache__/
 *.pyc
+
+# Verus build byproducts dropped in the working tree
+/*.rlib
+*.long-type-*.txt

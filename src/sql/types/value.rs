@@ -14,7 +14,7 @@ use crate::{errdata, errinput};
 
 /// A primitive SQL data type. For simplicity, only a handful of scalar types
 /// are supported (no compound types).
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum DataType {
     /// A boolean: true or false.
     Boolean,
