@@ -3034,6 +3034,118 @@ pub fn print_createtable_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
     }
 }
 
+// -- Select FROM join-tree exec printer --------------------------------------
+
+pub fn print_table_exec(f: &ast::From) -> (r: Vec<super::Token>)
+    requires is_stable(view_from(*f)),
+    ensures token_views(r@) == sprint_table(view_from(*f)),
+{
+    reveal_with_fuel(token_views, 4);
+    let mut r: Vec<super::Token> = Vec::new();
+    match f {
+        ast::From::Table { name, alias } => {
+            r.push(super::Token::Ident(name.clone()));
+            match alias {
+                Some(a) => {
+                    r.push(super::Token::Keyword(Keyword::As));
+                    r.push(super::Token::Ident(a.clone()));
+                    proof {
+                        assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    }
+                },
+                None => {
+                    proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+                },
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            r
+        },
+    }
+}
+
+/// Append `join_type`'s two keywords.
+pub fn print_join_kws(jt: ast::JoinType) -> (r: Vec<super::Token>)
+    ensures token_views(r@) == join_kws(jt),
+{
+    reveal_with_fuel(token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    match jt {
+        ast::JoinType::Cross => {
+            r.push(super::Token::Keyword(Keyword::Cross));
+            r.push(super::Token::Keyword(Keyword::Join));
+        },
+        ast::JoinType::Inner => {
+            r.push(super::Token::Keyword(Keyword::Inner));
+            r.push(super::Token::Keyword(Keyword::Join));
+        },
+        ast::JoinType::Left => {
+            r.push(super::Token::Keyword(Keyword::Left));
+            r.push(super::Token::Keyword(Keyword::Join));
+        },
+        ast::JoinType::Right => {
+            r.push(super::Token::Keyword(Keyword::Right));
+            r.push(super::Token::Keyword(Keyword::Join));
+        },
+    }
+    proof { assert(r@.drop_first().drop_first() =~= Seq::<super::Token>::empty()); }
+    r
+}
+
+#[verifier::rlimit(8000)]
+pub fn print_from_exec(f: &ast::From) -> (r: Vec<super::Token>)
+    requires printable_from(view_from(*f)),
+    ensures token_views(r@) == sprint_from(view_from(*f)),
+    decreases f,
+{
+    reveal(printable_from);
+    reveal_with_fuel(token_views, 1);
+    match f {
+        ast::From::Table { .. } => print_table_exec(f),
+        ast::From::Join { left, right, join_type, predicate } => {
+            let mut r = print_from_exec(&**left);
+            let ghost lv = r@;
+            let mut jk = print_join_kws(*join_type);
+            let ghost jkv = jk@;
+            r.append(&mut jk);
+            let ghost after_jk = r@;
+            let mut rt = print_table_exec(&**right);
+            let ghost rtv = rt@;
+            r.append(&mut rt);
+            let ghost after_rt = r@;
+            match predicate {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::On));
+                    let ghost on = r@;
+                    let mut body = print_expr_exec(e);
+                    let ghost body_old = body@;
+                    r.append(&mut body);
+                    proof {
+                        reveal_with_fuel(token_views, 2);
+                        assert(r@ =~= after_rt + seq![super::Token::Keyword(Keyword::On)] + body_old);
+                        token_views_concat(after_rt + seq![super::Token::Keyword(Keyword::On)], body_old);
+                        token_views_concat(after_rt, seq![super::Token::Keyword(Keyword::On)]);
+                        token_views_concat(lv + jkv, rtv);
+                        token_views_concat(lv, jkv);
+                        assert(token_views(seq![super::Token::Keyword(Keyword::On)])
+                            =~= seq![TokenView::Keyword(Keyword::On)]);
+                    }
+                    r
+                },
+                None => {
+                    proof {
+                        token_views_concat(lv + jkv, rtv);
+                        token_views_concat(lv, jkv);
+                    }
+                    r
+                },
+            }
+        },
+    }
+}
+
 pub open spec fn is_sinsert(s: SStmt) -> bool {
     match s {
         SStmt::Insert { .. } => true,
