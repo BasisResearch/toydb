@@ -3172,4 +3172,115 @@ pub proof fn lemma_lex_all_exec_roundtrip(ts: Seq<TokenView>, input: Seq<u8>)
 }
 
 
+// -- L18: String-payload bridge primitives (ASCII, axiom-free) ------------------
+//
+// `Ident` and `String` tokens carry a `String` payload. Unlike the byte-determined
+// classes, a `String` cannot be constructed in spec (like `Vec`), so these are
+// handled at the exec level with a char-view refinement. The key finding: for
+// ASCII payloads NO trust axiom is needed — Verus proves the `char`<->`u8` cast
+// roundtrip natively, so a char-per-byte encoding is self-inverse. (Production
+// `as_bytes()` is UTF-8, which coincides with this for ASCII; faithfulness to
+// non-ASCII UTF-8 is a separate, later concern.) These primitives build a
+// `String` from a byte run and prove its char view, the basis for the `Ident`/
+// `String` scanners.
+
+/// Char seq -> bytes: each char truncated to its low byte (exact for ASCII).
+pub open spec fn ascii_bytes(cs: Seq<char>) -> Seq<u8> {
+    Seq::new(cs.len(), |i: int| cs[i] as u8)
+}
+
+/// Bytes -> char seq: each byte as a char.
+pub open spec fn ascii_chars(bytes: Seq<u8>) -> Seq<char> {
+    Seq::new(bytes.len(), |i: int| bytes[i] as char)
+}
+
+/// `char`->`u8`->`char` round-trips for ASCII (Verus proves the casts natively).
+pub proof fn lemma_char_u8_char(c: char)
+    requires
+        (c as u32) < 128,
+    ensures
+        (c as u8) as char == c,
+{
+}
+
+/// `u8`->`char`->`u8` round-trips for ASCII.
+pub proof fn lemma_u8_char_u8(b: u8)
+    requires
+        b < 128,
+    ensures
+        (b as char) as u8 == b,
+{
+}
+
+/// Every char is ASCII (fits in one byte).
+pub open spec fn all_ascii_chars(cs: Seq<char>) -> bool {
+    forall|i: int| 0 <= i < cs.len() ==> (cs[i] as u32) < 128
+}
+
+/// Every byte is ASCII.
+pub open spec fn all_ascii_bytes(bytes: Seq<u8>) -> bool {
+    forall|i: int| 0 <= i < bytes.len() ==> (#[trigger] bytes[i]) < 128
+}
+
+/// ASCII char seq re-encodes exactly: decoding its bytes recovers it.
+pub proof fn lemma_ascii_chars_bytes(cs: Seq<char>)
+    requires
+        all_ascii_chars(cs),
+    ensures
+        ascii_chars(ascii_bytes(cs)) == cs,
+{
+    assert forall|i: int| 0 <= i < cs.len() implies ascii_chars(ascii_bytes(cs))[i] == cs[i] by {
+        let c = cs[i];
+        assert((c as u32) < 128);
+        lemma_char_u8_char(c);
+        assert(ascii_bytes(cs)[i] == (c as u8));
+    }
+    assert(ascii_chars(ascii_bytes(cs)) =~= cs);
+}
+
+/// ASCII byte run re-decodes exactly: encoding its chars recovers it.
+pub proof fn lemma_ascii_bytes_chars(bytes: Seq<u8>)
+    requires
+        all_ascii_bytes(bytes),
+    ensures
+        ascii_bytes(ascii_chars(bytes)) == bytes,
+{
+    assert forall|i: int| 0 <= i < bytes.len() implies ascii_bytes(ascii_chars(bytes))[i] == bytes[i] by {
+        let b = bytes[i];
+        assert(b < 128);
+        lemma_u8_char_u8(b);
+        assert(ascii_chars(bytes)[i] == (b as char));
+    }
+    assert(ascii_bytes(ascii_chars(bytes)) =~= bytes);
+}
+
+/// Build a `String` from an ASCII byte run `input[p..e]`, proving its char view.
+pub fn build_ascii_string(input: &Vec<u8>, p: usize, e: usize) -> (r: String)
+    requires
+        p <= e <= input.len(),
+        forall|i: int| p <= i < e ==> (#[trigger] input[i]) < 128,
+    ensures
+        r@ == ascii_chars(input@.subrange(p as int, e as int)),
+{
+    let mut s = String::new();
+    let mut i = p;
+    assert(s@ =~= ascii_chars(input@.subrange(p as int, p as int)));
+    while i < e
+        invariant
+            p <= i <= e <= input.len(),
+            forall|j: int| p <= j < e ==> (#[trigger] input[j]) < 128,
+            s@ == ascii_chars(input@.subrange(p as int, i as int)),
+        decreases e - i,
+    {
+        let b = input[i];
+        s.push(b as char);
+        assert(s@ =~= ascii_chars(input@.subrange(p as int, (i + 1) as int))) by {
+            assert(input@[i as int] < 128);
+        }
+        i += 1;
+    }
+    s
+}
+
+
 } // verus!
