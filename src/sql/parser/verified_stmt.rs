@@ -2926,6 +2926,83 @@ pub open spec fn is_sinsert(s: SStmt) -> bool {
     }
 }
 
+pub open spec fn is_sbegin(s: SStmt) -> bool {
+    match s {
+        SStmt::Begin { .. } => true,
+        _ => false,
+    }
+}
+
+/// Executable BEGIN printer. Only two optional clauses (READ ONLY prefix,
+/// AS OF SYSTEM TIME suffix), so no per-segment helper is needed.
+#[verifier::rlimit(8000)]
+pub fn print_begin_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires
+        printable_stmt(view_stmt(*s)),
+        is_sbegin(view_stmt(*s)),
+    ensures
+        token_views(r@) == sprint_stmt(view_stmt(*s)),
+{
+    reveal_with_fuel(token_views, 3);
+    match s {
+        ast::Statement::Begin { read_only, as_of } => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Begin));
+            if *read_only {
+                r.push(super::Token::Keyword(Keyword::Read));
+                r.push(super::Token::Keyword(Keyword::Only));
+            }
+            let ghost prefix = r@;
+            proof {
+                reveal_with_fuel(token_views, 4);
+                if *read_only {
+                    assert(prefix.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                    assert(token_views(prefix) =~= seq![
+                        TokenView::Keyword(Keyword::Begin),
+                        TokenView::Keyword(Keyword::Read),
+                        TokenView::Keyword(Keyword::Only),
+                    ]);
+                } else {
+                    assert(prefix.drop_first() =~= Seq::<super::Token>::empty());
+                    assert(token_views(prefix) =~= seq![TokenView::Keyword(Keyword::Begin)]);
+                }
+            }
+            match as_of {
+                Some(v) => {
+                    r.push(super::Token::Keyword(Keyword::As));
+                    r.push(super::Token::Keyword(Keyword::Of));
+                    r.push(super::Token::Keyword(Keyword::System));
+                    r.push(super::Token::Keyword(Keyword::Time));
+                    r.push(super::Token::Number(super::verified_integer::print_u64(*v)));
+                    proof {
+                        reveal_with_fuel(token_views, 6);
+                        let seg = r@.subrange(prefix.len() as int, r@.len() as int);
+                        assert(r@ =~= prefix + seg);
+                        token_views_concat(prefix, seg);
+                        assert(seg.drop_first().drop_first().drop_first().drop_first().drop_first()
+                            =~= Seq::<super::Token>::empty());
+                        assert(token_views(seg) =~= seq![
+                            TokenView::Keyword(Keyword::As),
+                            TokenView::Keyword(Keyword::Of),
+                            TokenView::Keyword(Keyword::System),
+                            TokenView::Keyword(Keyword::Time),
+                            TokenView::Number(verified_integer::decimal_digits(*v)),
+                        ]);
+                    }
+                },
+                None => {
+                    proof { assert(r@ =~= prefix); }
+                },
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
 #[verifier::rlimit(8000)]
 pub fn print_insert_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
     requires
