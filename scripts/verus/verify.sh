@@ -24,6 +24,20 @@ set -euo pipefail
 VERIFY_MODULES=(
   encoding::keycode
   sql::types::value
+  sql::parser::ast
+  sql::parser::float_trust
+  sql::parser::lexer
+  sql::parser::printer
+  sql::parser::unicode_trust
+  sql::parser::verified
+  sql::parser::verified_expression
+  sql::parser::verified_function_list
+  sql::parser::verified_integer
+  sql::parser::verified_lists
+  sql::parser::verified_production
+  sql::parser::verified_roundtrip
+  sql::parser::verified_simple_statement
+  sql::parser::verified_statements
 )
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
