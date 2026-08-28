@@ -4853,6 +4853,20 @@ pub proof fn lemma_view_map_insert(
     assert(view_map(m.insert(k, v)) =~= view_map(m).insert(k, view_opt(v)));
 }
 
+/// The `Map` a sorted set-list denotes: the head is inserted last (wins on
+/// duplicate keys), matching the recursive `parse_set_map_exec` (parse head,
+/// build the rest, then `insert` the head).
+pub open spec fn seq_to_map(s: Seq<(String, Option<SExpr>)>)
+    -> vstd::map::Map<String, Option<SExpr>>
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        vstd::map::Map::empty()
+    } else {
+        seq_to_map(s.drop_first()).insert(s[0].0, s[0].1)
+    }
+}
+
 /// Build a one-entry `BTreeMap` with a known view.
 pub fn build_one_entry_map(k: String, v: Option<ast::Expression>)
     -> (m: std::collections::BTreeMap<String, Option<ast::Expression>>)
@@ -5968,6 +5982,97 @@ pub proof fn lemma_sparse_set_list_len(input: Seq<TokenView>, fuel: nat)
             },
             (None, _) => {},
         }
+    }
+}
+
+/// Multi-assignment set-list parser that builds the `BTreeMap` directly, refining
+/// `sparse_set_list` at the order-free `view_map` level (piece 4 of the multi-Update
+/// plan). Parses `k = v, k = v, ...` and folds `insert`, moving each parsed value
+/// (never cloning — `Option<Expression>::clone` is not value-exact). The head is
+/// parsed first and inserted last, matching `seq_to_map`.
+#[verifier::rlimit(40000)]
+pub fn parse_set_map_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<std::collections::BTreeMap<String, Option<ast::Expression>>>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_set_list(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(m) => sopt is Some && view_map(m@) == seq_to_map(sopt.unwrap())
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+    decreases fuel,
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    proof { axiom_string_key_obeys_cmp(); }
+    reveal(sparse_set_list);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if fuel == 0 {
+        return (None, pos);
+    }
+    let (aopt, apos) = parse_assign_exec(toks, pos, fuel);
+    match aopt {
+        Some((k, ve)) => {
+            let ghost gk = k;
+            let ghost gve = ve;
+            let ghost a = (gk, view_opt(gve));
+            proof { token_views_len(toks@.subrange(apos as int, toks@.len() as int)); }
+            if apos < toks.len() && matches!(toks[apos], super::Token::Comma) {
+                proof { token_views_suffix(toks@, apos as int); }
+                let (mopt, mpos) = parse_set_map_exec(toks, apos + 1, fuel - 1);
+                match mopt {
+                    Some(mut m) => {
+                        let ghost old_m = m@;
+                        m.insert(k, ve);
+                        proof {
+                            let more = sparse_set_list(
+                                token_views(toks@.subrange(apos as int + 1, toks@.len() as int)),
+                                (fuel - 1) as nat,
+                            ).0.unwrap();
+                            // recursion ensures: view_map(old_m) == seq_to_map(more)
+                            assert(view_map(old_m) == seq_to_map(more));
+                            // BTreeMap insert view + view_map distribution
+                            assert(m@ == old_m.insert(gk, gve));
+                            lemma_view_map_insert(old_m, gk, gve);
+                            assert(view_map(m@) == seq_to_map(more).insert(gk, view_opt(gve)));
+                            // seq_to_map unfolds on the head a == (gk, view_opt(gve))
+                            assert((seq![a] + more)[0] == a);
+                            assert((seq![a] + more).drop_first() =~= more);
+                            assert(seq_to_map(seq![a] + more)
+                                == seq_to_map(more).insert(a.0, a.1));
+                            assert(view_map(m@) == seq_to_map(seq![a] + more));
+                        }
+                        (Some(m), mpos)
+                    },
+                    None => (None, pos),
+                }
+            } else {
+                if apos < toks.len() {
+                    proof { token_views_suffix(toks@, apos as int); }
+                }
+                let mut m: std::collections::BTreeMap<String, Option<ast::Expression>> =
+                    std::collections::BTreeMap::new();
+                let ghost old_m = m@;
+                m.insert(k, ve);
+                proof {
+                    assert(old_m == vstd::map::Map::<String, Option<ast::Expression>>::empty());
+                    assert(m@ == old_m.insert(gk, gve));
+                    lemma_view_map_empty();
+                    lemma_view_map_insert(old_m, gk, gve);
+                    assert(view_map(m@) == view_map(old_m).insert(gk, view_opt(gve)));
+                    assert(seq![a][0] == a);
+                    assert(seq![a].drop_first() =~= Seq::<(String, Option<SExpr>)>::empty());
+                    assert(seq_to_map(seq![a]) == seq_to_map(seq![a].drop_first()).insert(a.0, a.1));
+                    assert(view_map(m@) == seq_to_map(seq![a]));
+                }
+                (Some(m), apos)
+            }
+        },
+        None => (None, pos),
     }
 }
 
