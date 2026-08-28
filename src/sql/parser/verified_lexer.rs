@@ -19,7 +19,7 @@ use super::Token;
 #[allow(unused_imports)]
 use super::Keyword;
 #[allow(unused_imports)]
-use super::verified_production::TokenView;
+use super::verified_production::{token_view, TokenView};
 
 verus! {
 
@@ -2075,6 +2075,273 @@ pub proof fn lemma_lscan_keyword(kw: Keyword, tail: Seq<u8>)
     assert(input.subrange(0, d.len() as int) =~= d);
     lemma_ascii_lower_idem(d);
     lemma_classify_kw_text(kw);
+}
+
+// -- L15: single-token value dispatcher + roundtrip ----------------------------
+//
+// Composes L9/L12/L14 into one token-*value* scanner over the byte-determined
+// classes (numbers, keywords, all symbols): skip whitespace, dispatch on the
+// first byte, and produce the actual `TokenView`. lemma_lscan_token proves the
+// single-token roundtrip for every such class, axiom-free. `Ident`/`String`
+// (String payloads) are the remaining classes, deferred to the trust bridge.
+
+/// Map a symbol `TokenView` back to its `Token` (unit variants; safe because
+/// symbols carry no payload). Non-symbol views map to `Period` (unused).
+pub open spec fn sym_token_of(tv: TokenView) -> Token {
+    match tv {
+        TokenView::Period => Token::Period,
+        TokenView::Equal => Token::Equal,
+        TokenView::NotEqual => Token::NotEqual,
+        TokenView::GreaterThan => Token::GreaterThan,
+        TokenView::GreaterThanOrEqual => Token::GreaterThanOrEqual,
+        TokenView::LessThan => Token::LessThan,
+        TokenView::LessThanOrEqual => Token::LessThanOrEqual,
+        TokenView::LessOrGreaterThan => Token::LessOrGreaterThan,
+        TokenView::Plus => Token::Plus,
+        TokenView::Minus => Token::Minus,
+        TokenView::Asterisk => Token::Asterisk,
+        TokenView::Slash => Token::Slash,
+        TokenView::Caret => Token::Caret,
+        TokenView::Percent => Token::Percent,
+        TokenView::Exclamation => Token::Exclamation,
+        TokenView::Question => Token::Question,
+        TokenView::Comma => Token::Comma,
+        TokenView::Semicolon => Token::Semicolon,
+        TokenView::OpenParen => Token::OpenParen,
+        TokenView::CloseParen => Token::CloseParen,
+        _ => Token::Period,
+    }
+}
+
+/// A symbol token view (punctuation or operator — not number/keyword/ident/string).
+pub open spec fn is_sym_view(tv: TokenView) -> bool {
+    match tv {
+        TokenView::Number(_) => false,
+        TokenView::Keyword(_) => false,
+        TokenView::Ident(_) => false,
+        TokenView::String(_) => false,
+        _ => true,
+    }
+}
+
+#[verifier::spinoff_prover]
+pub proof fn lemma_sym_token_props(tv: TokenView)
+    requires is_sym_view(tv),
+    ensures
+        token_view(sym_token_of(tv)) == tv,
+        is_punct1(sym_token_of(tv)) || is_op(sym_token_of(tv)),
+        lex_print_sym(sym_token_of(tv)).len() >= 1,
+        !is_digit(lex_print_sym(sym_token_of(tv))[0]),
+        !is_ident_start(lex_print_sym(sym_token_of(tv))[0]),
+        !is_ws(lex_print_sym(sym_token_of(tv))[0]),
+{
+    match tv {
+        TokenView::Period => {
+            let t = Token::Period;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Equal => {
+            let t = Token::Equal;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::NotEqual => {
+            let t = Token::NotEqual;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::GreaterThan => {
+            let t = Token::GreaterThan;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::GreaterThanOrEqual => {
+            let t = Token::GreaterThanOrEqual;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::LessThan => {
+            let t = Token::LessThan;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::LessThanOrEqual => {
+            let t = Token::LessThanOrEqual;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::LessOrGreaterThan => {
+            let t = Token::LessOrGreaterThan;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Plus => {
+            let t = Token::Plus;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Minus => {
+            let t = Token::Minus;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Asterisk => {
+            let t = Token::Asterisk;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Slash => {
+            let t = Token::Slash;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Caret => {
+            let t = Token::Caret;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Percent => {
+            let t = Token::Percent;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Exclamation => {
+            let t = Token::Exclamation;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Question => {
+            let t = Token::Question;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Comma => {
+            let t = Token::Comma;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::Semicolon => {
+            let t = Token::Semicolon;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::OpenParen => {
+            let t = Token::OpenParen;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        TokenView::CloseParen => {
+            let t = Token::CloseParen;
+            assert(lex_print_sym(t).len() >= 1);
+        },
+        _ => {},
+    }
+}
+
+/// Canonical byte print of a byte-determined token view. Numbers print their raw
+/// bytes; keywords print their lowercase text (the lexer lowercases before
+/// classifying, so lowercase re-lexes exactly — the uppercase `Display` form is a
+/// string-level printer concern); symbols delegate to `lex_print_sym`. `Ident`
+/// and `String` carry `String` payloads and are handled by the deferred trust
+/// bridge, so they print empty here.
+pub open spec fn lex_print_tv(tv: TokenView) -> Seq<u8> {
+    match tv {
+        TokenView::Number(v) => v,
+        TokenView::Keyword(kw) => kw_text(kw),
+        TokenView::Ident(_) => Seq::empty(),
+        TokenView::String(_) => Seq::empty(),
+        _ => lex_print_sym(sym_token_of(tv)),
+    }
+}
+
+/// A number byte-run re-scans to itself under any number boundary. Both printed
+/// number forms (pure integer run, `digits.digits`) satisfy this; carrying it as
+/// a predicate lets the token roundtrip stay agnostic to which form a number is.
+pub open spec fn rescans_num(v: Seq<u8>) -> bool {
+    forall|tail: Seq<u8>| num_tail_ok(tail) ==> #[trigger] scan_num_full_end(v + tail, 0) == v.len()
+}
+
+/// A byte-determined, printable token view: numbers are a non-empty digit-led
+/// self-rescanning run; keywords and symbols are always printable; `Ident`/`String`
+/// need the deferred trust bridge.
+pub open spec fn printable_tv(tv: TokenView) -> bool {
+    match tv {
+        TokenView::Number(v) => v.len() >= 1 && is_digit(v[0]) && rescans_num(v),
+        TokenView::Ident(_) => false,
+        TokenView::String(_) => false,
+        _ => true,
+    }
+}
+
+/// The boundary a token's printed bytes need for an exact re-scan: numbers need a
+/// number boundary, keywords a non-continuation byte, symbols the operator
+/// boundary (vacuous for punctuation and two-char operators).
+pub open spec fn token_tail_ok(tv: TokenView, tail: Seq<u8>) -> bool {
+    match tv {
+        TokenView::Number(_) => num_tail_ok(tail),
+        TokenView::Keyword(_) => tail.len() == 0 || !is_ident_cont(tail[0]),
+        _ => op_tail_ok(sym_token_of(tv), tail),
+    }
+}
+
+/// Scan one whole token value: skip whitespace, then dispatch on the first byte
+/// to the number / keyword / symbol scanner. `None` with a non-advancing (ident)
+/// or non-symbol lead marks a class handled by a later brick.
+pub open spec fn lscan_token(input: Seq<u8>, pos: int) -> (Option<TokenView>, int) {
+    let p = skip_ws(input, pos);
+    if 0 <= p < input.len() {
+        let b = input[p];
+        if is_digit(b) {
+            lscan_num_full(input, p)
+        } else if is_ident_start(b) {
+            let r = lscan_keyword(input, p);
+            match r.0 {
+                Some(kw) => (Some(TokenView::Keyword(kw)), r.1),
+                None => (None, r.1),
+            }
+        } else {
+            let r = lscan_sym(input, p);
+            match r.0 {
+                Some(t) => (Some(token_view(t)), r.1),
+                None => (None, r.1),
+            }
+        }
+    } else {
+        (None, p)
+    }
+}
+
+/// Single-token roundtrip over every byte-determined token class (numbers,
+/// keywords, all symbols): scanning a printable token's print, under its
+/// boundary, recovers exactly that token and advances past it. Axiom-free.
+pub proof fn lemma_lscan_token(tv: TokenView, tail: Seq<u8>)
+    requires
+        printable_tv(tv),
+        token_tail_ok(tv, tail),
+    ensures
+        lscan_token(lex_print_tv(tv) + tail, 0) == (Some(tv), lex_print_tv(tv).len() as int),
+{
+    let bytes = lex_print_tv(tv);
+    let input = bytes + tail;
+    match tv {
+        TokenView::Number(v) => {
+            assert(bytes == v);
+            assert(input[0] == v[0]);
+            assert(!is_ws(input[0])) by { assert(is_digit(v[0])); }
+            assert(skip_ws(input, 0) == 0);
+            assert(scan_num_full_end(input, 0) == v.len()) by {
+                assert(rescans_num(v));
+                assert(num_tail_ok(tail));
+            }
+            assert(input.subrange(0, v.len() as int) =~= v);
+        }
+        TokenView::Keyword(kw) => {
+            assert(bytes == kw_text(kw));
+            lemma_kw_text_shape(kw);
+            assert(input[0] == kw_text(kw)[0]);
+            assert(is_lower_letter(kw_text(kw)[0]));
+            assert(!is_ws(input[0]));
+            assert(!is_digit(input[0]));
+            assert(is_ident_start(input[0]));
+            assert(skip_ws(input, 0) == 0);
+            lemma_lscan_keyword(kw, tail);
+        }
+        TokenView::Ident(_) => { assert(false); }
+        TokenView::String(_) => { assert(false); }
+        _ => {
+            lemma_sym_token_props(tv);
+            let t = sym_token_of(tv);
+            assert(bytes == lex_print_sym(t));
+            assert(input[0] == lex_print_sym(t)[0]);
+            assert(!is_ws(input[0]));
+            assert(!is_digit(input[0]));
+            assert(!is_ident_start(input[0]));
+            assert(skip_ws(input, 0) == 0);
+            lemma_lscan_sym(t, tail);
+        }
+    }
 }
 
 } // verus!
