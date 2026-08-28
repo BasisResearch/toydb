@@ -2926,6 +2926,114 @@ pub open spec fn is_sinsert(s: SStmt) -> bool {
     }
 }
 
+/// Executable BEGIN parser, refining `sparse_begin` at the `view_stmt` level.
+/// `sparse_begin` always succeeds (it is the BEGIN-keyword branch of the
+/// dispatcher), so this never returns `None`.
+#[verifier::rlimit(30000)]
+pub fn parse_begin_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos < toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_begin(input);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    // read-only prefix: sparse_begin needs input.len() >= 3 && input[1]==Read && input[2]==Only
+    let read_only: bool;
+    let after_pos: usize;
+    if pos + 1 < toks.len() && pos + 2 < toks.len()
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Read))
+        && matches!(toks[pos + 2], super::Token::Keyword(Keyword::Only)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+            token_views_suffix(toks@, pos as int + 2);
+        }
+        read_only = true;
+        after_pos = pos + 3;
+    } else {
+        proof {
+            if pos < toks.len() {
+                token_views_suffix(toks@, pos as int);
+                if pos + 1 < toks.len() {
+                    token_views_suffix(toks@, pos as int + 1);
+                    if pos + 2 < toks.len() {
+                        token_views_suffix(toks@, pos as int + 2);
+                    } else {
+                        token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int));
+                    }
+                } else {
+                    token_views_len(toks@.subrange(pos as int + 1, toks@.len() as int));
+                }
+            }
+        }
+        read_only = false;
+        after_pos = if pos < toks.len() { pos + 1 } else { pos };
+    }
+    let ghost after = token_views(toks@.subrange(after_pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(after_pos as int, toks@.len() as int)); }
+    // AS OF SYSTEM TIME <number>
+    if after_pos < toks.len() && after_pos + 1 < toks.len() && after_pos + 2 < toks.len()
+        && after_pos + 3 < toks.len() && after_pos + 4 < toks.len()
+        && matches!(toks[after_pos], super::Token::Keyword(Keyword::As))
+        && matches!(toks[after_pos + 1], super::Token::Keyword(Keyword::Of))
+        && matches!(toks[after_pos + 2], super::Token::Keyword(Keyword::System))
+        && matches!(toks[after_pos + 3], super::Token::Keyword(Keyword::Time)) {
+        proof {
+            token_views_suffix(toks@, after_pos as int);
+            token_views_suffix(toks@, after_pos as int + 1);
+            token_views_suffix(toks@, after_pos as int + 2);
+            token_views_suffix(toks@, after_pos as int + 3);
+            token_views_suffix(toks@, after_pos as int + 4);
+        }
+        match &toks[after_pos + 4] {
+            super::Token::Number(bytes) => match super::verified_integer::parse_u64(bytes.as_slice()) {
+                Some(version) => (
+                    Some(ast::Statement::Begin { read_only, as_of: Some(version) }),
+                    after_pos + 5,
+                ),
+                None => (Some(ast::Statement::Begin { read_only, as_of: None }), after_pos),
+            },
+            _ => (Some(ast::Statement::Begin { read_only, as_of: None }), after_pos),
+        }
+    } else {
+        if after_pos < toks.len() {
+            proof {
+                token_views_suffix(toks@, after_pos as int);
+                if after_pos + 1 < toks.len() {
+                    token_views_suffix(toks@, after_pos as int + 1);
+                    if after_pos + 2 < toks.len() {
+                        token_views_suffix(toks@, after_pos as int + 2);
+                        if after_pos + 3 < toks.len() {
+                            token_views_suffix(toks@, after_pos as int + 3);
+                            if after_pos + 4 < toks.len() {
+                                token_views_suffix(toks@, after_pos as int + 4);
+                            } else {
+                                token_views_len(toks@.subrange(after_pos as int + 4, toks@.len() as int));
+                            }
+                        } else {
+                            token_views_len(toks@.subrange(after_pos as int + 3, toks@.len() as int));
+                        }
+                    } else {
+                        token_views_len(toks@.subrange(after_pos as int + 2, toks@.len() as int));
+                    }
+                } else {
+                    token_views_len(toks@.subrange(after_pos as int + 1, toks@.len() as int));
+                }
+            }
+        }
+        (Some(ast::Statement::Begin { read_only, as_of: None }), after_pos)
+    }
+}
+
 pub open spec fn is_sbegin(s: SStmt) -> bool {
     match s {
         SStmt::Begin { .. } => true,
