@@ -3146,6 +3146,240 @@ pub fn print_from_exec(f: &ast::From) -> (r: Vec<super::Token>)
     }
 }
 
+pub proof fn view_froms_len(froms: Seq<ast::From>)
+    ensures view_froms(froms).len() == froms.len(),
+    decreases froms.len(),
+{
+    if froms.len() > 0 {
+        view_froms_len(froms.drop_first());
+    }
+}
+
+pub proof fn view_froms_step(froms: Seq<ast::From>)
+    requires froms.len() > 0,
+    ensures
+        view_froms(froms).len() == froms.len(),
+        view_froms(froms)[0] == view_from(froms[0]),
+        view_froms(froms).drop_first() == view_froms(froms.drop_first()),
+{
+    assert(view_froms(froms) =~= seq![view_from(froms[0])] + view_froms(froms.drop_first()));
+    view_froms_len(froms);
+}
+
+#[verifier::rlimit(4000)]
+pub fn print_from_list_slice(froms: &[ast::From]) -> (r: Vec<super::Token>)
+    requires froms.len() >= 1, all_printable_froms(view_froms(froms@)),
+    ensures token_views(r@) == sprint_from_list(view_froms(froms@)),
+    decreases froms.len(),
+{
+    reveal_with_fuel(token_views, 1);
+    if froms.len() == 1 {
+        proof {
+            view_froms_step(froms@);
+            assert(view_froms(froms@.drop_first()) =~= Seq::<SFrom>::empty());
+            assert(printable_from(view_from(froms@[0])));
+            assert(sprint_from_list(view_froms(froms@)) == sprint_from(view_froms(froms@)[0]));
+        }
+        print_from_exec(&froms[0])
+    } else {
+        proof {
+            view_froms_step(froms@);
+            assert(printable_from(view_from(froms@[0])));
+            assert(all_printable_froms(view_froms(froms@.drop_first())));
+        }
+        let mut r = print_from_exec(&froms[0]);
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(froms, 1, froms.len());
+        proof { assert(rest@ =~= froms@.drop_first()); }
+        let mut more = print_from_list_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            token_views_concat(head, more_old);
+            token_views_concat(p0, seq![super::Token::Comma]);
+            assert(token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+            view_froms_step(froms@);
+            assert(sprint_from_list(view_froms(froms@)) =~= sprint_from(view_froms(froms@)[0])
+                + seq![TokenView::Comma] + sprint_from_list(view_froms(froms@).drop_first()));
+        }
+        r
+    }
+}
+
+// -- select-list exec printer ------------------------------------------------
+
+pub fn print_select_item_exec(item: &(ast::Expression, Option<String>)) -> (r: Vec<super::Token>)
+    requires printable_select_item((view_expr(item.0), item.1)),
+    ensures token_views(r@) == sprint_select_item((view_expr(item.0), item.1)),
+{
+    reveal_with_fuel(token_views, 2);
+    let mut r = print_expr_exec(&item.0);
+    let ghost e_toks = r@;
+    match &item.1 {
+        Some(a) => {
+            r.push(super::Token::Keyword(Keyword::As));
+            r.push(super::Token::Ident(a.clone()));
+            proof {
+                reveal_with_fuel(token_views, 3);
+                assert(r@ =~= e_toks + seq![super::Token::Keyword(Keyword::As), super::Token::Ident(*a)]);
+                token_views_concat(e_toks, seq![super::Token::Keyword(Keyword::As), super::Token::Ident(*a)]);
+                assert(seq![super::Token::Keyword(Keyword::As), super::Token::Ident(*a)]
+                    .drop_first().drop_first() =~= Seq::<super::Token>::empty());
+            }
+        },
+        None => {
+            proof { assert(r@ =~= e_toks); }
+        },
+    }
+    r
+}
+
+pub proof fn view_select_list_len(items: Seq<(ast::Expression, Option<String>)>)
+    ensures view_select_list(items).len() == items.len(),
+    decreases items.len(),
+{
+    if items.len() > 0 {
+        view_select_list_len(items.drop_first());
+    }
+}
+
+pub proof fn view_select_list_step(items: Seq<(ast::Expression, Option<String>)>)
+    requires items.len() > 0,
+    ensures
+        view_select_list(items).len() == items.len(),
+        view_select_list(items)[0] == (view_expr(items[0].0), items[0].1),
+        view_select_list(items).drop_first() == view_select_list(items.drop_first()),
+{
+    assert(view_select_list(items) =~= seq![(view_expr(items[0].0), items[0].1)]
+        + view_select_list(items.drop_first()));
+    view_select_list_len(items);
+}
+
+#[verifier::rlimit(4000)]
+pub fn print_select_list_slice(items: &[(ast::Expression, Option<String>)]) -> (r: Vec<super::Token>)
+    requires items.len() >= 1, all_printable_select(view_select_list(items@)),
+    ensures token_views(r@) == sprint_select_list(view_select_list(items@)),
+    decreases items.len(),
+{
+    reveal_with_fuel(token_views, 1);
+    if items.len() == 1 {
+        proof {
+            view_select_list_step(items@);
+            assert(view_select_list(items@.drop_first()) =~= Seq::<(SExpr, Option<String>)>::empty());
+            assert(printable_select_item(view_select_list(items@)[0]));
+            assert(sprint_select_list(view_select_list(items@)) == sprint_select_item(view_select_list(items@)[0]));
+        }
+        print_select_item_exec(&items[0])
+    } else {
+        proof {
+            view_select_list_step(items@);
+            assert(printable_select_item(view_select_list(items@)[0]));
+            assert(all_printable_select(view_select_list(items@.drop_first())));
+        }
+        let mut r = print_select_item_exec(&items[0]);
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(items, 1, items.len());
+        proof { assert(rest@ =~= items@.drop_first()); }
+        let mut more = print_select_list_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            token_views_concat(head, more_old);
+            token_views_concat(p0, seq![super::Token::Comma]);
+            assert(token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+            view_select_list_step(items@);
+            assert(sprint_select_list(view_select_list(items@)) =~= sprint_select_item(view_select_list(items@)[0])
+                + seq![TokenView::Comma] + sprint_select_list(view_select_list(items@).drop_first()));
+        }
+        r
+    }
+}
+
+pub open spec fn is_sselect(s: SStmt) -> bool {
+    match s {
+        SStmt::Select { .. } => true,
+        _ => false,
+    }
+}
+
+#[verifier::rlimit(20000)]
+pub fn print_select_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires printable_stmt(view_stmt(*s)), is_sselect(view_stmt(*s)),
+    ensures token_views(r@) == sprint_stmt(view_stmt(*s)),
+{
+    reveal(printable_stmt);
+    reveal_with_fuel(token_views, 2);
+    match s {
+        ast::Statement::Select { select, from, where_clause, .. } => {
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Select));
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            let ghost sel_head = r@;
+            let mut sl = print_select_list_slice(select.as_slice());
+            let ghost slo = sl@;
+            r.append(&mut sl);
+            proof {
+                token_views_concat(sel_head, slo);
+                assert(token_views(sel_head) =~= seq![TokenView::Keyword(Keyword::Select)]);
+            }
+            // FROM
+            let ghost before_from = r@;
+            if from.len() > 0 {
+                r.push(super::Token::Keyword(Keyword::From));
+                let ghost fk = r@;
+                let mut fl = print_from_list_slice(from.as_slice());
+                let ghost flo = fl@;
+                r.append(&mut fl);
+                proof {
+                    token_views_concat(fk, flo);
+                    token_views_concat(before_from, seq![super::Token::Keyword(Keyword::From)]);
+                    assert(fk =~= before_from + seq![super::Token::Keyword(Keyword::From)]);
+                }
+            }
+            let ghost after_from = r@;
+            // token_views(after_from) == token_views(before_from) + frompart
+            proof {
+                if from.len() > 0 {
+                    view_froms_len(from@);
+                } else {
+                    assert(after_from =~= before_from);
+                }
+            }
+            // WHERE
+            match where_clause {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Where));
+                    let ghost wk = r@;
+                    let mut wb = print_expr_exec(e);
+                    let ghost wbo = wb@;
+                    r.append(&mut wb);
+                    proof {
+                        token_views_concat(wk, wbo);
+                        token_views_concat(after_from, seq![super::Token::Keyword(Keyword::Where)]);
+                        assert(wk =~= after_from + seq![super::Token::Keyword(Keyword::Where)]);
+                    }
+                },
+                None => {},
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
 pub open spec fn is_sinsert(s: SStmt) -> bool {
     match s {
         SStmt::Insert { .. } => true,
