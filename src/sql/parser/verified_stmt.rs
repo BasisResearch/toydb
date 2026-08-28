@@ -3644,6 +3644,159 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     }
 }
 
+/// End-to-end executable statement roundtrip for the full_exec_ok domain
+/// (8 of 10 statement kinds plus Explain): printing a printable statement with
+/// the executable printer and parsing the result with the executable parser
+/// recovers it up to `view_stmt`. Self-contained; the parser's fuel is the token
+/// count, which `full_sdepth_le_len` bounds against `sdepth_stmt`.
+pub fn print_parse_roundtrip_stmt_full(s: &ast::Statement) -> (out: ast::Statement)
+    requires
+        printable_stmt(view_stmt(*s)),
+        full_exec_ok(view_stmt(*s)),
+    ensures
+        view_stmt(out) == view_stmt(*s),
+{
+    let ghost sm = view_stmt(*s);
+    let toks = print_stmt_full_exec(s);
+    let fuel = toks.len();
+    proof {
+        full_sdepth_le_len(sm);
+        token_views_len(toks@);
+        lemma_sparse_stmt_sprint(sm, fuel as nat);
+        assert(toks@.subrange(0int, toks@.len() as int) =~= toks@);
+    }
+    let (res, consumed) = parse_stmt_full_exec(&toks, 0, fuel);
+    match res {
+        Some(out) => out,
+        None => {
+            proof { assert(false); }
+            ast::Statement::Commit
+        },
+    }
+}
+
+// -- fuel bound for the unified headline -------------------------------------
+
+pub proof fn sdepth_column_le_len(c: SColumn)
+    requires printable_column(c),
+    ensures sdepth_column(c) <= sprint_column(c).len(),
+{
+    reveal(printable_column);
+    let base = seq![TokenView::Ident(c.name), datatype_kw(c.datatype)];
+    assert(sprint_column(c) =~= base + col_pk_toks(c) + col_null_toks(c) + col_unique_toks(c)
+        + col_index_toks(c) + col_ref_toks(c) + col_default_toks(c));
+    match c.default {
+        Some(e) => {
+            sdepth_le_len(e);
+            assert(col_default_toks(c) =~= seq![TokenView::Keyword(Keyword::Default)] + sprint(e));
+        },
+        None => {},
+    }
+}
+
+pub proof fn slist_depth_columns_le_len(cols: Seq<SColumn>)
+    requires all_printable_columns(cols),
+    ensures slist_depth_columns(cols) <= sprint_columns(cols).len() + 1,
+    decreases cols,
+{
+    if cols.len() == 0 {
+    } else if cols.len() == 1 {
+        sdepth_column_le_len(cols[0]);
+    } else {
+        sdepth_column_le_len(cols[0]);
+        slist_depth_columns_le_len(cols.drop_first());
+    }
+}
+
+pub proof fn slist_depth_rows_le_len(rows: Seq<Seq<SExpr>>)
+    requires all_printable_rows(rows),
+    ensures slist_depth_rows(rows) <= sprint_rows(rows).len() + 1,
+    decreases rows,
+{
+    if rows.len() == 0 {
+    } else if rows.len() == 1 {
+        assert(all_printable_se(rows[0]));
+        super::verified_roundtrip::slist_depth_le_len(rows[0]);
+        assert(slist_depth(rows[0]) >= 1);
+        assert(slist_depth_rows(rows.drop_first()) == 1) by {
+            assert(rows.drop_first().len() == 0);
+        }
+        assert(sprint_row(rows[0]) =~= seq![TokenView::OpenParen] + sprint_args(rows[0])
+            + seq![TokenView::CloseParen]);
+        assert(sprint_rows(rows) =~= sprint_row(rows[0]));
+    } else {
+        assert(all_printable_se(rows[0]));
+        assert(all_printable_rows(rows.drop_first()));
+        super::verified_roundtrip::slist_depth_le_len(rows[0]);
+        slist_depth_rows_le_len(rows.drop_first());
+        assert(sprint_row(rows[0]) =~= seq![TokenView::OpenParen] + sprint_args(rows[0])
+            + seq![TokenView::CloseParen]);
+        assert(sprint_rows(rows) =~= sprint_row(rows[0]) + seq![TokenView::Comma]
+            + sprint_rows(rows.drop_first()));
+    }
+}
+
+pub proof fn sprint_names_len_ge(names: Seq<String>)
+    ensures names.len() <= sprint_names(names).len(),
+    decreases names,
+{
+    if names.len() <= 1 {
+    } else {
+        sprint_names_len_ge(names.drop_first());
+    }
+}
+
+#[verifier::rlimit(8000)]
+pub proof fn full_sdepth_le_len(s: SStmt)
+    requires printable_stmt(s), full_exec_ok(s),
+    ensures sdepth_stmt(s) <= sprint_stmt(s).len(),
+    decreases s,
+{
+    reveal(printable_stmt);
+    reveal(full_exec_ok);
+    match s {
+        SStmt::Begin { .. } => {},
+        SStmt::Commit => {},
+        SStmt::Rollback => {},
+        SStmt::CreateTable { name, columns } => {
+            slist_depth_columns_le_len(columns);
+            assert(sprint_stmt(s) =~= seq![
+                TokenView::Keyword(Keyword::Create),
+                TokenView::Keyword(Keyword::Table),
+                TokenView::Ident(name),
+                TokenView::OpenParen,
+            ] + sprint_columns(columns) + seq![TokenView::CloseParen]);
+        },
+        SStmt::DropTable { .. } => {},
+        SStmt::Delete { table, where_clause } => {
+            match where_clause {
+                Some(e) => {
+                    sdepth_le_len(e);
+                    assert(sprint_stmt(s) =~= seq![
+                        TokenView::Keyword(Keyword::Delete),
+                        TokenView::Keyword(Keyword::From),
+                        TokenView::Ident(table),
+                        TokenView::Keyword(Keyword::Where),
+                    ] + sprint(e));
+                },
+                None => {},
+            }
+        },
+        SStmt::Insert { table, columns, values } => {
+            slist_depth_rows_le_len(values);
+            match columns {
+                Some(names) => { sprint_names_len_ge(names); },
+                None => {},
+            }
+        },
+        SStmt::Explain(inner) => {
+            full_sdepth_le_len(*inner);
+            assert(sprint_stmt(s) =~= seq![TokenView::Keyword(Keyword::Explain)] + sprint_stmt(*inner));
+        },
+        _ => {},
+    }
+}
+
 #[verifier::rlimit(8000)]
 pub fn print_stmt_full_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
     requires printable_stmt(view_stmt(*s)), full_exec_ok(view_stmt(*s)),
