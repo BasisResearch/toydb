@@ -380,4 +380,95 @@ pub fn skip_ws_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
     }
 }
 
+// -- L3: number scanning (integer core) ---------------------------------------
+//
+// `Number` is the first token with a payload. The production `scan_number_bytes`
+// (in `lexer.rs`, already verified) consumes digits then an optional `.`-fraction
+// and `e`-exponent, storing the raw bytes. This brick proves the spec-level
+// roundtrip for the integer core: a maximal digit run re-scans to exactly itself,
+// given the following byte does not continue the run. Decimal/exponent extension
+// is deferred to a later brick; the boundary reasoning is identical to L1.
+
+/// ASCII digit `0`-`9`.
+pub open spec fn is_digit(b: u8) -> bool {
+    48 <= b <= 57
+}
+
+/// Every byte of the sequence is a digit.
+pub open spec fn all_digits(s: Seq<u8>) -> bool {
+    forall|i: int| 0 <= i < s.len() ==> is_digit(#[trigger] s[i])
+}
+
+/// End of the maximal digit run starting at `pos`.
+pub open spec fn scan_digits_end(input: Seq<u8>, pos: int) -> int
+    decreases input.len() - pos,
+{
+    if 0 <= pos < input.len() && is_digit(input[pos]) {
+        scan_digits_end(input, pos + 1)
+    } else {
+        pos
+    }
+}
+
+/// Maximal-run characterization: if `[pos, k)` are all digits and position `k` is
+/// end-of-input or a non-digit, the scan stops exactly at `k`.
+pub proof fn lemma_scan_digits_end_run(input: Seq<u8>, pos: int, k: int)
+    requires
+        0 <= pos <= k <= input.len(),
+        forall|i: int| pos <= i < k ==> is_digit(#[trigger] input[i]),
+        k == input.len() || !is_digit(input[k]),
+    ensures
+        scan_digits_end(input, pos) == k,
+    decreases k - pos,
+{
+    if pos < k {
+        assert(is_digit(input[pos]));
+        lemma_scan_digits_end_run(input, pos + 1, k);
+    }
+}
+
+/// Integer roundtrip: a non-empty digit run followed by a non-digit boundary byte
+/// (or end) re-scans to exactly itself. This is the number analogue of L1's
+/// maximal-munch boundary — the tail must not start with a byte that extends the
+/// run (here, another digit; decimal/exponent bytes are the deferred extension).
+pub proof fn lemma_scan_digits_roundtrip(d: Seq<u8>, tail: Seq<u8>)
+    requires
+        d.len() >= 1,
+        all_digits(d),
+        tail.len() == 0 || !is_digit(tail[0]),
+    ensures
+        scan_digits_end(d + tail, 0) == d.len(),
+{
+    let input = d + tail;
+    assert forall|i: int| 0 <= i < d.len() implies is_digit(#[trigger] input[i]) by {
+        assert(input[i] == d[i]);
+    }
+    if tail.len() == 0 {
+        assert(input.len() == d.len());
+    } else {
+        assert(input[d.len() as int] == tail[0]);
+    }
+    lemma_scan_digits_end_run(input, 0, d.len() as int);
+}
+
+/// Executable maximal digit-run scanner, refining `scan_digits_end`.
+pub fn scan_digits_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
+    requires
+        pos <= input.len(),
+    ensures
+        r == scan_digits_end(input@, pos as int),
+    decreases input.len() - pos,
+{
+    if pos < input.len() {
+        let b = input[pos];
+        if 48u8 <= b && b <= 57u8 {
+            scan_digits_exec(input, pos + 1)
+        } else {
+            pos
+        }
+    } else {
+        pos
+    }
+}
+
 } // verus!
