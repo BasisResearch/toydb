@@ -320,6 +320,24 @@ is the multi-week gate) and the ast-equivalence argument so the verified parser 
 sound drop-in for the hand-written one, then the actual `parser.rs`/`lexer.rs` swap run
 green against the SQL suite. No grammar work remains.
 
+**Production lexer STARTED (2026-08-28, `verified_lexer.rs`, in verify.sh — 18 modules).**
+Same discipline as the grammar: smallest self-contained verified bricks, produces the
+REAL production `Token` (not `verified.rs`'s Phase-0 toy), byte cursor over `Seq<u8>`.
+- **L0 — munch-free punctuation** (`. = + - * / ^ % ? , ; ( )`): `punct1_byte` /
+  `scan_punct1` / `lscan1` / `lex_print1` + `lemma_lscan1_lex_print1` (scan inverts print
+  for any tail — these are never a longer token's prefix) + `scan_punct1_exec`.
+- **L1 — maximal-munch operators** (`< > !` and `<= >= <> !=`): `lscan_op` looks one byte
+  ahead and commits to the longest match. Introduces BYTE-level boundary reasoning
+  (`op_tail_ok`): a printed `<` before `=`/`>` re-scans as `<=`/`<>`, so the single-char
+  forms roundtrip only when the next byte doesn't extend them; two-char forms impose
+  nothing. `lemma_lscan_op` + `scan_op_exec`.
+- **Remaining lexer bricks:** numbers (`Number(Vec<u8>)` — digits/decimals/exponents),
+  strings (quotes + escapes, Unicode), identifiers (quoted vs unquoted-lowercased),
+  keywords (ident-then-classify), whitespace + line comments (skip), then the
+  whole-input token-LIST scanner + its roundtrip (with inter-token separator canonicalisation
+  — two adjacent `Number`s need a space or they re-lex as one), and the executable
+  `Vec<u8> -> Vec<Token>` top-level lexer. THEN ast-equivalence + cutover. Multi-week.
+
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
 `sparse_where_group` opaque helper + roundtrip lemma + `print_select_exec`), but
