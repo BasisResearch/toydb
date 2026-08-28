@@ -218,6 +218,17 @@ impl<R: Role> RawNode<R> {
         self.cluster_size() as u8
     }
 
+    /// Sends a message justified by a verified send-only core (see
+    /// `refine::Refined`): the token proves the message is a model message.
+    fn send_refined(&self, _proof: refine::Refined, to: NodeID, message: Message) -> Result<()> {
+        self.send(to, message)
+    }
+
+    /// Broadcasts a message justified by a verified send-only core.
+    fn broadcast_refined(&self, _proof: refine::Refined, message: Message) -> Result<()> {
+        self.broadcast(message)
+    }
+
     /// Returns the node's current term.
     fn term(&self) -> Term {
         self.log.get_term_vote().0
@@ -417,22 +428,26 @@ impl RawNode<Follower> {
                 let match_index = if self.log.has(last_index, msg.term)? { last_index } else { 0 };
                 // Verified: a match is the model's t_send_ack transition, and
                 // echoing the read sequence number is t_confirm_read.
-                refine::core_send_ack(
+                let proof = refine::core_send_ack(
                     self.habs,
                     self.rank(self.id),
                     self.size(),
                     msg.term,
                     last_index,
                     match_index != 0,
-                );
-                refine::core_confirm_read(
+                )
+                .and(refine::core_confirm_read(
                     self.habs,
                     self.rank(self.id),
                     self.size(),
                     msg.term,
                     read_seq,
-                );
-                self.send(msg.from, Message::HeartbeatResponse { match_index, read_seq })?;
+                ));
+                self.send_refined(
+                    proof,
+                    msg.from,
+                    Message::HeartbeatResponse { match_index, read_seq },
+                )?;
 
                 // Advance the commit index and apply entries. We can only do
                 // this if we matched the leader's last_index, which implies
@@ -520,14 +535,14 @@ impl RawNode<Follower> {
                 }
 
                 // Confirm the read. Verified: the model's t_confirm_read.
-                refine::core_confirm_read(
+                let proof = refine::core_confirm_read(
                     self.habs,
                     self.rank(self.id),
                     self.size(),
                     msg.term,
                     seq,
                 );
-                self.send(msg.from, Message::ReadResponse { seq })?;
+                self.send_refined(proof, msg.from, Message::ReadResponse { seq })?;
             }
 
             // A candidate is requesting our vote. We only grant one per term:
@@ -723,12 +738,7 @@ impl RawNode<Candidate> {
         // roundtrip if the heartbeat response indicates the peer is behind.
         // (Part of the t_become_leader step above, so appended directly
         // rather than through propose's t_propose core.)
-        let index = node.log.append(None)?;
-        for peer in node.peers.iter().copied().sorted() {
-            if index == node.progress(peer).next_index {
-                node.maybe_send_append(peer, false)?;
-            }
-        }
+        node.append_and_replicate(None)?;
         node.maybe_commit_and_apply()?;
         node.heartbeat()?;
 
@@ -814,7 +824,8 @@ impl RawNode<Candidate> {
     /// message carrying our log view and our implicit self-vote.
     fn campaign(&mut self) -> Result<()> {
         let (term, habs) =
-            refine::core_campaign(self.habs, self.rank(self.id), self.size(), self.term());
+            refine::core_campaign(self.habs, self.rank(self.id), self.size(), self.term())
+                .expect("term overflow");
         info!("Starting new election for term {term}");
         self.role = Candidate::new(self.random_election_timeout());
         self.role.votes.insert(self.id); // vote for ourself
@@ -1168,7 +1179,7 @@ impl RawNode<Leader> {
 
         // Verified: re-announcing the commit index is the model's
         // t_send_commit transition, carrying our ghost commit witness.
-        refine::core_send_commit(
+        let proof = refine::core_send_commit(
             self.habs,
             self.rank(self.id),
             self.size(),
@@ -1176,7 +1187,7 @@ impl RawNode<Leader> {
             commit_index,
         );
         self.role.since_heartbeat = 0;
-        self.broadcast(Message::Heartbeat { last_index, commit_index, read_seq })
+        self.broadcast_refined(proof, Message::Heartbeat { last_index, commit_index, read_seq })
     }
 
     /// Proposes a command for consensus by appending it to our log and
@@ -1187,6 +1198,14 @@ impl RawNode<Leader> {
         let cmd = refine::cmd_ghost(&command);
         self.habs =
             refine::core_propose(self.habs, self.rank(self.id), self.size(), self.term(), cmd);
+        self.append_and_replicate(command)
+    }
+
+    /// Appends a command to our log and eagerly replicates it to peers in
+    /// steady state, returning its index. The ghost step is the caller's
+    /// (`t_propose` for `propose`, part of `t_become_leader` for
+    /// `into_leader`).
+    fn append_and_replicate(&mut self, command: Option<Vec<u8>>) -> Result<Index> {
         let index = self.log.append(command)?;
         for peer in self.peers.iter().copied().sorted() {
             // Eagerly send the entry to the peer if it's in steady state and
@@ -1231,7 +1250,7 @@ impl RawNode<Leader> {
         // re-validates that a strict majority's acked match indexes reach
         // commit_index and that the entry there is from our own term, backed
         // by the accumulated ack evidence.
-        refine::core_send_ack(
+        let proof = refine::core_send_ack(
             self.habs,
             self.rank(self.id),
             self.size(),
@@ -1239,7 +1258,8 @@ impl RawNode<Leader> {
             last_index,
             true,
         );
-        self.evid = refine::note_ack(self.evid, self.rank(self.id), self.term(), last_index);
+        self.evid =
+            refine::note_own_ack(self.evid, proof, self.rank(self.id), self.term(), last_index);
         let members: Vec<(NodeID, Index)> = self
             .role
             .progress
@@ -1411,7 +1431,7 @@ impl RawNode<Leader> {
 
         // Verified: sending this window of our log is the model's
         // t_send_append transition.
-        refine::core_send_append(
+        let proof = refine::core_send_append(
             self.habs,
             self.rank(self.id),
             self.size(),
@@ -1420,7 +1440,7 @@ impl RawNode<Leader> {
             base_index + entries.len() as u64,
         );
         debug!("Replicating {} entries with base {base_index} to {peer}", entries.len());
-        self.send(peer, Message::Append { base_index, base_term, entries })
+        self.send_refined(proof, peer, Message::Append { base_index, base_term, entries })
     }
 
     /// Generates cluster status.

@@ -40,8 +40,18 @@
 //!    summaries (they equal the ghost state's fields — each core's
 //!    `requires` documents the obligation), threads the returned ghost state,
 //!    and performs exactly the writes and sends in the plan. Preconditions of
-//!    calls from unverified code are not machine-checked; each call site is
-//!    written so the correspondence is locally auditable.
+//!    calls from unverified code are not machine-checked, so the cores keep
+//!    them to ghost-only facts where possible and check everything else at
+//!    runtime themselves (member ids, overflow); each remaining call site is
+//!    written so the correspondence is locally auditable. The send-only
+//!    cores return a `#[must_use]` `Refined` token that the shell hands to
+//!    `send_refined`, so a dropped core call is at least a compiler warning.
+//!
+//! The model's message-receiving transitions (`t_grant`, `t_recv_append`,
+//! `t_confirm_read`) also accept a higher-term message in one step; the
+//! implementation always bumps the term first (`core_bump_term`, the model's
+//! `t_bump_term`) and then handles the message at its own term, so the
+//! receiving cores only cover — and only need — the equal-term case.
 //! 4. **Cluster configuration**: all nodes agree on the member set (already a
 //!    documented requirement of `RawNode::peers`).
 //!
@@ -69,7 +79,7 @@ use super::safety::{AEntry, CommitRec, GState, MHost, MRole, Msg, ReadRec, TStep
 use super::safety::{
     inv, is_quorum, last_term, next, next_step, node_ids, prefix_eq, splice, t_become_leader,
     t_bump_term, t_campaign, t_collect_vote, t_confirm_read, t_grant, t_leader_commit, t_propose,
-    t_recv_append, t_recv_commit, t_restart, t_send_ack, t_send_append, t_send_commit, t_step_down,
+    t_recv_append, t_recv_commit, t_send_ack, t_send_append, t_send_commit, t_step_down,
     t_submit_read, thm_read_linearizable, up_to_date,
 };
 
@@ -156,7 +166,12 @@ pub fn recv_commit_evidence() -> (rec: Ghost<CommitRec>)
 
 /// TRUSTED (storage integrity): the abstract state of this node recovered
 /// from its durable log at startup. The summaries reported by `Log` pin the
-/// view's shape; its contents are whatever the disk holds.
+/// view's shape; its contents are whatever the disk holds. On a fresh start
+/// this is the model's initial host state; after a crash it is the
+/// `t_restart` post-state of the pre-crash host — term, vote and log are
+/// fsynced, and the commit index (which is not) may have regressed, which
+/// `t_restart` allows. Not covered: with `Log::fsync` disabled a crash can
+/// leave the commit index beyond the log, a state outside the model.
 #[verifier::external_body]
 pub fn recover_abs(term: u64, vote: Option<u8>, last_index: u64, lterm: u64, commit: u64) -> (h: Ghost<MHost>)
     ensures
@@ -176,6 +191,22 @@ pub fn recover_abs(term: u64, vote: Option<u8>, last_index: u64, lterm: u64, com
 // Ghost plumbing helpers for the (unverified) shell
 // ---------------------------------------------------------------------------
 
+/// A proof token returned by the send-only cores (`core_send_*`,
+/// `core_confirm_read`): the message the shell is about to send is a model
+/// message. It carries no data; its purpose is to be consumed by
+/// `RawNode::send_refined`, so that removing a core call from the shell
+/// leaves an unused-value warning rather than a silent gap.
+#[must_use = "pass the refinement token to the send it justifies"]
+pub struct Refined;
+
+impl Refined {
+    /// Combines the tokens of two cores justifying one message (a heartbeat
+    /// response is both an ack and a read confirmation).
+    pub fn and(self, _other: Refined) -> Refined {
+        Refined
+    }
+}
+
 /// An empty evidence set, for node startup.
 pub fn empty_evidence() -> (r: Ghost<Set<Msg>>)
     ensures
@@ -188,6 +219,16 @@ pub fn empty_evidence() -> (r: Ghost<Set<Msg>>)
 /// with a nonzero match index abstracts to an Ack in the history (trusted
 /// assumption 1; for the leader's own last index, its own emission).
 pub fn note_ack(Ghost(evid): Ghost<Set<Msg>>, from: u8, term: u64, mi: u64) -> (r: Ghost<Set<Msg>>)
+    ensures
+        r@ == evid.insert(Msg::Ack { v: from as int, term: term as nat, mi: mi as nat }),
+{
+    Ghost(evid.insert(Msg::Ack { v: from as int, term: term as nat, mi: mi as nat }))
+}
+
+/// Record the leader's own ack of its last entry (`t_send_ack` by the
+/// leader itself), consuming the `core_send_ack` token: there is no message
+/// to send, so the evidence note is what justifies the step.
+pub fn note_own_ack(Ghost(evid): Ghost<Set<Msg>>, _proof: Refined, from: u8, term: u64, mi: u64) -> (r: Ghost<Set<Msg>>)
     ensures
         r@ == evid.insert(Msg::Ack { v: from as int, term: term as nat, mi: mi as nat }),
 {
@@ -261,28 +302,6 @@ proof fn lemma_lift_step_down(i: int, n: u8, hpre: MHost)
         let s2 = GState { hosts: s.hosts.update(i, hpost), ..s };
         assert(t_step_down(s, s2, i));
         assert(next_step(s, s2, TStep::StepDown { i }));
-        assert(next(s, s2));
-        assert(s2.net =~= s.net.union(Set::empty()));
-        assert(s2.net == s.net.union(Set::empty()));
-    }
-}
-
-proof fn lemma_lift_restart(i: int, n: u8, hpre: MHost)
-    ensures
-        host_refines(i, n, hpre,
-            MHost { role: MRole::Follower, votes: Set::empty(), vote_logs: Map::empty(), read_seq: 0, ..hpre },
-            Set::empty(), Set::empty()),
-{
-    let hpost = MHost { role: MRole::Follower, votes: Set::empty(), vote_logs: Map::empty(), read_seq: 0, ..hpre };
-    assert forall|s: GState| #[trigger] binds(s, i, n, hpre, Set::empty()) implies exists|s2: GState| {
-        &&& #[trigger] next(s, s2)
-        &&& s2.n == s.n
-        &&& s2.hosts == s.hosts.update(i, hpost)
-        &&& s2.net == s.net.union(Set::empty())
-    } by {
-        let s2 = GState { hosts: s.hosts.update(i, hpost), ..s };
-        assert(t_restart(s, s2, i));
-        assert(next_step(s, s2, TStep::Restart { i }));
         assert(next(s, s2));
         assert(s2.net =~= s.net.union(Set::empty()));
         assert(s2.net == s.net.union(Set::empty()));
@@ -616,54 +635,47 @@ pub fn core_step_down(Ghost(h): Ghost<MHost>, i: u8, n: u8) -> (r: Ghost<MHost>)
     Ghost(MHost { role: MRole::Follower, ..h })
 }
 
-/// A crash-restart: durable state survives, volatile role state resets.
-/// Refines `t_restart`.
-pub fn core_restart(Ghost(h): Ghost<MHost>, i: u8, n: u8) -> (r: Ghost<MHost>)
-    ensures
-        r@ == (MHost { role: MRole::Follower, votes: Set::empty(), vote_logs: Map::empty(), read_seq: 0, ..h }),
-        host_refines(i as int, n, h, r@, Set::empty(), Set::empty()),
-{
-    proof {
-        lemma_lift_restart(i as int, n, h);
-    }
-    Ghost(MHost { role: MRole::Follower, votes: Set::empty(), vote_logs: Map::empty(), read_seq: 0, ..h })
-}
-
 /// Campaigning: bump the term, vote for self, solicit votes
 /// (`RawNode::<Candidate>::campaign`). Returns the new term; the shell writes
-/// it with `set_term_vote(term, Some(self))` and broadcasts Campaign. Refines
+/// it with `set_term_vote(term, Some(self))` and broadcasts Campaign. `None`
+/// iff the term counter is exhausted (unreachable in practice). Refines
 /// `t_campaign`.
-pub fn core_campaign(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64) -> (r: (u64, Ghost<MHost>))
+pub fn core_campaign(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64) -> (r: Option<(u64, Ghost<MHost>)>)
     requires
         h.term == term as nat,
         !(h.role is Leader),
-        term < u64::MAX,
     ensures
-        r.0 == term + 1,
-        r.1@ == (MHost {
-            term: (term + 1) as nat,
-            vote: Some(i as int),
-            role: MRole::Candidate,
-            votes: Set::empty().insert(i as int),
-            vote_logs: Map::empty().insert(i as int, h.log),
-            ..h
-        }),
-        host_refines(i as int, n, h, r.1@, Set::empty(),
-            Set::empty()
-                .insert(Msg::Campaign { c: i as int, term: (term + 1) as nat, clog: h.log })
-                .insert(Msg::Vote { v: i as int, c: i as int, term: (term + 1) as nat, vlog: h.log })),
+        r is None <==> term == u64::MAX,
+        r matches Some((t2, h2)) ==> {
+            &&& t2 == term + 1
+            &&& h2@ == (MHost {
+                term: (term + 1) as nat,
+                vote: Some(i as int),
+                role: MRole::Candidate,
+                votes: Set::empty().insert(i as int),
+                vote_logs: Map::empty().insert(i as int, h.log),
+                ..h
+            })
+            &&& host_refines(i as int, n, h, h2@, Set::empty(),
+                Set::empty()
+                    .insert(Msg::Campaign { c: i as int, term: (term + 1) as nat, clog: h.log })
+                    .insert(Msg::Vote { v: i as int, c: i as int, term: (term + 1) as nat, vlog: h.log }))
+        },
 {
+    if term == u64::MAX {
+        return None;
+    }
     proof {
         lemma_lift_campaign(i as int, n, h);
     }
-    (term + 1, Ghost(MHost {
+    Some((term + 1, Ghost(MHost {
         term: (term + 1) as nat,
         vote: Some(i as int),
         role: MRole::Candidate,
         votes: Set::empty().insert(i as int),
         vote_logs: Map::empty().insert(i as int, h.log),
         ..h
-    }))
+    })))
 }
 
 /// Deciding a vote request at the receiver's own term (`Message::Campaign`
@@ -780,11 +792,6 @@ pub fn core_become_leader(
     }))
 }
 
-/// The view of a concrete command payload.
-pub open spec fn cmd_view(c: Option<Seq<u8>>) -> Option<Seq<u8>> {
-    c
-}
-
 /// A leader appending a client command to its log (`Leader::propose`).
 /// Refines `t_propose`.
 pub fn core_propose(
@@ -807,7 +814,7 @@ pub fn core_propose(
 /// including empty probes). No state change; the concrete message the shell
 /// sends carries the entries the leader log holds in that window. Refines
 /// `t_send_append`.
-pub fn core_send_append(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, b: u64, e: u64)
+pub fn core_send_append(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, b: u64, e: u64) -> Refined
     requires
         h.term == term as nat,
         h.role is Leader,
@@ -825,13 +832,14 @@ pub fn core_send_append(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, b: u64,
     proof {
         lemma_lift_send_append(i as int, n, h, b as nat, e as nat);
     }
+    Refined
 }
 
 /// A host acking a match of its own-term entry at `mi` (a matching heartbeat
 /// response, or the leader counting its own last index). `has_mi` is
 /// `log.has(mi, term)` — trusted to agree with the ghost view. Refines
 /// `t_send_ack` when the entry matches; no-op otherwise.
-pub fn core_send_ack(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, mi: u64, has_mi: bool)
+pub fn core_send_ack(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, mi: u64, has_mi: bool) -> Refined
     requires
         h.term == term as nat,
         has_mi == (1 <= mi as nat <= h.log.len() && h.log[mi as int - 1].term == term as nat),
@@ -844,6 +852,7 @@ pub fn core_send_ack(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, mi: u64, h
             lemma_lift_send_ack(i as int, n, h, mi as nat);
         }
     }
+    Refined
 }
 
 /// A follower splicing appended entries (`Message::Append` handling at the
@@ -863,8 +872,8 @@ pub fn core_recv_append(
         aentries.len() == entries_len as nat,
         base_ok == (base_index == 0
             || (base_index as nat <= h.log.len() && h.log[base_index as int - 1].term == base_term as nat)),
-        base_index + entries_len <= u64::MAX,
     ensures
+        r is None <==> !base_ok || base_index + entries_len > u64::MAX,
         r matches Some((mi, h2)) ==> {
             &&& mi == base_index + entries_len as u64
             &&& h2@ == (MHost { log: splice(h.log, base_index as nat, aentries), ..h })
@@ -878,6 +887,11 @@ pub fn core_recv_append(
         },
 {
     if !base_ok {
+        return None;
+    }
+    // The ack index must be representable (unreachable in practice: the
+    // leader's log has at most u64::MAX entries).
+    if entries_len as u64 > u64::MAX - base_index {
         return None;
     }
     proof {
@@ -894,6 +908,54 @@ pub fn core_recv_append(
 // ---------------------------------------------------------------------------
 // The commit path
 // ---------------------------------------------------------------------------
+
+/// The shell reports one (id, value) pair per cluster member. Ids must be
+/// distinct ranks below `n` for the quorum count to be meaningful; this is
+/// checked here at runtime rather than assumed of the shell.
+pub open spec fn members_wf(members: Seq<(u8, u64)>, n: u8) -> bool {
+    &&& forall|k1: int, k2: int| 0 <= k1 < k2 < members.len() ==> (#[trigger] members[k1]).0 != (#[trigger] members[k2]).0
+    &&& forall|k: int| 0 <= k < members.len() ==> (#[trigger] members[k]).0 < n
+}
+
+fn check_members(members: &Vec<(u8, u64)>, n: u8) -> (r: bool)
+    ensures
+        r == members_wf(members@, n),
+{
+    let mut k: usize = 0;
+    while k < members.len()
+        invariant
+            k <= members@.len(),
+            forall|k1: int, k2: int| 0 <= k1 < k2 < k ==> (#[trigger] members@[k1]).0 != (#[trigger] members@[k2]).0,
+            forall|k1: int| 0 <= k1 < k ==> (#[trigger] members@[k1]).0 < n,
+        decreases members@.len() - k,
+    {
+        let (id, _) = members[k];
+        if id >= n {
+            assert(!members_wf(members@, n)) by {
+                assert(members@[k as int].0 >= n);
+            }
+            return false;
+        }
+        let mut j: usize = 0;
+        while j < k
+            invariant
+                j <= k < members@.len(),
+                id == members@[k as int].0,
+                forall|j1: int| 0 <= j1 < j ==> (#[trigger] members@[j1]).0 != id,
+            decreases k - j,
+        {
+            if members[j].0 == id {
+                assert(!members_wf(members@, n)) by {
+                    assert(members@[j as int].0 == members@[k as int].0);
+                }
+                return false;
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+    true
+}
 
 proof fn lemma_lift_leader_commit(i: int, n: u8, hpre: MHost, ci: nat, q: Map<int, nat>, evid: Set<Msg>)
     requires
@@ -1000,9 +1062,9 @@ proof fn lemma_lift_send_commit(i: int, n: u8, hpre: MHost, ci: nat)
 /// or past it, each backed by ack evidence — and the section 5.4.2 own-term
 /// condition (`ci_term_ok`, trusted to agree with `log.get(ci)`). `members`
 /// holds each member's (id, match index) with the leader's own last index
-/// included; ids must be distinct and in range. Returns the post-state with
-/// the new commit witness, or `None` if the commit is not justified. Refines
-/// `t_leader_commit`.
+/// included; ids are checked to be distinct and in range. Returns the
+/// post-state with the new commit witness, or `None` if the commit is not
+/// justified. Refines `t_leader_commit`.
 pub fn core_leader_commit(
     Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64,
     ci: u64, commit_index: u64, ci_term_ok: bool,
@@ -1013,11 +1075,8 @@ pub fn core_leader_commit(
         h.role is Leader,
         h.commit == commit_index as nat,
         ci_term_ok == (1 <= ci as nat <= h.log.len() && h.log[ci as int - 1].term == term as nat),
-        forall|k1: int, k2: int| 0 <= k1 < k2 < members@.len() ==> (#[trigger] members@[k1]).0 != (#[trigger] members@[k2]).0,
-        forall|k: int| 0 <= k < members@.len() ==> (#[trigger] members@[k]).0 < n,
         forall|k: int| 0 <= k < members@.len() && (#[trigger] members@[k]).1 >= 1 ==>
             evid.contains(Msg::Ack { v: members@[k].0 as int, term: term as nat, mi: members@[k].1 as nat }),
-        n >= 1,
     ensures
         r matches Some(h2) ==> {
             &&& h2@.commit == ci as nat
@@ -1027,7 +1086,7 @@ pub fn core_leader_commit(
                     Set::empty().insert(Msg::Commit { term: term as nat, ci: ci as nat, rec: h2@.crec }))
         },
 {
-    if ci <= commit_index || !ci_term_ok {
+    if ci <= commit_index || !ci_term_ok || n == 0 || !check_members(members, n) {
         return None;
     }
     // Count members whose match index reaches ci, collecting the ghost
@@ -1149,7 +1208,7 @@ pub fn core_recv_commit(
 /// A leader re-announcing its commit index in a heartbeat
 /// (`Leader::heartbeat`). No state change; a zero commit index announces
 /// nothing. Refines `t_send_commit`.
-pub fn core_send_commit(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, ci: u64)
+pub fn core_send_commit(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, ci: u64) -> Refined
     requires
         h.term == term as nat,
         h.role is Leader,
@@ -1163,6 +1222,7 @@ pub fn core_send_commit(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, ci: u64
             lemma_lift_send_commit(i as int, n, h, ci as nat);
         }
     }
+    Refined
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,7 +1326,7 @@ pub fn core_submit_read(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, read_se
 /// A follower confirming the leader's read sequence number (`Message::Read`
 /// and heartbeat read_seq handling). No state change; a zero sequence number
 /// confirms nothing. Refines `t_confirm_read`.
-pub fn core_confirm_read(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, sq: u64)
+pub fn core_confirm_read(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, sq: u64) -> Refined
     requires
         h.term == term as nat,
         h.role is Follower,
@@ -1280,6 +1340,7 @@ pub fn core_confirm_read(Ghost(h): Ghost<MHost>, i: u8, n: u8, term: u64, sq: u6
             lemma_lift_confirm_read(i as int, n, h, sq as nat);
         }
     }
+    Refined
 }
 
 /// The linearizable-read gate (`maybe_read`): a read with sequence number
@@ -1305,11 +1366,8 @@ pub fn core_can_serve(
         commit_term_ok == (1 <= commit_index as nat <= h.log.len()
             && h.log[commit_index as int - 1].term == term as nat),
         seq >= 1,
-        forall|k1: int, k2: int| 0 <= k1 < k2 < confirms@.len() ==> (#[trigger] confirms@[k1]).0 != (#[trigger] confirms@[k2]).0,
-        forall|k: int| 0 <= k < confirms@.len() ==> (#[trigger] confirms@[k]).0 < n,
         forall|k: int| 0 <= k < confirms@.len() && (#[trigger] confirms@[k]).1 >= 1 ==>
             evid.contains(Msg::ReadConfirm { v: confirms@[k].0 as int, term: term as nat, seq: confirms@[k].1 as nat }),
-        n >= 1,
     ensures
         r ==> forall|s: GState, rr: ReadRec|
             #[trigger] binds(s, i as int, n, h, evid) && inv(s)
@@ -1320,7 +1378,7 @@ pub fn core_can_serve(
                 &&& prefix_eq(h.log, s.leader_log[rec.term], rec.ci)
             },
 {
-    if !commit_term_ok {
+    if !commit_term_ok || n == 0 || !check_members(confirms, n) {
         return false;
     }
     // Count members that confirmed at or past seq, collecting the quorum.

@@ -249,7 +249,9 @@ mod node;
 mod safety;
 // The node-local refinement layer: verified step cores proving that the step
 // functions implement the safety model's transitions. Called from `node`.
-#[allow(dead_code, unused_variables)]
+// (A normal build erases the ghost code, leaving the parameters that only
+// feed ghost state unused.)
+#[allow(unused_variables)]
 mod refine;
 mod state;
 

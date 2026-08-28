@@ -48,7 +48,7 @@
 //! | `t_leader_commit`   | `Leader::maybe_commit_and_apply`                      |
 //! | `t_send_commit`     | `Leader::heartbeat` (commit_index)                    |
 //! | `t_recv_commit`     | `Message::Heartbeat` commit handling                  |
-//! | `t_restart`         | `Node::new` after a crash-restart                     |
+//! | `t_restart`         | `Node::new` after a crash-restart (commit may lag)    |
 //! | `t_submit_read`     | `ClientRequest::Read` handling (leader step)          |
 //! | `t_confirm_read`    | `Message::Read`/`ReadResponse` handling               |
 //!
@@ -762,13 +762,18 @@ pub open spec fn t_step_down(pre: GState, post: GState, i: int) -> bool {
 }
 
 /// A crash-restart (`Node::new` after restart): durable state (term, vote,
-/// log, commit) survives; volatile role state resets to follower.
-pub open spec fn t_restart(pre: GState, post: GState, i: int) -> bool {
+/// log) survives; volatile role state resets to follower. The commit index
+/// is not fsynced (`Log::commit`), so the recovered value `c` may lag the
+/// pre-crash one — it is recovered from the quorum later. The commit witness
+/// `crec` is kept: it still covers the (smaller) committed prefix.
+pub open spec fn t_restart(pre: GState, post: GState, i: int, c: nat) -> bool {
     let h = pre.hosts[i];
     &&& 0 <= i < pre.n
+    &&& c <= h.commit
     &&& post.n == pre.n
     &&& post.hosts == pre.hosts.update(i, MHost {
         role: MRole::Follower,
+        commit: c,
         votes: Set::empty(),
         vote_logs: Map::empty(),
         read_seq: 0,
@@ -833,7 +838,7 @@ pub enum TStep {
     RecvCommit { i: int, ci: nat, mi: nat, rec: CommitRec },
     BumpTerm { i: int, term: nat },
     StepDown { i: int },
-    Restart { i: int },
+    Restart { i: int, commit: nat },
     SubmitRead { i: int },
     ConfirmRead { i: int, term: nat, seq: nat },
 }
@@ -854,7 +859,7 @@ pub open spec fn next_step(pre: GState, post: GState, step: TStep) -> bool {
         TStep::RecvCommit { i, ci, mi, rec } => t_recv_commit(pre, post, i, ci, mi, rec),
         TStep::BumpTerm { i, term } => t_bump_term(pre, post, i, term),
         TStep::StepDown { i } => t_step_down(pre, post, i),
-        TStep::Restart { i } => t_restart(pre, post, i),
+        TStep::Restart { i, commit } => t_restart(pre, post, i, commit),
         TStep::SubmitRead { i } => t_submit_read(pre, post, i),
         TStep::ConfirmRead { i, term, seq } => t_confirm_read(pre, post, i, term, seq),
     }
@@ -1291,11 +1296,13 @@ pub open spec fn inv_host_commits(s: GState) -> bool {
     forall|i: int| 0 <= i < s.n ==> #[trigger] host_commit_ok(s, i)
 }
 
-/// A committing leader's own commit index covers its records (while it stays
-/// leader in that term). Used by the linearizable-read theorem.
+/// A committing leader's own commit index covers its records while it stays
+/// leader in that term. (After a crash-restart it is a follower, possibly
+/// with a regressed commit index, and can never lead that term again.) Used
+/// by the linearizable-read theorem.
 pub open spec fn commit_leader_ok(s: GState, rec: CommitRec) -> bool {
-    s.hosts[s.leader_of[rec.term]].term == rec.term ==>
-        s.hosts[s.leader_of[rec.term]].commit >= rec.ci
+    let l = s.hosts[s.leader_of[rec.term]];
+    l.role is Leader && l.term == rec.term ==> l.commit >= rec.ci
 }
 
 pub open spec fn inv_commit_leaders(s: GState) -> bool {
@@ -1643,11 +1650,16 @@ proof fn campaign_preserves(pre: GState, post: GState, i: int)
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -1890,11 +1902,16 @@ proof fn collect_vote_preserves(pre: GState, post: GState, i: int, v: int, vlog:
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -2624,11 +2641,16 @@ proof fn send_append_preserves(pre: GState, post: GState, i: int, b: nat, e: nat
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -3030,11 +3052,16 @@ proof fn send_ack_preserves(pre: GState, post: GState, i: int, mi: nat)
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -3475,8 +3502,8 @@ proof fn step_down_preserves(pre: GState, post: GState, i: int)
     }
 }
 
-proof fn restart_preserves(pre: GState, post: GState, i: int)
-    requires inv(pre), t_restart(pre, post, i),
+proof fn restart_preserves(pre: GState, post: GState, i: int, c: nat)
+    requires inv(pre), t_restart(pre, post, i, c),
     ensures inv(post),
 {
     assert forall|j: int| 0 <= j < post.n implies #[trigger] host_ok(post, j) by {
@@ -3508,11 +3535,16 @@ proof fn restart_preserves(pre: GState, post: GState, i: int)
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -3601,11 +3633,16 @@ proof fn submit_read_preserves(pre: GState, post: GState, i: int)
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -3706,11 +3743,16 @@ proof fn confirm_read_preserves(pre: GState, post: GState, i: int, t: nat, sq: n
     }
 
     // Commit families (framed: leader logs, commits, and commit messages are
-    // unchanged; host terms only grow, so committing-leader claims persist).
+    // unchanged). The restarted host's commit index may regress; its witness
+    // still covers the shorter prefix. It is a follower afterwards, so the
+    // committing-leader claim for its term is vacuous.
     assert forall|j2: int| 0 <= j2 < post.n implies #[trigger] host_commit_ok(post, j2) by {
         assert(host_commit_ok(pre, j2));
         if pre.hosts[j2].commit > 0 {
             assert(commit_rec_ok(pre, pre.hosts[j2].crec));
+        }
+        if j2 == i && post.hosts[i].commit > 0 {
+            assert(prefix_eq(pre.hosts[i].log, pre.leader_log[pre.hosts[i].crec.term], pre.hosts[i].commit));
         }
     }
     assert forall|rec: CommitRec| #[trigger] post.commits.contains(rec) implies commit_rec_ok(post, rec) by {
@@ -3755,7 +3797,7 @@ pub proof fn step_preserves_inv(pre: GState, post: GState, step: TStep)
         TStep::RecvCommit { i, ci, mi, rec } => recv_commit_preserves(pre, post, i, ci, mi, rec),
         TStep::BumpTerm { i, term } => bump_term_preserves(pre, post, i, term),
         TStep::StepDown { i } => step_down_preserves(pre, post, i),
-        TStep::Restart { i } => restart_preserves(pre, post, i),
+        TStep::Restart { i, commit } => restart_preserves(pre, post, i, commit),
         TStep::SubmitRead { i } => submit_read_preserves(pre, post, i),
         TStep::ConfirmRead { i, term, seq } => confirm_read_preserves(pre, post, i, term, seq),
     }
