@@ -331,12 +331,24 @@ REAL production `Token` (not `verified.rs`'s Phase-0 toy), byte cursor over `Seq
   (`op_tail_ok`): a printed `<` before `=`/`>` re-scans as `<=`/`<>`, so the single-char
   forms roundtrip only when the next byte doesn't extend them; two-char forms impose
   nothing. `lemma_lscan_op` + `scan_op_exec`.
-- **Remaining lexer bricks:** numbers (`Number(Vec<u8>)` — digits/decimals/exponents),
-  strings (quotes + escapes, Unicode), identifiers (quoted vs unquoted-lowercased),
-  keywords (ident-then-classify), whitespace + line comments (skip), then the
-  whole-input token-LIST scanner + its roundtrip (with inter-token separator canonicalisation
-  — two adjacent `Number`s need a space or they re-lex as one), and the executable
-  `Vec<u8> -> Vec<Token>` top-level lexer. THEN ast-equivalence + cutover. Multi-week.
+- **L2 — whitespace skip:** `skip_ws` + `lemma_skip_ws_bounds` / `_fixpoint` / `_nonws`
+  + `skip_ws_exec`. The inter-token machinery prerequisite.
+- **L3 — number integer core:** `is_digit` / `all_digits` / `scan_digits_end` +
+  `lemma_scan_digits_end_run` (maximal-run characterization) +
+  `lemma_scan_digits_roundtrip` (digit run re-scans under a non-digit boundary) +
+  `scan_digits_exec`. (`scan_number_bytes` exec already verified in `lexer.rs`.)
+- **L4 — unquoted identifier char-run:** `is_ident_start`/`_cont`/`is_ident_bytes` +
+  `scan_ident_end` + `lemma_scan_ident_end_run` + `lemma_scan_ident_roundtrip` +
+  `scan_ident_exec`. Same maximal-munch shape as L3.
+- **Remaining lexer bricks:** number decimal/exponent extension; strings (quotes +
+  escapes, Unicode — expands the trust surface); identifier lowercasing + keyword
+  classification (ident-then-lookup); quoted identifiers; line comments; then the
+  single-token DISPATCHER (skip_ws then classify the first byte to the right scanner)
+  and the whole-input token-LIST scanner + its roundtrip (inter-token separator
+  canonicalisation — two adjacent `Number`s/idents need a space or they re-lex as one),
+  and the executable `Vec<u8> -> Vec<Token>` top-level lexer. THEN ast-equivalence +
+  cutover. Multi-week. The five bricks done (L0-L4) are the mechanically-clean core;
+  each reuses the token-level boundary discipline at the byte level.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
