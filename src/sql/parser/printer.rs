@@ -44,9 +44,19 @@ fn print_atom_expression(expression: &ast::Expression) -> (r: Option<Vec<Token>>
 
 /// Prints an expression in the canonical token format.
 ///
-/// `None` denotes an AST shape which the parser cannot produce without losing
-/// information.  In particular, signed and non-finite literal values must be
-/// represented by the parser as operators or special syntax, respectively.
+/// Returns `None` for AST shapes this printer cannot emit as tokens that
+/// re-parse to the same expression.  Note that some of these shapes *are*
+/// reachable from the parser — `None` marks "no canonical token form", not
+/// "unparseable".  Specifically:
+///
+/// * A negative integer or float literal: the leading sign is a separate parser
+///   operator, never part of a `Number` token, so the bare literal has no
+///   canonical form here.
+/// * A non-finite float (`INFINITY`, `NAN`): these parse from keywords of the
+///   same name into `Literal::Float`, but `is_printable_f64` rejects them, as
+///   they have no canonical decimal `Number` token.
+/// * An `IS` comparison against a literal other than `NULL` or the canonical
+///   `NaN`.
 pub fn print_expr(expression: &ast::Expression) -> Option<Vec<Token>> {
     match expression {
         ast::Expression::All | ast::Expression::Column(_, _) => print_atom_expression(expression),
@@ -681,9 +691,13 @@ fn print_operator(operator: &ast::Operator) -> Option<Vec<Token>> {
 
 /// Prints a statement in canonical token form.
 ///
-/// The statement grammar is intentionally stricter than the AST types.  The
-/// parser cannot produce empty required lists, right-nested joins, nested
-/// `EXPLAIN`, or an `All` expression outside a direct select item.
+/// Returns `None` for statement shapes with no canonical token form.  Some of
+/// these the parser genuinely cannot produce — empty required lists,
+/// right-nested joins, nested `EXPLAIN`.  Others the parser *can* produce but
+/// this printer still rejects, because they have no canonical form that
+/// re-parses identically: notably an `All` (`*`) expression anywhere but a
+/// direct select item, e.g. `count(*)`, which parses to
+/// `Function("count", [All])`.
 pub fn print_statement(statement: &ast::Statement) -> Option<Vec<Token>> {
     if let Some(tokens) = print_simple_statement(statement) {
         return Some(tokens);

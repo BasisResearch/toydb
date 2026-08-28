@@ -85,31 +85,59 @@ pub open spec fn parse_i64_spec(input: Seq<u8>) -> Option<i64> {
     }
 }
 
+// An iterative Horner scan, left to right.  `parse_digits_spec` peels the last
+// byte, which unfolds to exactly this most-significant-first fold, so the loop
+// invariant tracks the spec over the prefix scanned so far.  The earlier
+// recursive form recursed once per byte and overflowed the stack on long
+// all-digit literals; a `len` guard is unsound because arbitrarily long
+// leading-zero runs still parse to `Some`.
 pub fn parse_digits(input: &[u8]) -> (r: Option<u64>)
     ensures r == parse_digits_spec(input@),
-    decreases input.len(),
 {
     if input.is_empty() {
-        None
+        return None;
+    }
+    let b0 = input[0];
+    let mut acc: Option<u64> = if 48u8 <= b0 && b0 <= 57u8 {
+        Some((b0 - 48u8) as u64)
     } else {
-        let b = input[input.len() - 1];
-        if 48u8 <= b && b <= 57u8 {
+        None
+    };
+    proof {
+        reveal(parse_digits_spec);
+        assert(input@.subrange(0, 1).len() == 1);
+        assert(input@.subrange(0, 1)[0] == input@[0]);
+    }
+    let mut i: usize = 1;
+    while i < input.len()
+        invariant
+            1 <= i <= input.len(),
+            acc == parse_digits_spec(input@.subrange(0, i as int)),
+        decreases input.len() - i,
+    {
+        let b = input[i];
+        let ghost cur = input@.subrange(0, i as int + 1);
+        acc = if 48u8 <= b && b <= 57u8 {
             let digit = (b - 48u8) as u64;
-            if input.len() == 1 {
-                Some(digit)
-            } else {
-                let prefix_input = vstd::slice::slice_subrange(input, 0, input.len() - 1);
-                match parse_digits(prefix_input) {
-                    Some(prefix) if prefix <= (U64_MAX - digit) / 10 => {
-                        Some(prefix * 10 + digit)
-                    }
-                    _ => None,
-                }
+            match acc {
+                Some(prefix) if prefix <= (U64_MAX - digit) / 10 => Some(prefix * 10 + digit),
+                _ => None,
             }
         } else {
             None
+        };
+        proof {
+            reveal(parse_digits_spec);
+            assert(cur.len() == i + 1);
+            assert(cur[i as int] == input@[i as int]);
+            assert(cur.drop_last() =~= input@.subrange(0, i as int));
         }
+        i += 1;
     }
+    proof {
+        assert(input@.subrange(0, input.len() as int) =~= input@);
+    }
+    acc
 }
 
 pub fn parse_i64(input: &[u8]) -> (r: Option<i64>)
@@ -199,3 +227,28 @@ pub proof fn print_parse_roundtrip(n: i64)
 }
 
 } // verus!
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_i64, parse_u64};
+
+    #[test]
+    fn long_all_digit_input_overflows_cleanly() {
+        // Regression: `parse_digits` used to recurse once per byte, so a long
+        // numeric literal (e.g. `SELECT 111…1`) overflowed the thread stack and
+        // aborted the node. The iterative scan returns a clean `None` instead.
+        let long = vec![b'1'; 100_000];
+        assert_eq!(parse_i64(&long), None);
+        assert_eq!(parse_u64(&long), None);
+    }
+
+    #[test]
+    fn long_leading_zero_run_still_parses() {
+        // A `len > 20 ⇒ None` guard would be unsound: an arbitrarily long run of
+        // leading zeros keeps the value in range, so it must still parse.
+        let mut input = vec![b'0'; 100];
+        input.push(b'7');
+        assert_eq!(parse_u64(&input), Some(7));
+        assert_eq!(parse_i64(&input), Some(7));
+    }
+}

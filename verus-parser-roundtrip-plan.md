@@ -725,7 +725,10 @@ The roundtrip `parse(print(Float(x))) == Float(x)` unfolds to `parse_f64(display
 bit-exact, which needs correctly-rounded decimal<->binary conversion (Ryu/Dragonbox + Lemire) and
 an IEEE model. Verus has no `f64` reasoning, so proving it is out of scope. Instead:
 
-- Parser-produced floats are always **finite** (`NaN`/`inf` lex as identifiers, not `Number` tokens).
+- Floats reachable through a **`Number` token** are always **finite**. `NaN`/`inf` lex as
+  the `NAN`/`INFINITY` *keywords* (not identifiers, and not `Number` tokens); the parser does
+  turn those keywords into non-finite `Literal::Float`s, but the canonical printer returns
+  `None` for them rather than emitting a `Number`, so they stay outside the proven roundtrip.
 - For finite `x`, Rust's `Display` emits the shortest string that `FromStr` reads back bit-exactly.
   So the finite-guarded roundtrip is a **true** statement; we trust rustc's float conversion rather
   than prove it.
