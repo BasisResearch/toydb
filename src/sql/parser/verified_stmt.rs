@@ -2156,6 +2156,7 @@ pub proof fn lemma_sparse_steps_sprint(steps: Seq<SJoinStep>, tail: Seq<TokenVie
 }
 
 /// The FROM join-tree roundtrip.
+#[verifier::rlimit(8000)]
 pub proof fn lemma_sparse_from_sprint(f: SFrom, tail: Seq<TokenView>, fuel: nat)
     requires
         printable_from(f),
@@ -3499,6 +3500,223 @@ pub open spec fn is_sbegin(s: SStmt) -> bool {
     match s {
         SStmt::Begin { .. } => true,
         _ => false,
+    }
+}
+
+// -- CreateTable column exec parser ------------------------------------------
+//
+// Refines `sparse_column`. Its optional-clause helpers (`col_parse_pk`,
+// `col_parse_null`, `opt_flag`, `col_parse_ref`) are opaque, so the cursor is
+// advanced by dedicated exec helpers that each carry a matching fact, keeping
+// the token-view bookkeeping local.
+
+/// Advance past `PRIMARY KEY` if present. Returns the flag and new position;
+/// the ghost fact matches `col_parse_pk` on the remaining view.
+pub fn exec_col_pk(toks: &Vec<super::Token>, pos: usize) -> (r: (bool, usize))
+    requires pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks@.len(),
+        ({
+            let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+            col_parse_pk(rem) == (r.0, token_views(toks@.subrange(r.1 as int, toks@.len() as int)))
+        }),
+{
+    reveal(col_parse_pk);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && pos + 1 < toks.len()
+        && matches!(toks[pos], super::Token::Keyword(Keyword::Primary))
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Key)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+        }
+        (true, pos + 2)
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+            }
+        }
+        (false, pos)
+    }
+}
+
+pub fn exec_col_null(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<bool>, usize))
+    requires pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks@.len(),
+        ({
+            let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+            col_parse_null(rem) == (r.0, token_views(toks@.subrange(r.1 as int, toks@.len() as int)))
+        }),
+{
+    reveal(col_parse_null);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && pos + 1 < toks.len()
+        && matches!(toks[pos], super::Token::Keyword(Keyword::Not))
+        && matches!(toks[pos + 1], super::Token::Keyword(Keyword::Null)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+        }
+        (Some(false), pos + 2)
+    } else if pos < toks.len() && matches!(toks[pos], super::Token::Keyword(Keyword::Null)) {
+        proof { token_views_suffix(toks@, pos as int); }
+        (Some(true), pos + 1)
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+            }
+        }
+        (None, pos)
+    }
+}
+
+pub fn exec_col_unique(toks: &Vec<super::Token>, pos: usize) -> (r: (bool, usize))
+    requires pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks@.len(),
+        ({
+            let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+            opt_flag(rem, Keyword::Unique) == (r.0, token_views(toks@.subrange(r.1 as int, toks@.len() as int)))
+        }),
+{
+    reveal(opt_flag);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && matches!(toks[pos], super::Token::Keyword(Keyword::Unique)) {
+        proof { token_views_suffix(toks@, pos as int); }
+        (true, pos + 1)
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+        }
+        (false, pos)
+    }
+}
+
+pub fn exec_col_index(toks: &Vec<super::Token>, pos: usize) -> (r: (bool, usize))
+    requires pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks@.len(),
+        ({
+            let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+            opt_flag(rem, Keyword::Index) == (r.0, token_views(toks@.subrange(r.1 as int, toks@.len() as int)))
+        }),
+{
+    reveal(opt_flag);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && matches!(toks[pos], super::Token::Keyword(Keyword::Index)) {
+        proof { token_views_suffix(toks@, pos as int); }
+        (true, pos + 1)
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+        }
+        (false, pos)
+    }
+}
+
+pub fn exec_col_ref(toks: &Vec<super::Token>, pos: usize) -> (r: (Option<String>, usize))
+    requires pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks@.len(),
+        ({
+            let rem = token_views(toks@.subrange(pos as int, toks@.len() as int));
+            col_parse_ref(rem) == (r.0, token_views(toks@.subrange(r.1 as int, toks@.len() as int)))
+        }),
+{
+    reveal(col_parse_ref);
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() && pos + 1 < toks.len() && matches!(toks[pos], super::Token::Keyword(Keyword::References)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+        }
+        match &toks[pos + 1] {
+            super::Token::Ident(t) => (Some(t.clone()), pos + 2),
+            _ => (None, pos),
+        }
+    } else {
+        if pos < toks.len() {
+            proof { token_views_suffix(toks@, pos as int); }
+            if pos + 1 < toks.len() {
+                proof { token_views_suffix(toks@, pos as int + 1); }
+            }
+        }
+        (None, pos)
+    }
+}
+
+#[verifier::rlimit(15000)]
+pub fn parse_column_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Column>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_column(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(col) => sopt is Some && view_column(col) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos >= toks.len() {
+        return (None, pos);
+    }
+    if pos + 1 >= toks.len() {
+        return (None, pos);
+    }
+    proof {
+        token_views_suffix(toks@, pos as int);
+        token_views_suffix(toks@, pos as int + 1);
+    }
+    let datatype = match &toks[pos + 1] {
+        super::Token::Keyword(Keyword::Boolean) => DataType::Boolean,
+        super::Token::Keyword(Keyword::Integer) => DataType::Integer,
+        super::Token::Keyword(Keyword::Float) => DataType::Float,
+        super::Token::Keyword(Keyword::String) => DataType::String,
+        _ => return (None, pos),
+    };
+    let name = match &toks[pos] {
+        super::Token::Ident(n) => n.clone(),
+        _ => return (None, pos),
+    };
+    let (primary_key, c1) = exec_col_pk(toks, pos + 2);
+    let (nullable, c2) = exec_col_null(toks, c1);
+    let (unique, c3) = exec_col_unique(toks, c2);
+    let (index, c4) = exec_col_index(toks, c3);
+    let (references, c5) = exec_col_ref(toks, c4);
+    if c5 < toks.len() && matches!(toks[c5], super::Token::Keyword(Keyword::Default)) {
+        proof { token_views_suffix(toks@, c5 as int); }
+        let (eopt, epos) = parse_expr_exec(toks, c5 + 1, fuel);
+        match eopt {
+            Some(e) => (
+                Some(ast::Column {
+                    name, datatype, primary_key, nullable, default: Some(e),
+                    unique, index, references,
+                }),
+                epos,
+            ),
+            None => (None, pos),
+        }
+    } else {
+        if c5 < toks.len() {
+            proof { token_views_suffix(toks@, c5 as int); }
+        }
+        (
+            Some(ast::Column {
+                name, datatype, primary_key, nullable, default: None,
+                unique, index, references,
+            }),
+            c5,
+        )
     }
 }
 
