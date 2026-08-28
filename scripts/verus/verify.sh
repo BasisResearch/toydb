@@ -38,6 +38,7 @@ VERIFY_MODULES=(
   sql::parser::verified_roundtrip
   sql::parser::verified_simple_statement
   sql::parser::verified_statements
+  sql::parser::verified_stmt
 )
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

@@ -16,6 +16,7 @@ pub mod verified_production;
 pub mod verified_roundtrip;
 pub mod verified_simple_statement;
 pub mod verified_statements;
+pub mod verified_stmt;
 
 pub use lexer::{Keyword, Lexer, Token, is_ident};
 pub use parser::Parser;
