@@ -522,6 +522,50 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
 
 // ---- canonical statement printer over the mirror ---------------------------
 
+/// Canonical print of a Select's clauses. Opaque so the Select grammar (which
+/// grows clause by clause) stays out of the global SMT context — otherwise the
+/// enlarged `sprint_stmt` axiom degrades unrelated proofs (e.g. the fragile
+/// CreateTable `slist_depth_columns_le_len`). Revealed only in the Select lemma
+/// and `print_select_exec`.
+#[verifier::opaque]
+pub open spec fn sprint_select_body(
+    select: Seq<(SExpr, Option<String>)>,
+    from: Seq<SFrom>,
+    where_clause: Option<SExpr>,
+    group_by: Seq<SExpr>,
+) -> Seq<TokenView> {
+    seq![TokenView::Keyword(Keyword::Select)] + sprint_select_list(select)
+        + (if from.len() > 0 {
+            seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
+        } else {
+            Seq::empty()
+        })
+        + (match where_clause {
+            Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+            None => Seq::empty(),
+        })
+        + (if group_by.len() > 0 {
+            seq![TokenView::Keyword(Keyword::Group), TokenView::Keyword(Keyword::By)]
+                + sprint_args(group_by)
+        } else {
+            Seq::empty()
+        })
+}
+
+/// Fuel measure of a Select's clauses. Opaque for the same reason as
+/// `sprint_select_body`.
+#[verifier::opaque]
+pub open spec fn sdepth_select_body(
+    select: Seq<(SExpr, Option<String>)>,
+    from: Seq<SFrom>,
+    where_clause: Option<SExpr>,
+    group_by: Seq<SExpr>,
+) -> nat {
+    (1 + select_list_depth(select) + from_list_depth(from)
+        + (match where_clause { Some(e) => sdepth(e), None => 0nat })
+        + slist_depth(group_by)) as nat
+}
+
 pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
     decreases s,
 {
@@ -595,17 +639,8 @@ pub open spec fn sprint_stmt(s: SStmt) -> Seq<TokenView>
                 Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
                 None => Seq::empty(),
             }),
-        SStmt::Select { select, from, where_clause, .. } =>
-            seq![TokenView::Keyword(Keyword::Select)] + sprint_select_list(select)
-                + (if from.len() > 0 {
-                    seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
-                } else {
-                    Seq::empty()
-                })
-                + (match where_clause {
-                    Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
-                    None => Seq::empty(),
-                }),
+        SStmt::Select { select, from, where_clause, group_by, .. } =>
+            sprint_select_body(select, from, where_clause, group_by),
         SStmt::Explain(inner) => seq![TokenView::Keyword(Keyword::Explain)] + sprint_stmt(*inner),
         SStmt::Unsupported => Seq::empty(),
     }
@@ -625,12 +660,8 @@ pub open spec fn sdepth_stmt(s: SStmt) -> nat
                 Some(e) => sdepth(e),
                 None => 0nat,
             })) as nat,
-        SStmt::Select { select, from, where_clause, .. } =>
-            (1 + select_list_depth(select) + from_list_depth(from)
-                + (match where_clause {
-                    Some(e) => sdepth(e),
-                    None => 0nat,
-                })) as nat,
+        SStmt::Select { select, from, where_clause, group_by, .. } =>
+            sdepth_select_body(select, from, where_clause, group_by),
         SStmt::Explain(inner) => 1 + sdepth_stmt(*inner),
         _ => 1,
     }
@@ -1067,6 +1098,9 @@ pub proof fn lemma_sparse_stmt_sprint(s: SStmt, fuel: nat)
             assert(sparse_update(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
+            reveal(sprint_select_body);
+            reveal(sdepth_select_body);
+            assert(group_by =~= Seq::<SExpr>::empty());
             let frompart = if from.len() > 0 {
                 seq![TokenView::Keyword(Keyword::From)] + sprint_from_list(from)
             } else {
@@ -3383,8 +3417,10 @@ pub fn print_select_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
 {
     reveal(printable_stmt);
     reveal_with_fuel(token_views, 2);
+    reveal(sprint_select_body);
     match s {
-        ast::Statement::Select { select, from, where_clause, .. } => {
+        ast::Statement::Select { select, from, where_clause, group_by, .. } => {
+            proof { assert(view_args(group_by@) =~= Seq::<SExpr>::empty()); }
             let mut r: Vec<super::Token> = Vec::new();
             r.push(super::Token::Keyword(Keyword::Select));
             proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
