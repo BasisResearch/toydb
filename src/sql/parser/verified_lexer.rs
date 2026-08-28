@@ -1631,4 +1631,450 @@ pub fn classify_kw_exec(s: &Vec<u8>) -> (r: Option<Keyword>)
 }
 
 
+// -- L14: case-folding + keyword-run token scanner -----------------------------
+//
+// The production lexer scans an identifier run, lowercases it, and classifies it
+// (L13) as a keyword or a plain `Ident`. This brick proves the *keyword* arm
+// end to end and axiom-free (keywords carry no `String`, unlike `Ident`, whose
+// UTF-8/`String` payload needs the deferred trust bridge). It carries ASCII
+// case-folding (`ascii_lower`), the `kw_text` shape facts (every keyword is a
+// non-empty lowercase-letter run), and the roundtrip: an identifier run equal to
+// a keyword's lowercase text, under a non-continuation boundary, lowercases to
+// itself and classifies back to that keyword.
+
+/// ASCII lowercase of one byte (upper-case letters map down 32; others fixed).
+pub open spec fn ascii_lower(b: u8) -> u8 {
+    if 65 <= b <= 90 { (b + 32) as u8 } else { b }
+}
+
+/// A lowercase ASCII letter.
+pub open spec fn is_lower_letter(b: u8) -> bool {
+    97 <= b <= 122
+}
+
+/// Every byte is a lowercase ASCII letter.
+pub open spec fn all_lower_letters(s: Seq<u8>) -> bool {
+    forall|i: int| 0 <= i < s.len() ==> is_lower_letter(#[trigger] s[i])
+}
+
+/// ASCII-lowercase a byte sequence, pointwise.
+pub open spec fn ascii_lower_seq(s: Seq<u8>) -> Seq<u8> {
+    Seq::new(s.len(), |i: int| ascii_lower(s[i]))
+}
+
+/// Lowercasing an already-lowercase-letter run is the identity.
+pub proof fn lemma_ascii_lower_idem(t: Seq<u8>)
+    requires
+        all_lower_letters(t),
+    ensures
+        ascii_lower_seq(t) == t,
+{
+    assert forall|i: int| 0 <= i < t.len() implies ascii_lower_seq(t)[i] == t[i] by {
+        assert(is_lower_letter(t[i]));
+    }
+    assert(ascii_lower_seq(t) =~= t);
+}
+
+/// A non-empty lowercase-letter run is a well-formed identifier byte run.
+pub proof fn lemma_lower_letters_ident_bytes(t: Seq<u8>)
+    requires
+        t.len() >= 1,
+        all_lower_letters(t),
+    ensures
+        is_ident_bytes(t),
+{
+    assert(is_lower_letter(t[0]));
+    assert(is_ident_start(t[0]));
+    assert forall|i: int| 0 <= i < t.len() implies is_ident_cont(#[trigger] t[i]) by {
+        assert(is_lower_letter(t[i]));
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g0(k: Keyword)
+    requires k == Keyword::As || k == Keyword::Asc || k == Keyword::And || k == Keyword::Begin || k == Keyword::Bool || k == Keyword::Boolean || k == Keyword::By || k == Keyword::Commit || k == Keyword::Create || k == Keyword::Cross || k == Keyword::Default,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::As => {
+            assert(kw_text(Keyword::As).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::As)));
+        },
+        Keyword::Asc => {
+            assert(kw_text(Keyword::Asc).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Asc)));
+        },
+        Keyword::And => {
+            assert(kw_text(Keyword::And).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::And)));
+        },
+        Keyword::Begin => {
+            assert(kw_text(Keyword::Begin).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Begin)));
+        },
+        Keyword::Bool => {
+            assert(kw_text(Keyword::Bool).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Bool)));
+        },
+        Keyword::Boolean => {
+            assert(kw_text(Keyword::Boolean).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Boolean)));
+        },
+        Keyword::By => {
+            assert(kw_text(Keyword::By).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::By)));
+        },
+        Keyword::Commit => {
+            assert(kw_text(Keyword::Commit).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Commit)));
+        },
+        Keyword::Create => {
+            assert(kw_text(Keyword::Create).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Create)));
+        },
+        Keyword::Cross => {
+            assert(kw_text(Keyword::Cross).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Cross)));
+        },
+        Keyword::Default => {
+            assert(kw_text(Keyword::Default).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Default)));
+        },
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g1(k: Keyword)
+    requires k == Keyword::Delete || k == Keyword::Desc || k == Keyword::Double || k == Keyword::Drop || k == Keyword::Exists || k == Keyword::Explain || k == Keyword::False || k == Keyword::Float || k == Keyword::From || k == Keyword::Group || k == Keyword::Having,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::Delete => {
+            assert(kw_text(Keyword::Delete).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Delete)));
+        },
+        Keyword::Desc => {
+            assert(kw_text(Keyword::Desc).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Desc)));
+        },
+        Keyword::Double => {
+            assert(kw_text(Keyword::Double).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Double)));
+        },
+        Keyword::Drop => {
+            assert(kw_text(Keyword::Drop).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Drop)));
+        },
+        Keyword::Exists => {
+            assert(kw_text(Keyword::Exists).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Exists)));
+        },
+        Keyword::Explain => {
+            assert(kw_text(Keyword::Explain).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Explain)));
+        },
+        Keyword::False => {
+            assert(kw_text(Keyword::False).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::False)));
+        },
+        Keyword::Float => {
+            assert(kw_text(Keyword::Float).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Float)));
+        },
+        Keyword::From => {
+            assert(kw_text(Keyword::From).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::From)));
+        },
+        Keyword::Group => {
+            assert(kw_text(Keyword::Group).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Group)));
+        },
+        Keyword::Having => {
+            assert(kw_text(Keyword::Having).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Having)));
+        },
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g2(k: Keyword)
+    requires k == Keyword::If || k == Keyword::Index || k == Keyword::Infinity || k == Keyword::Inner || k == Keyword::Insert || k == Keyword::Int || k == Keyword::Integer || k == Keyword::Into || k == Keyword::Is || k == Keyword::Join || k == Keyword::Key,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::If => {
+            assert(kw_text(Keyword::If).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::If)));
+        },
+        Keyword::Index => {
+            assert(kw_text(Keyword::Index).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Index)));
+        },
+        Keyword::Infinity => {
+            assert(kw_text(Keyword::Infinity).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Infinity)));
+        },
+        Keyword::Inner => {
+            assert(kw_text(Keyword::Inner).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Inner)));
+        },
+        Keyword::Insert => {
+            assert(kw_text(Keyword::Insert).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Insert)));
+        },
+        Keyword::Int => {
+            assert(kw_text(Keyword::Int).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Int)));
+        },
+        Keyword::Integer => {
+            assert(kw_text(Keyword::Integer).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Integer)));
+        },
+        Keyword::Into => {
+            assert(kw_text(Keyword::Into).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Into)));
+        },
+        Keyword::Is => {
+            assert(kw_text(Keyword::Is).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Is)));
+        },
+        Keyword::Join => {
+            assert(kw_text(Keyword::Join).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Join)));
+        },
+        Keyword::Key => {
+            assert(kw_text(Keyword::Key).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Key)));
+        },
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g3(k: Keyword)
+    requires k == Keyword::Left || k == Keyword::Like || k == Keyword::Limit || k == Keyword::NaN || k == Keyword::Not || k == Keyword::Null || k == Keyword::Of || k == Keyword::Offset || k == Keyword::On || k == Keyword::Only || k == Keyword::Or,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::Left => {
+            assert(kw_text(Keyword::Left).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Left)));
+        },
+        Keyword::Like => {
+            assert(kw_text(Keyword::Like).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Like)));
+        },
+        Keyword::Limit => {
+            assert(kw_text(Keyword::Limit).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Limit)));
+        },
+        Keyword::NaN => {
+            assert(kw_text(Keyword::NaN).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::NaN)));
+        },
+        Keyword::Not => {
+            assert(kw_text(Keyword::Not).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Not)));
+        },
+        Keyword::Null => {
+            assert(kw_text(Keyword::Null).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Null)));
+        },
+        Keyword::Of => {
+            assert(kw_text(Keyword::Of).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Of)));
+        },
+        Keyword::Offset => {
+            assert(kw_text(Keyword::Offset).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Offset)));
+        },
+        Keyword::On => {
+            assert(kw_text(Keyword::On).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::On)));
+        },
+        Keyword::Only => {
+            assert(kw_text(Keyword::Only).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Only)));
+        },
+        Keyword::Or => {
+            assert(kw_text(Keyword::Or).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Or)));
+        },
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g4(k: Keyword)
+    requires k == Keyword::Order || k == Keyword::Outer || k == Keyword::Primary || k == Keyword::Read || k == Keyword::References || k == Keyword::Right || k == Keyword::Rollback || k == Keyword::Select || k == Keyword::Set || k == Keyword::String || k == Keyword::System,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::Order => {
+            assert(kw_text(Keyword::Order).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Order)));
+        },
+        Keyword::Outer => {
+            assert(kw_text(Keyword::Outer).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Outer)));
+        },
+        Keyword::Primary => {
+            assert(kw_text(Keyword::Primary).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Primary)));
+        },
+        Keyword::Read => {
+            assert(kw_text(Keyword::Read).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Read)));
+        },
+        Keyword::References => {
+            assert(kw_text(Keyword::References).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::References)));
+        },
+        Keyword::Right => {
+            assert(kw_text(Keyword::Right).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Right)));
+        },
+        Keyword::Rollback => {
+            assert(kw_text(Keyword::Rollback).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Rollback)));
+        },
+        Keyword::Select => {
+            assert(kw_text(Keyword::Select).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Select)));
+        },
+        Keyword::Set => {
+            assert(kw_text(Keyword::Set).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Set)));
+        },
+        Keyword::String => {
+            assert(kw_text(Keyword::String).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::String)));
+        },
+        Keyword::System => {
+            assert(kw_text(Keyword::System).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::System)));
+        },
+        _ => {},
+    }
+}
+
+#[verifier::spinoff_prover]
+proof fn lemma_kw_text_shape_g5(k: Keyword)
+    requires k == Keyword::Table || k == Keyword::Text || k == Keyword::Time || k == Keyword::Transaction || k == Keyword::True || k == Keyword::Unique || k == Keyword::Update || k == Keyword::Values || k == Keyword::Varchar || k == Keyword::Where || k == Keyword::Write,
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::Table => {
+            assert(kw_text(Keyword::Table).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Table)));
+        },
+        Keyword::Text => {
+            assert(kw_text(Keyword::Text).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Text)));
+        },
+        Keyword::Time => {
+            assert(kw_text(Keyword::Time).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Time)));
+        },
+        Keyword::Transaction => {
+            assert(kw_text(Keyword::Transaction).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Transaction)));
+        },
+        Keyword::True => {
+            assert(kw_text(Keyword::True).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::True)));
+        },
+        Keyword::Unique => {
+            assert(kw_text(Keyword::Unique).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Unique)));
+        },
+        Keyword::Update => {
+            assert(kw_text(Keyword::Update).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Update)));
+        },
+        Keyword::Values => {
+            assert(kw_text(Keyword::Values).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Values)));
+        },
+        Keyword::Varchar => {
+            assert(kw_text(Keyword::Varchar).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Varchar)));
+        },
+        Keyword::Where => {
+            assert(kw_text(Keyword::Where).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Where)));
+        },
+        Keyword::Write => {
+            assert(kw_text(Keyword::Write).len() >= 1);
+            assert(all_lower_letters(kw_text(Keyword::Write)));
+        },
+        _ => {},
+    }
+}
+
+/// Every keyword's text is a non-empty run of lowercase ASCII letters (so it
+/// scans as one identifier and lowercasing it is the identity).
+pub proof fn lemma_kw_text_shape(k: Keyword)
+    ensures
+        kw_text(k).len() >= 1,
+        all_lower_letters(kw_text(k)),
+{
+    match k {
+        Keyword::As | Keyword::Asc | Keyword::And | Keyword::Begin | Keyword::Bool | Keyword::Boolean | Keyword::By | Keyword::Commit | Keyword::Create | Keyword::Cross | Keyword::Default => lemma_kw_text_shape_g0(k),
+        Keyword::Delete | Keyword::Desc | Keyword::Double | Keyword::Drop | Keyword::Exists | Keyword::Explain | Keyword::False | Keyword::Float | Keyword::From | Keyword::Group | Keyword::Having => lemma_kw_text_shape_g1(k),
+        Keyword::If | Keyword::Index | Keyword::Infinity | Keyword::Inner | Keyword::Insert | Keyword::Int | Keyword::Integer | Keyword::Into | Keyword::Is | Keyword::Join | Keyword::Key => lemma_kw_text_shape_g2(k),
+        Keyword::Left | Keyword::Like | Keyword::Limit | Keyword::NaN | Keyword::Not | Keyword::Null | Keyword::Of | Keyword::Offset | Keyword::On | Keyword::Only | Keyword::Or => lemma_kw_text_shape_g3(k),
+        Keyword::Order | Keyword::Outer | Keyword::Primary | Keyword::Read | Keyword::References | Keyword::Right | Keyword::Rollback | Keyword::Select | Keyword::Set | Keyword::String | Keyword::System => lemma_kw_text_shape_g4(k),
+        Keyword::Table | Keyword::Text | Keyword::Time | Keyword::Transaction | Keyword::True | Keyword::Unique | Keyword::Update | Keyword::Values | Keyword::Varchar | Keyword::Where | Keyword::Write => lemma_kw_text_shape_g5(k),
+    }
+}
+
+/// Scan an identifier run as a *keyword*: if it starts an identifier, take the
+/// maximal run, lowercase it, and classify. `None` here means "not a keyword"
+/// (a plain identifier — a later brick, needing the `String` trust bridge).
+pub open spec fn lscan_keyword(input: Seq<u8>, pos: int) -> (Option<Keyword>, int) {
+    if 0 <= pos < input.len() && is_ident_start(input[pos]) {
+        let e = scan_ident_end(input, pos);
+        (classify_kw(ascii_lower_seq(input.subrange(pos, e))), e)
+    } else {
+        (None, pos)
+    }
+}
+
+/// Keyword roundtrip: an identifier run equal to a keyword's lowercase text,
+/// followed by a non-continuation boundary, scans back to that keyword and
+/// advances past it. Fully axiom-free.
+pub proof fn lemma_lscan_keyword(kw: Keyword, tail: Seq<u8>)
+    requires
+        tail.len() == 0 || !is_ident_cont(tail[0]),
+    ensures
+        lscan_keyword(kw_text(kw) + tail, 0) == (Some(kw), kw_text(kw).len() as int),
+{
+    let d = kw_text(kw);
+    let input = d + tail;
+    lemma_kw_text_shape(kw);
+    lemma_lower_letters_ident_bytes(d);
+    assert(input[0] == d[0]);
+    assert(is_ident_start(input[0]));
+    lemma_scan_ident_roundtrip(d, tail);
+    assert(scan_ident_end(input, 0) == d.len());
+    assert(input.subrange(0, d.len() as int) =~= d);
+    lemma_ascii_lower_idem(d);
+    lemma_classify_kw_text(kw);
+}
+
 } // verus!
