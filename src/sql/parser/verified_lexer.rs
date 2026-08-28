@@ -1030,4 +1030,61 @@ pub proof fn lemma_lscan_num(d: Seq<u8>, tail: Seq<u8>)
     assert(input.subrange(0, d.len() as int) =~= d);
 }
 
+// -- L11: decimal number extension (digits.digits) ----------------------------
+//
+// Extends L3/L10 past the integer core to `digits.digits`. This is the first
+// multi-phase scan (integer run, then a `.`, then a fraction run) and its
+// roundtrip needs two applications of the run characterization with concatenation
+// index bookkeeping. Exponent (`e[+-]digits`) is the next phase, deferred.
+
+/// End of a `digits[.digits]` number scan starting at a digit position: consume
+/// the integer run, then (if a `.` follows) the fraction run.
+pub open spec fn scan_num_dec_end(input: Seq<u8>, pos: int) -> int {
+    let d1 = scan_digits_end(input, pos);
+    if 0 <= d1 < input.len() && input[d1] == 46 {
+        scan_digits_end(input, d1 + 1)
+    } else {
+        d1
+    }
+}
+
+/// Decimal roundtrip: an integer run `a`, a `.`, and a fraction run `b`, followed
+/// by a non-digit boundary, scan to exactly `a.b` (length `|a| + 1 + |b|`). `.` in
+/// the tail is harmless (only one `.` is consumed).
+pub proof fn lemma_scan_num_dec_roundtrip(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
+    requires
+        a.len() >= 1,
+        all_digits(a),
+        b.len() >= 1,
+        all_digits(b),
+        tail.len() == 0 || !is_digit(tail[0]),
+    ensures
+        scan_num_dec_end(a + seq![46u8] + b + tail, 0) == a.len() + 1 + b.len(),
+{
+    let dot = seq![46u8];
+    let input = a + dot + b + tail;
+    // Phase 1: the integer run stops at the `.` (index a.len()).
+    assert forall|i: int| 0 <= i < a.len() implies is_digit(#[trigger] input[i]) by {
+        assert(input[i] == a[i]);
+    }
+    assert(input[a.len() as int] == 46) by {
+        assert(input[a.len() as int] == dot[0]);
+    }
+    lemma_scan_digits_end_run(input, 0, a.len() as int);
+    assert(scan_digits_end(input, 0) == a.len());
+    // Phase 2: from just past the `.`, the fraction run stops at the boundary.
+    let f0: int = a.len() as int + 1;
+    let fend: int = f0 + b.len() as int;
+    assert forall|i: int| f0 <= i < fend implies is_digit(#[trigger] input[i]) by {
+        assert(input[i] == b[i - f0]);
+    }
+    if tail.len() == 0 {
+        assert(input.len() == fend);
+    } else {
+        assert(input[fend] == tail[0]);
+    }
+    lemma_scan_digits_end_run(input, f0, fend);
+    assert(scan_digits_end(input, f0) == fend);
+}
+
 } // verus!
