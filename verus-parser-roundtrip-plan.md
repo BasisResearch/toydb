@@ -120,12 +120,19 @@ verified parser to the full production grammar:
    keyword prefixes threaded through `sprint_from`/`sparse_from`).
 3. **Multi-assignment Update** — the sorted-`iter()` bridge over `Map` equality
    (the general case `extract_one_entry` was built for the singleton).
-4. **Byte-cursor lexer** — retarget the production `Lexer` onto
-   `verified.rs::next_token` (self-contained; independent of 1-3).
+4. **Byte-cursor lexer** — `verified.rs::next_token` as it stands is a **Phase 0
+   toy** (its own 25-variant `Token`; single-digit integers via `b-48`,
+   single-byte keywords `t`/`f`/`n`), so it cannot tokenize real SQL. Item 4 is
+   therefore "build a production-capable verified byte-cursor lexer" (multi-char
+   numbers, identifiers, quoted strings, the full `Keyword` set) plus the
+   token-stream equivalence argument — not a retarget of the existing skeleton.
 
 Only then does the parser swap keep the suite green. Items 1-3 are verification
-work in the established mirror+exec style; item 4 is a lexer refactor plus a
-token-stream equivalence argument.
+work in the established mirror+exec style; item 4 is a full verified lexer.
+Verified by reading the code (2026-08-28): the exec parsers accept a strict
+`printable_stmt` subset, and the sole verified scanner is the Phase 0 skeleton —
+so no sound single-implementation cutover is available without this work, and any
+partial swap regresses `tests/scripts/queries` (which uses `GROUP BY`/`ORDER BY`).
 
 The techniques that landed S0-S3 (opaque+peel for optional-clause soup;
 force-evaluate a recursive `sparse_X` with an explicit `assert(sparse_X(..)==..)`;
