@@ -772,4 +772,41 @@ pub proof fn lemma_lex_all_ends_bounded(input: Seq<u8>, pos: int, fuel: nat)
     }
 }
 
+// -- L7: token-list fuel stability --------------------------------------------
+//
+// Each token consumes at least one position, so `lex_all_ends` reaches its fixed
+// result once `fuel >= input.len() - pos`; extra fuel changes nothing. This is
+// what lets a fuel-free executable token-list loop (a later brick) refine the
+// fuel-bounded spec — the same move the parser made from `sparse` to its exec.
+
+pub proof fn lemma_lex_all_ends_fuel_stable(input: Seq<u8>, pos: int, fuel: nat)
+    requires
+        0 <= pos <= input.len(),
+        fuel >= input.len() - pos,
+    ensures
+        lex_all_ends(input, pos, fuel) == lex_all_ends(input, pos, (fuel + 1) as nat),
+    decreases input.len() - pos,
+{
+    let e = lex_token_end(input, pos);
+    lemma_lex_token_end_bounds(input, pos);
+    lemma_skip_ws_bounds(input, pos);
+    if e > pos {
+        // A token was consumed: e >= pos + 1, so the tail has strictly less to do
+        // and still enough fuel. fuel > 0 here since fuel >= len - pos >= e - pos >= 1.
+        assert(fuel >= input.len() - pos);
+        assert(e <= input.len());
+        assert(fuel - 1 >= input.len() - e);
+        lemma_lex_all_ends_fuel_stable(input, e, (fuel - 1) as nat);
+        assert(lex_all_ends(input, pos, fuel)
+            == seq![e] + lex_all_ends(input, e, (fuel - 1) as nat));
+        assert(lex_all_ends(input, pos, (fuel + 1) as nat)
+            == seq![e] + lex_all_ends(input, e, fuel));
+    } else {
+        // No progress (end of input or a deferred-class byte): both are empty.
+        // fuel could be 0 only if len - pos <= 0, i.e. pos == len, where e == pos.
+        assert(lex_all_ends(input, pos, (fuel + 1) as nat) =~= Seq::<int>::empty());
+        assert(lex_all_ends(input, pos, fuel) =~= Seq::<int>::empty());
+    }
+}
+
 } // verus!
