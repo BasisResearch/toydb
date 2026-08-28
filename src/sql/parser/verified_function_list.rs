@@ -31,6 +31,9 @@
 // `roundtrip_demo`'s `e` and `consumed` are used only in ghost positions, which
 // the non-Verus build erases; the module is verification scaffolding.
 #![allow(dead_code, unused_variables)]
+// Proof/verification scaffolding, not idiomatic library code: exempt from the
+// crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.
+#![allow(clippy::all)]
 
 use vstd::prelude::*;
 

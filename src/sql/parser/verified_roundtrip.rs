@@ -33,6 +33,9 @@
 // positions, which the non-Verus build erases; the module is verification
 // scaffolding.
 #![allow(dead_code, unused_variables)]
+// Proof/verification scaffolding, not idiomatic library code: exempt from the
+// crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.
+#![allow(clippy::all)]
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use vstd::prelude::*;
@@ -45,7 +48,7 @@ use super::verified_expression::{BinaryTag, UnaryTag};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_production::TokenView;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::{ast, float_trust, verified_expression, verified_production, Keyword};
+use super::{Keyword, ast, float_trust, verified_expression, verified_production};
 
 verus! {
 
@@ -1656,4 +1659,3 @@ pub proof fn roundtrip_injective(left: ast::Expression, right: ast::Expression)
 }
 
 } // verus!
-

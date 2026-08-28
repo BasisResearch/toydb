@@ -732,4 +732,3 @@ pub proof fn print_expr_injective(left: ast::Expression, right: ast::Expression)
 }
 
 }
-

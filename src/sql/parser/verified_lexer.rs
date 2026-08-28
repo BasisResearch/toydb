@@ -11,13 +11,16 @@
 //! identifiers and keywords to later bricks.
 
 #![allow(dead_code)]
+// Proof/verification scaffolding, not idiomatic library code: exempt from the
+// crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.
+#![allow(clippy::all)]
 
 use vstd::prelude::*;
 
 #[allow(unused_imports)]
-use super::Token;
-#[allow(unused_imports)]
 use super::Keyword;
+#[allow(unused_imports)]
+use super::Token;
 #[allow(unused_imports)]
 use super::verified_production::TokenView;
 // `token_view`/`token_views` are `spec fn` and `token_views_concat` is a `proof fn`;

@@ -21,6 +21,9 @@
 //! roundtrip lemma never has to reason about them.
 
 #![allow(dead_code, unused_variables)]
+// Proof/verification scaffolding, not idiomatic library code: exempt from the
+// crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.
+#![allow(clippy::all)]
 
 #[allow(unused_imports)]
 use vstd::prelude::*;
@@ -30,30 +33,30 @@ use super::verified_production::TokenView;
 // Executable helpers + the `SExpr` mirror enum: needed under a plain `cargo build`.
 #[allow(unused_imports)]
 use super::verified_roundtrip::{
-    parse_args_exec, parse_expr_exec, print_args_slice, print_expr_exec, SExpr,
+    SExpr, parse_args_exec, parse_expr_exec, print_args_slice, print_expr_exec,
 };
 // Ghost (spec/proof) helpers: stripped under a plain `cargo build`, so gate the
 // imports behind `verus_keep_ghost` to keep the non-Verus build resolving.
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
+use super::verified_production::{token_view, token_views, token_views_concat};
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
 use super::verified_roundtrip::{
-    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, printable_se, sdepth,
-    sdepth_le_len, slist_depth, sparse, sparse_args, sprint, sprint_args, token_views_len,
+    all_printable_se, boundary, lemma_sparse_args_sprint, lemma_sparse_sprint, printable_se,
+    sdepth, sdepth_le_len, slist_depth, sparse, sparse_args, sprint, sprint_args, token_views_len,
     token_views_suffix, view_args, view_args_len, view_expr,
 };
+#[allow(unused_imports)]
+use super::{Keyword, ast, verified_integer, verified_production, verified_roundtrip};
+#[allow(unused_imports)]
+use crate::sql::types::DataType;
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use vstd::std_specs::cmp::{OrdSpec, PartialOrdSpec};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use vstd::std_specs::iter::IteratorSpec;
-#[cfg(verus_keep_ghost)]
-#[allow(unused_imports)]
-use super::verified_production::{token_view, token_views, token_views_concat};
-#[allow(unused_imports)]
-use super::{ast, verified_integer, verified_production, verified_roundtrip, Keyword};
-#[allow(unused_imports)]
-use crate::sql::types::DataType;
 
 verus! {
 
