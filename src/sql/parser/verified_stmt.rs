@@ -4196,6 +4196,589 @@ pub fn parse_select_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
     }
 }
 
+// ==== Update executable layer (S5, 10th kind; single-assignment) ============
+//
+// `view_stmt` only bridges single-assignment `Update`s (a `BTreeMap` whose spec
+// view is an unordered `Map` cannot be sorted by a pure `spec fn`). The executable
+// layer therefore covers exactly that case, using the trusted `String` cmp axiom
+// to build/read the one-entry map (`build_one_entry_map` / `extract_one_entry`).
+
+pub open spec fn is_supdate(s: SStmt) -> bool {
+    match s {
+        SStmt::Update { .. } => true,
+        _ => false,
+    }
+}
+
+/// Executable printer for a single-assignment `UPDATE`. Mirrors `print_select_exec`:
+/// build the token vector incrementally, discharging `token_views` by concatenation.
+pub fn print_update_exec(s: &ast::Statement) -> (r: Vec<super::Token>)
+    requires printable_stmt(view_stmt(*s)), is_supdate(view_stmt(*s)),
+    ensures token_views(r@) == sprint_stmt(view_stmt(*s)),
+{
+    reveal(printable_stmt);
+    reveal_with_fuel(token_views, 4);
+    match s {
+        ast::Statement::Update { table, set, where_clause } => {
+            proof {
+                // is_supdate(view_stmt(s)) rules out the multi/empty branch.
+                assert(set@.dom().len() == 1);
+            }
+            let ghost m = view_stmt(*s);
+            let ghost k0 = set@.dom().choose();
+            let mut r: Vec<super::Token> = Vec::new();
+            r.push(super::Token::Keyword(Keyword::Update));
+            r.push(super::Token::Ident(table.clone()));
+            r.push(super::Token::Keyword(Keyword::Set));
+            proof {
+                assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                assert(token_views(r@) =~= seq![
+                    TokenView::Keyword(Keyword::Update),
+                    TokenView::Ident(*table),
+                    TokenView::Keyword(Keyword::Set),
+                ]);
+            }
+            let ghost head = r@;
+            let (rk, rv) = extract_one_entry(set);
+            proof {
+                // singleton domain: the chosen key is rk.
+                assert(set@.dom() =~= set![rk]);
+                assert(k0 == rk);
+            }
+            r.push(super::Token::Ident(rk));
+            r.push(super::Token::Equal);
+            proof {
+                assert(r@ =~= head + seq![super::Token::Ident(rk), super::Token::Equal]);
+                token_views_concat(head, seq![super::Token::Ident(rk), super::Token::Equal]);
+                assert(token_views(seq![super::Token::Ident(rk), super::Token::Equal])
+                    =~= seq![TokenView::Ident(rk), TokenView::Equal]) by {
+                    reveal_with_fuel(token_views, 3);
+                }
+                assert(k0 == rk);
+                assert(set@[rk] == *rv);
+            }
+            let ghost kv_head = r@;
+            let ghost head_set = seq![
+                TokenView::Keyword(Keyword::Update),
+                TokenView::Ident(*table),
+                TokenView::Keyword(Keyword::Set),
+            ] + sprint_set_list(m->Update_set);
+            proof {
+                // token_views(kv_head) == head_views ++ [Ident(rk), Equal]
+                assert(token_views(kv_head) =~= seq![
+                    TokenView::Keyword(Keyword::Update),
+                    TokenView::Ident(*table),
+                    TokenView::Keyword(Keyword::Set),
+                    TokenView::Ident(rk),
+                    TokenView::Equal,
+                ]);
+            }
+            // value: expression, tried first in the mirror, else DEFAULT keyword.
+            match rv {
+                Some(e) => {
+                    let mut vb = print_expr_exec(e);
+                    let ghost vbo = vb@;
+                    r.append(&mut vb);
+                    proof {
+                        token_views_concat(kv_head, vbo);
+                        // set@[rk] == Some(*e); m.set == seq![(rk, Some(view_expr(*e)))]
+                        assert(m->Update_set =~= seq![(rk, Some(view_expr(*e)))]);
+                        assert(sprint_set_list(m->Update_set)
+                            =~= seq![TokenView::Ident(rk), TokenView::Equal] + sprint(view_expr(*e)));
+                        assert(token_views(r@) =~= head_set);
+                    }
+                },
+                None => {
+                    r.push(super::Token::Keyword(Keyword::Default));
+                    proof {
+                        assert(r@ =~= kv_head + seq![super::Token::Keyword(Keyword::Default)]);
+                        token_views_concat(kv_head, seq![super::Token::Keyword(Keyword::Default)]);
+                        assert(token_views(seq![super::Token::Keyword(Keyword::Default)])
+                            =~= seq![TokenView::Keyword(Keyword::Default)]);
+                        assert(m->Update_set =~= seq![(rk, None::<SExpr>)]);
+                        assert(sprint_set_list(m->Update_set) =~= seq![
+                            TokenView::Ident(rk),
+                            TokenView::Equal,
+                            TokenView::Keyword(Keyword::Default),
+                        ]);
+                        assert(token_views(r@) =~= head_set);
+                    }
+                },
+            }
+            let ghost after_val = r@;
+            proof { assert(token_views(after_val) =~= head_set); }
+            match where_clause {
+                Some(e) => {
+                    r.push(super::Token::Keyword(Keyword::Where));
+                    let ghost wk = r@;
+                    let mut wb = print_expr_exec(e);
+                    let ghost wbo = wb@;
+                    r.append(&mut wb);
+                    proof {
+                        token_views_concat(wk, wbo);
+                        token_views_concat(after_val, seq![super::Token::Keyword(Keyword::Where)]);
+                        assert(wk =~= after_val + seq![super::Token::Keyword(Keyword::Where)]);
+                        assert(token_views(r@)
+                            =~= head_set + (seq![TokenView::Keyword(Keyword::Where)] + sprint(view_expr(*e))));
+                        assert(token_views(r@) =~= sprint_stmt(m));
+                    }
+                },
+                None => {
+                    proof { assert(token_views(r@) =~= sprint_stmt(m)); }
+                },
+            }
+            r
+        },
+        _ => {
+            proof { assert(false); }
+            Vec::new()
+        },
+    }
+}
+
+/// Executable parser for `k = expr` or `k = DEFAULT`, refining `sparse_assign`.
+pub fn parse_assign_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<(String, Option<ast::Expression>)>, usize))
+    requires pos <= toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_assign(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some((k, ve)) => sopt is Some
+                    && (k, match ve { Some(e) => Some(view_expr(e)), None => None::<SExpr> })
+                        == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+    }),
+{
+    reveal(sparse_assign);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos >= toks.len() {
+        // input is empty (pos == toks.len()); sparse_assign needs len >= 2.
+        return (None, pos);
+    }
+    if pos + 1 < toks.len() && matches!(toks[pos + 1], super::Token::Equal) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+        }
+        match &toks[pos] {
+            super::Token::Ident(k) => {
+                // rest = input.drop_first().drop_first() == subrange(pos+2)
+                let ghost rest = token_views(toks@.subrange(pos as int + 2, toks@.len() as int));
+                proof {
+                    token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int));
+                    assert(input.len() >= 2);
+                    assert(input[0] == TokenView::Ident(*k));
+                    assert(input[1] == TokenView::Equal);
+                    assert(input.drop_first().drop_first() =~= rest);
+                }
+                let (eopt, epos) = parse_expr_exec(toks, pos + 2, fuel);
+                match eopt {
+                    Some(e) => {
+                        proof { assert(sparse(rest, fuel as nat).0 is Some); }
+                        (Some((k.clone(), Some(e))), epos)
+                    },
+                    None => {
+                        proof { assert(sparse(rest, fuel as nat).0 is None); }
+                        if pos + 2 < toks.len()
+                            && matches!(toks[pos + 2], super::Token::Keyword(Keyword::Default)) {
+                            proof {
+                                token_views_suffix(toks@, pos as int + 2);
+                                assert(rest.len() >= 1 && rest[0] == TokenView::Keyword(Keyword::Default));
+                                assert(rest.drop_first()
+                                    =~= token_views(toks@.subrange(pos as int + 3, toks@.len() as int)));
+                            }
+                            (Some((k.clone(), None)), pos + 3)
+                        } else {
+                            proof {
+                                if (pos as int) + 2 < toks@.len() {
+                                    token_views_suffix(toks@, pos as int + 2);
+                                }
+                                assert(rest.len() == 0
+                                    || rest[0] != TokenView::Keyword(Keyword::Default));
+                            }
+                            (None, pos)
+                        }
+                    },
+                }
+            },
+            _ => {
+                // input[0] is not an Ident, so sparse_assign's inner match fails.
+                proof { token_views_suffix(toks@, pos as int); }
+                (None, pos)
+            },
+        }
+    } else {
+        // Either input.len() < 2 or input[1] != Equal.
+        proof {
+            if (pos as int) + 1 < toks@.len() {
+                token_views_suffix(toks@, pos as int);
+                token_views_suffix(toks@, pos as int + 1);
+            }
+        }
+        (None, pos)
+    }
+}
+
+/// A successful `sparse_set_list` parse yields at least one assignment.
+pub proof fn lemma_sparse_set_list_len(input: Seq<TokenView>, fuel: nat)
+    ensures
+        sparse_set_list(input, fuel).0 is Some ==> sparse_set_list(input, fuel).0.unwrap().len() >= 1,
+    decreases fuel,
+{
+    reveal_with_fuel(sparse_set_list, 1);
+    if fuel == 0 {
+    } else {
+        match sparse_assign(input, fuel) {
+            (Some(a), r) => {
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    lemma_sparse_set_list_len(r.drop_first(), (fuel - 1) as nat);
+                } else {
+                    assert(sparse_set_list(input, fuel) == (Some(seq![a]), r));
+                }
+            },
+            (None, _) => {},
+        }
+    }
+}
+
+/// Executable parser for a single-assignment `UPDATE`, refining `sparse_update`.
+/// A trailing comma (multi-assignment) is outside `view_stmt`'s domain, so this
+/// returns `None` there (the relaxed `None` disjunct).
+#[verifier::rlimit(30000)]
+pub fn parse_update_exec(toks: &Vec<super::Token>, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Statement>, usize))
+    requires pos < toks.len(),
+    ensures ({
+        let input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+        let (sopt, srest) = sparse_update(input, fuel as nat);
+        &&& pos <= r.1 <= toks@.len()
+        &&& match r.0 {
+                Some(st) => sopt is Some && is_supdate(sopt.unwrap())
+                    && view_stmt(st) == sopt.unwrap()
+                    && srest == token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None || !is_supdate(sopt.unwrap())
+                    || sopt.unwrap()->Update_set.len() != 1,
+            }
+    }),
+{
+    reveal_with_fuel(sparse_set_list, 1);
+    let ghost input = token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if fuel == 0 {
+        // sparse_set_list(_, 0) is None, so sparse_update yields None.
+        proof { assert(sparse_update(input, 0nat).0 is None); }
+        return (None, pos);
+    }
+    // sparse_update: input.len()>=3 && input[2]==Set, input[1]==Ident(table)
+    if pos + 1 < toks.len() && pos + 2 < toks.len()
+        && matches!(toks[pos + 2], super::Token::Keyword(Keyword::Set)) {
+        proof {
+            token_views_suffix(toks@, pos as int);
+            token_views_suffix(toks@, pos as int + 1);
+            token_views_suffix(toks@, pos as int + 2);
+        }
+        match &toks[pos + 1] {
+            super::Token::Ident(table) => {
+                let ghost after_set = token_views(toks@.subrange(pos as int + 3, toks@.len() as int));
+                proof { token_views_len(toks@.subrange(pos as int + 3, toks@.len() as int)); }
+                let (aopt, apos) = parse_assign_exec(toks, pos + 3, fuel);
+                match aopt {
+                    Some((k, ve)) => {
+                        let ghost gk = k;
+                        let ghost gve = ve;
+                        let ghost a_m = (gk, match gve {
+                            Some(e) => Some(view_expr(e)),
+                            None => None::<SExpr>,
+                        });
+                        let ghost r_m = token_views(toks@.subrange(apos as int, toks@.len() as int));
+                        proof {
+                            token_views_len(toks@.subrange(apos as int, toks@.len() as int));
+                            // sparse_update dispatches into sparse_set_list(after_set).
+                            assert(input.len() >= 3);
+                            assert(input[1] == TokenView::Ident(*table));
+                            assert(input[2] == TokenView::Keyword(Keyword::Set));
+                            assert(input.drop_first().drop_first().drop_first() =~= after_set);
+                            assert(sparse_assign(after_set, fuel as nat) == (Some(a_m), r_m));
+                        }
+                        // Reject multi-assignment: a comma means sparse_set_list continues.
+                        if apos < toks.len()
+                            && matches!(toks[apos], super::Token::Comma) {
+                            proof {
+                                token_views_suffix(toks@, apos as int);
+                                assert(r_m.len() >= 1 && r_m[0] == TokenView::Comma);
+                                lemma_sparse_set_list_len(r_m.drop_first(), (fuel - 1) as nat);
+                                let (sopt, srest) = sparse_update(input, fuel as nat);
+                                assert(sopt is None || sopt.unwrap()->Update_set.len() != 1);
+                            }
+                            (None, pos)
+                        } else {
+                            proof {
+                                if apos < toks.len() {
+                                    token_views_suffix(toks@, apos as int);
+                                }
+                                // no comma ⟹ sparse_set_list == (Some(seq![a_m]), r_m)
+                                assert(r_m.len() == 0 || r_m[0] != TokenView::Comma);
+                                assert(sparse_assign(after_set, fuel as nat).0.unwrap() == a_m);
+                                assert(sparse_assign(after_set, fuel as nat) == (Some(a_m), r_m));
+                                reveal_with_fuel(sparse_set_list, 1);
+                                assert(sparse_set_list(after_set, fuel as nat) == (Some(seq![a_m]), r_m));
+                            }
+                            let mut m = build_one_entry_map(k, ve);
+                            proof {
+                                // view_stmt(Update{table, m, ..}).set == seq![a_m]
+                                assert(m@.dom() =~= set![k]);
+                                assert(m@.dom().len() == 1);
+                                assert(m@.dom().contains(m@.dom().choose()));
+                                assert(m@.dom().choose() == k);
+                                assert(m@[k] == ve);
+                            }
+                            // where clause?
+                            if apos < toks.len()
+                                && matches!(toks[apos], super::Token::Keyword(Keyword::Where)) {
+                                proof {
+                                    token_views_suffix(toks@, apos as int);
+                                    assert(r_m[0] == TokenView::Keyword(Keyword::Where));
+                                    assert(r_m.drop_first()
+                                        =~= token_views(toks@.subrange(apos as int + 1, toks@.len() as int)));
+                                }
+                                let (eopt, epos) = parse_expr_exec(toks, apos + 1, fuel);
+                                match eopt {
+                                    Some(e) => {
+                                        let st = ast::Statement::Update {
+                                            table: table.clone(),
+                                            set: m,
+                                            where_clause: Some(e),
+                                        };
+                                        proof {
+                                            let (sopt, srest) = sparse_update(input, fuel as nat);
+                                            assert(a_m == (k, match ve {
+                                                Some(e2) => Some(view_expr(e2)),
+                                                None => None::<SExpr>,
+                                            }));
+                                            assert(view_stmt(st) == SStmt::Update {
+                                                table: *table,
+                                                set: seq![a_m],
+                                                where_clause: Some(view_expr(e)),
+                                            });
+                                            assert(sopt == Some(view_stmt(st)));
+                                            assert(srest
+                                                == token_views(toks@.subrange(epos as int, toks@.len() as int)));
+                                        }
+                                        (Some(st), epos)
+                                    },
+                                    None => {
+                                        proof {
+                                            let (sopt, srest) = sparse_update(input, fuel as nat);
+                                            assert(sopt is None);
+                                        }
+                                        (None, pos)
+                                    },
+                                }
+                            } else {
+                                proof {
+                                    if apos < toks.len() {
+                                        token_views_suffix(toks@, apos as int);
+                                    }
+                                    assert(r_m.len() == 0 || r_m[0] != TokenView::Keyword(Keyword::Where));
+                                }
+                                let st = ast::Statement::Update {
+                                    table: table.clone(),
+                                    set: m,
+                                    where_clause: None,
+                                };
+                                proof {
+                                    let (sopt, srest) = sparse_update(input, fuel as nat);
+                                    assert(a_m == (k, match ve {
+                                        Some(e2) => Some(view_expr(e2)),
+                                        None => None::<SExpr>,
+                                    }));
+                                    assert(view_stmt(st) == SStmt::Update {
+                                        table: *table,
+                                        set: seq![a_m],
+                                        where_clause: None,
+                                    });
+                                    assert(sopt == Some(view_stmt(st)));
+                                    assert(srest
+                                        == token_views(toks@.subrange(apos as int, toks@.len() as int)));
+                                }
+                                (Some(st), apos)
+                            }
+                        }
+                    },
+                    None => {
+                        // parse_assign failed ⟹ sparse_set_list None ⟹ sparse_update None.
+                        proof { assert(sparse_update(input, fuel as nat).0 is None); }
+                        (None, pos)
+                    },
+                }
+            },
+            _ => {
+                // input[1] is not an Ident, so sparse_update's inner match fails.
+                proof { assert(sparse_update(input, fuel as nat).0 is None); }
+                (None, pos)
+            },
+        }
+    } else {
+        proof {
+            // sparse_update fails: either input.len() < 3 (from token_views_len at
+            // top: input.len() == toks.len() - pos) or input[2] != Set.
+            if (pos as int) + 2 < toks@.len() {
+                token_views_suffix(toks@, pos as int);
+                token_views_suffix(toks@, pos as int + 1);
+                token_views_suffix(toks@, pos as int + 2);
+                assert(input.len() >= 3);
+                assert(input[2] != TokenView::Keyword(Keyword::Set));
+            } else {
+                assert(input.len() < 3);
+            }
+            assert(sparse_update(input, fuel as nat).0 is None);
+        }
+        (None, pos)
+    }
+}
+
+/// `sparse_update` roundtrip for a single-assignment `Update` (the `sparse_update`
+/// slice of `lemma_sparse_stmt_sprint`, exposed for the executable headline).
+pub proof fn lemma_sparse_update_sprint(s: SStmt, fuel: nat)
+    requires
+        is_supdate(s),
+        printable_stmt(s),
+        fuel >= sdepth_stmt(s),
+    ensures
+        sparse_update(sprint_stmt(s), fuel) == (Some(s), Seq::<TokenView>::empty()),
+{
+    reveal(printable_stmt);
+    let tokens = sprint_stmt(s);
+    match s {
+        SStmt::Update { table, set, where_clause } => {
+            let wherepart = match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::<TokenView>::empty(),
+            };
+            let head = seq![
+                TokenView::Keyword(Keyword::Update),
+                TokenView::Ident(table),
+                TokenView::Keyword(Keyword::Set),
+            ];
+            assert(tokens =~= head + sprint_set_list(set) + wherepart);
+            assert(tokens[0] == TokenView::Keyword(Keyword::Update));
+            assert(tokens[1] == TokenView::Ident(table));
+            assert(tokens[2] == TokenView::Keyword(Keyword::Set));
+            assert(tokens.drop_first().drop_first().drop_first() =~= sprint_set_list(set) + wherepart);
+            assert(wherepart.len() == 0
+                || (wherepart[0] != TokenView::Comma
+                    && wherepart[0] != TokenView::Period
+                    && wherepart[0] != TokenView::OpenParen)) by {
+                match where_clause {
+                    Some(e) => { assert(wherepart[0] == TokenView::Keyword(Keyword::Where)); },
+                    None => { assert(wherepart =~= Seq::<TokenView>::empty()); },
+                }
+            }
+            lemma_sparse_set_list_sprint(set, wherepart, fuel);
+            match where_clause {
+                Some(e) => {
+                    assert(wherepart =~= seq![TokenView::Keyword(Keyword::Where)] + sprint(e));
+                    assert(wherepart[0] == TokenView::Keyword(Keyword::Where));
+                    assert(wherepart.drop_first() =~= sprint(e));
+                    assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
+                    lemma_sparse_sprint(e, Seq::<TokenView>::empty(), fuel);
+                },
+                None => {
+                    assert(wherepart =~= Seq::<TokenView>::empty());
+                },
+            }
+            assert(sparse_update(tokens, fuel) == (Some(s), Seq::<TokenView>::empty()));
+        },
+        _ => { assert(false); },
+    }
+}
+
+/// `sdepth_stmt(Update) <= sprint_stmt(Update).len()` for a single-assignment
+/// Update — the fuel bound for the headline (the `full_exec_ok`-domain
+/// `full_sdepth_le_len` excludes Update). The `+3` head and `[Ident,Equal]`
+/// prefix give slack over the single set-list level.
+pub proof fn update_sdepth_le_len(s: SStmt)
+    requires
+        is_supdate(s),
+        printable_stmt(s),
+        s->Update_set.len() == 1,
+    ensures
+        sdepth_stmt(s) <= sprint_stmt(s).len(),
+{
+    reveal(printable_stmt);
+    match s {
+        SStmt::Update { table, set, where_clause } => {
+            let a = set[0];
+            let wherepart = match where_clause {
+                Some(e) => seq![TokenView::Keyword(Keyword::Where)] + sprint(e),
+                None => Seq::<TokenView>::empty(),
+            };
+            assert(sprint_stmt(s) =~= seq![
+                TokenView::Keyword(Keyword::Update),
+                TokenView::Ident(table),
+                TokenView::Keyword(Keyword::Set),
+            ] + sprint_set_list(set) + wherepart);
+            assert(set.drop_first().len() == 0);
+            assert(set_list_depth(set.drop_first()) == 1);
+            assert(sprint_set_list(set) =~= sprint_assign(a));
+            match a.1 {
+                Some(e) => {
+                    sdepth_le_len(e);
+                    assert(sprint_assign(a) =~= seq![TokenView::Ident(a.0), TokenView::Equal]
+                        + sprint(e));
+                },
+                None => {
+                    assert(sprint_assign(a) =~= seq![
+                        TokenView::Ident(a.0),
+                        TokenView::Equal,
+                        TokenView::Keyword(Keyword::Default),
+                    ]);
+                },
+            }
+            match where_clause {
+                Some(e) => { sdepth_le_len(e); },
+                None => {},
+            }
+        },
+        _ => { assert(false); },
+    }
+}
+
+/// End-to-end executable roundtrip for a single-assignment `UPDATE`: printing a
+/// printable single-assignment Update and parsing the result recovers it up to
+/// `view_stmt`. This closes the 10th (and last) statement kind.
+pub fn print_parse_roundtrip_update(s: &ast::Statement) -> (out: ast::Statement)
+    requires
+        printable_stmt(view_stmt(*s)),
+        is_supdate(view_stmt(*s)),
+    ensures
+        view_stmt(out) == view_stmt(*s),
+{
+    let ghost sm = view_stmt(*s);
+    let toks = print_update_exec(s);
+    let fuel = toks.len();
+    proof {
+        assert(sm->Update_set.len() == 1);
+        update_sdepth_le_len(sm);
+        token_views_len(toks@);
+        lemma_sparse_update_sprint(sm, fuel as nat);
+        assert(toks@.subrange(0int, toks@.len() as int) =~= toks@);
+    }
+    let (res, consumed) = parse_update_exec(&toks, 0, fuel);
+    match res {
+        Some(out) => out,
+        None => {
+            proof { assert(false); }
+            ast::Statement::Commit
+        },
+    }
+}
+
 /// End-to-end executable statement roundtrip for the full_exec_ok domain
 /// (8 of 10 statement kinds plus Explain): printing a printable statement with
 /// the executable printer and parsing the result with the executable parser
@@ -4246,7 +4829,7 @@ pub proof fn sdepth_column_le_len(c: SColumn)
     }
 }
 
-#[verifier::rlimit(15000)]
+#[verifier::rlimit(25000)]
 pub proof fn slist_depth_columns_le_len(cols: Seq<SColumn>)
     requires all_printable_columns(cols),
     ensures slist_depth_columns(cols) <= sprint_columns(cols).len() + 1,
