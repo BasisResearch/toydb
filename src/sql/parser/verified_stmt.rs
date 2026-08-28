@@ -4718,6 +4718,24 @@ pub proof fn string_cmp_laws(a: String, b: String)
     assert(a.partial_cmp_spec(&a) == Some(a.cmp_spec(&a)));
 }
 
+/// A strictly-increasing key sequence has distinct entries. The print `iter()`
+/// loop's uniqueness fact (its keys are `increasing_seq`, hence a no-duplicate-key
+/// enumeration for `lemma_seq_to_map_enumerates`).
+pub proof fn lemma_increasing_keys_distinct(keys: Seq<String>)
+    requires
+        vstd::std_specs::btree::increasing_seq(keys),
+    ensures
+        forall|i: int, j: int| 0 <= i < j < keys.len() ==> #[trigger] keys[i] != #[trigger] keys[j],
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+    assert forall|i: int, j: int| 0 <= i < j < keys.len() implies
+        #[trigger] keys[i] != #[trigger] keys[j] by {
+        assert(keys[i].cmp_spec(&keys[j]) == core::cmp::Ordering::Less);
+        string_cmp_laws(keys[i], keys[j]);
+    }
+}
+
 /// A strictly-key-increasing sequence of `(key, value)` pairs is uniquely
 /// determined by its element set. Foundation of the multi-assignment Update
 /// bridge (piece 1 of 5 — see plan).
