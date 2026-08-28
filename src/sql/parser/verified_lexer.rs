@@ -148,4 +148,153 @@ pub fn scan_punct1_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usiz
     }
 }
 
+// -- L1: maximal-munch operators (`<` `>` `!` and `<=` `>=` `<>` `!=`) ---------
+//
+// These are the first tokens where a byte can begin more than one token, so the
+// scanner must look one byte ahead and commit to the longest match. The two-char
+// forms roundtrip for any tail (nothing extends them). The single-char forms
+// (`<`, `>`, `!`) need a byte-level boundary condition on the tail: a printed `<`
+// followed by `=` or `>` would re-scan as `<=`/`<>`, so the roundtrip holds only
+// when the next byte is not one that extends the operator — the same boundary
+// reasoning the grammar used at the token level, here at the byte level.
+
+/// The maximal-munch operator tokens.
+pub open spec fn is_op(t: Token) -> bool {
+    match t {
+        Token::LessThan
+        | Token::LessThanOrEqual
+        | Token::LessOrGreaterThan
+        | Token::GreaterThan
+        | Token::GreaterThanOrEqual
+        | Token::Exclamation
+        | Token::NotEqual => true,
+        _ => false,
+    }
+}
+
+/// Canonical byte print of an operator token (1 or 2 ASCII bytes).
+pub open spec fn lex_print_op(t: Token) -> Seq<u8> {
+    match t {
+        Token::LessThan => seq![60u8],                    // <
+        Token::LessThanOrEqual => seq![60u8, 61u8],       // <=
+        Token::LessOrGreaterThan => seq![60u8, 62u8],     // <>
+        Token::GreaterThan => seq![62u8],                 // >
+        Token::GreaterThanOrEqual => seq![62u8, 61u8],    // >=
+        Token::Exclamation => seq![33u8],                 // !
+        Token::NotEqual => seq![33u8, 61u8],              // !=
+        _ => Seq::empty(),
+    }
+}
+
+/// Maximal-munch scanner for the operator lead bytes `<` `>` `!`: look one byte
+/// ahead and commit to the longest operator.
+pub open spec fn lscan_op(input: Seq<u8>, pos: int) -> (Option<Token>, int) {
+    if 0 <= pos < input.len() {
+        let b0 = input[pos];
+        let has1 = pos + 1 < input.len();
+        if b0 == 60 {  // <
+            if has1 && input[pos + 1] == 61 { (Some(Token::LessThanOrEqual), pos + 2) }
+            else if has1 && input[pos + 1] == 62 { (Some(Token::LessOrGreaterThan), pos + 2) }
+            else { (Some(Token::LessThan), pos + 1) }
+        } else if b0 == 62 {  // >
+            if has1 && input[pos + 1] == 61 { (Some(Token::GreaterThanOrEqual), pos + 2) }
+            else { (Some(Token::GreaterThan), pos + 1) }
+        } else if b0 == 33 {  // !
+            if has1 && input[pos + 1] == 61 { (Some(Token::NotEqual), pos + 2) }
+            else { (Some(Token::Exclamation), pos + 1) }
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// Byte-level boundary condition for a single-char operator's tail: the next byte
+/// must not extend it into a two-char operator. Two-char operators impose nothing
+/// (nothing extends them), so this is vacuously true for them.
+pub open spec fn op_tail_ok(t: Token, tail: Seq<u8>) -> bool {
+    match t {
+        Token::LessThan => tail.len() == 0 || (tail[0] != 61 && tail[0] != 62),
+        Token::GreaterThan => tail.len() == 0 || tail[0] != 61,
+        Token::Exclamation => tail.len() == 0 || tail[0] != 61,
+        _ => true,
+    }
+}
+
+/// Maximal-munch roundtrip: scanning the print of any operator recovers it and
+/// advances by its byte length, given the tail respects the operator's boundary
+/// (always satisfied for the two-char forms).
+pub proof fn lemma_lscan_op(t: Token, tail: Seq<u8>)
+    requires
+        is_op(t),
+        op_tail_ok(t, tail),
+    ensures
+        lscan_op(lex_print_op(t) + tail, 0) == (Some(t), lex_print_op(t).len() as int),
+{
+    let input = lex_print_op(t) + tail;
+    match t {
+        Token::LessThanOrEqual => {
+            assert(input[0] == 60 && input[1] == 61);
+        },
+        Token::LessOrGreaterThan => {
+            assert(input[0] == 60 && input[1] == 62);
+        },
+        Token::GreaterThanOrEqual => {
+            assert(input[0] == 62 && input[1] == 61);
+        },
+        Token::NotEqual => {
+            assert(input[0] == 33 && input[1] == 61);
+        },
+        Token::LessThan => {
+            assert(input[0] == 60);
+            assert(input.len() > 1 ==> (input[1] != 61 && input[1] != 62)) by {
+                if input.len() > 1 { assert(input[1] == tail[0]); }
+            }
+        },
+        Token::GreaterThan => {
+            assert(input[0] == 62);
+            assert(input.len() > 1 ==> input[1] != 61) by {
+                if input.len() > 1 { assert(input[1] == tail[0]); }
+            }
+        },
+        Token::Exclamation => {
+            assert(input[0] == 33);
+            assert(input.len() > 1 ==> input[1] != 61) by {
+                if input.len() > 1 { assert(input[1] == tail[0]); }
+            }
+        },
+        _ => { assert(false); },
+    }
+}
+
+/// Executable maximal-munch operator scanner, refining `lscan_op` on real bytes.
+pub fn scan_op_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+    ensures
+        r.0 == lscan_op(input@, pos as int).0,
+        r.1 == lscan_op(input@, pos as int).1,
+{
+    if pos < input.len() {
+        let b0 = input[pos];
+        let has1 = pos + 1 < input.len();
+        if b0 == 60u8 {
+            if has1 && input[pos + 1] == 61u8 { (Some(Token::LessThanOrEqual), pos + 2) }
+            else if has1 && input[pos + 1] == 62u8 { (Some(Token::LessOrGreaterThan), pos + 2) }
+            else { (Some(Token::LessThan), pos + 1) }
+        } else if b0 == 62u8 {
+            if has1 && input[pos + 1] == 61u8 { (Some(Token::GreaterThanOrEqual), pos + 2) }
+            else { (Some(Token::GreaterThan), pos + 1) }
+        } else if b0 == 33u8 {
+            if has1 && input[pos + 1] == 61u8 { (Some(Token::NotEqual), pos + 2) }
+            else { (Some(Token::Exclamation), pos + 1) }
+        } else {
+            (None, pos)
+        }
+    } else {
+        (None, pos)
+    }
+}
+
 } // verus!
