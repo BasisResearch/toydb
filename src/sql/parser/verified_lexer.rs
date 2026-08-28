@@ -686,4 +686,90 @@ pub proof fn lemma_lex_token_end_progress(input: Seq<u8>, pos: int)
     }
 }
 
+// -- L6: executable dispatcher + spec token-list scanner ----------------------
+//
+// `lex_token_end_exec` is the runnable dispatcher (composes the L0-L5 exec
+// scanners), refining `lex_token_end`. `lex_all_ends` is the spec-level
+// whole-input scanner: the strictly-increasing sequence of token end positions,
+// fuel-bounded (like the parser's `sparse`, to sidestep proving termination
+// through the L5 progress lemma inside a spec fn).
+
+/// Executable "extent of the next token" — skip whitespace, dispatch on the first
+/// byte, return the token's end position. Refines `lex_token_end` exactly.
+pub fn lex_token_end_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
+    requires
+        pos <= input.len(),
+    ensures
+        r == lex_token_end(input@, pos as int),
+{
+    let p = skip_ws_exec(input, pos);
+    proof { lemma_skip_ws_bounds(input@, pos as int); }
+    if p < input.len() {
+        let b = input[p];
+        if 48u8 <= b && b <= 57u8 {
+            scan_digits_exec(input, p)
+        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
+            scan_ident_exec(input, p)
+        } else if b == 60u8 || b == 62u8 || b == 33u8 {
+            let (_t, e) = scan_op_exec(input, p);
+            e
+        } else {
+            let (t, e) = scan_punct1_exec(input, p);
+            match t {
+                Some(_) => e,
+                None => p,
+            }
+        }
+    } else {
+        p
+    }
+}
+
+/// Spec whole-input token-list scanner: the sequence of token end positions from
+/// `pos`, stopping at end-of-input or an unrecognized (deferred-class) byte.
+/// `fuel` bounds the recursion; a fuel of `input.len() + 1` always suffices.
+pub open spec fn lex_all_ends(input: Seq<u8>, pos: int, fuel: nat) -> Seq<int>
+    decreases fuel,
+{
+    if fuel == 0 {
+        Seq::empty()
+    } else {
+        let e = lex_token_end(input, pos);
+        if e > pos {
+            seq![e] + lex_all_ends(input, e, (fuel - 1) as nat)
+        } else {
+            Seq::empty()
+        }
+    }
+}
+
+/// Every token end position is strictly past the start and within the input:
+/// `pos < ends[i] <= len`. The well-formedness the token-list refinement builds on.
+pub proof fn lemma_lex_all_ends_bounded(input: Seq<u8>, pos: int, fuel: nat)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        forall|i: int| 0 <= i < lex_all_ends(input, pos, fuel).len()
+            ==> pos < #[trigger] lex_all_ends(input, pos, fuel)[i] <= input.len(),
+    decreases fuel,
+{
+    if fuel > 0 {
+        let e = lex_token_end(input, pos);
+        lemma_lex_token_end_bounds(input, pos);
+        if e > pos {
+            lemma_lex_all_ends_bounded(input, e, (fuel - 1) as nat);
+            let rest = lex_all_ends(input, e, (fuel - 1) as nat);
+            assert forall|i: int| 0 <= i < lex_all_ends(input, pos, fuel).len()
+                implies pos < #[trigger] lex_all_ends(input, pos, fuel)[i] <= input.len() by {
+                if i == 0 {
+                    assert(lex_all_ends(input, pos, fuel)[0] == e);
+                } else {
+                    assert(lex_all_ends(input, pos, fuel)[i] == rest[i - 1]);
+                    // rest entries are > e > pos and <= len.
+                }
+            }
+        }
+    }
+}
+
 } // verus!
