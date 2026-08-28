@@ -293,11 +293,21 @@ This is the glue that equates `parse(print(m))`'s `seq_to_map(S)` with `view_map
      by `lemma_seq_to_map_enumerates` + `lemma_increasing_keys_distinct`;
      `spinoff_prover` on `lemma_seq_to_map_enumerates` (module-scale regression as the
      file grew).
-   - **Remaining: statement wiring only.** All exec building blocks (print loop + parse
-     builder + all lemmas) are verified. Left: relax the single-assignment restriction in
-     the Update statement print/parse and state the multi-Update roundtrip headline at the
-     order-free `view_map` level (multi-assignment maps are outside `view_stmt`'s domain,
-     so it is a separate headline, not a `view_stmt` refinement).
+**Multi-Update Map wall TRAVERSED END TO END (2026-08-28, 185 verified).**
+`set_map_roundtrip_exec`: for a printable non-empty `BTreeMap` of assignments, parsing
+its print rebuilds a map with the same `SExpr`-view — `view_map(roundtrip(m)@) ==
+view_map(m@)`. Composes the print `iter()` loop + parse builder +
+`lemma_sparse_set_list_sprint` + `set_list_depth_le_len_ne` (token count is a valid
+fuel; the tighter no-`+1` bound needs `assign_depth(a) + 1 <= sprint_assign(a).len()`,
+the `Ident =` prefix giving the slack — avoids usize overflow). The order-free `view_map`
+headline is what dodged BOTH the Map-sort obstacle (no sorted normal form needed in
+spec) and the Expression-`==` obstacle (only value *views* match). This was the "one
+real wall" — done.
+
+Remaining for multi-`Update`: wrap the set-list roundtrip in the full `UPDATE table
+SET .. [WHERE e]` statement (a thin wrapper: the `UPDATE`/`table`/`SET` prefix keywords
++ optional `WHERE`). Then the real gates: the byte-cursor lexer (multi-week) and the
+ast-equivalence cutover.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
