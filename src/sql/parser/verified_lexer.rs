@@ -16,6 +16,8 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)]
 use super::Token;
+#[allow(unused_imports)]
+use super::verified_production::TokenView;
 
 verus! {
 
@@ -988,6 +990,44 @@ pub fn scan_sym_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
     } else {
         (None, pos)
     }
+}
+
+// -- L10: number token-value scanner (integer core) ---------------------------
+//
+// The first payload-carrying token scanner: it produces the token *value*
+// `TokenView::Number(bytes)` (the ghost view of the production `Token::Number`),
+// composing L3's digit run. `TokenView::Number(Seq<u8>)` carries the raw bytes,
+// exactly as `token_view(Token::Number(v)) == TokenView::Number(v@)`. The exec
+// byte-collection is already verified in `lexer.rs::scan_number_bytes`.
+
+/// Scan a number (integer core): if the byte at `pos` is a digit, consume the
+/// maximal digit run and produce `Number` carrying those bytes.
+pub open spec fn lscan_num(input: Seq<u8>, pos: int) -> (Option<TokenView>, int) {
+    if 0 <= pos < input.len() && is_digit(input[pos]) {
+        let e = scan_digits_end(input, pos);
+        (Some(TokenView::Number(input.subrange(pos, e))), e)
+    } else {
+        (None, pos)
+    }
+}
+
+/// Number token roundtrip: a non-empty digit run followed by a non-digit boundary
+/// scans to `Number` carrying exactly those bytes, advancing past them. The
+/// token-value analogue of `lemma_scan_digits_roundtrip`.
+pub proof fn lemma_lscan_num(d: Seq<u8>, tail: Seq<u8>)
+    requires
+        d.len() >= 1,
+        all_digits(d),
+        tail.len() == 0 || !is_digit(tail[0]),
+    ensures
+        lscan_num(d + tail, 0) == (Some(TokenView::Number(d)), d.len() as int),
+{
+    let input = d + tail;
+    assert(input[0] == d[0]);
+    assert(is_digit(input[0]));
+    lemma_scan_digits_roundtrip(d, tail);
+    assert(scan_digits_end(input, 0) == d.len());
+    assert(input.subrange(0, d.len() as int) =~= d);
 }
 
 } // verus!
