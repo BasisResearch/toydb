@@ -2637,4 +2637,402 @@ pub fn lscan_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usiz
 }
 
 
+// -- L17 (cont.): scanner locality bridge --------------------------------------
+//
+// The exec loop scans at absolute positions in the full input, but `lex_all_seq`
+// is defined on progressively sliced suffixes. These locality lemmas bridge the
+// two: each forward scanner's result over `input` at `pos` equals `pos` plus its
+// result over the suffix slice `input[pos..]` at `0` (and produces the same token
+// value). They compose up to `lscan_token_local`.
+
+/// `skip_ws` is suffix-local.
+pub proof fn lemma_skip_ws_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        skip_ws(input, pos) == pos + skip_ws(input.subrange(pos, input.len() as int), 0),
+    decreases input.len() - pos,
+{
+    let sub = input.subrange(pos, input.len() as int);
+    if pos < input.len() {
+        assert(sub[0] == input[pos]);
+        if is_ws(input[pos]) {
+            lemma_skip_ws_local(input, pos + 1);
+            lemma_skip_ws_local(sub, 1);
+            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
+        }
+    }
+}
+
+/// `scan_digits_end` is suffix-local.
+pub proof fn lemma_scan_digits_end_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        scan_digits_end(input, pos) == pos + scan_digits_end(input.subrange(pos, input.len() as int), 0),
+    decreases input.len() - pos,
+{
+    let sub = input.subrange(pos, input.len() as int);
+    if pos < input.len() {
+        assert(sub[0] == input[pos]);
+        if is_digit(input[pos]) {
+            lemma_scan_digits_end_local(input, pos + 1);
+            lemma_scan_digits_end_local(sub, 1);
+            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
+        }
+    }
+}
+
+/// `scan_ident_end` is suffix-local.
+pub proof fn lemma_scan_ident_end_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        scan_ident_end(input, pos) == pos + scan_ident_end(input.subrange(pos, input.len() as int), 0),
+    decreases input.len() - pos,
+{
+    let sub = input.subrange(pos, input.len() as int);
+    if pos < input.len() {
+        assert(sub[0] == input[pos]);
+        if is_ident_cont(input[pos]) {
+            lemma_scan_ident_end_local(input, pos + 1);
+            lemma_scan_ident_end_local(sub, 1);
+            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
+        }
+    }
+}
+
+
+/// `scan_num_dec_end` is suffix-local.
+pub proof fn lemma_scan_num_dec_end_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        scan_num_dec_end(input, pos) == pos + scan_num_dec_end(input.subrange(pos, input.len() as int), 0),
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    lemma_scan_digits_end_local(input, pos);
+    lemma_scan_digits_end_bounds(sub, 0);
+    let ds = scan_digits_end(sub, 0);
+    let d1 = scan_digits_end(input, pos);
+    assert(d1 == pos + ds);
+    if d1 < n && input[d1] == 46 {
+        assert(ds < sub.len());
+        assert(sub[ds] == input[d1]);
+        lemma_scan_digits_end_local(input, d1 + 1);
+        lemma_scan_digits_end_local(sub, ds + 1);
+        assert(input.subrange(d1 + 1, n) =~= sub.subrange(ds + 1, sub.len() as int));
+    } else {
+        if d1 < n {
+            assert(ds < sub.len());
+            assert(sub[ds] == input[d1]);
+        } else {
+            assert(ds >= sub.len());
+        }
+    }
+}
+
+/// Bounds for `scan_num_dec_end`.
+pub proof fn lemma_scan_num_dec_end_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        pos <= scan_num_dec_end(input, pos) <= input.len(),
+{
+    lemma_scan_digits_end_bounds(input, pos);
+    let d1 = scan_digits_end(input, pos);
+    if 0 <= d1 < input.len() && input[d1] == 46 {
+        lemma_scan_digits_end_bounds(input, d1 + 1);
+    }
+}
+
+/// `scan_num_full_end` is suffix-local.
+pub proof fn lemma_scan_num_full_end_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        scan_num_full_end(input, pos) == pos + scan_num_full_end(input.subrange(pos, input.len() as int), 0),
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    lemma_scan_num_dec_end_local(input, pos);
+    let ps = scan_num_dec_end(sub, 0);
+    let p = scan_num_dec_end(input, pos);
+    assert(p == pos + ps);
+    // bounds on ps
+    lemma_scan_num_dec_end_bounds(input, pos);
+    assert(0 <= ps <= sub.len());
+    if p < n && is_exp(input[p]) {
+        assert(ps < sub.len());
+        assert(sub[ps] == input[p]);
+        let q0 = p + 1;
+        let q0s = ps + 1;
+        let q = if q0 < n && is_num_sign(input[q0]) { q0 + 1 } else { q0 };
+        let qs = if q0s < sub.len() && is_num_sign(sub[q0s]) { q0s + 1 } else { q0s };
+        assert(q == pos + qs) by {
+            if q0 < n {
+                assert(q0s < sub.len());
+                assert(sub[q0s] == input[q0]);
+            } else {
+                assert(q0s >= sub.len());
+            }
+        }
+        lemma_scan_digits_end_local(input, q);
+        lemma_scan_digits_end_local(sub, qs);
+        assert(input.subrange(q, n) =~= sub.subrange(qs, sub.len() as int));
+    } else {
+        if p < n {
+            assert(ps < sub.len());
+            assert(sub[ps] == input[p]);
+        } else {
+            assert(ps >= sub.len());
+        }
+    }
+}
+
+/// `lscan_num_full` is suffix-local (same token value, shifted end).
+pub proof fn lemma_lscan_num_full_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_num_full(input, pos).0 == lscan_num_full(input.subrange(pos, input.len() as int), 0).0,
+        lscan_num_full(input, pos).1 == pos + lscan_num_full(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n && is_digit(input[pos]) {
+        assert(sub[0] == input[pos]);
+        lemma_scan_num_full_end_local(input, pos);
+        let es = scan_num_full_end(sub, 0);
+        let e = scan_num_full_end(input, pos);
+        assert(e == pos + es);
+        lemma_scan_num_full_bounds(input, pos);
+        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
+    } else {
+        if pos < n {
+            assert(sub[0] == input[pos]);
+        }
+    }
+}
+
+
+/// `lscan_op` is suffix-local (non-recursive: reads `pos` and `pos+1`).
+pub proof fn lemma_lscan_op_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_op(input, pos).0 == lscan_op(input.subrange(pos, input.len() as int), 0).0,
+        lscan_op(input, pos).1 == pos + lscan_op(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n {
+        assert(sub[0] == input[pos]);
+        assert((pos + 1 < n) == (1 < sub.len()));
+        if pos + 1 < n {
+            assert(sub[1] == input[pos + 1]);
+        }
+    }
+}
+
+/// `lscan_sym` is suffix-local.
+pub proof fn lemma_lscan_sym_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_sym(input, pos).0 == lscan_sym(input.subrange(pos, input.len() as int), 0).0,
+        lscan_sym(input, pos).1 == pos + lscan_sym(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n {
+        assert(sub[0] == input[pos]);
+        let b = input[pos];
+        if b == 60 || b == 62 || b == 33 {
+            lemma_lscan_op_local(input, pos);
+        }
+    }
+}
+
+/// `lscan_keyword` is suffix-local (same keyword classification, shifted end).
+pub proof fn lemma_lscan_keyword_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_keyword(input, pos).0 == lscan_keyword(input.subrange(pos, input.len() as int), 0).0,
+        lscan_keyword(input, pos).1 == pos + lscan_keyword(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if pos < n && is_ident_start(input[pos]) {
+        assert(sub[0] == input[pos]);
+        lemma_scan_ident_end_local(input, pos);
+        lemma_scan_ident_end_bounds(sub, 0);
+        let es = scan_ident_end(sub, 0);
+        let e = scan_ident_end(input, pos);
+        assert(e == pos + es);
+        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
+    }
+}
+
+/// `lscan_token` is suffix-local: scanning at `pos` yields the same token value
+/// as scanning the suffix `input[pos..]` at `0`, with the end shifted by `pos`.
+pub proof fn lemma_lscan_token_local(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_token(input, pos).0 == lscan_token(input.subrange(pos, input.len() as int), 0).0,
+        lscan_token(input, pos).1 == pos + lscan_token(input.subrange(pos, input.len() as int), 0).1,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    lemma_skip_ws_local(input, pos);
+    lemma_skip_ws_bounds(sub, 0);
+    let ps = skip_ws(sub, 0);
+    let p = skip_ws(input, pos);
+    assert(p == pos + ps);
+    if p < n {
+        assert(ps < sub.len());
+        assert(sub[ps] == input[p]);
+        let b = input[p];
+        if is_digit(b) {
+            lemma_lscan_num_full_local(input, p);
+            lemma_lscan_num_full_local(sub, ps);
+            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
+        } else if is_ident_start(b) {
+            lemma_lscan_keyword_local(input, p);
+            lemma_lscan_keyword_local(sub, ps);
+            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
+        } else {
+            lemma_lscan_sym_local(input, p);
+            lemma_lscan_sym_local(sub, ps);
+            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
+        }
+    } else {
+        assert(ps >= sub.len());
+    }
+}
+
+
+/// `skip_ws` is idempotent: re-skipping from where it landed is a no-op.
+pub proof fn lemma_skip_ws_idem(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        skip_ws(input, skip_ws(input, pos)) == skip_ws(input, pos),
+{
+    lemma_skip_ws_bounds(input, pos);
+    lemma_skip_ws_fixpoint(input, pos);
+    let s = skip_ws(input, pos);
+    if s < input.len() {
+        assert(!is_ws(input[s]));
+        lemma_skip_ws_nonws(input, s);
+    }
+}
+
+/// Scanning a token at `pos` is the same as scanning it at `skip_ws(input, pos)`
+/// (the token scanner skips leading whitespace itself, and `skip_ws` is idempotent).
+pub proof fn lemma_lscan_token_skip_ws(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lscan_token(input, pos) == lscan_token(input, skip_ws(input, pos)),
+{
+    lemma_skip_ws_bounds(input, pos);
+    lemma_skip_ws_idem(input, pos);
+}
+
+/// The end position of a single-token scan never exceeds the input length.
+pub proof fn lemma_lscan_token_bounds(input: Seq<u8>, pos: int)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        0 <= lscan_token(input, pos).1 <= input.len(),
+{
+    lemma_skip_ws_bounds(input, pos);
+    let p = skip_ws(input, pos);
+    if p < input.len() {
+        let b = input[p];
+        if is_digit(b) {
+            lemma_scan_num_full_bounds(input, p);
+        } else if is_ident_start(b) {
+            lemma_scan_ident_end_bounds(input, p);
+        }
+    }
+}
+
+/// Position-based whole-input scanner, mirroring the exec loop exactly: scan a
+/// token at `pos` (which skips leading whitespace), recurse at its end.
+pub open spec fn lex_from(input: Seq<u8>, pos: int, fuel: nat) -> Seq<TokenView>
+    decreases fuel,
+{
+    if fuel == 0 {
+        Seq::empty()
+    } else {
+        let p = skip_ws(input, pos);
+        if 0 <= p < input.len() {
+            let r = lscan_token(input, pos);
+            match r.0 {
+                Some(tv) => seq![tv] + lex_from(input, r.1, (fuel - 1) as nat),
+                None => Seq::empty(),
+            }
+        } else {
+            Seq::empty()
+        }
+    }
+}
+
+/// Bridge: the position-based `lex_from` equals the slice-based `lex_all_seq` on
+/// the suffix. Lets the exec loop (positions) inherit `lex_all_seq`'s roundtrip.
+pub proof fn lemma_lex_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
+    requires
+        0 <= pos <= input.len(),
+    ensures
+        lex_from(input, pos, fuel) == lex_all_seq(input.subrange(pos, input.len() as int), fuel),
+    decreases fuel,
+{
+    let n = input.len() as int;
+    let sub = input.subrange(pos, n);
+    if fuel != 0 {
+        lemma_skip_ws_local(input, pos);
+        lemma_skip_ws_bounds(sub, 0);
+        let p = skip_ws(input, pos);
+        let sp = skip_ws(sub, 0);
+        assert(p == pos + sp);
+        assert(0 <= sp <= sub.len());
+        assert(pos <= p <= n);
+        // stripped == input.subrange(p, n)
+        assert(skip_ws_seq(sub) =~= input.subrange(p, n));
+        if p < n {
+            // token value agreement
+            lemma_lscan_token_skip_ws(input, pos);
+            lemma_lscan_token_local(input, p);
+            // lscan_token(input,pos) == lscan_token(input,p); and lscan_token(input,p)
+            // relates to lscan_token(input.subrange(p,n),0) == lscan_token(skip_ws_seq(sub),0)
+            let r = lscan_token(input, pos);
+            let rp = lscan_token(input, p);
+            assert(r == rp);
+            match r.0 {
+                Some(tv) => {
+                    // recurse
+                    lemma_lscan_token_bounds(input, p);
+                    lemma_lscan_token_bounds(input.subrange(p, n), 0);
+                    assert(rp.1 == p + lscan_token(input.subrange(p, n), 0).1);
+                    let es = lscan_token(input.subrange(p, n), 0).1;
+                    assert(r.1 == p + es);
+                    assert(0 <= es <= n - p);
+                    assert(r.1 <= n);
+                    // sub-side stripped remainder
+                    assert(input.subrange(p, n).subrange(es, (n - p)) =~= input.subrange(r.1, n));
+                    lemma_lex_from_eq_seq(input, r.1, (fuel - 1) as nat);
+                    assert(input.subrange(r.1, n) =~= sub.subrange((r.1 - pos), sub.len() as int));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+
 } // verus!
