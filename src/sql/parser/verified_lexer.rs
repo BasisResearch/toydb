@@ -2539,4 +2539,102 @@ pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     }
 }
 
+// -- L17: executable top-level lexer (Vec<u8> -> Vec<Token>) --------------------
+//
+// Refines the spec scanners into runnable code producing the real production
+// `Token`. `lscan_token_exec` is the single-token exec dispatcher (refining
+// `lscan_token` at the `token_view` level); `lex_all_exec` is the fuel-free loop
+// refining `lex_all_seq`. The plain-`Ident`/`String` classes still return `None`
+// (their `String` payload needs the deferred UTF-8 trust bridge), so this exec
+// lexer is *sound but incomplete* — it tokenizes numbers, keywords and symbols.
+
+/// Copy `input[p..e]` into a fresh `Vec<u8>`.
+pub fn subrange_vec(input: &Vec<u8>, p: usize, e: usize) -> (r: Vec<u8>)
+    requires
+        p <= e <= input.len(),
+    ensures
+        r@ == input@.subrange(p as int, e as int),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = p;
+    while i < e
+        invariant
+            p <= i <= e <= input.len(),
+            out@ == input@.subrange(p as int, i as int),
+        decreases e - i,
+    {
+        out.push(input[i]);
+        assert(out@ =~= input@.subrange(p as int, (i + 1) as int));
+        i += 1;
+    }
+    assert(out@ =~= input@.subrange(p as int, e as int));
+    out
+}
+
+/// Copy `input[p..e]` into a fresh `Vec<u8>`, ASCII-lowercasing each byte.
+pub fn to_lower_vec(input: &Vec<u8>, p: usize, e: usize) -> (r: Vec<u8>)
+    requires
+        p <= e <= input.len(),
+    ensures
+        r@ == ascii_lower_seq(input@.subrange(p as int, e as int)),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = p;
+    while i < e
+        invariant
+            p <= i <= e <= input.len(),
+            out@ == ascii_lower_seq(input@.subrange(p as int, i as int)),
+        decreases e - i,
+    {
+        let b = input[i];
+        let lb = if 65u8 <= b && b <= 90u8 { b + 32 } else { b };
+        out.push(lb);
+        assert(out@ =~= ascii_lower_seq(input@.subrange(p as int, (i + 1) as int)));
+        i += 1;
+    }
+    assert(out@ =~= ascii_lower_seq(input@.subrange(p as int, e as int)));
+    out
+}
+
+/// Single-token exec dispatcher, refining `lscan_token` at the `token_view` level.
+/// Produces the real `Token`; `None` marks end-of-input, a stray non-token byte,
+/// or a plain identifier (deferred `String` bridge).
+pub fn lscan_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
+    requires
+        pos <= input.len(),
+    ensures
+        r.1 == lscan_token(input@, pos as int).1,
+        ({
+            let spec = lscan_token(input@, pos as int).0;
+            match r.0 {
+                Some(t) => spec == Some(token_view(t)),
+                None => spec is None,
+            }
+        }),
+{
+    let p = skip_ws_exec(input, pos);
+    if p < input.len() {
+        let b = input[p];
+        if 48u8 <= b && b <= 57u8 {
+            let e = scan_num_full_exec(input, p);
+            proof { lemma_scan_num_full_bounds(input@, p as int); }
+            let bytes = subrange_vec(input, p, e);
+            (Some(Token::Number(bytes)), e)
+        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
+            let e = scan_ident_exec(input, p);
+            proof { lemma_scan_ident_end_bounds(input@, p as int); }
+            let low = to_lower_vec(input, p, e);
+            match classify_kw_exec(&low) {
+                Some(kw) => (Some(Token::Keyword(kw)), e),
+                None => (None, e),
+            }
+        } else {
+            scan_sym_exec(input, p)
+        }
+    } else {
+        (None, p)
+    }
+}
+
+
 } // verus!
