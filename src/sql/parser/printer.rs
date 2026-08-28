@@ -75,9 +75,13 @@ pub fn print_expr(expression: &ast::Expression) -> Option<Vec<Token>> {
             tokens.push(Token::CloseParen);
             Some(tokens)
         }
-        ast::Expression::Operator(operator) => {
-            print_core_expr(expression).or_else(|| print_operator(operator))
-        }
+        // `print_operator` produces byte-identical tokens to the verified
+        // `print_core_expr` and also handles `Function` subtrees (which the
+        // function-free core rejects). Calling it directly avoids retrying
+        // `print_core_expr` over the whole subtree at every operator level — an
+        // O(n²) walk on operator trees containing a function — and drops the
+        // dual-dispatch. `print_core_expr` stays for the verified statement path.
+        ast::Expression::Operator(operator) => print_operator(operator),
     }
 }
 
