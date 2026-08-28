@@ -1452,6 +1452,7 @@ pub proof fn peel_ref(c: SColumn, rest: Seq<TokenView>)
 
 /// Parsing the canonical print of one printable column, followed by a
 /// column-terminator tail (comma or close-paren), recovers the column exactly.
+#[verifier::spinoff_prover]
 #[verifier::rlimit(8000)]
 pub proof fn lemma_sparse_column_sprint(c: SColumn, tail: Seq<TokenView>, fuel: nat)
     requires
