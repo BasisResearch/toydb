@@ -178,17 +178,29 @@ LIMIT/OFFSET *mirror* side verifies for all five clauses**: 5-tuple
 into a spinoff'd `lemma_sparse_select_sprint` (the 5-clause `sparse_select`
 composition is too big to evaluate in the main statement lemma's shared context).
 
-**Residual (2026-08-28): the LIMIT/OFFSET *exec* parser.** `parse_where_group_exec`
-refines the 5-level opaque `sparse_where_group`, which needs one `reveal` +
-threading through all five nested stages — inherently too big, and `spinoff_prover`
-does *not* help (the query size is intrinsic, not context). The fix is to **split
-the opaque tail parser** into `sparse_where_group` (WHERE/GROUP/HAVING, 3-tuple) +
-`sparse_limit_offset` (LIMIT/OFFSET, 2-tuple), each with its own exec parser
-refining a *smaller* opaque function so each `reveal` stays tractable; alternatively
-add a `parse_kw_expr_exec` helper refining `sparse_kw_expr` per clause. Do this,
-then LIMIT/OFFSET lands; the remaining Select clauses + ORDER BY follow the recipe.
-General rule discovered: keep each opaque parser to ≤3 clauses so its refinement's
-one-shot `reveal` doesn't crash the solver, and `spinoff_prover` the heavy lemmas.
+**ALL FIVE Select clauses landed (2026-08-28, 151 verified).** LIMIT/OFFSET went in
+via the 3+2 opaque split, confirming the scaling recipe end to end:
+- `sparse_where_group` kept at 3 clauses (WHERE/GROUP/HAVING), generalised with a
+  boundary `tail` param; a separate 2-clause opaque `sparse_limit_offset` parses
+  LIMIT/OFFSET; `sparse_select` composes them. Each opaque parser ≤3 clauses ⟹ its
+  exec refinement's one-shot `reveal` stays tractable (`parse_where_group_exec` +
+  `parse_limit_offset_exec`).
+- Heavy lemmas carry `#[verifier::spinoff_prover]` (fresh minimal solver context):
+  `lemma_sparse_column_sprint`, `lemma_sparse_where_group_sprint`, and the Select
+  roundtrip extracted into a spinoff'd `lemma_sparse_select_sprint`.
+- Shared per-clause helpers `sparse_kw_expr` / `kw_expr_part` /
+  `lemma_sparse_kw_expr_sprint` (one optional `KW <expr>` with an arbitrary tail).
+
+**Reusable scaling recipe (proven):** (1) keep each opaque parser ≤3 clauses so its
+exec refinement's `reveal` doesn't crash; (2) `spinoff_prover` any heavy lemma; (3)
+extract a big statement-kind's roundtrip into its own spinoff'd lemma; (4) thread a
+`tail` param through clause lemmas so tails compose; (5) dispatch gotcha —
+`sparse_stmt` needs `fuel >= 1` (reveal `sdepth_select_body`) to pick the Select arm.
+
+**Remaining for the parser cutover:** `ORDER BY` (an expr+ASC/DESC-direction list —
+same recipe, add a direction codec), the join *types* in the FROM tree, and
+multi-assignment `Update` (the sorted-`iter()` bridge). Then the byte-cursor lexer
+(from scratch) and the ast-equivalence argument for the actual swap.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
