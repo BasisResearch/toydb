@@ -1,5 +1,42 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
+Status: **PARSER CUTOVER IN PROGRESS (2026-08-28)** — branch
+`kg/verified-parser-cutover`, tracked in `verus-parser-cutover-prompt.md`.
+Supersedes the old "Phase 4 — production cutover" sketch below (which assumed
+swapping in the canonical `parse_expr_exec`/`parse_stmt_exec`; those accept only
+fully-parenthesised forms, so a straight swap would regress the concrete SQL
+suite). New strategy and progress:
+
+- **Proof target (settled with the user):** Verus proves the production exec
+  parser no-panic / no-overflow / terminating, plus a roundtrip anchor. Real
+  equivalence to the trusted legacy parser is *differential*, not proven — the
+  legacy parser has no formal spec, and `parse(print(e))==e` only pins the
+  parser on the printer's fully-parenthesised range, never on precedence in
+  concrete SQL (`a-b-c`). Both parsers stay compiled; legacy is the oracle.
+- **Types gap already closed:** exec parsers emit production `ast` directly
+  (mirror only in specs via `view_expr`/`view_stmt`); no boundary conversion.
+- **Precedence strategy:** port parser.rs's precedence climbing 1:1 into Verus
+  (not Pratt — avoids associativity divergence from the oracle).
+- **Phase 0** — plan + coverage table + strategy, signed off.
+- **Phase 1 DONE** (`6de8551`): `sql::parser::differential` (test-only). Diffs
+  legacy vs a verified-path seam on every SQL line in `src/sql/testscripts/**`
+  (wired into both goldenscript runners), plus proptest generators and fixed
+  concrete corpora.
+- **Phase 2.1 DONE** (`29c5ca2`): `sql::parser::verified_precedence` — Verus
+  1:1 port of the precedence-climbing parser → `ast::Expression` over
+  `super::Token`. No-panic/overflow/termination proven; the seam is repointed
+  at it, so it now parses every expression under test. Green: 26 expr
+  goldenscripts (incl. op_precedence), 256-case proptest, 35 concrete cases;
+  verify.sh 19 modules / 0 errors. Added `float_trust::infinity()`.
+- **Phase 2.2 (hard goal, user-promoted, NOT started):** roundtrip-(a) for the
+  precedence parser — `parse(print(e))==e`. Spec parser `sparse_prec` +
+  refinement at `view_expr` + precedence-climbing induction. Note the naive
+  `parse(sprint(e)+tail)==(e,tail)` is false in lhs positions (the infix loop
+  legitimately continues), so the full precedence invariant is required.
+- **Phases 3+:** per statement kind route `parse_new` off legacy (with logged,
+  tracked fallback), close surface variants (bare aliases, join types, optional
+  keywords), then flip `Parser::parse`/`parse_expr`; zero untracked fallbacks.
+
 Status: **LEXER + TOKEN-STREAM CUTOVER LANDED (2026-08-28)** — the production
 `Lexer`/`Parser` now run on the verified surface and the full suite is green.
 `Token::Number` is `Vec<u8>`; `Lexer::scan_symbol` routes through the verified
@@ -585,18 +622,20 @@ ordered by container difficulty rather than by statement kind.
 
 ### Phase 4 — production cutover (independent of S0-S5)
 
-Replace the two `std::iter::Peekable`s with the verified cursors so the verified
-functions become the production functions (coverage numerator up, denominator
-flat):
+**SUPERSEDED (2026-08-28).** See the "PARSER CUTOVER IN PROGRESS" status block
+at the top of this file. The sketch below is wrong: it swaps in the canonical
+`parse_expr_exec`/`parse_stmt_exec`, which accept only fully-parenthesised
+forms and would regress the concrete SQL suite (`GROUP BY`, `a + b * c`, bare
+aliases, …). The real cutover builds a *new* verified precedence-climbing parser
+accepting the full concrete grammar, gated by a differential harness against the
+retained legacy parser. Original (obsolete) sketch:
 
-- `Lexer.chars : Peekable<Chars>` -> the byte cursor `next_token(&[u8], pos)`
-  from `verified.rs`.
-- `Parser.lexer : Peekable<Lexer>` -> the `TokenStream` / `PeekStream` leaf.
-- Swap `parse.rs`'s recursive-descent expression/statement parsers for
-  `parse_expr_exec` / `parse_stmt_exec`, and delete the std-iterator plumbing.
-- Run the existing SQL suite green. Budget the ripple onto `verified_production`
-  / `verified_statements` (the spec-parser-backed statement proofs) — migrate
-  them onto the executable parser, then retire the spec parser.
+- ~~`Lexer.chars : Peekable<Chars>` -> the byte cursor `next_token(&[u8], pos)`.~~
+- ~~`Parser.lexer : Peekable<Lexer>` -> the `TokenStream` / `PeekStream` leaf.~~
+- ~~Swap `parse.rs`'s recursive-descent parsers for `parse_expr_exec` /
+  `parse_stmt_exec`, and delete the std-iterator plumbing.~~
+- ~~Run the existing SQL suite green; migrate the spec-parser proofs, then retire
+  the spec parser.~~
 
 ### Phase 5 — optional refinements
 
