@@ -134,10 +134,27 @@ Verified by reading the code (2026-08-28): the exec parsers accept a strict
 so no sound single-implementation cutover is available without this work, and any
 partial swap regresses `tests/scripts/queries` (which uses `GROUP BY`/`ORDER BY`).
 
-**Landed toward item 1 (2026-08-28):** `sparse_expr_list` + its roundtrip lemma —
-a boundary-terminated bare-expr comma-list parser (unlike the CloseParen-terminated
-`sparse_args`), the reusable codec for `GROUP BY`/`ORDER BY`. Committed, 144
-verified. Marked opaque so its unfolding axiom doesn't bloat the column lemma.
+**SMT wall cleared + GROUP BY landed end-to-end (2026-08-28).** The module-scale
+wall is fixed and the first Select clause is done, both directions, 147 verified /
+0 errors, full 17-module suite green:
+- *Enablers:* `sprint_select_body`/`sdepth_select_body` (opaque) hold the Select
+  clause structure; `sprint_column`/`sprint_columns`/`slist_depth_columns` are now
+  opaque with local reveals in the six column lemmas/printers — this pulled the
+  6-clause column body out of every unrelated proof's background, the root cause of
+  the fragility. Grammar can now grow without tipping the CreateTable lemma.
+- *`GROUP BY` mirror:* `sparse_where_group` (opaque helper + roundtrip lemma) parses
+  the `[WHERE][GROUP BY]` tail; `sparse_expr_list` (boundary-terminated bare-expr
+  comma-list, opaque) is its item parser; the Select roundtrip lemma composes them;
+  `printable_stmt` relaxed to `all_printable_se(group_by)`.
+- *`GROUP BY` exec:* `print_select_exec` emits the clause via `print_args_slice`;
+  `parse_expr_list_exec` (refines `sparse_expr_list`) + `parse_where_group_exec`
+  (refines `sparse_where_group`) parse it; `parse_select_exec` composes them.
+
+**The recipe for the remaining four clauses is now proven.** `HAVING`/`LIMIT`/
+`OFFSET` are single optional exprs (like the WHERE half of `sparse_where_group`);
+`ORDER BY` is `sparse_expr_list` plus a per-item ASC/DESC direction. Each extends
+`sprint_select_body`/`sdepth_select_body`/`sparse_where_group` (opaque, so no
+column-lemma regression) + the Select lemma + the two exec parsers.
 
 **Module-scale SMT wall + the partial fix (2026-08-28).** The full `GROUP BY`
 integration builds and the *mirror* verifies (sprint/sparse/printable/sdepth +
