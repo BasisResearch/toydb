@@ -1,7 +1,8 @@
 //! Verified concrete parser for the simple keyword-driven statements the cutover
 //! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control), `DROP TABLE`
-//! (DDL), and `DELETE` (whose `WHERE` predicate is parsed by the verified
-//! expression parser). These are the statement-structure cutover's first bricks
+//! (DDL), and the row-carrying DML `DELETE` and `INSERT` (whose predicates and
+//! row values are parsed by the verified expression parser). These are the
+//! statement-structure cutover's first bricks
 //! (see `verus-parser-roundtrip-plan.md`). Each is a 1:1 port of the
 //! corresponding `parser.rs` routine, producing the production `ast::Statement`
 //! over `super::Token` and returning the position past the consumed tokens (so
@@ -46,8 +47,131 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Begin) => parse_begin_at(toks, pos + 1),
         Token::Keyword(Keyword::Drop) => parse_drop_at(toks, pos + 1),
         Token::Keyword(Keyword::Delete) => parse_delete_at(toks, pos + 1),
+        Token::Keyword(Keyword::Insert) => parse_insert_at(toks, pos + 1),
         _ => (None, pos),
     }
+}
+
+/// Parses an `INSERT INTO <table> [(<col>, ...)] VALUES (<expr>, ...), ...`
+/// statement, having consumed `INSERT`. The row values are parsed by the
+/// verified expression parser. Mirrors `parse_insert`; a malformed form yields
+/// `(None, pos)` so the caller falls back to the legacy parser.
+fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    // INTO
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Into)) {
+        return (None, pos);
+    }
+    let mut cur = pos + 1;
+
+    // Table name.
+    if cur >= toks.len() {
+        return (None, pos);
+    }
+    let table = match &toks[cur] {
+        Token::Ident(name) => name.clone(),
+        _ => return (None, pos),
+    };
+    cur = cur + 1;
+
+    // Optional parenthesised column list.
+    let mut columns: Option<Vec<String>> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::OpenParen) {
+        cur = cur + 1;
+        let mut cols: Vec<String> = Vec::new();
+        loop
+            invariant
+                pos <= cur,
+                cur <= toks.len(),
+            decreases toks.len() - cur,
+        {
+            if cur >= toks.len() {
+                return (None, pos);
+            }
+            match &toks[cur] {
+                Token::Ident(name) => {
+                    cols.push(name.clone());
+                    cur = cur + 1;
+                },
+                _ => return (None, pos),
+            }
+            if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+                cur = cur + 1;
+            } else {
+                break;
+            }
+        }
+        if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
+            return (None, pos);
+        }
+        cur = cur + 1;
+        columns = Some(cols);
+    }
+
+    // VALUES
+    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Values)) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+
+    // One or more comma-separated parenthesised rows of expressions.
+    let mut values: Vec<Vec<ast::Expression>> = Vec::new();
+    loop
+        invariant
+            pos <= cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        if cur >= toks.len() || !matches!(toks[cur], Token::OpenParen) {
+            return (None, pos);
+        }
+        cur = cur + 1;
+        // Snapshot the post-`(` position: the inner loop only advances `cur`, so
+        // the outer loop's `decreases` sees strict progress across a row.
+        let ghost row_start = cur;
+        let mut row: Vec<ast::Expression> = Vec::new();
+        loop
+            invariant
+                pos <= row_start <= cur,
+                cur <= toks.len(),
+            decreases toks.len() - cur,
+        {
+            let n = toks.len() - cur;
+            if n > (usize::MAX - 3) / 2 {
+                return (None, pos);
+            }
+            let fuel = 2 * n + 3;
+            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            match opt {
+                Some(expr) => {
+                    row.push(expr);
+                    cur = consumed;
+                },
+                None => return (None, pos),
+            }
+            if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+                cur = cur + 1;
+            } else {
+                break;
+            }
+        }
+        if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
+            return (None, pos);
+        }
+        cur = cur + 1;
+        values.push(row);
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+
+    (Some(ast::Statement::Insert { table, columns, values }), cur)
 }
 
 /// Parses a `DELETE FROM <table> [WHERE <expr>]` statement, having consumed
