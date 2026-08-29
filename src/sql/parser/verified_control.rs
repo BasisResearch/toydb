@@ -1,8 +1,9 @@
 //! Verified concrete parser for the simple keyword-driven statements the cutover
 //! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control), `DROP TABLE`
-//! (DDL), and the row-carrying DML `DELETE` / `INSERT` / `UPDATE` (whose
-//! predicates and values are parsed by the verified expression parser). These
-//! are the statement-structure cutover's first bricks
+//! (DDL), `CREATE TABLE` (DDL, with full column definitions), and the
+//! row-carrying DML `DELETE` / `INSERT` / `UPDATE` (whose predicates and values
+//! are parsed by the verified expression parser). These are the
+//! statement-structure cutover's bricks
 //! (see `verus-parser-roundtrip-plan.md`). Each is a 1:1 port of the
 //! corresponding `parser.rs` routine, producing the production `ast::Statement`
 //! over `super::Token` and returning the position past the consumed tokens (so
@@ -25,6 +26,7 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
+use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 
 verus! {
@@ -50,8 +52,202 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Delete) => parse_delete_at(toks, pos + 1),
         Token::Keyword(Keyword::Insert) => parse_insert_at(toks, pos + 1),
         Token::Keyword(Keyword::Update) => parse_update_at(toks, pos + 1),
+        Token::Keyword(Keyword::Create) => parse_create_at(toks, pos + 1),
         _ => (None, pos),
     }
+}
+
+/// Parses a `CREATE TABLE <name> (<column>, ...)` statement, having consumed
+/// `CREATE`. Each column definition is parsed by `parse_create_column_at`.
+/// Mirrors `parse_create_table`; a malformed form yields `(None, pos)` so the
+/// caller falls back to the legacy parser.
+fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    // TABLE
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
+        return (None, pos);
+    }
+    let mut cur = pos + 1;
+
+    // Table name.
+    if cur >= toks.len() {
+        return (None, pos);
+    }
+    let name = match &toks[cur] {
+        Token::Ident(n) => n.clone(),
+        _ => return (None, pos),
+    };
+    cur = cur + 1;
+
+    // Opening paren of the column list.
+    if cur >= toks.len() || !matches!(toks[cur], Token::OpenParen) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+
+    // One or more comma-separated column definitions.
+    let mut columns: Vec<ast::Column> = Vec::new();
+    loop
+        invariant
+            pos <= cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        let (copt, ncur) = parse_create_column_at(toks, cur);
+        match copt {
+            Some(column) => {
+                columns.push(column);
+                cur = ncur;
+            },
+            None => return (None, pos),
+        }
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Closing paren.
+    if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+
+    (Some(ast::Statement::CreateTable { name, columns }), cur)
+}
+
+/// Parses a single `CREATE TABLE` column definition (`<name> <datatype>
+/// <constraint>*`) at `pos`. Constraints are the keyword-led clauses
+/// `PRIMARY KEY`, `[NOT] NULL`, `DEFAULT <expr>`, `UNIQUE`, `INDEX`, and
+/// `REFERENCES <table>`; the clause loop ends at the first non-keyword token.
+/// Returns `(None, pos)` on any malformed / unexpected keyword. Mirrors
+/// `parse_create_table_column`; strictly advances on success (a column always
+/// consumes at least its name and datatype).
+fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Column>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+        r.0 is Some ==> pos < r.1,
+{
+    // Column name.
+    if pos >= toks.len() {
+        return (None, pos);
+    }
+    let name = match &toks[pos] {
+        Token::Ident(n) => n.clone(),
+        _ => return (None, pos),
+    };
+    let mut cur = pos + 1;
+
+    // Datatype keyword.
+    if cur >= toks.len() {
+        return (None, pos);
+    }
+    let datatype = match &toks[cur] {
+        Token::Keyword(Keyword::Bool) | Token::Keyword(Keyword::Boolean) => DataType::Boolean,
+        Token::Keyword(Keyword::Float) | Token::Keyword(Keyword::Double) => DataType::Float,
+        Token::Keyword(Keyword::Int) | Token::Keyword(Keyword::Integer) => DataType::Integer,
+        Token::Keyword(Keyword::String)
+        | Token::Keyword(Keyword::Text)
+        | Token::Keyword(Keyword::Varchar) => DataType::String,
+        _ => return (None, pos),
+    };
+    cur = cur + 1;
+
+    // Column constraints; `cur` is now strictly past `pos` (name + datatype).
+    let mut primary_key = false;
+    let mut nullable: Option<bool> = None;
+    let mut default: Option<ast::Expression> = None;
+    let mut unique = false;
+    let mut index = false;
+    let mut references: Option<String> = None;
+    loop
+        invariant
+            pos < cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        if cur >= toks.len() {
+            break;
+        }
+        // Constraints are keyword-led; a non-keyword token ends the column.
+        let keyword = match &toks[cur] {
+            Token::Keyword(k) => *k,
+            _ => break,
+        };
+        cur = cur + 1;
+        if matches!(keyword, Keyword::Primary) {
+            if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Key)) {
+                return (None, pos);
+            }
+            cur = cur + 1;
+            primary_key = true;
+        } else if matches!(keyword, Keyword::Null) {
+            if nullable.is_some() {
+                return (None, pos);
+            }
+            nullable = Some(true);
+        } else if matches!(keyword, Keyword::Not) {
+            if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Null)) {
+                return (None, pos);
+            }
+            cur = cur + 1;
+            if nullable.is_some() {
+                return (None, pos);
+            }
+            nullable = Some(false);
+        } else if matches!(keyword, Keyword::Default) {
+            let n = toks.len() - cur;
+            if n > (usize::MAX - 3) / 2 {
+                return (None, pos);
+            }
+            let fuel = 2 * n + 3;
+            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            match opt {
+                Some(expr) => {
+                    default = Some(expr);
+                    cur = consumed;
+                },
+                None => return (None, pos),
+            }
+        } else if matches!(keyword, Keyword::Unique) {
+            unique = true;
+        } else if matches!(keyword, Keyword::Index) {
+            index = true;
+        } else if matches!(keyword, Keyword::References) {
+            if cur >= toks.len() {
+                return (None, pos);
+            }
+            match &toks[cur] {
+                Token::Ident(n) => {
+                    references = Some(n.clone());
+                    cur = cur + 1;
+                },
+                _ => return (None, pos),
+            }
+        } else {
+            // Unexpected keyword for a column definition.
+            return (None, pos);
+        }
+    }
+
+    let column = ast::Column {
+        name,
+        datatype,
+        primary_key,
+        nullable,
+        default,
+        unique,
+        index,
+        references,
+    };
+    (Some(column), cur)
 }
 
 /// Parses an `UPDATE <table> SET <col> = <expr|DEFAULT> [, ...] [WHERE <expr>]`
