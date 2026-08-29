@@ -28,11 +28,17 @@ suite). New strategy and progress:
   at it, so it now parses every expression under test. Green: 26 expr
   goldenscripts (incl. op_precedence), 256-case proptest, 35 concrete cases;
   verify.sh 19 modules / 0 errors. Added `float_trust::infinity()`.
-- **Phase 2.2 (hard goal, user-promoted, IN PROGRESS 2026-08-28):** roundtrip-(a)
-  for the precedence parser — `parse(print(e))==e`. Decomposed into 3 bricks; the
-  two hardest (the spec model + the precedence-climbing induction) are DONE and
-  committed green in `verified_precedence.rs` (30 verified / 0 errors, axiom-free;
-  commits `1358ffd`, `53cbed7`, `6f7f6fd`):
+- **Phase 2.2 (hard goal, user-promoted) — COMPLETE (2026-08-28).** roundtrip-(a)
+  for the precedence parser — `parse(print(e))==e` — is proven end to end, 48
+  verified / 0 errors, axiom-free beyond the pre-existing float trust. The headline
+  `print_parse_roundtrip` (commit `ebbf272`) proves
+  `view_expr(parse_expression(print_expr_exec(e))) == view_expr(e)` for any printable
+  `e`: the verified precedence-climbing parser provably inverts the canonical printer.
+  Path: spec model (Brick 1) + spec-level roundtrip `lemma_prec` (Brick 3) + full
+  exec→spec refinement of `parse_expression_at`/`parse_atom`/`parse_function_call`
+  (Brick 2, commit `ada869a`) + composition (`parse_expression` refinement `ensures`
+  + `lemma_prec`, fuel `2*len+3`). `verify.sh` green; `cargo build` clean. Brick
+  details below (historical):
   - **Brick 1 DONE — spec model.** `sparse_prec` / `sparse_atom` /
     `sparse_infix_loop` / `sparse_postfix_loop` / `sparse_fn_args[_nonempty]`: a
     pure-recursion model of the hybrid exec (whose 3 inner `while` loops terminate
