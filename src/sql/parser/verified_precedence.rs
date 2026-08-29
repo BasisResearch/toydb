@@ -35,7 +35,7 @@ use vstd::prelude::*;
 use super::verified_expression::{BinaryTag, UnaryTag};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_roundtrip::{
-    binary_tag_exec, build_binary, build_unary, prefix_op_exec, IsLit, SExpr,
+    binary_tag_exec, build_binary, build_unary, parse_literal_exec, prefix_op_exec, IsLit, SExpr,
 };
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_production::TokenView;
@@ -183,6 +183,7 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.1 == pos,
         forall|lhs: SExpr| #[trigger] sparse_postfix_loop(
             lhs,
             verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
@@ -370,35 +371,59 @@ pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> (r: ast::Expression
 
 // ---- the parser ------------------------------------------------------------
 
-/// Parses an expression atom: a literal, `*`, a column reference, a function
-/// call, or a parenthesised expression. Mirrors `parse_expression_atom`.
+/// Parses an expression atom, proven to refine `sparse_atom` at the `view_expr`
+/// / `token_views` level. The `fuel >= 2*len + 2` precondition keeps every
+/// sub-parse well-fuelled so fuel-stability applies.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(600000)]
 pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast::Expression>, usize))
-    requires pos <= toks.len(),
+    requires
+        pos <= toks.len(),
+        fuel >= 2 * (toks.len() - pos) + 2,
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
-    decreases fuel, 1int,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = sparse_atom(input, fuel as nat);
+            match r.0 {
+                Some(e) => sopt is Some
+                    && super::verified_roundtrip::view_expr(e) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
+    decreases fuel, 3int,
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    reveal_with_fuel(sparse_atom, 1);
+    proof {
+        reveal_with_fuel(super::verified_roundtrip::view_expr, 2);
+        reveal(verified_production::parse_literal_views);
+    }
     if fuel == 0 || pos >= toks.len() {
+        proof {
+            super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        }
         return (None, pos);
+    }
+    proof {
+        super::verified_roundtrip::token_views_suffix(toks@, pos as int);
     }
     match &toks[pos] {
         Token::Asterisk => (Some(ast::Expression::All), pos + 1),
-        Token::Number(bytes) => {
-            if all_digits_exec_local(bytes.as_slice()) {
-                match verified_integer::parse_i64(bytes.as_slice()) {
-                    Some(value) => (Some(ast::Expression::Literal(ast::Literal::Integer(value))), pos + 1),
-                    None => (None, pos),
-                }
-            } else {
-                match float_trust::parse_f64(bytes.as_slice()) {
-                    Some(value) => (Some(ast::Expression::Literal(ast::Literal::Float(value))), pos + 1),
-                    None => (None, pos),
-                }
+        Token::Number(_) => {
+            match parse_literal_exec(&toks[pos]) {
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
+                None => (None, pos),
             }
         },
-        Token::String(value) => {
-            (Some(ast::Expression::Literal(ast::Literal::String(value.clone()))), pos + 1)
+        Token::String(_) => {
+            match parse_literal_exec(&toks[pos]) {
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
+                None => (None, pos),
+            }
         },
         Token::Keyword(Keyword::True) => {
             (Some(ast::Expression::Literal(ast::Literal::Boolean(true))), pos + 1)
@@ -419,22 +444,51 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
             (Some(ast::Expression::Literal(ast::Literal::Null)), pos + 1)
         },
         Token::Ident(name) => {
+            if pos + 1 < toks.len() {
+                proof {
+                    super::verified_roundtrip::token_views_suffix(toks@, pos as int + 1);
+                }
+            } else {
+                proof {
+                    super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+                }
+            }
             if pos + 1 < toks.len() && matches!(toks[pos + 1], Token::OpenParen) {
-                // Function call: name ( args ).
                 let fname = name.clone();
-                parse_function_call(toks, fname, pos + 2, fuel)
+                proof {
+                    // input[0] == token_view(toks[pos]) == TokenView::Ident(fname),
+                    // so sparse_atom's Function name matches parse_function_call's.
+                    assert(input[0] == verified_production::token_view(toks@[pos as int]));
+                    assert(input[0] == TokenView::Ident(fname));
+                }
+                let (fopt, fpos) = parse_function_call(toks, fname, pos + 2, fuel);
+                proof {
+                    super::verified_roundtrip::token_views_len(
+                        toks@.subrange(pos as int, toks@.len() as int));
+                    token_views_shift(toks@, pos as int, 2);
+                    assert(input.subrange(2, input.len() as int)
+                        == verified_production::token_views(toks@.subrange(pos as int + 2, toks@.len() as int)));
+                }
+                (fopt, fpos)
             } else if pos + 1 < toks.len() && matches!(toks[pos + 1], Token::Period) {
-                // Qualified column: table . column.
                 let table = name.clone();
                 if pos + 2 < toks.len() {
+                    proof {
+                        super::verified_roundtrip::token_views_suffix(toks@, pos as int + 2);
+                    }
                     match &toks[pos + 2] {
-                        Token::Ident(column) => (
-                            Some(ast::Expression::Column(Some(table), column.clone())),
-                            pos + 3,
-                        ),
+                        Token::Ident(column) => {
+                            proof {
+                                token_views_shift(toks@, pos as int, 3);
+                            }
+                            (Some(ast::Expression::Column(Some(table), column.clone())), pos + 3)
+                        },
                         _ => (None, pos),
                     }
                 } else {
+                    proof {
+                        super::verified_roundtrip::token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int));
+                    }
                     (None, pos)
                 }
             } else {
@@ -446,8 +500,20 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
             match inner {
                 Some(expr) => {
                     if ipos < toks.len() && matches!(toks[ipos], Token::CloseParen) {
+                        proof {
+                            super::verified_roundtrip::token_views_suffix(toks@, ipos as int);
+                        }
                         (Some(expr), ipos + 1)
                     } else {
+                        if ipos < toks.len() {
+                            proof {
+                                super::verified_roundtrip::token_views_suffix(toks@, ipos as int);
+                            }
+                        } else {
+                            proof {
+                                super::verified_roundtrip::token_views_len(toks@.subrange(ipos as int, toks@.len() as int));
+                            }
+                        }
                         (None, pos)
                     }
                 },
@@ -458,143 +524,454 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
     }
 }
 
-/// Parses a function call's argument list, having consumed `name (`. `pos`
-/// points just past the `(`. Mirrors the `Token::Ident(name) if ... OpenParen`
-/// arm of `parse_expression_atom`.
-pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: usize)
-    -> (r: (Option<ast::Expression>, usize))
-    requires pos <= toks.len(),
-    ensures pos <= r.1 <= toks.len(),
-    decreases fuel, 0int,
+/// Reads a function-call argument list starting at `pos` (just past `name (`),
+/// stopping at the closing `)`. Structural recursion refining `sparse_fn_args`
+/// (empty list, or delegate to the non-empty reader).
+#[verifier::spinoff_prover]
+#[verifier::rlimit(50000)]
+pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<ast::Expression>>, usize))
+    requires
+        pos <= toks.len(),
+        fuel >= 2 * (toks.len() - pos) + 4,
+    ensures
+        pos <= r.1 <= toks.len(),
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (aopt, arest) = sparse_fn_args(input, fuel as nat);
+            match r.0 {
+                Some(args) => aopt is Some
+                    && super::verified_roundtrip::view_args(args@) == aopt.unwrap()
+                    && arest == verified_production::token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => aopt is None,
+            }
+        }),
+    decreases fuel, 1int,
 {
-    if fuel == 0 {
+    reveal_with_fuel(sparse_fn_args, 1);
+    if pos >= toks.len() {
+        proof {
+            super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        }
         return (None, pos);
     }
-    let mut args: Vec<ast::Expression> = Vec::new();
-    let mut cur = pos;
-    let mut first = true;
-    loop
-        invariant
-            pos <= cur <= toks.len(),
-            fuel > 0,
-        decreases toks.len() - cur,
-    {
-        if cur >= toks.len() {
-            return (None, pos);
-        }
-        if matches!(toks[cur], Token::CloseParen) {
-            return (Some(ast::Expression::Function(name, args)), cur + 1);
-        }
-        if !first {
-            if matches!(toks[cur], Token::Comma) {
-                cur = cur + 1;
-            } else {
-                return (None, pos);
+    proof {
+        super::verified_roundtrip::token_views_suffix(toks@, pos as int);
+    }
+    if matches!(toks[pos], Token::CloseParen) {
+        let v: Vec<ast::Expression> = Vec::new();
+        assert(super::verified_roundtrip::view_args(v@) == Seq::<SExpr>::empty());
+        (Some(v), pos)
+    } else {
+        parse_fn_args_ne_exec(toks, pos, fuel)
+    }
+}
+
+/// Reads a non-empty argument list (`arg (, arg)*`) ending at `)`. Structural
+/// recursion refining `sparse_fn_args_nonempty`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(50000)]
+pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
+    -> (r: (Option<Vec<ast::Expression>>, usize))
+    requires
+        pos <= toks.len(),
+        fuel >= 2 * (toks.len() - pos) + 4,
+    ensures
+        pos <= r.1 <= toks.len(),
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (aopt, arest) = sparse_fn_args_nonempty(input, fuel as nat);
+            match r.0 {
+                Some(args) => aopt is Some
+                    && super::verified_roundtrip::view_args(args@) == aopt.unwrap()
+                    && arest == verified_production::token_views(toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => aopt is None,
             }
+        }),
+    decreases fuel, 0int,
+{
+    reveal_with_fuel(sparse_fn_args_nonempty, 1);
+    if pos >= toks.len() {
+        proof {
+            super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        if cur >= toks.len() {
-            return (None, pos);
-        }
-        let (arg, npos) = parse_expression_at(toks, cur, 0, fuel - 1);
-        match arg {
-            Some(expr) => {
-                args.push(expr);
-                cur = npos;
-                first = false;
-            },
-            None => return (None, pos),
-        }
+        return (None, pos);
+    }
+    let (eopt, npos) = parse_expression_at(toks, pos, 0, fuel - 1);
+    match eopt {
+        Some(expr) => {
+            if npos >= toks.len() {
+                proof {
+                    super::verified_roundtrip::token_views_len(toks@.subrange(npos as int, toks@.len() as int));
+                }
+                (None, pos)
+            } else {
+                proof {
+                    super::verified_roundtrip::token_views_suffix(toks@, npos as int);
+                }
+                if matches!(toks[npos], Token::CloseParen) {
+                    let mut v: Vec<ast::Expression> = Vec::new();
+                    v.push(expr);
+                    proof {
+                        super::verified_roundtrip::view_args_step(v@);
+                        assert(v@.drop_first() =~= Seq::<ast::Expression>::empty());
+                    }
+                    (Some(v), npos)
+                } else if matches!(toks[npos], Token::Comma) {
+                    let (more, mpos) = parse_fn_args_ne_exec(toks, npos + 1, fuel - 1);
+                    match more {
+                        Some(mut mv) => {
+                            let ghost old_mv = mv@;
+                            mv.insert(0, expr);
+                            proof {
+                                super::verified_roundtrip::view_args_step(mv@);
+                                assert(mv@.drop_first() =~= old_mv);
+                            }
+                            (Some(mv), mpos)
+                        },
+                        None => (None, pos),
+                    }
+                } else {
+                    (None, pos)
+                }
+            }
+        },
+        None => (None, pos),
+    }
+}
+
+/// Parses a function call's argument list and closing `)`, building the
+/// `Function` expression. Refines `sparse_atom`'s function-call handling.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(50000)]
+pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: usize)
+    -> (r: (Option<ast::Expression>, usize))
+    requires
+        pos <= toks.len(),
+        fuel >= 2 * (toks.len() - pos) + 4,
+    ensures
+        pos <= r.1 <= toks.len(),
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (aopt, arest) = sparse_fn_args(input, fuel as nat);
+            match r.0 {
+                Some(e) => aopt is Some && arest.len() > 0 && arest[0] == TokenView::CloseParen
+                    && super::verified_roundtrip::view_expr(e) == SExpr::Function(name, aopt.unwrap())
+                    && verified_production::token_views(toks@.subrange(r.1 as int, toks@.len() as int))
+                        == arest.drop_first(),
+                None => !(aopt is Some && arest.len() > 0 && arest[0] == TokenView::CloseParen),
+            }
+        }),
+    decreases fuel, 2int,
+{
+    let (aopt, apos) = parse_fn_args_exec(toks, pos, fuel);
+    match aopt {
+        Some(args) => {
+            if apos < toks.len() && matches!(toks[apos], Token::CloseParen) {
+                proof {
+                    super::verified_roundtrip::token_views_suffix(toks@, apos as int);
+                    reveal_with_fuel(super::verified_roundtrip::view_expr, 1);
+                }
+                (Some(ast::Expression::Function(name, args)), apos + 1)
+            } else {
+                if apos < toks.len() {
+                    proof {
+                        super::verified_roundtrip::token_views_suffix(toks@, apos as int);
+                    }
+                } else {
+                    proof {
+                        super::verified_roundtrip::token_views_len(toks@.subrange(apos as int, toks@.len() as int));
+                    }
+                }
+                (None, pos)
+            }
+        },
+        None => (None, pos),
     }
 }
 
 /// Parses an expression at the given minimum precedence. Mirrors
 /// `parse_expression_at`: prefix operator or atom for the left-hand side, a
 /// postfix pass, an infix precedence-climbing loop, then a second postfix pass.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(400000)]
 pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: usize)
     -> (r: (Option<ast::Expression>, usize))
-    requires pos <= toks.len(),
+    requires
+        pos <= toks.len(),
+        fuel >= 2 * (toks.len() - pos) + 3,
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
-    decreases fuel, 2int,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = sparse_prec(input, min_prec, fuel as nat);
+            match r.0 {
+                Some(e) => sopt is Some
+                    && super::verified_roundtrip::view_expr(e) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
+    decreases fuel, 4int,
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    reveal_with_fuel(sparse_prec, 1);
     if fuel == 0 || pos >= toks.len() {
+        proof {
+            super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        }
         return (None, pos);
     }
+    proof {
+        super::verified_roundtrip::token_views_suffix(toks@, pos as int);
+    }
+    // Ghost: the spec's lhs-phase result (lhs_opt_s, after_lhs_s).
+    let ghost lhs_opt_s = prec_lhs_phase(input, min_prec, fuel as nat).0;
+    let ghost after_lhs_s = prec_lhs_phase(input, min_prec, fuel as nat).1;
     // Left-hand side: prefix operator (if its precedence clears min_prec) or atom.
-    let (lhs_opt, lhs_pos) = match prefix_op_exec(&toks[pos]) {
-        Some(tag) if prefix_prec(tag) >= min_prec => {
-            let next_prec = prefix_prec(tag); // prefix operators are right-associative (+0).
-            let (rhs, rpos) = parse_expression_at(toks, pos + 1, next_prec, fuel - 1);
-            match rhs {
-                Some(inner) => (Some(build_unary(tag, inner)), rpos),
-                None => (None, pos),
-            }
-        },
-        _ => parse_atom(toks, pos, fuel - 1),
+    // `popt == prefix_operator(input[0])`, so the exec branch decision matches the
+    // ghost's; each arm establishes the correspondence before the join.
+    let popt = prefix_op_exec(&toks[pos]);
+    let (lhs_opt, lhs_pos) = if popt.is_some() && prefix_prec(popt.unwrap()) >= min_prec {
+        let tag = popt.unwrap();
+        let next_prec = prefix_prec(tag);
+        proof {
+            super::verified_roundtrip::token_views_suffix(toks@, pos as int);
+        }
+        let (rhs, rpos) = parse_expression_at(toks, pos + 1, next_prec, fuel - 1);
+        let res = match rhs {
+            Some(inner) => (Some(build_unary(tag, inner)), rpos),
+            None => (None, pos),
+        };
+        proof {
+            assert(verified_expression::prefix_operator(input[0]) == Some(tag));
+            assert(input.drop_first() == verified_production::token_views(
+                toks@.subrange(pos as int + 1, toks@.len() as int)));
+        }
+        res
+    } else {
+        parse_atom(toks, pos, fuel - 1)
     };
+    proof {
+        assert(match lhs_opt {
+            Some(e) => lhs_opt_s is Some
+                && super::verified_roundtrip::view_expr(e) == lhs_opt_s.unwrap()
+                && verified_production::token_views(toks@.subrange(lhs_pos as int, toks@.len() as int)) == after_lhs_s,
+            None => lhs_opt_s is None,
+        });
+    }
     let mut lhs = match lhs_opt {
         Some(expr) => expr,
         None => return (None, pos),
     };
     let mut cur = lhs_pos;
+    // Ghost anchors for the loop resumption invariants.
+    let ghost lhs0_view = super::verified_roundtrip::view_expr(lhs);
+    let ghost after_lhs_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost (lhs1_s, cur1_s) = sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec);
 
     // Postfix pass 1.
     loop
         invariant
             pos < cur <= toks.len(),
+            sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec)
+                == sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec),
+        ensures
+            sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec)
+                == (super::verified_roundtrip::view_expr(lhs),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
         let (op, npos) = parse_postfix_at(toks, cur, min_prec);
         match op {
             Some(op) => {
+                proof {
+                    assert(sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec)
+                        == postfix_after((Some(op), npos), super::verified_roundtrip::view_expr(lhs), toks@, min_prec));
+                }
                 lhs = build_postfix(op, lhs);
                 cur = npos;
             },
-            None => break,
+            None => {
+                proof {
+                    assert(sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec)
+                        == postfix_after((None::<PostfixOp>, npos),
+                            super::verified_roundtrip::view_expr(lhs), toks@, min_prec));
+                }
+                break;
+            },
         }
     }
+    let ghost target_infix = sparse_infix_loop(lhs1_s, cur1_s, min_prec, fuel as nat);
+    let ghost mut gfuel: nat = fuel as nat;
 
     // Infix precedence-climbing loop.
     loop
         invariant
             pos < cur <= toks.len(),
             fuel > 0,
+            gfuel <= fuel,
+            2 * (toks.len() - cur) + 3 <= gfuel,
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            lhs_opt_s == prec_lhs_phase(input, min_prec, fuel as nat).0,
+            after_lhs_s == prec_lhs_phase(input, min_prec, fuel as nat).1,
+            lhs_opt_s == Some(lhs0_view),
+            after_lhs_s == after_lhs_v,
+            lhs1_s == sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec).0,
+            cur1_s == sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec).1,
+            target_infix == sparse_infix_loop(lhs1_s, cur1_s, min_prec, fuel as nat),
+            sparse_infix_loop(super::verified_roundtrip::view_expr(lhs),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec, gfuel)
+                == target_infix,
+        ensures
+            target_infix == (Some(super::verified_roundtrip::view_expr(lhs)),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
         if cur >= toks.len() {
+            proof {
+                super::verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                lemma_infix_stop(super::verified_roundtrip::view_expr(lhs),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec, gfuel);
+            }
             break;
+        }
+        proof {
+            super::verified_roundtrip::token_views_suffix(toks@, cur as int);
         }
         match binary_tag_exec(&toks[cur]) {
             Some(tag) if binary_prec(tag) >= min_prec => {
                 let next_prec = binary_prec(tag) + binary_assoc(tag);
+                proof {
+                    super::verified_roundtrip::token_views_len(toks@.subrange(cur as int + 1, toks@.len() as int));
+                }
                 let (rhs, rpos) = parse_expression_at(toks, cur + 1, next_prec, fuel - 1);
                 match rhs {
                     Some(right) => {
+                        proof {
+                            lemma_prec_fuel(
+                                verified_production::token_views(toks@.subrange(cur as int + 1, toks@.len() as int)),
+                                next_prec, (fuel - 1) as nat, (gfuel - 1) as nat);
+                            lemma_infix_step(super::verified_roundtrip::view_expr(lhs), tag,
+                                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)),
+                                super::verified_roundtrip::view_expr(right),
+                                verified_production::token_views(toks@.subrange(rpos as int, toks@.len() as int)),
+                                min_prec, gfuel);
+                        }
                         lhs = build_binary(tag, lhs, right);
                         cur = rpos;
+                        proof {
+                            gfuel = (gfuel - 1) as nat;
+                        }
                     },
-                    None => return (None, pos),
+                    None => {
+                        let ghost cv = verified_production::token_views(
+                            toks@.subrange(cur as int, toks@.len() as int));
+                        proof {
+                            // Capture the loop invariant BEFORE revealing sparse_prec
+                            // (its body holds sparse_infix_loop; revealing it would
+                            // unfold that and break this opacity).
+                            assert(sparse_infix_loop(super::verified_roundtrip::view_expr(lhs), cv, min_prec, gfuel)
+                                == target_infix);
+                            super::verified_roundtrip::token_views_suffix(toks@, cur as int);
+                            super::verified_roundtrip::token_views_len(
+                                toks@.subrange(cur as int, toks@.len() as int));
+                            super::verified_roundtrip::token_views_len(
+                                toks@.subrange(cur as int + 1, toks@.len() as int));
+                            lemma_prec_fuel(
+                                verified_production::token_views(toks@.subrange(cur as int + 1, toks@.len() as int)),
+                                next_prec, (fuel - 1) as nat, (gfuel - 1) as nat);
+                            assert(next_prec == (binary_prec_s(tag) + binary_assoc_s(tag)) as u8);
+                            assert(sparse_prec(verified_production::token_views(
+                                toks@.subrange(cur as int + 1, toks@.len() as int)), next_prec,
+                                (fuel - 1) as nat).0 is None);
+                            assert(cv.drop_first() == verified_production::token_views(
+                                toks@.subrange(cur as int + 1, toks@.len() as int)));
+                            assert(sparse_prec(cv.drop_first(),
+                                (binary_prec_s(tag) + binary_assoc_s(tag)) as u8, (gfuel - 1) as nat).0 is None);
+                            assert(cv.len() > 0);
+                            assert(cv[0] == verified_production::token_view(toks@[cur as int]));
+                            assert(verified_expression::binary_from_token(cv[0]) == Some(tag)) by {
+                                reveal(verified_expression::binary_from_token);
+                            }
+                            assert(binary_prec_s(tag) >= min_prec);
+                            assert(gfuel > 0);
+                            lemma_infix_step_none(super::verified_roundtrip::view_expr(lhs), tag, cv, min_prec, gfuel);
+                            assert(target_infix.0 is None);
+                            super::verified_roundtrip::token_views_len(
+                                toks@.subrange(pos as int, toks@.len() as int));
+                            assert(input.len() > 0);
+                            lemma_prec_none(input, min_prec, fuel as nat, lhs0_view, after_lhs_v);
+                        }
+                        return (None, pos);
+                    },
                 }
             },
-            _ => break,
+            _ => {
+                proof {
+                    lemma_infix_stop(super::verified_roundtrip::view_expr(lhs),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec, gfuel);
+                }
+                break;
+            },
         }
     }
+    let ghost lhs2_view = super::verified_roundtrip::view_expr(lhs);
+    let ghost after2_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost (lhs3_v, cur3_v) = sparse_postfix_loop(lhs2_view, after2_v, min_prec);
 
-    // Postfix pass 2 (e.g. `1 + NULL IS NULL`).
+    // Postfix pass 2.
     loop
         invariant
             pos < cur <= toks.len(),
+            sparse_postfix_loop(lhs2_view, after2_v, min_prec)
+                == sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec),
+        ensures
+            sparse_postfix_loop(lhs2_view, after2_v, min_prec)
+                == (super::verified_roundtrip::view_expr(lhs),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
         let (op, npos) = parse_postfix_at(toks, cur, min_prec);
         match op {
             Some(op) => {
+                proof {
+                    assert(sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec)
+                        == postfix_after((Some(op), npos), super::verified_roundtrip::view_expr(lhs), toks@, min_prec));
+                }
                 lhs = build_postfix(op, lhs);
                 cur = npos;
             },
-            None => break,
+            None => {
+                proof {
+                    assert(sparse_postfix_loop(super::verified_roundtrip::view_expr(lhs),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)), min_prec)
+                        == postfix_after((None::<PostfixOp>, npos),
+                            super::verified_roundtrip::view_expr(lhs), toks@, min_prec));
+                }
+                break;
+            },
         }
+    }
+    // Compose: sparse_prec = pf2(infix(pf1(lhs0, after_lhs))) matches the exec.
+    proof {
+        reveal_with_fuel(sparse_prec, 1);
+        assert(lhs_opt_s == Some(lhs0_view));
+        assert(after_lhs_s == after_lhs_v);
+        assert(sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec) == (lhs1_s, cur1_s));
+        assert(target_infix == (Some(lhs2_view), after2_v));
+        assert(lhs3_v == super::verified_roundtrip::view_expr(lhs));
+        assert(cur3_v == verified_production::token_views(
+            toks@.subrange(cur as int, toks@.len() as int)));
+        assert(sparse_prec(input, min_prec, fuel as nat)
+            == (Some::<SExpr>(lhs3_v), cur3_v));
     }
 
     (Some(lhs), cur)
@@ -621,9 +998,13 @@ fn all_digits_exec_local(bytes: &[u8]) -> (r: bool)
 /// vector is consumed. Returns `None` on any parse failure or trailing tokens.
 /// This is the entry point the cutover routes `Parser::parse_expr` through.
 pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>) {
-    // Fuel exceeds the expression-tree depth (bounded by the token count); the
-    // guard keeps the `+ 1` from overflowing on a degenerate maximal vector.
-    let fuel = if toks.len() < usize::MAX { toks.len() + 1 } else { toks.len() };
+    // `parse_expression_at` needs `2*len + 3` fuel so fuel-stability applies to
+    // every sub-parse (the worst case is a deep run of unmatched `(`). A vector
+    // that large cannot exist in practice; reject it rather than overflow.
+    if toks.len() > (usize::MAX - 3) / 2 {
+        return None;
+    }
+    let fuel = 2 * toks.len() + 3;
     let (opt, consumed) = parse_expression_at(toks, 0, 0, fuel);
     match opt {
         Some(expr) => {
@@ -730,11 +1111,18 @@ pub open spec fn sparse_atom(input: Seq<TokenView>, fuel: nat)
                             (Some(SExpr::Function(name, args)), rest.drop_first()),
                         _ => (None, input),
                     }
-                } else if input.len() >= 3 && input[1] == TokenView::Period {
-                    match input[2] {
-                        TokenView::Ident(column) =>
-                            (Some(SExpr::Column(Some(name), column)), input.subrange(3, input.len() as int)),
-                        _ => (None, input),
+                } else if input.len() >= 2 && input[1] == TokenView::Period {
+                    // A `.` commits to a qualified column (matching the exec); a
+                    // missing column name after it is a parse failure, not a bare
+                    // column with a dangling `.`.
+                    if input.len() >= 3 {
+                        match input[2] {
+                            TokenView::Ident(column) =>
+                                (Some(SExpr::Column(Some(name), column)), input.subrange(3, input.len() as int)),
+                            _ => (None, input),
+                        }
+                    } else {
+                        (None, input)
                     }
                 } else {
                     (Some(SExpr::Column(None, name)), input.drop_first())
@@ -1319,6 +1707,74 @@ pub proof fn lemma_infix_stop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f
         sparse_infix_loop(lhs, input, min_prec, fuel) == (Some(lhs), input),
 {
     reveal_with_fuel(sparse_infix_loop, 1);
+}
+
+/// One infix step whose right-hand side fails to parse: the loop yields the hard
+/// failure `(None, input)`.
+pub proof fn lemma_infix_step_none(
+    lhs: SExpr,
+    tag: BinaryTag,
+    input: Seq<TokenView>,
+    min_prec: u8,
+    fuel: nat,
+)
+    requires
+        fuel > 0,
+        input.len() > 0,
+        verified_expression::binary_from_token(input[0]) == Some(tag),
+        binary_prec_s(tag) >= min_prec,
+        sparse_prec(
+            input.drop_first(),
+            (binary_prec_s(tag) + binary_assoc_s(tag)) as u8,
+            (fuel - 1) as nat,
+        ).0 is None,
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, fuel) == (None::<SExpr>, input),
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+}
+
+/// The lhs phase of `sparse_prec` (prefix operator or atom), extracted so both
+/// the exec refinement and `lemma_prec_none` can name it.
+pub open spec fn prec_lhs_phase(input: Seq<TokenView>, min_prec: u8, fuel: nat)
+    -> (Option<SExpr>, Seq<TokenView>) {
+    match verified_expression::prefix_operator(input[0]) {
+        Some(tag) => if prefix_prec_s(tag) >= min_prec {
+            match sparse_prec(input.drop_first(), prefix_prec_s(tag), (fuel - 1) as nat) {
+                (Some(inner), rest) => (Some(SExpr::Unary(tag, Box::new(inner))), rest),
+                (None, _) => (None::<SExpr>, input),
+            }
+        } else {
+            sparse_atom(input, (fuel - 1) as nat)
+        },
+        None => sparse_atom(input, (fuel - 1) as nat),
+    }
+}
+
+/// `sparse_prec` yields a hard failure when the lhs phase produced `Some(lhs0)`
+/// (with tail `after_lhs`) but the infix loop over the postfix-1 result fails.
+pub proof fn lemma_prec_none(
+    input: Seq<TokenView>,
+    min_prec: u8,
+    fuel: nat,
+    lhs0: SExpr,
+    after_lhs: Seq<TokenView>,
+)
+    requires
+        fuel > 0,
+        input.len() > 0,
+        prec_lhs_phase(input, min_prec, fuel).0 == Some(lhs0),
+        prec_lhs_phase(input, min_prec, fuel).1 == after_lhs,
+        sparse_infix_loop(
+            sparse_postfix_loop(lhs0, after_lhs, min_prec).0,
+            sparse_postfix_loop(lhs0, after_lhs, min_prec).1,
+            min_prec,
+            fuel,
+        ).0 is None,
+    ensures
+        sparse_prec(input, min_prec, fuel).0 is None,
+{
+    reveal_with_fuel(sparse_prec, 1);
 }
 
 /// A prec-boundary head is neither a binary operator nor a postfix operator, so
