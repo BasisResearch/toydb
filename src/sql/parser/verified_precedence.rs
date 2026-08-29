@@ -185,9 +185,35 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
     }
 }
 
+/// The mirror expression a detected postfix operator produces over an operand
+/// view. Mirrors `build_postfix` at the `SExpr` level; used by the postfix-loop
+/// refinement to connect the exec's `build_postfix` to `sparse_postfix_loop`.
+pub open spec fn postfix_view(op: PostfixOp, lhs: SExpr) -> SExpr {
+    match op {
+        PostfixOp::Factorial => SExpr::Factorial(Box::new(lhs)),
+        PostfixOp::Is { negated, nan } => {
+            let lit = if nan { IsLit::NaN } else { IsLit::Null };
+            let is = SExpr::Is(Box::new(lhs), lit);
+            if negated {
+                SExpr::Unary(UnaryTag::Not, Box::new(is))
+            } else {
+                is
+            }
+        },
+    }
+}
+
 /// Builds the `ast::Expression` for a detected postfix operator applied to `lhs`.
 /// Mirrors `PostfixOperator::into_expression`.
-pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> ast::Expression {
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30000)]
+pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> (r: ast::Expression)
+    ensures
+        super::verified_roundtrip::view_expr(r) == postfix_view(op, super::verified_roundtrip::view_expr(lhs)),
+{
+    proof {
+        reveal_with_fuel(super::verified_roundtrip::view_expr, 2);
+    }
     match op {
         PostfixOp::Factorial => {
             ast::Expression::Operator(ast::Operator::Factorial(Box::new(lhs)))
