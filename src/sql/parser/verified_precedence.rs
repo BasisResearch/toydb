@@ -919,6 +919,55 @@ pub proof fn postfix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     reveal_with_fuel(sparse_postfix_loop, 1);
 }
 
+/// One productive step of the infix loop: given the right operand already parsed
+/// by `sparse_prec`, the loop consumes the operator and recurses on the built
+/// `Binary` with one less fuel. The exec infix loop uses this with the result of
+/// its recursive `parse_expression_at` call.
+pub proof fn lemma_infix_step(
+    lhs: SExpr,
+    tag: BinaryTag,
+    input: Seq<TokenView>,
+    rhs: SExpr,
+    rest: Seq<TokenView>,
+    min_prec: u8,
+    fuel: nat,
+)
+    requires
+        fuel > 0,
+        input.len() > 0,
+        verified_expression::binary_from_token(input[0]) == Some(tag),
+        binary_prec_s(tag) >= min_prec,
+        sparse_prec(
+            input.drop_first(),
+            (binary_prec_s(tag) + binary_assoc_s(tag)) as u8,
+            (fuel - 1) as nat,
+        ) == (Some(rhs), rest),
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, fuel) == sparse_infix_loop(
+            SExpr::Binary(tag, Box::new(lhs), Box::new(rhs)),
+            rest,
+            min_prec,
+            (fuel - 1) as nat,
+        ),
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+}
+
+/// The infix loop halts: the head is either absent, not a binary operator, or a
+/// binary operator whose precedence is below `min_prec`. Covers every way the
+/// exec infix loop's `_ => break` fires.
+pub proof fn lemma_infix_stop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
+    requires
+        input.len() == 0 || match verified_expression::binary_from_token(input[0]) {
+            Some(tag) => binary_prec_s(tag) < min_prec,
+            None => true,
+        },
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, fuel) == (Some(lhs), input),
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+}
+
 /// A prec-boundary head is neither a binary operator nor a postfix operator, so
 /// both continuation loops halt on it.
 pub proof fn prec_boundary_halts(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
