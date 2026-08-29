@@ -48,23 +48,25 @@ suite). New strategy and progress:
     capture exact error strings, e.g. i64 overflow) stay byte-identical. Not a parse
     fallback: every accepted expression is parsed by the verified parser. Full
     `cargo test` green (317 lib + goldenscript integration), fmt clean.
-  - **NEXT — statement-path expression cutover (the big one).** The 16
-    `self.parse_expression()` sites inside the statement parser (used by the
-    PRODUCTION `Parser::parse`, via `Session::execute`) need cutting over. Design:
-    add a production `BufferedTokenStream { tokens: Vec<Token>, pos }` (owns the
-    lexed vec, position-based) + `PeekStream::buffer() -> Option<(&Vec<Token>, usize)>`
-    / `set_pos` (default `None`/no-op; only `BufferedTokenStream` overrides). Make
-    `StreamingParser::parse_expression` run `verified_precedence::parse_expression_at
-    (vec, pos, 0, 2*(len-pos)+3)` when `buffer()` is `Some`, advancing `pos` by the
-    returned consumed count; else fall back to the legacy streaming path. Then
-    `Parser::parse` uses `BufferedTokenStream` (verified expressions), and a retained
-    `Parser::parse_legacy` (over `TokenStream`) is the differential oracle;
-    `check_statement` compares them. RISK to handle: buffering lexes upfront, so a
-    lexer error moves from lazy (mid-parse) to eager — this changes error *timing/
-    text* on malformed input, which the statement goldenscripts capture. Reconcile
-    the same way as `parse_expr` (delegate rejection text to legacy) or update the
-    goldenfiles. The verified expr parser must consume EXACTLY as many tokens as
-    legacy (it's a 1:1 port; the statement differential gates it).
+  - **Statement-path expression cutover DONE (commit `2398110`).** The PRODUCTION
+    `Parser::parse` (used by `Session::execute`) now parses every embedded expression
+    (all 16 `self.parse_expression()` sites) via the verified `parse_expression_at`.
+    New `BufferedTokenStream` (owns the lexed `Vec<Token>`, index cursor) +
+    `PeekStream::buffer()`/`set_pos`; `parse_expression` runs the verified parser at
+    the cursor and advances by the consumed count. The streaming `TokenStream` is now
+    test-only, retained with `Parser::parse_legacy` as the differential oracle
+    (`check_statement` compares them). The eager-lex error-timing risk did NOT bite —
+    full `cargo test` (317 lib + queries/isolation/anomalies goldenscripts) green, fmt
+    + clippy clean, build warning-free. So the verified precedence parser now runs in
+    production for EVERY expression (bare and inside every statement kind).
+  - **REMAINING — statement STRUCTURE cutover (the multi-week tail).** `Parser::parse`
+    still uses the legacy recursive-descent code for statement keywords/clauses (only
+    the *expressions* are verified). Cutting the statement structure over needs a
+    verified CONCRETE statement parser — analogous to `verified_precedence` for
+    expressions, but for the full production statement grammar (all clauses, join
+    types, etc.). Note `verified_stmt.rs`'s `parse_stmt_full_exec` is over the MIRROR
+    types + domain-restricted to `printable_stmt` (the canonical roundtrip), NOT the
+    full concrete grammar, so it is not a drop-in. This is a large new build.
   - **Brick 1 DONE — spec model.** `sparse_prec` / `sparse_atom` /
     `sparse_infix_loop` / `sparse_postfix_loop` / `sparse_fn_args[_nonempty]`: a
     pure-recursion model of the hybrid exec (whose 3 inner `while` loops terminate
