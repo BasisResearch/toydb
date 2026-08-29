@@ -1,20 +1,23 @@
-//! Verified concrete parser for the simple keyword-driven statements the cutover
-//! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control), `DROP TABLE`
-//! (DDL), `CREATE TABLE` (DDL, with full column definitions), and the
-//! row-carrying DML `DELETE` / `INSERT` / `UPDATE` (whose predicates and values
-//! are parsed by the verified expression parser). These are the
-//! statement-structure cutover's bricks
-//! (see `verus-parser-roundtrip-plan.md`). Each is a 1:1 port of the
+//! Verified concrete parser for the statement kinds the cutover has reached —
+//! `BEGIN` / `COMMIT` / `ROLLBACK` (control), `CREATE TABLE` / `DROP TABLE`
+//! (DDL, with full column definitions), and the row-carrying DML `DELETE` /
+//! `INSERT` / `UPDATE` / `SELECT` (whose predicates, values, and clause
+//! expressions are parsed by the verified expression parser). `SELECT` covers
+//! the full clause set: select list with aliases, the `FROM` join tree
+//! (INNER/LEFT/RIGHT/CROSS, left-deep folded), `WHERE`, `GROUP BY`, `HAVING`,
+//! `ORDER BY` (with direction), `LIMIT`, and `OFFSET`. See
+//! `verus-parser-roundtrip-plan.md`. Each entry is a 1:1 port of the
 //! corresponding `parser.rs` routine, producing the production `ast::Statement`
 //! over `super::Token` and returning the position past the consumed tokens (so
 //! the statement parser can check for a trailing semicolon / end of input,
 //! exactly like the legacy path).
 //!
-//! Verus proves no panic, no arithmetic overflow, and termination (no recursion
-//! or loops; every `Vec` index is bounds-guarded, every `cur + 1` is bounded by
-//! the token count). There is no functional specification: behavioural
-//! equivalence to the trusted legacy parser is established by the differential
-//! harness (`sql::parser::differential`), not by proof — the same contract as
+//! Verus proves no panic, no arithmetic overflow, and termination: every `Vec`
+//! index is bounds-guarded, every `cur + 1` is bounded by the token count, and
+//! every clause loop `decreases toks.len() - cur` on a strictly-advancing
+//! cursor. There is no functional specification: behavioural equivalence to the
+//! trusted legacy parser is established by the differential harness
+//! (`sql::parser::differential`), not by proof — the same contract as
 //! `verified_precedence`.
 
 // Proof/verification scaffolding, not idiomatic library code.
@@ -53,8 +56,476 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Insert) => parse_insert_at(toks, pos + 1),
         Token::Keyword(Keyword::Update) => parse_update_at(toks, pos + 1),
         Token::Keyword(Keyword::Create) => parse_create_at(toks, pos + 1),
+        Token::Keyword(Keyword::Select) => parse_select_at(toks, pos + 1),
         _ => (None, pos),
     }
+}
+
+/// Parses a required expression clause at `pos` (the caller has already consumed
+/// the leading keyword), wrapping the verified expression parser with the
+/// guarded fuel computation. `(None, pos)` on a parse failure or overflow.
+fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expression>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+        r.0 is Some ==> pos < r.1,
+{
+    let n = toks.len() - pos;
+    if n > (usize::MAX - 3) / 2 {
+        return (None, pos);
+    }
+    let fuel = 2 * n + 3;
+    verified_precedence::parse_expression_at(toks, pos, 0, fuel)
+}
+
+/// Parses a `SELECT` statement's clauses, having consumed the leading `SELECT`
+/// keyword: the select list, then optional `FROM` / `WHERE` / `GROUP BY` /
+/// `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`. Mirrors `parse_select`; a
+/// malformed clause yields `(None, pos)` so the caller falls back to legacy.
+fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    // Select list (the `SELECT` keyword is already consumed).
+    let (sopt, c1) = parse_select_list_at(toks, pos);
+    let select = match sopt {
+        Some(s) => s,
+        None => return (None, pos),
+    };
+    let mut cur = c1;
+
+    // FROM
+    let (fopt, c2) = parse_from_clause_at(toks, cur);
+    let from = match fopt {
+        Some(f) => f,
+        None => return (None, pos),
+    };
+    cur = c2;
+
+    // WHERE
+    let mut where_clause: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
+        cur = cur + 1;
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        match opt {
+            Some(e) => {
+                where_clause = Some(e);
+                cur = c;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    // GROUP BY
+    let (gopt, cg) = parse_group_by_at(toks, cur);
+    let group_by = match gopt {
+        Some(g) => g,
+        None => return (None, pos),
+    };
+    cur = cg;
+
+    // HAVING
+    let mut having: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Having)) {
+        cur = cur + 1;
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        match opt {
+            Some(e) => {
+                having = Some(e);
+                cur = c;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    // ORDER BY
+    let (oopt, co) = parse_order_by_at(toks, cur);
+    let order_by = match oopt {
+        Some(o) => o,
+        None => return (None, pos),
+    };
+    cur = co;
+
+    // LIMIT
+    let mut limit: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Limit)) {
+        cur = cur + 1;
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        match opt {
+            Some(e) => {
+                limit = Some(e);
+                cur = c;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    // OFFSET
+    let mut offset: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Offset)) {
+        cur = cur + 1;
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        match opt {
+            Some(e) => {
+                offset = Some(e);
+                cur = c;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    let statement = ast::Statement::Select {
+        select,
+        from,
+        where_clause,
+        group_by,
+        having,
+        order_by,
+        offset,
+        limit,
+    };
+    (Some(statement), cur)
+}
+
+/// Parses the `SELECT` list (one or more `<expr> [[AS] <alias>]`, comma
+/// separated), having consumed the `SELECT` keyword. `*` (the `All`
+/// expression) cannot be aliased. Mirrors `parse_select_clause`.
+fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
+    Option<Vec<(ast::Expression, Option<String>)>>,
+    usize,
+))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    let mut select: Vec<(ast::Expression, Option<String>)> = Vec::new();
+    let mut cur = pos;
+    loop
+        invariant
+            pos <= cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let expr = match opt {
+            Some(e) => e,
+            None => return (None, pos),
+        };
+        cur = c;
+
+        // Optional alias: `AS <ident>` or a bare `<ident>`.
+        let is_as = cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As));
+        let is_ident = cur < toks.len() && matches!(toks[cur], Token::Ident(_));
+        let mut alias: Option<String> = None;
+        if is_as || is_ident {
+            if matches!(expr, ast::Expression::All) {
+                return (None, pos); // can't alias *
+            }
+            if is_as {
+                cur = cur + 1;
+                if cur >= toks.len() {
+                    return (None, pos);
+                }
+            }
+            match &toks[cur] {
+                Token::Ident(name) => {
+                    alias = Some(name.clone());
+                    cur = cur + 1;
+                },
+                _ => return (None, pos),
+            }
+        }
+        select.push((expr, alias));
+
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+    (Some(select), cur)
+}
+
+/// Parses an optional `FROM` clause: a comma-separated list of join trees.
+/// Returns `(Some(vec![]), pos)` when no `FROM` keyword is present. Mirrors
+/// `parse_from_clause` (including the left-deep join folding).
+fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::From>>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::From)) {
+        return (Some(Vec::new()), pos);
+    }
+    let mut cur = pos + 1;
+    let mut from: Vec<ast::From> = Vec::new();
+    loop
+        invariant
+            pos < cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        // Base table for this from-item.
+        let (topt, tc) = parse_from_table_at(toks, cur);
+        let mut from_item = match topt {
+            Some(t) => t,
+            None => return (None, pos),
+        };
+        cur = tc;
+
+        // Snapshot the post-base-table position: the join loop only advances
+        // `cur`, so the outer from-list loop's `decreases` sees strict progress.
+        let ghost item_start = cur;
+        // Fold any joins into a left-deep tree.
+        loop
+            invariant
+                pos < item_start <= cur,
+                cur <= toks.len(),
+            decreases toks.len() - cur,
+        {
+            if cur >= toks.len() {
+                break;
+            }
+            let join_type: ast::JoinType;
+            let jc: usize;
+            match &toks[cur] {
+                Token::Keyword(Keyword::Join) => {
+                    join_type = ast::JoinType::Inner;
+                    jc = cur + 1;
+                },
+                Token::Keyword(Keyword::Cross) => {
+                    if cur + 1 >= toks.len() || !matches!(
+                        toks[cur + 1],
+                        Token::Keyword(Keyword::Join),
+                    ) {
+                        return (None, pos);
+                    }
+                    join_type = ast::JoinType::Cross;
+                    jc = cur + 2;
+                },
+                Token::Keyword(Keyword::Inner) => {
+                    if cur + 1 >= toks.len() || !matches!(
+                        toks[cur + 1],
+                        Token::Keyword(Keyword::Join),
+                    ) {
+                        return (None, pos);
+                    }
+                    join_type = ast::JoinType::Inner;
+                    jc = cur + 2;
+                },
+                Token::Keyword(Keyword::Left) => {
+                    let mut c = cur + 1;
+                    if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
+                        c = c + 1;
+                    }
+                    if c >= toks.len() || !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        return (None, pos);
+                    }
+                    join_type = ast::JoinType::Left;
+                    jc = c + 1;
+                },
+                Token::Keyword(Keyword::Right) => {
+                    let mut c = cur + 1;
+                    if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
+                        c = c + 1;
+                    }
+                    if c >= toks.len() || !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        return (None, pos);
+                    }
+                    join_type = ast::JoinType::Right;
+                    jc = c + 1;
+                },
+                _ => break, // no join keyword: this from-item is complete
+            }
+
+            // Right table of the join.
+            let (ropt, rc) = parse_from_table_at(toks, jc);
+            let right = match ropt {
+                Some(t) => t,
+                None => return (None, pos),
+            };
+            let mut cur2 = rc;
+
+            // ON <predicate>, except for CROSS joins.
+            let mut predicate: Option<ast::Expression> = None;
+            if !matches!(join_type, ast::JoinType::Cross) {
+                if cur2 >= toks.len() || !matches!(toks[cur2], Token::Keyword(Keyword::On)) {
+                    return (None, pos);
+                }
+                cur2 = cur2 + 1;
+                let (opt, c) = parse_clause_expr_at(toks, cur2);
+                match opt {
+                    Some(e) => {
+                        predicate = Some(e);
+                        cur2 = c;
+                    },
+                    None => return (None, pos),
+                }
+            }
+
+            from_item = ast::From::Join {
+                left: Box::new(from_item),
+                right: Box::new(right),
+                join_type,
+                predicate,
+            };
+            cur = cur2;
+        }
+
+        from.push(from_item);
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+    (Some(from), cur)
+}
+
+/// Parses a `FROM` table (`<name> [[AS] <alias>]`), strictly advancing on
+/// success (a table always consumes its name). Mirrors `parse_from_table`.
+fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+        r.0 is Some ==> pos < r.1,
+{
+    if pos >= toks.len() {
+        return (None, pos);
+    }
+    let name = match &toks[pos] {
+        Token::Ident(n) => n.clone(),
+        _ => return (None, pos),
+    };
+    let mut cur = pos + 1;
+
+    // Optional alias: `AS <ident>` or a bare `<ident>`.
+    let is_as = cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As));
+    let is_ident = cur < toks.len() && matches!(toks[cur], Token::Ident(_));
+    let mut alias: Option<String> = None;
+    if is_as || is_ident {
+        if is_as {
+            cur = cur + 1;
+            if cur >= toks.len() {
+                return (None, pos);
+            }
+        }
+        match &toks[cur] {
+            Token::Ident(n) => {
+                alias = Some(n.clone());
+                cur = cur + 1;
+            },
+            _ => return (None, pos),
+        }
+    }
+    (Some(ast::From::Table { name, alias }), cur)
+}
+
+/// Parses an optional `GROUP BY <expr> [, ...]` clause. Returns
+/// `(Some(vec![]), pos)` when no `GROUP` keyword is present. Mirrors
+/// `parse_group_by_clause`.
+fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expression>>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Group)) {
+        return (Some(Vec::new()), pos);
+    }
+    let mut cur = pos + 1;
+    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::By)) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+    let mut group_by: Vec<ast::Expression> = Vec::new();
+    loop
+        invariant
+            pos < cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        match opt {
+            Some(e) => {
+                group_by.push(e);
+                cur = c;
+            },
+            None => return (None, pos),
+        }
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+    (Some(group_by), cur)
+}
+
+/// Parses an optional `ORDER BY <expr> [ASC|DESC] [, ...]` clause. Returns
+/// `(Some(vec![]), pos)` when no `ORDER` keyword is present. Mirrors
+/// `parse_order_by_clause`.
+fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
+    Option<Vec<(ast::Expression, ast::Direction)>>,
+    usize,
+))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Order)) {
+        return (Some(Vec::new()), pos);
+    }
+    let mut cur = pos + 1;
+    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::By)) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+    let mut order_by: Vec<(ast::Expression, ast::Direction)> = Vec::new();
+    loop
+        invariant
+            pos < cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let expr = match opt {
+            Some(e) => e,
+            None => return (None, pos),
+        };
+        cur = c;
+
+        // Optional direction; defaults to ascending.
+        let mut direction = ast::Direction::Ascending;
+        if cur < toks.len() {
+            match &toks[cur] {
+                Token::Keyword(Keyword::Asc) => {
+                    direction = ast::Direction::Ascending;
+                    cur = cur + 1;
+                },
+                Token::Keyword(Keyword::Desc) => {
+                    direction = ast::Direction::Descending;
+                    cur = cur + 1;
+                },
+                _ => {},
+            }
+        }
+        order_by.push((expr, direction));
+
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+    (Some(order_by), cur)
 }
 
 /// Parses a `CREATE TABLE <name> (<column>, ...)` statement, having consumed
