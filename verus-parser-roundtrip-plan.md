@@ -40,8 +40,38 @@ suite). New strategy and progress:
   + `lemma_prec`, fuel `2*len+3`). `verify.sh` green; `cargo build` clean. Brick
   details below (historical):
 - **Phase 3 (production cutover) — COMPLETE (2026-08-29).** Expressions and every
-  statement kind now run on the verified parser in production; legacy is retained
-  only as the differential oracle and for malformed-input error text.
+  statement kind now run on the verified parser in production. **Legacy fully
+  retired (2026-08-29).**
+
+- **Phase 4 (error production + legacy retirement) — COMPLETE (2026-08-29).** The
+  verified parser now produces its own rejection errors and the legacy
+  recursive-descent parser is deleted outright. New `sql::parser::parse_error`:
+  a `ParseError` data enum (in `verus!`) covering all 14 legacy rejection
+  messages, with an untrusted `render()` (outside `verus!`, where `format!` is
+  available) reproducing the exact `Error::InvalidInput` string. Threaded an
+  `Option<ParseError>` as a 3rd return component through `verified_precedence`
+  (expression parser — `.0`/`.1` unchanged so the 48-verified roundtrip proof is
+  untouched; new `parse_expression_full` entry) and all 15 `verified_control`
+  functions, each failure site mapped to the legacy `errinput!` it mirrors
+  (EOF-vs-wrong-token guards split). `Parser::parse`/`parse_expr` render that
+  error directly — no legacy fallback. Confirmed byte-identical via the
+  differential harness upgraded to compare error *messages* (green across
+  proptest + corpus), then **deleted the legacy parser**: all `StreamingParser`
+  recursive-descent methods + operator types, the `parse_legacy`/`parse_expr_legacy`
+  oracles, the differential harness, and the streaming `TokenStream`/
+  `SliceTokenStream`. `parse_expr_tokens`/`parse_statement_tokens` (printer
+  roundtrip proptests) reimplemented on the verified parser. Coverage now rests on
+  the Verus proofs + printer roundtrip proptests + goldenscripts. Gates: verify.sh
+  green (21 modules), cargo build/clippy warning-free, 313 lib + 5 goldenscript
+  integration tests green. Commits `63abf41` (error channel), `2b0da3e` (wire
+  production), `fd10b3c` (differential error-equivalence), `56b67cf` (delete
+  legacy), `df25a7e` (docs).
+  - Residual: the verified parser's reject *control flow* can differ from the old
+    parser on a few untested malformed corners (e.g. `a IS <bad>` halts + trailing
+    error vs erroring inside), since only accept-equivalence + the tested error
+    corpus were pinned; every goldenscript-exercised error string matches exactly.
+
+  Historical detail of the earlier (expression + statement) cutover follows.
   - **`Parser::parse_expr` CUT OVER (commit `f25e31b`).** It now parses via
     `verified_precedence::parse_expression`; the legacy recursive-descent parser is
     retained as `Parser::parse_expr_legacy` (the differential oracle). Rejection
