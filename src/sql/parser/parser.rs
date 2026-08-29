@@ -59,22 +59,20 @@ impl Parser {
     /// Parse the input string into a SQL expression AST. The entire string must
     /// be parsed as a single expression. Only used in tests.
     ///
-    /// Cut over to the Verus-verified precedence parser
-    /// ([`verified_precedence::parse_expression`], proven to invert the canonical
-    /// printer and shown behaviourally equivalent to the legacy parser by the
-    /// differential harness). The legacy recursive-descent parser is retained as
-    /// [`Parser::parse_expr_legacy`], the differential oracle.
+    /// Fully cut over to the Verus-verified precedence parser
+    /// ([`verified_precedence::parse_expression_full`], proven to invert the
+    /// canonical printer): it produces both the AST and, on rejection, the
+    /// structured `ParseError` rendered to the production error string. No legacy
+    /// fallback.
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
         let tokens: Vec<Token> = super::Lexer::new(expr).collect::<Result<_>>()?;
-        match super::verified_precedence::parse_expression(&tokens) {
+        let (opt, perr) = super::verified_precedence::parse_expression_full(&tokens);
+        match opt {
             Some(expression) => Ok(expression),
-            // The verified parser rejects (returns `None`) exactly when the legacy
-            // parser rejects — the differential harness gates that equivalence. It
-            // carries no error detail, so defer to the legacy parser only to
-            // reproduce its specific rejection message (e.g. integer overflow).
-            // This is not a parse fallback: the accepted surface is fully verified.
-            None => Self::parse_expr_legacy(expr),
+            None => Err(perr
+                .expect("the verified parser always reports an error on rejection")
+                .render()),
         }
     }
 
@@ -180,21 +178,25 @@ impl<S: PeekStream> StreamingParser<S> {
 
     /// Parses a SQL statement.
     fn parse_statement(&mut self) -> Result<ast::Statement> {
-        // Cutover: over a buffered stream, parse the control statements
-        // (BEGIN/COMMIT/ROLLBACK) with the Verus-verified concrete parser and
-        // advance the cursor by what it consumed. Other statement kinds, and a
-        // malformed control clause, fall through to the retained legacy path.
-        let verified = if let Some((tokens, pos)) = self.stream.buffer() {
-            let (opt, consumed, _perr) = verified_control::parse_control_at(tokens, pos);
-            opt.map(|statement| (statement, consumed))
-        } else {
-            None
-        };
-        if let Some((statement, consumed)) = verified {
-            self.stream.set_pos(consumed);
-            return Ok(statement);
+        // Production cutover: over a buffered stream, the Verus-verified concrete
+        // statement parser handles every kind and produces the rejection error
+        // itself (rendered from its structured `ParseError`). No legacy fallback.
+        if let Some((tokens, pos)) = self.stream.buffer() {
+            let (opt, consumed, perr) = verified_control::parse_control_at(tokens, pos);
+            match opt {
+                Some(statement) => {
+                    self.stream.set_pos(consumed);
+                    return Ok(statement);
+                }
+                None => {
+                    return Err(perr
+                        .expect("the verified parser always reports an error on rejection")
+                        .render());
+                }
+            }
         }
 
+        // Streaming/slice source (test oracle only): legacy recursive-descent.
         let Some(token) = self.peek()? else {
             return errinput!("unexpected end of input");
         };
