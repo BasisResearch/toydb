@@ -1,6 +1,7 @@
 //! Verified concrete parser for the simple keyword-driven statements the cutover
-//! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control) and
-//! `DROP TABLE` (DDL). These are the statement-structure cutover's first bricks
+//! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control), `DROP TABLE`
+//! (DDL), and `DELETE` (whose `WHERE` predicate is parsed by the verified
+//! expression parser). These are the statement-structure cutover's first bricks
 //! (see `verus-parser-roundtrip-plan.md`). Each is a 1:1 port of the
 //! corresponding `parser.rs` routine, producing the production `ast::Statement`
 //! over `super::Token` and returning the position past the consumed tokens (so
@@ -22,7 +23,7 @@
 use vstd::prelude::*;
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::{Keyword, Token, ast, verified_integer};
+use super::{Keyword, Token, ast, verified_integer, verified_precedence};
 
 verus! {
 
@@ -44,8 +45,58 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Rollback) => (Some(ast::Statement::Rollback), pos + 1),
         Token::Keyword(Keyword::Begin) => parse_begin_at(toks, pos + 1),
         Token::Keyword(Keyword::Drop) => parse_drop_at(toks, pos + 1),
+        Token::Keyword(Keyword::Delete) => parse_delete_at(toks, pos + 1),
         _ => (None, pos),
     }
+}
+
+/// Parses a `DELETE FROM <table> [WHERE <expr>]` statement, having consumed
+/// `DELETE`. The optional `WHERE` predicate is parsed by the Verus-verified
+/// expression parser. Mirrors `parse_delete`; a malformed form yields
+/// `(None, pos)` so the caller falls back to the legacy parser.
+fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    // FROM
+    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::From)) {
+        return (None, pos);
+    }
+    let mut cur = pos + 1;
+
+    // Table name (an identifier).
+    if cur >= toks.len() {
+        return (None, pos);
+    }
+    let table = match &toks[cur] {
+        Token::Ident(name) => name.clone(),
+        _ => return (None, pos),
+    };
+    cur = cur + 1;
+
+    // Optional WHERE <expr>, parsed by the verified expression parser.
+    let mut where_clause: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
+        cur = cur + 1;
+        // Fuel the verified parser needs (`2*(len-pos)+3`); guard the arithmetic.
+        let n = toks.len() - cur;
+        if n > (usize::MAX - 3) / 2 {
+            return (None, pos);
+        }
+        let fuel = 2 * n + 3;
+        let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+        match opt {
+            Some(expr) => {
+                where_clause = Some(expr);
+                cur = consumed;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    (Some(ast::Statement::Delete { table, where_clause }), cur)
 }
 
 /// Parses a `DROP TABLE [IF EXISTS] <name>` statement, having consumed `DROP`
