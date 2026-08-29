@@ -1063,6 +1063,172 @@ pub proof fn lemma_prec_slen(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     }
 }
 
+// ---- fuel-stability: enough fuel fixes the result --------------------------
+//
+// The exec infix loop feeds `fuel-1` to EVERY rhs parse, but `sparse_infix_loop`
+// decrements fuel per step; these lemmas bridge that gap. `sparse_X(input, f) ==
+// sparse_X(input, g)` once both fuels clear a print-length-independent bound
+// (`2*len + c`, the worst case being a deep run of unmatched `(` that spends two
+// fuel per token). Measure: `(input.len(), phase)` with atom < prec < nonempty <
+// fn_args and infix below all (its recursions strictly shrink the input via
+// suffix-monotonicity); every same-input edge drops phase.
+
+/// Atom-parser fuel-stability.
+pub proof fn lemma_atom_fuel(input: Seq<TokenView>, f: nat, g: nat)
+    requires
+        f >= 2 * input.len() + 2,
+        g >= 2 * input.len() + 2,
+    ensures
+        sparse_atom(input, f) == sparse_atom(input, g),
+    decreases input.len(), 1nat,
+{
+    reveal_with_fuel(sparse_atom, 1);
+    if input.len() == 0 {
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                if input.len() >= 2 && input[1] == TokenView::OpenParen {
+                    lemma_fnargs_fuel(input.subrange(2, input.len() as int), f, g);
+                } else if input.len() >= 3 && input[1] == TokenView::Period {
+                } else {
+                }
+            },
+            TokenView::OpenParen => {
+                lemma_prec_fuel(input.drop_first(), 0, (f - 1) as nat, (g - 1) as nat);
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Infix-loop fuel-stability.
+pub proof fn lemma_infix_fuel(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f: nat, g: nat)
+    requires
+        f >= 2 * input.len() + 3,
+        g >= 2 * input.len() + 3,
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, f) == sparse_infix_loop(lhs, input, min_prec, g),
+    decreases input.len(), 0nat,
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+    if input.len() == 0 {
+    } else {
+        match verified_expression::binary_from_token(input[0]) {
+            Some(tag) => if binary_prec_s(tag) >= min_prec {
+                let next_prec = (binary_prec_s(tag) + binary_assoc_s(tag)) as u8;
+                lemma_prec_fuel(input.drop_first(), next_prec, (f - 1) as nat, (g - 1) as nat);
+                match sparse_prec(input.drop_first(), next_prec, (f - 1) as nat) {
+                    (Some(right), rest) => {
+                        lemma_prec_slen(input.drop_first(), next_prec, (f - 1) as nat);
+                        lemma_infix_fuel(
+                            SExpr::Binary(tag, Box::new(lhs), Box::new(right)),
+                            rest,
+                            min_prec,
+                            (f - 1) as nat,
+                            (g - 1) as nat,
+                        );
+                    },
+                    (None, _) => {},
+                }
+            } else {
+            },
+            None => {},
+        }
+    }
+}
+
+/// Argument-list fuel-stability.
+pub proof fn lemma_fnargs_fuel(input: Seq<TokenView>, f: nat, g: nat)
+    requires
+        f >= 2 * input.len() + 4,
+        g >= 2 * input.len() + 4,
+    ensures
+        sparse_fn_args(input, f) == sparse_fn_args(input, g),
+    decreases input.len(), 4nat,
+{
+    reveal_with_fuel(sparse_fn_args, 1);
+    if input.len() == 0 {
+    } else if input[0] == TokenView::CloseParen {
+    } else {
+        lemma_fnargs_ne_fuel(input, f, g);
+    }
+}
+
+/// Non-empty argument-list fuel-stability.
+pub proof fn lemma_fnargs_ne_fuel(input: Seq<TokenView>, f: nat, g: nat)
+    requires
+        f >= 2 * input.len() + 4,
+        g >= 2 * input.len() + 4,
+    ensures
+        sparse_fn_args_nonempty(input, f) == sparse_fn_args_nonempty(input, g),
+    decreases input.len(), 3nat,
+{
+    reveal_with_fuel(sparse_fn_args_nonempty, 1);
+    if input.len() == 0 {
+    } else {
+        lemma_prec_fuel(input, 0, (f - 1) as nat, (g - 1) as nat);
+        match sparse_prec(input, 0, (f - 1) as nat) {
+            (Some(e), rest) => {
+                lemma_prec_slen(input, 0, (f - 1) as nat);
+                if rest.len() == 0 {
+                } else if rest[0] == TokenView::CloseParen {
+                } else if rest[0] == TokenView::Comma {
+                    lemma_fnargs_ne_fuel(rest.drop_first(), (f - 1) as nat, (g - 1) as nat);
+                } else {
+                }
+            },
+            (None, _) => {},
+        }
+    }
+}
+
+/// Expression-parser fuel-stability.
+pub proof fn lemma_prec_fuel(input: Seq<TokenView>, min_prec: u8, f: nat, g: nat)
+    requires
+        f >= 2 * input.len() + 3,
+        g >= 2 * input.len() + 3,
+    ensures
+        sparse_prec(input, min_prec, f) == sparse_prec(input, min_prec, g),
+    decreases input.len(), 2nat,
+{
+    reveal_with_fuel(sparse_prec, 1);
+    if input.len() == 0 {
+    } else {
+        match verified_expression::prefix_operator(input[0]) {
+            Some(tag) => if prefix_prec_s(tag) >= min_prec {
+                lemma_prec_fuel(input.drop_first(), prefix_prec_s(tag), (f - 1) as nat, (g - 1) as nat);
+                lemma_prec_slen(input.drop_first(), prefix_prec_s(tag), (f - 1) as nat);
+            } else {
+                lemma_atom_fuel(input, (f - 1) as nat, (g - 1) as nat);
+                lemma_atom_slen(input, (f - 1) as nat);
+            },
+            None => {
+                lemma_atom_fuel(input, (f - 1) as nat, (g - 1) as nat);
+                lemma_atom_slen(input, (f - 1) as nat);
+            },
+        }
+        let (lhs_opt, after_lhs) = match verified_expression::prefix_operator(input[0]) {
+            Some(tag) => if prefix_prec_s(tag) >= min_prec {
+                match sparse_prec(input.drop_first(), prefix_prec_s(tag), (f - 1) as nat) {
+                    (Some(inner), rest) => (Some(SExpr::Unary(tag, Box::new(inner))), rest),
+                    (None, _) => (None::<SExpr>, input),
+                }
+            } else {
+                sparse_atom(input, (f - 1) as nat)
+            },
+            None => sparse_atom(input, (f - 1) as nat),
+        };
+        match lhs_opt {
+            None => {},
+            Some(lhs0) => {
+                let (lhs1, cur1) = sparse_postfix_loop(lhs0, after_lhs, min_prec);
+                lemma_postfix_slen(lhs0, after_lhs, min_prec);
+                lemma_infix_fuel(lhs1, cur1, min_prec, f, g);
+            },
+        }
+    }
+}
+
 // ===========================================================================
 // Phase 2.2 — spec-level roundtrip: sparse_prec(sprint(e) ++ tail) == (e, tail)
 // ===========================================================================
