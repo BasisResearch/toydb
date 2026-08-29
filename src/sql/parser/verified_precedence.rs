@@ -997,7 +997,15 @@ fn all_digits_exec_local(bytes: &[u8]) -> (r: bool)
 /// Parses a complete expression from a token vector, requiring that the whole
 /// vector is consumed. Returns `None` on any parse failure or trailing tokens.
 /// This is the entry point the cutover routes `Parser::parse_expr` through.
-pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>) {
+pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>)
+    ensures
+        ({
+            let input = verified_production::token_views(toks@.subrange(0, toks@.len() as int));
+            let (sopt, srest) = sparse_prec(input, 0, (2 * toks.len() + 3) as nat);
+            (toks.len() <= (usize::MAX - 3) / 2 && sopt is Some && srest.len() == 0)
+                ==> (r is Some && super::verified_roundtrip::view_expr(r.unwrap()) == sopt.unwrap())
+        }),
+{
     // `parse_expression_at` needs `2*len + 3` fuel so fuel-stability applies to
     // every sub-parse (the worst case is a deep run of unmatched `(`). A vector
     // that large cannot exist in practice; reject it rather than overflow.
@@ -1006,6 +1014,12 @@ pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>) {
     }
     let fuel = 2 * toks.len() + 3;
     let (opt, consumed) = parse_expression_at(toks, 0, 0, fuel);
+    proof {
+        if consumed <= toks.len() {
+            super::verified_roundtrip::token_views_len(
+                toks@.subrange(consumed as int, toks@.len() as int));
+        }
+    }
     match opt {
         Some(expr) => {
             if consumed == toks.len() {
@@ -1016,6 +1030,32 @@ pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>) {
         },
         None => None,
     }
+}
+
+/// Headline: the verified precedence parser inverts the canonical printer.
+/// Parsing the print of any printable expression recovers an expression with the
+/// same mirror view. Composes `parse_expression`'s refinement of `sparse_prec`
+/// with the spec-level roundtrip `lemma_prec` over `print_expr_exec`'s output.
+pub fn print_parse_roundtrip(e: &ast::Expression) -> (r: Option<ast::Expression>)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+        super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e)).len()
+            <= (usize::MAX - 3) / 2,
+    ensures
+        r is Some,
+        super::verified_roundtrip::view_expr(r.unwrap()) == super::verified_roundtrip::view_expr(*e),
+{
+    let toks = super::verified_roundtrip::print_expr_exec(e);
+    proof {
+        super::verified_roundtrip::token_views_len(toks@);
+        lemma_prec(super::verified_roundtrip::view_expr(*e), 0, Seq::<TokenView>::empty(),
+            (2 * toks.len() + 3) as nat);
+        assert(super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e))
+            + Seq::<TokenView>::empty()
+            == super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e)));
+        assert(toks@.subrange(0, toks@.len() as int) == toks@);
+    }
+    parse_expression(&toks)
 }
 
 // ===========================================================================
