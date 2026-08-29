@@ -49,14 +49,23 @@ suite). New strategy and progress:
     may fire) from `lemma_prec` (`prec_boundary` tail, loops halt). Fuel bounds are
     print-length-based (`fuel >= sprint(e).len()[+1]`) so they compose with the
     exec's `toks.len()+1`. `lemma_atom` carries `spinoff_prover` + `rlimit(20000)`.
-  - **Brick 2 REMAINING — exec→spec refinement.** Add `ensures` to
-    `parse_expression_at` / `parse_atom` / `parse_function_call` relating them to
-    `sparse_prec` / `sparse_atom` / `sparse_fn_args` at the `view_expr` /
-    `token_views` level (the `parse_expr_exec` pattern), with loop invariants
-    `sparse_<loop>(view(lhs_cur), views(cur..), mp) == final` (resumption
-    invariance: each exec step = one spec unfold, exit = halt). Then compose with
-    `print_expr_exec` for the exec headline `parse_expression(print(e)) == Some(e)`.
-    Fuel already lines up (`toks.len()+1 == sprint.len()+1 == lemma_prec's bound`).
+  - **Brick 2 IN PROGRESS — exec→spec refinement.** Loop building blocks DONE and
+    committed green (`39fd949`, `58f431b`, `a386ebf`; 33 verified / 0 errors):
+    `build_postfix` functional spec (`view_expr(r) == postfix_view(op, view(lhs))`);
+    `parse_postfix_at` fully refined (`forall lhs. sparse_postfix_loop(lhs,
+    views(pos), mp) == postfix_after(r, ...)` — the invariant-preservation fact for
+    both postfix passes); the reusable `token_views_shift` (multi-step
+    `token_views_suffix`); and `lemma_infix_step` / `lemma_infix_stop`. So every one
+    of `parse_expression_at`'s three loops has its step+stop proven.
+    *Crux still to build:* spec FUEL-STABILITY. The exec infix loop feeds `fuel-1`
+    to every rhs `parse_expression_at` (fixed), while `sparse_infix_loop` decrements
+    fuel per step, so the general refinement needs `sparse_prec(input, mp, f) ==
+    sparse_prec(input, mp, g)` for `f,g >= input.len()` (mutual induction over the
+    family). Then the three exec `ensures` (refine `sparse_*` at the same fuel) with
+    ghost-fuel loop invariants, and compose with `print_expr_exec` +`lemma_prec` for
+    `parse_expression(print(e)) == Some(e)` (fuel `toks.len()+1 == sprint.len()+1`
+    lines up). A bespoke exec-canonical induction (mirroring `lemma_atom` on the
+    exec, infix chains length 1) would dodge stability at the cost of reusability.
 - **Phases 3+:** per statement kind route `parse_new` off legacy (with logged,
   tracked fallback), close surface variants (bare aliases, join types, optional
   keywords), then flip `Parser::parse`/`parse_expr`; zero untracked fallbacks.
