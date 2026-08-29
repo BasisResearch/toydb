@@ -57,15 +57,18 @@ suite). New strategy and progress:
     both postfix passes); the reusable `token_views_shift` (multi-step
     `token_views_suffix`); and `lemma_infix_step` / `lemma_infix_stop`. So every one
     of `parse_expression_at`'s three loops has its step+stop proven.
-    *Crux still to build:* spec FUEL-STABILITY. The exec infix loop feeds `fuel-1`
-    to every rhs `parse_expression_at` (fixed), while `sparse_infix_loop` decrements
-    fuel per step, so the general refinement needs `sparse_prec(input, mp, f) ==
-    sparse_prec(input, mp, g)` for `f,g >= input.len()` (mutual induction over the
-    family). Then the three exec `ensures` (refine `sparse_*` at the same fuel) with
-    ghost-fuel loop invariants, and compose with `print_expr_exec` +`lemma_prec` for
-    `parse_expression(print(e)) == Some(e)` (fuel `toks.len()+1 == sprint.len()+1`
-    lines up). A bespoke exec-canonical induction (mirroring `lemma_atom` on the
-    exec, infix chains length 1) would dodge stability at the cost of reusability.
+    Suffix-monotonicity (`a81e553`, 39v) and fuel-stability (`b23228b`, 44v) now
+    landed (both first try): `lemma_*_slen` (output suffix ≤ input) and `lemma_*_fuel`
+    (`sparse_X(input,f)==sparse_X(input,g)` for `f,g >= 2*len+c`).
+    *Assembly (remaining):* give the three exec fns the same-fuel refinement `ensures`
+    under a `fuel >= 2*len+3` precondition — then fuel stays generous enough that
+    stability applies at every infix step (each step drops `2*len` from the
+    requirement but only 1 from fuel, so the invariant `gfuel >= 2*views(cur).len()+3`
+    holds throughout). Loop invariants use `parse_postfix_at`'s ensures +
+    `lemma_infix_step`/`_stop` + `postfix_halt`. Balanced input (incl. every canonical
+    print) fits in `len+1`, so bumping `parse_expression`'s fuel to `2*len+3` is
+    behaviour-preserving; the headline `parse_expression(print(e)) == Some(e)` then
+    follows via `print_expr_exec` (`token_views==sprint`) + `lemma_prec`.
 - **Phases 3+:** per statement kind route `parse_new` off legacy (with logged,
   tracked fallback), close surface variants (bare aliases, join types, optional
   keywords), then flip `Parser::parse`/`parse_expr`; zero untracked fallbacks.
