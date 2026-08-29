@@ -17,10 +17,12 @@
 //! Verus proves no panic, no arithmetic overflow, and termination: every `Vec`
 //! index is bounds-guarded, every `cur + 1` is bounded by the token count, and
 //! every clause loop `decreases toks.len() - cur` on a strictly-advancing
-//! cursor. There is no functional specification: behavioural equivalence to the
-//! trusted legacy parser is established by the differential harness
-//! (`sql::parser::differential`), not by proof — the same contract as
-//! `verified_precedence`.
+//! cursor. There is no functional specification for the statement structure; it
+//! is a 1:1 port of the (now-removed) recursive-descent parser, and its accepted
+//! ASTs and rejection errors are pinned by the goldenscript suite. Embedded
+//! expressions are parsed by `verified_precedence`, which additionally carries a
+//! print/parse roundtrip proof. On rejection each parser returns a structured
+//! [`super::parse_error::ParseError`], rendered to the production error string.
 
 // Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]

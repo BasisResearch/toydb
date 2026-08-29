@@ -13,16 +13,16 @@
 //!
 //! No panic, no arithmetic overflow, and termination. Every `Vec` index is
 //! bounds-guarded, every `pos + k` / `prec + assoc` is range-bounded, and
-//! recursion terminates on a `fuel` measure (the caller passes `toks.len() + 1`,
-//! which always exceeds the expression-tree depth). There is deliberately no
-//! functional specification at this milestone: behavioural equivalence to the
-//! trusted production parser is established by the differential harness
-//! (`sql::parser::differential`), not by proof. The roundtrip lemma
-//! `parse(print(e)) == e` for this parser lands in milestone 2.
+//! recursion terminates on a `fuel` measure. On top of that, the roundtrip lemma
+//! `print_parse_roundtrip` proves this parser inverts the canonical printer
+//! (`parse(print(e))`'s mirror view equals `e`'s). This is the sole production
+//! expression parser; on rejection it returns a structured
+//! [`super::parse_error::ParseError`] (see `parse_expression_full`), rendered to
+//! the production error string at the boundary.
 //!
-//! The `fuel == 0` and out-of-bounds branches return `None` (a safe parse
-//! failure). Because the caller supplies enough fuel, these are never taken on
-//! well-formed input; the differential harness would flag it if they were.
+//! The `fuel == 0` and out-of-bounds branches return a parse failure. Because the
+//! caller supplies enough fuel, the `fuel == 0` guard is never taken on
+//! well-formed input.
 
 // Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
@@ -176,10 +176,9 @@ pub proof fn token_views_shift(s: Seq<Token>, pos: int, k: int)
 
 /// Detects a postfix operator at `pos` whose precedence is at least `min_prec`,
 /// returning it and the position past its tokens. `IS`/`IS NOT` is precedence 4,
-/// `!` is precedence 9. Mirrors `parse_postfix_operator_at`; a malformed
-/// `IS ... <other>` yields no postfix (leaving the tokens for the caller to
-/// reject), which the differential harness confirms matches the production
-/// parser's error on the same input.
+/// `!` is precedence 9. Mirrors the legacy `parse_postfix_operator_at`; a
+/// malformed `IS ... <other>` yields no postfix (leaving the tokens for the
+/// caller to reject as a trailing-token error).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(40000)]
 pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Option<PostfixOp>, usize))
