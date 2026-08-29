@@ -135,53 +135,170 @@ pub enum PostfixOp {
     Is { negated: bool, nan: bool },
 }
 
+/// `token_views` commutes with a `k`-step shift of the subrange start: dropping
+/// the first `k` views of the suffix at `pos` equals the suffix at `pos + k`.
+/// The multi-step generalisation of `token_views_suffix` (which is `k == 1`);
+/// used to reach `input[k]` and the post-`k` tail without chaining drops by hand.
+pub proof fn token_views_shift(s: Seq<Token>, pos: int, k: int)
+    requires
+        0 <= pos,
+        0 <= k,
+        pos + k <= s.len(),
+    ensures
+        verified_production::token_views(s.subrange(pos, s.len() as int)).subrange(
+            k,
+            (s.len() - pos) as int,
+        ) == verified_production::token_views(s.subrange(pos + k, s.len() as int)),
+    decreases k,
+{
+    super::verified_roundtrip::token_views_len(s.subrange(pos, s.len() as int));
+    if k == 0 {
+        assert(verified_production::token_views(s.subrange(pos, s.len() as int)).subrange(
+            0,
+            (s.len() - pos) as int,
+        ) =~= verified_production::token_views(s.subrange(pos, s.len() as int)));
+    } else {
+        super::verified_roundtrip::token_views_suffix(s, pos);
+        token_views_shift(s, pos + 1, k - 1);
+        assert(verified_production::token_views(s.subrange(pos, s.len() as int)).subrange(
+            k,
+            (s.len() - pos) as int,
+        ) =~= verified_production::token_views(s.subrange(pos, s.len() as int)).drop_first().subrange(
+            k - 1,
+            (s.len() - pos - 1) as int,
+        ));
+    }
+}
+
 /// Detects a postfix operator at `pos` whose precedence is at least `min_prec`,
 /// returning it and the position past its tokens. `IS`/`IS NOT` is precedence 4,
 /// `!` is precedence 9. Mirrors `parse_postfix_operator_at`; a malformed
 /// `IS ... <other>` yields no postfix (leaving the tokens for the caller to
 /// reject), which the differential harness confirms matches the production
 /// parser's error on the same input.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40000)]
 pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Option<PostfixOp>, usize))
     requires pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        forall|lhs: SExpr| #[trigger] sparse_postfix_loop(
+            lhs,
+            verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            min_prec,
+        ) == postfix_after(r, lhs, toks@, min_prec),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     if pos >= toks.len() {
+        proof {
+            super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+            assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                == postfix_after((None::<PostfixOp>, pos), lhs, toks@, min_prec) by {
+                reveal_with_fuel(sparse_postfix_loop, 1);
+            }
+        }
         return (None, pos);
     }
+    proof {
+        super::verified_roundtrip::token_views_suffix(toks@, pos as int);
+    }
+    // input[0] == token_view(toks@[pos]); input.drop_first() == views from pos+1.
     match &toks[pos] {
         Token::Keyword(Keyword::Is) => {
             if 4 < min_prec {
+                proof {
+                    assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                        == postfix_after((None::<PostfixOp>, pos), lhs, toks@, min_prec) by {
+                        reveal_with_fuel(sparse_postfix_loop, 1);
+                    }
+                }
                 return (None, pos);
             }
             let mut p = pos + 1;
             let negated = if p < toks.len() && matches!(toks[p], Token::Keyword(Keyword::Not)) {
+                proof {
+                    super::verified_roundtrip::token_views_suffix(toks@, pos as int + 1);
+                }
                 p = p + 1;
                 true
             } else {
+                if p < toks.len() {
+                    proof {
+                        super::verified_roundtrip::token_views_suffix(toks@, pos as int + 1);
+                    }
+                }
                 false
             };
+            // Ghost: the spec's relative postfix index, matching exec `p - pos`.
+            let ghost sp: int = if negated { 2 } else { 1 };
             if p < toks.len() {
-                match &toks[p] {
+                proof {
+                    assert(p as int == pos as int + sp);
+                    super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+                    super::verified_roundtrip::token_views_suffix(toks@, p as int);
+                    if pos + 1 < toks.len() {
+                        super::verified_roundtrip::token_views_suffix(toks@, pos as int + 1);
+                    }
+                    // input[sp] == token_view(toks[p]); tail input[sp+1..] == views(p+1).
+                    token_views_shift(toks@, pos as int, sp);
+                    token_views_shift(toks@, pos as int, sp + 1);
+                }
+                let res = match &toks[p] {
                     Token::Keyword(Keyword::NaN) => (Some(PostfixOp::Is { negated, nan: true }), p + 1),
                     Token::Keyword(Keyword::Null) => {
                         (Some(PostfixOp::Is { negated, nan: false }), p + 1)
                     },
                     _ => (None, pos),
+                };
+                proof {
+                    assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                        == postfix_after(res, lhs, toks@, min_prec) by {
+                        reveal_with_fuel(sparse_postfix_loop, 1);
+                    }
                 }
+                res
             } else {
+                proof {
+                    super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+                    assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                        == postfix_after((None::<PostfixOp>, pos), lhs, toks@, min_prec) by {
+                        reveal_with_fuel(sparse_postfix_loop, 1);
+                    }
+                }
                 (None, pos)
             }
         },
         Token::Exclamation => {
             if 9 < min_prec {
+                proof {
+                    assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                        == postfix_after((None::<PostfixOp>, pos), lhs, toks@, min_prec) by {
+                        reveal_with_fuel(sparse_postfix_loop, 1);
+                    }
+                }
                 (None, pos)
             } else {
-                (Some(PostfixOp::Factorial), pos + 1)
+                let res = (Some(PostfixOp::Factorial), pos + 1);
+                proof {
+                    assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                        == postfix_after(res, lhs, toks@, min_prec) by {
+                        reveal_with_fuel(sparse_postfix_loop, 1);
+                    }
+                }
+                res
             }
         },
-        _ => (None, pos),
+        _ => {
+            proof {
+                assert forall|lhs: SExpr| #[trigger] sparse_postfix_loop(lhs, input, min_prec)
+                    == postfix_after((None::<PostfixOp>, pos), lhs, toks@, min_prec) by {
+                    reveal_with_fuel(sparse_postfix_loop, 1);
+                    reveal(verified_production::token_view);
+                }
+            }
+            (None, pos)
+        },
     }
 }
 
@@ -200,6 +317,23 @@ pub open spec fn postfix_view(op: PostfixOp, lhs: SExpr) -> SExpr {
                 is
             }
         },
+    }
+}
+
+/// The `sparse_postfix_loop` state after `parse_postfix_at` reports result `r`
+/// from position `pos`: if it detected an op, one loop step (apply `postfix_view`,
+/// advance to `r.1`); if not (`r.1 == pos`), the loop halts here. This is the
+/// exact right-hand side of `parse_postfix_at`'s step ensures.
+pub open spec fn postfix_after(
+    r: (Option<PostfixOp>, usize),
+    lhs: SExpr,
+    toks: Seq<Token>,
+    min_prec: u8,
+) -> (SExpr, Seq<TokenView>) {
+    let rest = verified_production::token_views(toks.subrange(r.1 as int, toks.len() as int));
+    match r.0 {
+        Some(op) => sparse_postfix_loop(postfix_view(op, lhs), rest, min_prec),
+        None => (lhs, rest),
     }
 }
 
