@@ -792,7 +792,7 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
         super::verified_roundtrip::boundary(tail),
-        fuel >= 3 * super::verified_roundtrip::sdepth(e),
+        fuel >= super::verified_roundtrip::sprint(e).len(),
     ensures
         sparse_atom(super::verified_roundtrip::sprint(e) + tail, fuel) == (Some(e), tail),
     decreases e, 0nat,
@@ -945,7 +945,7 @@ pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
         prec_boundary(tail),
-        fuel >= 3 * super::verified_roundtrip::sdepth(e) + 1,
+        fuel >= super::verified_roundtrip::sprint(e).len() + 1,
     ensures
         sparse_prec(super::verified_roundtrip::sprint(e) + tail, min_prec, fuel) == (Some(e), tail),
     decreases e, 1nat,
@@ -968,7 +968,7 @@ pub proof fn lemma_fn_args(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
         super::verified_roundtrip::all_printable_se(args),
         tail.len() > 0,
         tail[0] == TokenView::CloseParen,
-        fuel >= 3 * super::verified_roundtrip::slist_depth(args),
+        fuel >= super::verified_roundtrip::sprint_args(args).len() + 2,
     ensures
         sparse_fn_args(super::verified_roundtrip::sprint_args(args) + tail, fuel)
             == (Some(args), tail),
@@ -995,7 +995,7 @@ pub proof fn lemma_fn_args_nonempty(args: Seq<SExpr>, tail: Seq<TokenView>, fuel
         args.len() > 0,
         tail.len() > 0,
         tail[0] == TokenView::CloseParen,
-        fuel >= 3 * super::verified_roundtrip::slist_depth(args),
+        fuel >= super::verified_roundtrip::sprint_args(args).len() + 2,
     ensures
         sparse_fn_args_nonempty(super::verified_roundtrip::sprint_args(args) + tail, fuel)
             == (Some(args), tail),
@@ -1083,7 +1083,7 @@ pub proof fn infix_step_binary(
         super::verified_roundtrip::printable_se(right),
         close_tail.len() > 0,
         close_tail[0] == TokenView::CloseParen,
-        fuel >= 3 * super::verified_roundtrip::sdepth(right) + 2,
+        fuel >= super::verified_roundtrip::sprint(right).len() + 2,
     ensures
         sparse_infix_loop(
             left,
