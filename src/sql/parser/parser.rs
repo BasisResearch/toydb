@@ -5,7 +5,9 @@ use super::stream::SliceTokenStream;
 #[cfg(test)]
 use super::stream::TokenStream;
 use super::stream::{BufferedTokenStream, PeekStream};
-use super::{Keyword, Token, ast, float_trust, verified_integer, verified_precedence};
+use super::{
+    Keyword, Token, ast, float_trust, verified_control, verified_integer, verified_precedence,
+};
 use crate::errinput;
 use crate::error::Result;
 use crate::sql::types::DataType;
@@ -178,6 +180,21 @@ impl<S: PeekStream> StreamingParser<S> {
 
     /// Parses a SQL statement.
     fn parse_statement(&mut self) -> Result<ast::Statement> {
+        // Cutover: over a buffered stream, parse the control statements
+        // (BEGIN/COMMIT/ROLLBACK) with the Verus-verified concrete parser and
+        // advance the cursor by what it consumed. Other statement kinds, and a
+        // malformed control clause, fall through to the retained legacy path.
+        let verified = if let Some((tokens, pos)) = self.stream.buffer() {
+            let (opt, consumed) = verified_control::parse_control_at(tokens, pos);
+            opt.map(|statement| (statement, consumed))
+        } else {
+            None
+        };
+        if let Some((statement, consumed)) = verified {
+            self.stream.set_pos(consumed);
+            return Ok(statement);
+        }
+
         let Some(token) = self.peek()? else {
             return errinput!("unexpected end of input");
         };

@@ -10,6 +10,7 @@ mod printer;
 mod stream;
 pub mod unicode_trust;
 pub mod verified;
+pub mod verified_control;
 pub mod verified_expression;
 pub mod verified_function_list;
 pub mod verified_integer;
