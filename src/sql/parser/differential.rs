@@ -346,8 +346,8 @@ proptest! {
 /// A hand-picked corpus of concrete-syntax SQL that the generators (which emit
 /// only the canonical, fully-parenthesised printed form) do not reach:
 /// precedence without parentheses, aliases without `AS`, join-keyword variants,
-/// and optional keywords. This is the surface the verified parser must grow to
-/// accept in later phases; today it just confirms old vs new agree.
+/// and optional keywords. The verified parser now accepts this whole surface as
+/// production; this corpus confirms it stays byte-for-byte in step with legacy.
 const CONCRETE_SYNTAX_CORPUS: &[&str] = &[
     // Expression precedence / associativity (no parentheses).
     "SELECT 1 + 2 * 3",
