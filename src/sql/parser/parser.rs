@@ -185,7 +185,7 @@ impl<S: PeekStream> StreamingParser<S> {
         // advance the cursor by what it consumed. Other statement kinds, and a
         // malformed control clause, fall through to the retained legacy path.
         let verified = if let Some((tokens, pos)) = self.stream.buffer() {
-            let (opt, consumed) = verified_control::parse_control_at(tokens, pos);
+            let (opt, consumed, _perr) = verified_control::parse_control_at(tokens, pos);
             opt.map(|statement| (statement, consumed))
         } else {
             None
@@ -704,7 +704,7 @@ impl<S: PeekStream> StreamingParser<S> {
         } else {
             None
         };
-        if let Some((Some(expression), consumed)) = verified {
+        if let Some((Some(expression), consumed, _err)) = verified {
             self.stream.set_pos(consumed);
             return Ok(expression);
         }

@@ -27,6 +27,7 @@ VERIFY_MODULES=(
   sql::parser::ast
   sql::parser::float_trust
   sql::parser::lexer
+  sql::parser::parse_error
   sql::parser::printer
   sql::parser::unicode_trust
   sql::parser::verified

@@ -32,6 +32,8 @@
 use vstd::prelude::*;
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+use super::parse_error::ParseError;
+#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_expression::{BinaryTag, UnaryTag};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_production::TokenView;
@@ -373,18 +375,41 @@ pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> (r: ast::Expression
 
 // ---- the parser ------------------------------------------------------------
 
+/// Whether every byte of `n` is an ASCII digit — mirrors the legacy
+/// `n.iter().all(u8::is_ascii_digit)` guard that decides integer vs. float
+/// literals, used only to pick the matching rejection message.
+fn all_ascii_digits(n: &Vec<u8>) -> bool {
+    let mut i = 0;
+    while i < n.len()
+        invariant
+            i <= n.len(),
+        decreases n.len() - i,
+    {
+        if n[i] < b'0' || n[i] > b'9' {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
 /// Parses an expression atom, proven to refine `sparse_atom` at the `view_expr`
 /// / `token_views` level. The `fuel >= 2*len + 2` precondition keeps every
 /// sub-parse well-fuelled so fuel-stability applies.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(600000)]
-pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast::Expression>, usize))
+pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
+    Option<ast::Expression>,
+    usize,
+    Option<super::parse_error::ParseError>,
+))
     requires
         pos <= toks.len(),
         fuel >= 2 * (toks.len() - pos) + 2,
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.2 is Some,
         ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = sparse_atom(input, fuel as nat);
@@ -408,42 +433,54 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
         proof {
             super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     proof {
         super::verified_roundtrip::token_views_suffix(toks@, pos as int);
     }
     match &toks[pos] {
-        Token::Asterisk => (Some(ast::Expression::All), pos + 1),
-        Token::Number(_) => {
+        Token::Asterisk => (Some(ast::Expression::All), pos + 1, None),
+        Token::Number(n) => {
             match parse_literal_exec(&toks[pos]) {
-                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
-                None => (None, pos),
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1, None),
+                // Integer overflow vs. malformed float: mirror the two legacy
+                // errinput! sites for a `Number` token.
+                None => if all_ascii_digits(n) {
+                    (None, pos, Some(ParseError::NumberTooLarge))
+                } else {
+                    (None, pos, Some(ParseError::InvalidFloatLiteral(n.clone())))
+                },
             }
         },
         Token::String(_) => {
             match parse_literal_exec(&toks[pos]) {
-                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1),
-                None => (None, pos),
+                Some(l) => (Some(ast::Expression::Literal(l)), pos + 1, None),
+                // Unreachable (a string literal always parses); defensive.
+                None => (None, pos, Some(ParseError::ExpectedAtom(toks[pos].clone()))),
             }
         },
         Token::Keyword(Keyword::True) => {
-            (Some(ast::Expression::Literal(ast::Literal::Boolean(true))), pos + 1)
+            (Some(ast::Expression::Literal(ast::Literal::Boolean(true))), pos + 1, None)
         },
         Token::Keyword(Keyword::False) => {
-            (Some(ast::Expression::Literal(ast::Literal::Boolean(false))), pos + 1)
+            (Some(ast::Expression::Literal(ast::Literal::Boolean(false))), pos + 1, None)
         },
         Token::Keyword(Keyword::Infinity) => {
-            (Some(ast::Expression::Literal(ast::Literal::Float(float_trust::infinity()))), pos + 1)
+            (
+                Some(ast::Expression::Literal(ast::Literal::Float(float_trust::infinity()))),
+                pos + 1,
+                None,
+            )
         },
         Token::Keyword(Keyword::NaN) => {
             (
                 Some(ast::Expression::Literal(ast::Literal::Float(float_trust::canonical_nan()))),
                 pos + 1,
+                None,
             )
         },
         Token::Keyword(Keyword::Null) => {
-            (Some(ast::Expression::Literal(ast::Literal::Null)), pos + 1)
+            (Some(ast::Expression::Literal(ast::Literal::Null)), pos + 1, None)
         },
         Token::Ident(name) => {
             if pos + 1 < toks.len() {
@@ -463,7 +500,7 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
                     assert(input[0] == verified_production::token_view(toks@[pos as int]));
                     assert(input[0] == TokenView::Ident(fname));
                 }
-                let (fopt, fpos) = parse_function_call(toks, fname, pos + 2, fuel);
+                let (fopt, fpos, ferr) = parse_function_call(toks, fname, pos + 2, fuel);
                 proof {
                     super::verified_roundtrip::token_views_len(
                         toks@.subrange(pos as int, toks@.len() as int));
@@ -471,7 +508,7 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
                     assert(input.subrange(2, input.len() as int)
                         == verified_production::token_views(toks@.subrange(pos as int + 2, toks@.len() as int)));
                 }
-                (fopt, fpos)
+                (fopt, fpos, ferr)
             } else if pos + 1 < toks.len() && matches!(toks[pos + 1], Token::Period) {
                 let table = name.clone();
                 if pos + 2 < toks.len() {
@@ -483,46 +520,59 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
                             proof {
                                 token_views_shift(toks@, pos as int, 3);
                             }
-                            (Some(ast::Expression::Column(Some(table), column.clone())), pos + 3)
+                            (
+                                Some(ast::Expression::Column(Some(table), column.clone())),
+                                pos + 3,
+                                None,
+                            )
                         },
-                        _ => (None, pos),
+                        // `table . <non-ident>`: legacy `next_ident()` errors.
+                        _ => (None, pos, Some(ParseError::ExpectedIdent(toks[pos + 2].clone()))),
                     }
                 } else {
                     proof {
                         super::verified_roundtrip::token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int));
                     }
-                    (None, pos)
+                    // `table .` at end of input: legacy `next_ident()` hits EOF.
+                    (None, pos, Some(ParseError::UnexpectedEof))
                 }
             } else {
-                (Some(ast::Expression::Column(None, name.clone())), pos + 1)
+                (Some(ast::Expression::Column(None, name.clone())), pos + 1, None)
             }
         },
         Token::OpenParen => {
-            let (inner, ipos) = parse_expression_at(toks, pos + 1, 0, fuel - 1);
+            let (inner, ipos, ierr) = parse_expression_at(toks, pos + 1, 0, fuel - 1);
             match inner {
                 Some(expr) => {
                     if ipos < toks.len() && matches!(toks[ipos], Token::CloseParen) {
                         proof {
                             super::verified_roundtrip::token_views_suffix(toks@, ipos as int);
                         }
-                        (Some(expr), ipos + 1)
+                        (Some(expr), ipos + 1, None)
                     } else {
                         if ipos < toks.len() {
                             proof {
                                 super::verified_roundtrip::token_views_suffix(toks@, ipos as int);
                             }
+                            // Missing closing paren: legacy `expect(CloseParen)`.
+                            (
+                                None,
+                                pos,
+                                Some(ParseError::ExpectedToken(Token::CloseParen, toks[ipos].clone())),
+                            )
                         } else {
                             proof {
                                 super::verified_roundtrip::token_views_len(toks@.subrange(ipos as int, toks@.len() as int));
                             }
+                            (None, pos, Some(ParseError::UnexpectedEof))
                         }
-                        (None, pos)
                     }
                 },
-                None => (None, pos),
+                // Inner expression failed: propagate its error.
+                None => (None, pos, ierr),
             }
         },
-        _ => (None, pos),
+        _ => (None, pos, Some(ParseError::ExpectedAtom(toks[pos].clone()))),
     }
 }
 
@@ -532,12 +582,13 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (Option<ast
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
-    -> (r: (Option<Vec<ast::Expression>>, usize))
+    -> (r: (Option<Vec<ast::Expression>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
         fuel >= 2 * (toks.len() - pos) + 4,
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
         ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (aopt, arest) = sparse_fn_args(input, fuel as nat);
@@ -555,7 +606,8 @@ pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
         proof {
             super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        return (None, pos);
+        // Legacy reads the first arg via `parse_expression()`, hitting EOF.
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     proof {
         super::verified_roundtrip::token_views_suffix(toks@, pos as int);
@@ -563,7 +615,7 @@ pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
     if matches!(toks[pos], Token::CloseParen) {
         let v: Vec<ast::Expression> = Vec::new();
         assert(super::verified_roundtrip::view_args(v@) == Seq::<SExpr>::empty());
-        (Some(v), pos)
+        (Some(v), pos, None)
     } else {
         parse_fn_args_ne_exec(toks, pos, fuel)
     }
@@ -574,12 +626,13 @@ pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
-    -> (r: (Option<Vec<ast::Expression>>, usize))
+    -> (r: (Option<Vec<ast::Expression>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
         fuel >= 2 * (toks.len() - pos) + 4,
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
         ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (aopt, arest) = sparse_fn_args_nonempty(input, fuel as nat);
@@ -597,16 +650,17 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
         proof {
             super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
-    let (eopt, npos) = parse_expression_at(toks, pos, 0, fuel - 1);
+    let (eopt, npos, eerr) = parse_expression_at(toks, pos, 0, fuel - 1);
     match eopt {
         Some(expr) => {
             if npos >= toks.len() {
                 proof {
                     super::verified_roundtrip::token_views_len(toks@.subrange(npos as int, toks@.len() as int));
                 }
-                (None, pos)
+                // After an arg, legacy expects `)` or `,`, hitting EOF.
+                (None, pos, Some(ParseError::UnexpectedEof))
             } else {
                 proof {
                     super::verified_roundtrip::token_views_suffix(toks@, npos as int);
@@ -618,9 +672,9 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
                         super::verified_roundtrip::view_args_step(v@);
                         assert(v@.drop_first() =~= Seq::<ast::Expression>::empty());
                     }
-                    (Some(v), npos)
+                    (Some(v), npos, None)
                 } else if matches!(toks[npos], Token::Comma) {
-                    let (more, mpos) = parse_fn_args_ne_exec(toks, npos + 1, fuel - 1);
+                    let (more, mpos, merr) = parse_fn_args_ne_exec(toks, npos + 1, fuel - 1);
                     match more {
                         Some(mut mv) => {
                             let ghost old_mv = mv@;
@@ -629,16 +683,17 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
                                 super::verified_roundtrip::view_args_step(mv@);
                                 assert(mv@.drop_first() =~= old_mv);
                             }
-                            (Some(mv), mpos)
+                            (Some(mv), mpos, None)
                         },
-                        None => (None, pos),
+                        None => (None, pos, merr),
                     }
                 } else {
-                    (None, pos)
+                    // Neither `)` nor `,`: legacy `expect(Comma)` fails.
+                    (None, pos, Some(ParseError::ExpectedToken(Token::Comma, toks[npos].clone())))
                 }
             }
         },
-        None => (None, pos),
+        None => (None, pos, eerr),
     }
 }
 
@@ -647,12 +702,13 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: usize)
-    -> (r: (Option<ast::Expression>, usize))
+    -> (r: (Option<ast::Expression>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
         fuel >= 2 * (toks.len() - pos) + 4,
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
         ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (aopt, arest) = sparse_fn_args(input, fuel as nat);
@@ -666,7 +722,7 @@ pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: us
         }),
     decreases fuel, 2int,
 {
-    let (aopt, apos) = parse_fn_args_exec(toks, pos, fuel);
+    let (aopt, apos, aerr) = parse_fn_args_exec(toks, pos, fuel);
     match aopt {
         Some(args) => {
             if apos < toks.len() && matches!(toks[apos], Token::CloseParen) {
@@ -674,21 +730,27 @@ pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: us
                     super::verified_roundtrip::token_views_suffix(toks@, apos as int);
                     reveal_with_fuel(super::verified_roundtrip::view_expr, 1);
                 }
-                (Some(ast::Expression::Function(name, args)), apos + 1)
+                (Some(ast::Expression::Function(name, args)), apos + 1, None)
             } else {
                 if apos < toks.len() {
                     proof {
                         super::verified_roundtrip::token_views_suffix(toks@, apos as int);
                     }
+                    // Unreachable: the arg reader stops at `)`. Defensive.
+                    (
+                        None,
+                        pos,
+                        Some(ParseError::ExpectedToken(Token::CloseParen, toks[apos].clone())),
+                    )
                 } else {
                     proof {
                         super::verified_roundtrip::token_views_len(toks@.subrange(apos as int, toks@.len() as int));
                     }
+                    (None, pos, Some(ParseError::UnexpectedEof))
                 }
-                (None, pos)
             }
         },
-        None => (None, pos),
+        None => (None, pos, aerr),
     }
 }
 
@@ -698,13 +760,14 @@ pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: us
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: usize)
-    -> (r: (Option<ast::Expression>, usize))
+    -> (r: (Option<ast::Expression>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
         fuel >= 2 * (toks.len() - pos) + 3,
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.2 is Some,
         ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = sparse_prec(input, min_prec, fuel as nat);
@@ -724,7 +787,7 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
         proof {
             super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     proof {
         super::verified_roundtrip::token_views_suffix(toks@, pos as int);
@@ -736,16 +799,16 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     // `popt == prefix_operator(input[0])`, so the exec branch decision matches the
     // ghost's; each arm establishes the correspondence before the join.
     let popt = prefix_op_exec(&toks[pos]);
-    let (lhs_opt, lhs_pos) = if popt.is_some() && prefix_prec(popt.unwrap()) >= min_prec {
+    let (lhs_opt, lhs_pos, lhs_err) = if popt.is_some() && prefix_prec(popt.unwrap()) >= min_prec {
         let tag = popt.unwrap();
         let next_prec = prefix_prec(tag);
         proof {
             super::verified_roundtrip::token_views_suffix(toks@, pos as int);
         }
-        let (rhs, rpos) = parse_expression_at(toks, pos + 1, next_prec, fuel - 1);
+        let (rhs, rpos, rerr) = parse_expression_at(toks, pos + 1, next_prec, fuel - 1);
         let res = match rhs {
-            Some(inner) => (Some(build_unary(tag, inner)), rpos),
-            None => (None, pos),
+            Some(inner) => (Some(build_unary(tag, inner)), rpos, None),
+            None => (None, pos, rerr),
         };
         proof {
             assert(verified_expression::prefix_operator(input[0]) == Some(tag));
@@ -766,7 +829,7 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     }
     let mut lhs = match lhs_opt {
         Some(expr) => expr,
-        None => return (None, pos),
+        None => return (None, pos, lhs_err),
     };
     let mut cur = lhs_pos;
     // Ghost anchors for the loop resumption invariants.
@@ -852,7 +915,7 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
                 proof {
                     super::verified_roundtrip::token_views_len(toks@.subrange(cur as int + 1, toks@.len() as int));
                 }
-                let (rhs, rpos) = parse_expression_at(toks, cur + 1, next_prec, fuel - 1);
+                let (rhs, rpos, rerr) = parse_expression_at(toks, cur + 1, next_prec, fuel - 1);
                 match rhs {
                     Some(right) => {
                         proof {
@@ -910,7 +973,8 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
                             assert(input.len() > 0);
                             lemma_prec_none(input, min_prec, fuel as nat, lhs0_view, after_lhs_v);
                         }
-                        return (None, pos);
+                        // Infix right-hand side failed: propagate its error.
+                        return (None, pos, rerr);
                     },
                 }
             },
@@ -976,7 +1040,7 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
             == (Some::<SExpr>(lhs3_v), cur3_v));
     }
 
-    (Some(lhs), cur)
+    (Some(lhs), cur, None)
 }
 
 /// Local copy of `all_digits_exec` (byte-slice all-ASCII-digit test). Kept here
@@ -1015,7 +1079,7 @@ pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>)
         return None;
     }
     let fuel = 2 * toks.len() + 3;
-    let (opt, consumed) = parse_expression_at(toks, 0, 0, fuel);
+    let (opt, consumed, _err) = parse_expression_at(toks, 0, 0, fuel);
     proof {
         if consumed <= toks.len() {
             super::verified_roundtrip::token_views_len(
@@ -1031,6 +1095,37 @@ pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>)
             }
         },
         None => None,
+    }
+}
+
+/// Production entry for a complete expression, returning the parsed value or the
+/// structured `ParseError` on rejection. Same accept/reject boundary as
+/// [`parse_expression`] (which powers the roundtrip proof), but keeps the
+/// rejection reason so `Parser::parse_expr` can report it without the legacy
+/// parser. Leftover tokens after a complete parse become the trailing-token
+/// `unexpected token` error, matching `Parser::parse_expr_legacy`.
+pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
+    Option<ast::Expression>,
+    Option<ParseError>,
+))
+    ensures
+        r.0 is None ==> r.1 is Some,
+{
+    if toks.len() > (usize::MAX - 3) / 2 {
+        // Unreachable in practice (no such vector exists); reject defensively.
+        return (None, Some(ParseError::UnexpectedEof));
+    }
+    let fuel = 2 * toks.len() + 3;
+    let (opt, consumed, err) = parse_expression_at(toks, 0, 0, fuel);
+    match opt {
+        Some(expr) => {
+            if consumed == toks.len() {
+                (Some(expr), None)
+            } else {
+                (None, Some(ParseError::UnexpectedToken(toks[consumed].clone())))
+            }
+        },
+        None => (None, err),
     }
 }
 

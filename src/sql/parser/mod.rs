@@ -5,6 +5,7 @@ pub mod ast;
 pub(crate) mod differential;
 pub mod float_trust;
 mod lexer;
+pub mod parse_error;
 mod parser;
 mod printer;
 mod stream;

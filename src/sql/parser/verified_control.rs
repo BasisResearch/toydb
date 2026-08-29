@@ -30,6 +30,8 @@
 use vstd::prelude::*;
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+use super::parse_error::ParseError;
+#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
@@ -44,19 +46,20 @@ verus! {
 /// `parse_statement` dispatches. The `decreases` measure pairs with
 /// `parse_explain_at` for their mutual recursion (`EXPLAIN <statement>`): the
 /// second component orders the two functions at an equal token position.
-pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
     decreases toks.len() - pos, 0int,
 {
     if pos >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     match &toks[pos] {
-        Token::Keyword(Keyword::Commit) => (Some(ast::Statement::Commit), pos + 1),
-        Token::Keyword(Keyword::Rollback) => (Some(ast::Statement::Rollback), pos + 1),
+        Token::Keyword(Keyword::Commit) => (Some(ast::Statement::Commit), pos + 1, None),
+        Token::Keyword(Keyword::Rollback) => (Some(ast::Statement::Rollback), pos + 1, None),
         Token::Keyword(Keyword::Begin) => parse_begin_at(toks, pos + 1),
         Token::Keyword(Keyword::Drop) => parse_drop_at(toks, pos + 1),
         Token::Keyword(Keyword::Delete) => parse_delete_at(toks, pos + 1),
@@ -65,7 +68,7 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Create) => parse_create_at(toks, pos + 1),
         Token::Keyword(Keyword::Select) => parse_select_at(toks, pos + 1),
         Token::Keyword(Keyword::Explain) => parse_explain_at(toks, pos + 1),
-        _ => (None, pos),
+        _ => (None, pos, Some(ParseError::UnexpectedToken(toks[pos].clone()))),
     }
 }
 
@@ -76,37 +79,39 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
 /// (`1int` vs `parse_control_at`'s `0int`) breaks the equal-position mutual
 /// recursion: `parse_explain_at(pos)` calls `parse_control_at(pos)` at the same
 /// `pos`, and `1int > 0int` makes that call strictly smaller.
-fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
     decreases toks.len() - pos, 1int,
 {
     // Nested EXPLAIN is disallowed; defer to legacy for the specific error.
     if pos < toks.len() && matches!(toks[pos], Token::Keyword(Keyword::Explain)) {
-        return (None, pos);
+        return (None, pos, Some(ParseError::NestedExplain));
     }
-    let (opt, newpos) = parse_control_at(toks, pos);
+    let (opt, newpos, e) = parse_control_at(toks, pos);
     match opt {
-        Some(inner) => (Some(ast::Statement::Explain(Box::new(inner))), newpos),
-        None => (None, pos),
+        Some(inner) => (Some(ast::Statement::Explain(Box::new(inner))), newpos, None),
+        None => (None, pos, e),
     }
 }
 
 /// Parses a required expression clause at `pos` (the caller has already consumed
 /// the leading keyword), wrapping the verified expression parser with the
 /// guarded fuel computation. `(None, pos)` on a parse failure or overflow.
-fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expression>, usize))
+fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expression>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.2 is Some,
 {
     let n = toks.len() - pos;
     if n > (usize::MAX - 3) / 2 {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let fuel = 2 * n + 3;
     verified_precedence::parse_expression_at(toks, pos, 0, fuel)
@@ -116,25 +121,26 @@ fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expre
 /// keyword: the select list, then optional `FROM` / `WHERE` / `GROUP BY` /
 /// `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`. Mirrors `parse_select`; a
 /// malformed clause yields `(None, pos)` so the caller falls back to legacy.
-fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // Select list (the `SELECT` keyword is already consumed).
-    let (sopt, c1) = parse_select_list_at(toks, pos);
+    let (sopt, c1, serr) = parse_select_list_at(toks, pos);
     let select = match sopt {
         Some(s) => s,
-        None => return (None, pos),
+        None => return (None, pos, serr),
     };
     let mut cur = c1;
 
     // FROM
-    let (fopt, c2) = parse_from_clause_at(toks, cur);
+    let (fopt, c2, ferr) = parse_from_clause_at(toks, cur);
     let from = match fopt {
         Some(f) => f,
-        None => return (None, pos),
+        None => return (None, pos, ferr),
     };
     cur = c2;
 
@@ -142,21 +148,21 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let mut where_clause: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
         cur = cur + 1;
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, werr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
                 where_clause = Some(e);
                 cur = c;
             },
-            None => return (None, pos),
+            None => return (None, pos, werr),
         }
     }
 
     // GROUP BY
-    let (gopt, cg) = parse_group_by_at(toks, cur);
+    let (gopt, cg, gerr) = parse_group_by_at(toks, cur);
     let group_by = match gopt {
         Some(g) => g,
-        None => return (None, pos),
+        None => return (None, pos, gerr),
     };
     cur = cg;
 
@@ -164,21 +170,21 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let mut having: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Having)) {
         cur = cur + 1;
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, herr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
                 having = Some(e);
                 cur = c;
             },
-            None => return (None, pos),
+            None => return (None, pos, herr),
         }
     }
 
     // ORDER BY
-    let (oopt, co) = parse_order_by_at(toks, cur);
+    let (oopt, co, oerr) = parse_order_by_at(toks, cur);
     let order_by = match oopt {
         Some(o) => o,
-        None => return (None, pos),
+        None => return (None, pos, oerr),
     };
     cur = co;
 
@@ -186,13 +192,13 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let mut limit: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Limit)) {
         cur = cur + 1;
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, lerr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
                 limit = Some(e);
                 cur = c;
             },
-            None => return (None, pos),
+            None => return (None, pos, lerr),
         }
     }
 
@@ -200,13 +206,13 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let mut offset: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Offset)) {
         cur = cur + 1;
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, ferr2) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
                 offset = Some(e);
                 cur = c;
             },
-            None => return (None, pos),
+            None => return (None, pos, ferr2),
         }
     }
 
@@ -220,7 +226,7 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         offset,
         limit,
     };
-    (Some(statement), cur)
+    (Some(statement), cur, None)
 }
 
 /// Parses the `SELECT` list (one or more `<expr> [[AS] <alias>]`, comma
@@ -229,11 +235,13 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
     Option<Vec<(ast::Expression, Option<String>)>>,
     usize,
+    Option<ParseError>,
 ))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     let mut select: Vec<(ast::Expression, Option<String>)> = Vec::new();
     let mut cur = pos;
@@ -243,10 +251,10 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             cur <= toks.len(),
         decreases toks.len() - cur,
     {
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
         let expr = match opt {
             Some(e) => e,
-            None => return (None, pos),
+            None => return (None, pos, eerr),
         };
         cur = c;
 
@@ -256,12 +264,12 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
         let mut alias: Option<String> = None;
         if is_as || is_ident {
             if matches!(expr, ast::Expression::All) {
-                return (None, pos); // can't alias *
+                return (None, pos, Some(ParseError::CantAliasStar)); // can't alias *
             }
             if is_as {
                 cur = cur + 1;
                 if cur >= toks.len() {
-                    return (None, pos);
+                    return (None, pos, Some(ParseError::UnexpectedEof));
                 }
             }
             match &toks[cur] {
@@ -269,7 +277,7 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
                     alias = Some(name.clone());
                     cur = cur + 1;
                 },
-                _ => return (None, pos),
+                _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
             }
         }
         select.push((expr, alias));
@@ -280,20 +288,21 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             break;
         }
     }
-    (Some(select), cur)
+    (Some(select), cur, None)
 }
 
 /// Parses an optional `FROM` clause: a comma-separated list of join trees.
 /// Returns `(Some(vec![]), pos)` when no `FROM` keyword is present. Mirrors
 /// `parse_from_clause` (including the left-deep join folding).
-fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::From>>, usize))
+fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::From>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::From)) {
-        return (Some(Vec::new()), pos);
+        return (Some(Vec::new()), pos, None);
     }
     let mut cur = pos + 1;
     let mut from: Vec<ast::From> = Vec::new();
@@ -304,10 +313,10 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
         decreases toks.len() - cur,
     {
         // Base table for this from-item.
-        let (topt, tc) = parse_from_table_at(toks, cur);
+        let (topt, tc, terr) = parse_from_table_at(toks, cur);
         let mut from_item = match topt {
             Some(t) => t,
-            None => return (None, pos),
+            None => return (None, pos, terr),
         };
         cur = tc;
 
@@ -332,21 +341,27 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     jc = cur + 1;
                 },
                 Token::Keyword(Keyword::Cross) => {
-                    if cur + 1 >= toks.len() || !matches!(
-                        toks[cur + 1],
-                        Token::Keyword(Keyword::Join),
-                    ) {
-                        return (None, pos);
+                    if cur + 1 >= toks.len() {
+                        return (None, pos, Some(ParseError::UnexpectedEof));
+                    }
+                    if !matches!(toks[cur + 1], Token::Keyword(Keyword::Join)) {
+                        return (None, pos, Some(ParseError::ExpectedToken(
+                            Token::Keyword(Keyword::Join),
+                            toks[cur + 1].clone(),
+                        )));
                     }
                     join_type = ast::JoinType::Cross;
                     jc = cur + 2;
                 },
                 Token::Keyword(Keyword::Inner) => {
-                    if cur + 1 >= toks.len() || !matches!(
-                        toks[cur + 1],
-                        Token::Keyword(Keyword::Join),
-                    ) {
-                        return (None, pos);
+                    if cur + 1 >= toks.len() {
+                        return (None, pos, Some(ParseError::UnexpectedEof));
+                    }
+                    if !matches!(toks[cur + 1], Token::Keyword(Keyword::Join)) {
+                        return (None, pos, Some(ParseError::ExpectedToken(
+                            Token::Keyword(Keyword::Join),
+                            toks[cur + 1].clone(),
+                        )));
                     }
                     join_type = ast::JoinType::Inner;
                     jc = cur + 2;
@@ -356,8 +371,14 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
                         c = c + 1;
                     }
-                    if c >= toks.len() || !matches!(toks[c], Token::Keyword(Keyword::Join)) {
-                        return (None, pos);
+                    if c >= toks.len() {
+                        return (None, pos, Some(ParseError::UnexpectedEof));
+                    }
+                    if !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        return (None, pos, Some(ParseError::ExpectedToken(
+                            Token::Keyword(Keyword::Join),
+                            toks[c].clone(),
+                        )));
                     }
                     join_type = ast::JoinType::Left;
                     jc = c + 1;
@@ -367,8 +388,14 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
                         c = c + 1;
                     }
-                    if c >= toks.len() || !matches!(toks[c], Token::Keyword(Keyword::Join)) {
-                        return (None, pos);
+                    if c >= toks.len() {
+                        return (None, pos, Some(ParseError::UnexpectedEof));
+                    }
+                    if !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        return (None, pos, Some(ParseError::ExpectedToken(
+                            Token::Keyword(Keyword::Join),
+                            toks[c].clone(),
+                        )));
                     }
                     join_type = ast::JoinType::Right;
                     jc = c + 1;
@@ -377,27 +404,33 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
             }
 
             // Right table of the join.
-            let (ropt, rc) = parse_from_table_at(toks, jc);
+            let (ropt, rc, rerr) = parse_from_table_at(toks, jc);
             let right = match ropt {
                 Some(t) => t,
-                None => return (None, pos),
+                None => return (None, pos, rerr),
             };
             let mut cur2 = rc;
 
             // ON <predicate>, except for CROSS joins.
             let mut predicate: Option<ast::Expression> = None;
             if !matches!(join_type, ast::JoinType::Cross) {
-                if cur2 >= toks.len() || !matches!(toks[cur2], Token::Keyword(Keyword::On)) {
-                    return (None, pos);
+                if cur2 >= toks.len() {
+                    return (None, pos, Some(ParseError::UnexpectedEof));
+                }
+                if !matches!(toks[cur2], Token::Keyword(Keyword::On)) {
+                    return (None, pos, Some(ParseError::ExpectedToken(
+                        Token::Keyword(Keyword::On),
+                        toks[cur2].clone(),
+                    )));
                 }
                 cur2 = cur2 + 1;
-                let (opt, c) = parse_clause_expr_at(toks, cur2);
+                let (opt, c, perr) = parse_clause_expr_at(toks, cur2);
                 match opt {
                     Some(e) => {
                         predicate = Some(e);
                         cur2 = c;
                     },
-                    None => return (None, pos),
+                    None => return (None, pos, perr),
                 }
             }
 
@@ -417,24 +450,25 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
             break;
         }
     }
-    (Some(from), cur)
+    (Some(from), cur, None)
 }
 
 /// Parses a `FROM` table (`<name> [[AS] <alias>]`), strictly advancing on
 /// success (a table always consumes its name). Mirrors `parse_from_table`.
-fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>, usize))
+fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.2 is Some,
 {
     if pos >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let name = match &toks[pos] {
         Token::Ident(n) => n.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone()))),
     };
     let mut cur = pos + 1;
 
@@ -446,7 +480,7 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
         if is_as {
             cur = cur + 1;
             if cur >= toks.len() {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
         }
         match &toks[cur] {
@@ -454,27 +488,34 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
                 alias = Some(n.clone());
                 cur = cur + 1;
             },
-            _ => return (None, pos),
+            _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
         }
     }
-    (Some(ast::From::Table { name, alias }), cur)
+    (Some(ast::From::Table { name, alias }), cur, None)
 }
 
 /// Parses an optional `GROUP BY <expr> [, ...]` clause. Returns
 /// `(Some(vec![]), pos)` when no `GROUP` keyword is present. Mirrors
 /// `parse_group_by_clause`.
-fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expression>>, usize))
+fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expression>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Group)) {
-        return (Some(Vec::new()), pos);
+        return (Some(Vec::new()), pos, None);
     }
     let mut cur = pos + 1;
-    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::By)) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::Keyword(Keyword::By)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::By),
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
     let mut group_by: Vec<ast::Expression> = Vec::new();
@@ -484,13 +525,13 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
             cur <= toks.len(),
         decreases toks.len() - cur,
     {
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
                 group_by.push(e);
                 cur = c;
             },
-            None => return (None, pos),
+            None => return (None, pos, eerr),
         }
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
             cur = cur + 1;
@@ -498,7 +539,7 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
             break;
         }
     }
-    (Some(group_by), cur)
+    (Some(group_by), cur, None)
 }
 
 /// Parses an optional `ORDER BY <expr> [ASC|DESC] [, ...]` clause. Returns
@@ -507,18 +548,26 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
 fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
     Option<Vec<(ast::Expression, ast::Direction)>>,
     usize,
+    Option<ParseError>,
 ))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Order)) {
-        return (Some(Vec::new()), pos);
+        return (Some(Vec::new()), pos, None);
     }
     let mut cur = pos + 1;
-    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::By)) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::Keyword(Keyword::By)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::By),
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
     let mut order_by: Vec<(ast::Expression, ast::Direction)> = Vec::new();
@@ -528,10 +577,10 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
             cur <= toks.len(),
         decreases toks.len() - cur,
     {
-        let (opt, c) = parse_clause_expr_at(toks, cur);
+        let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
         let expr = match opt {
             Some(e) => e,
-            None => return (None, pos),
+            None => return (None, pos, eerr),
         };
         cur = c;
 
@@ -558,38 +607,51 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
             break;
         }
     }
-    (Some(order_by), cur)
+    (Some(order_by), cur, None)
 }
 
 /// Parses a `CREATE TABLE <name> (<column>, ...)` statement, having consumed
 /// `CREATE`. Each column definition is parsed by `parse_create_column_at`.
 /// Mirrors `parse_create_table`; a malformed form yields `(None, pos)` so the
 /// caller falls back to the legacy parser.
-fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // TABLE
-    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
-        return (None, pos);
+    if pos >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::Table),
+            toks[pos].clone(),
+        )));
     }
     let mut cur = pos + 1;
 
     // Table name.
     if cur >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let name = match &toks[cur] {
         Token::Ident(n) => n.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
 
     // Opening paren of the column list.
-    if cur >= toks.len() || !matches!(toks[cur], Token::OpenParen) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::OpenParen) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::OpenParen,
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
 
@@ -601,13 +663,13 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             cur <= toks.len(),
         decreases toks.len() - cur,
     {
-        let (copt, ncur) = parse_create_column_at(toks, cur);
+        let (copt, ncur, cerr) = parse_create_column_at(toks, cur);
         match copt {
             Some(column) => {
                 columns.push(column);
                 cur = ncur;
             },
-            None => return (None, pos),
+            None => return (None, pos, cerr),
         }
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
             cur = cur + 1;
@@ -617,12 +679,18 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     }
 
     // Closing paren.
-    if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::CloseParen) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::CloseParen,
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
 
-    (Some(ast::Statement::CreateTable { name, columns }), cur)
+    (Some(ast::Statement::CreateTable { name, columns }), cur, None)
 }
 
 /// Parses a single `CREATE TABLE` column definition (`<name> <datatype>
@@ -632,26 +700,27 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 /// Returns `(None, pos)` on any malformed / unexpected keyword. Mirrors
 /// `parse_create_table_column`; strictly advances on success (a column always
 /// consumes at least its name and datatype).
-fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Column>, usize))
+fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Column>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
+        r.0 is None ==> r.2 is Some,
 {
     // Column name.
     if pos >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let name = match &toks[pos] {
         Token::Ident(n) => n.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone()))),
     };
     let mut cur = pos + 1;
 
     // Datatype keyword.
     if cur >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let datatype = match &toks[cur] {
         Token::Keyword(Keyword::Bool) | Token::Keyword(Keyword::Boolean) => DataType::Boolean,
@@ -660,7 +729,7 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         Token::Keyword(Keyword::String)
         | Token::Keyword(Keyword::Text)
         | Token::Keyword(Keyword::Varchar) => DataType::String,
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::UnexpectedToken(toks[cur].clone()))),
     };
     cur = cur + 1;
 
@@ -687,38 +756,50 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         };
         cur = cur + 1;
         if matches!(keyword, Keyword::Primary) {
-            if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Key)) {
-                return (None, pos);
+            if cur >= toks.len() {
+                return (None, pos, Some(ParseError::UnexpectedEof));
+            }
+            if !matches!(toks[cur], Token::Keyword(Keyword::Key)) {
+                return (None, pos, Some(ParseError::ExpectedToken(
+                    Token::Keyword(Keyword::Key),
+                    toks[cur].clone(),
+                )));
             }
             cur = cur + 1;
             primary_key = true;
         } else if matches!(keyword, Keyword::Null) {
             if nullable.is_some() {
-                return (None, pos);
+                return (None, pos, Some(ParseError::NullabilityAlreadySet(name.clone())));
             }
             nullable = Some(true);
         } else if matches!(keyword, Keyword::Not) {
-            if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Null)) {
-                return (None, pos);
+            if cur >= toks.len() {
+                return (None, pos, Some(ParseError::UnexpectedEof));
+            }
+            if !matches!(toks[cur], Token::Keyword(Keyword::Null)) {
+                return (None, pos, Some(ParseError::ExpectedToken(
+                    Token::Keyword(Keyword::Null),
+                    toks[cur].clone(),
+                )));
             }
             cur = cur + 1;
             if nullable.is_some() {
-                return (None, pos);
+                return (None, pos, Some(ParseError::NullabilityAlreadySet(name.clone())));
             }
             nullable = Some(false);
         } else if matches!(keyword, Keyword::Default) {
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
-            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            let (opt, consumed, derr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
             match opt {
                 Some(expr) => {
                     default = Some(expr);
                     cur = consumed;
                 },
-                None => return (None, pos),
+                None => return (None, pos, derr),
             }
         } else if matches!(keyword, Keyword::Unique) {
             unique = true;
@@ -726,18 +807,18 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
             index = true;
         } else if matches!(keyword, Keyword::References) {
             if cur >= toks.len() {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
             match &toks[cur] {
                 Token::Ident(n) => {
                     references = Some(n.clone());
                     cur = cur + 1;
                 },
-                _ => return (None, pos),
+                _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
             }
         } else {
             // Unexpected keyword for a column definition.
-            return (None, pos);
+            return (None, pos, Some(ParseError::UnexpectedKeyword(keyword)));
         }
     }
 
@@ -751,7 +832,7 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         index,
         references,
     };
-    (Some(column), cur)
+    (Some(column), cur, None)
 }
 
 /// Parses an `UPDATE <table> SET <col> = <expr|DEFAULT> [, ...] [WHERE <expr>]`
@@ -760,25 +841,32 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
 /// maps to `None`. A duplicate column, like any malformed form, yields
 /// `(None, pos)` so the caller falls back to the legacy parser (which also
 /// carries the specific error text). Mirrors `parse_update`.
-fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // Table name.
     if pos >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let table = match &toks[pos] {
         Token::Ident(name) => name.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone()))),
     };
     let mut cur = pos + 1;
 
     // SET
-    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Set)) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::Keyword(Keyword::Set)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::Set),
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
 
@@ -792,17 +880,23 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     {
         // Column name.
         if cur >= toks.len() {
-            return (None, pos);
+            return (None, pos, Some(ParseError::UnexpectedEof));
         }
         let column = match &toks[cur] {
             Token::Ident(name) => name.clone(),
-            _ => return (None, pos),
+            _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
         };
         cur = cur + 1;
 
         // `=`
-        if cur >= toks.len() || !matches!(toks[cur], Token::Equal) {
-            return (None, pos);
+        if cur >= toks.len() {
+            return (None, pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::Equal) {
+            return (None, pos, Some(ParseError::ExpectedToken(
+                Token::Equal,
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
 
@@ -814,22 +908,22 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         } else {
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
-            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            let (opt, consumed, verr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
             match opt {
                 Some(expr) => {
                     value = Some(expr);
                     cur = consumed;
                 },
-                None => return (None, pos),
+                None => return (None, pos, verr),
             }
         }
 
         // Reject a column set twice (legacy owns the error text).
         if set.contains_key(&column) {
-            return (None, pos);
+            return (None, pos, Some(ParseError::DuplicateColumn(column.clone())));
         }
         set.insert(column, value);
 
@@ -846,45 +940,52 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         cur = cur + 1;
         let n = toks.len() - cur;
         if n > (usize::MAX - 3) / 2 {
-            return (None, pos);
+            return (None, pos, Some(ParseError::UnexpectedEof));
         }
         let fuel = 2 * n + 3;
-        let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+        let (opt, consumed, werr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
         match opt {
             Some(expr) => {
                 where_clause = Some(expr);
                 cur = consumed;
             },
-            None => return (None, pos),
+            None => return (None, pos, werr),
         }
     }
 
-    (Some(ast::Statement::Update { table, set, where_clause }), cur)
+    (Some(ast::Statement::Update { table, set, where_clause }), cur, None)
 }
 
 /// Parses an `INSERT INTO <table> [(<col>, ...)] VALUES (<expr>, ...), ...`
 /// statement, having consumed `INSERT`. The row values are parsed by the
 /// verified expression parser. Mirrors `parse_insert`; a malformed form yields
 /// `(None, pos)` so the caller falls back to the legacy parser.
-fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // INTO
-    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Into)) {
-        return (None, pos);
+    if pos >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[pos], Token::Keyword(Keyword::Into)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::Into),
+            toks[pos].clone(),
+        )));
     }
     let mut cur = pos + 1;
 
     // Table name.
     if cur >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let table = match &toks[cur] {
         Token::Ident(name) => name.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
 
@@ -900,14 +1001,14 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             decreases toks.len() - cur,
         {
             if cur >= toks.len() {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
             match &toks[cur] {
                 Token::Ident(name) => {
                     cols.push(name.clone());
                     cur = cur + 1;
                 },
-                _ => return (None, pos),
+                _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
             }
             if cur < toks.len() && matches!(toks[cur], Token::Comma) {
                 cur = cur + 1;
@@ -915,16 +1016,28 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 break;
             }
         }
-        if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
-            return (None, pos);
+        if cur >= toks.len() {
+            return (None, pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::CloseParen) {
+            return (None, pos, Some(ParseError::ExpectedToken(
+                Token::CloseParen,
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
         columns = Some(cols);
     }
 
     // VALUES
-    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Values)) {
-        return (None, pos);
+    if cur >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[cur], Token::Keyword(Keyword::Values)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::Values),
+            toks[cur].clone(),
+        )));
     }
     cur = cur + 1;
 
@@ -936,8 +1049,14 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             cur <= toks.len(),
         decreases toks.len() - cur,
     {
-        if cur >= toks.len() || !matches!(toks[cur], Token::OpenParen) {
-            return (None, pos);
+        if cur >= toks.len() {
+            return (None, pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::OpenParen) {
+            return (None, pos, Some(ParseError::ExpectedToken(
+                Token::OpenParen,
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
         // Snapshot the post-`(` position: the inner loop only advances `cur`, so
@@ -952,16 +1071,16 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         {
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
-                return (None, pos);
+                return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
-            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            let (opt, consumed, verr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
             match opt {
                 Some(expr) => {
                     row.push(expr);
                     cur = consumed;
                 },
-                None => return (None, pos),
+                None => return (None, pos, verr),
             }
             if cur < toks.len() && matches!(toks[cur], Token::Comma) {
                 cur = cur + 1;
@@ -969,8 +1088,14 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 break;
             }
         }
-        if cur >= toks.len() || !matches!(toks[cur], Token::CloseParen) {
-            return (None, pos);
+        if cur >= toks.len() {
+            return (None, pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::CloseParen) {
+            return (None, pos, Some(ParseError::ExpectedToken(
+                Token::CloseParen,
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
         values.push(row);
@@ -981,32 +1106,39 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    (Some(ast::Statement::Insert { table, columns, values }), cur)
+    (Some(ast::Statement::Insert { table, columns, values }), cur, None)
 }
 
 /// Parses a `DELETE FROM <table> [WHERE <expr>]` statement, having consumed
 /// `DELETE`. The optional `WHERE` predicate is parsed by the Verus-verified
 /// expression parser. Mirrors `parse_delete`; a malformed form yields
 /// `(None, pos)` so the caller falls back to the legacy parser.
-fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // FROM
-    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::From)) {
-        return (None, pos);
+    if pos >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[pos], Token::Keyword(Keyword::From)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::From),
+            toks[pos].clone(),
+        )));
     }
     let mut cur = pos + 1;
 
     // Table name (an identifier).
     if cur >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let table = match &toks[cur] {
         Token::Ident(name) => name.clone(),
-        _ => return (None, pos),
+        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
 
@@ -1017,33 +1149,40 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         // Fuel the verified parser needs (`2*(len-pos)+3`); guard the arithmetic.
         let n = toks.len() - cur;
         if n > (usize::MAX - 3) / 2 {
-            return (None, pos);
+            return (None, pos, Some(ParseError::UnexpectedEof));
         }
         let fuel = 2 * n + 3;
-        let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+        let (opt, consumed, werr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
         match opt {
             Some(expr) => {
                 where_clause = Some(expr);
                 cur = consumed;
             },
-            None => return (None, pos),
+            None => return (None, pos, werr),
         }
     }
 
-    (Some(ast::Statement::Delete { table, where_clause }), cur)
+    (Some(ast::Statement::Delete { table, where_clause }), cur, None)
 }
 
 /// Parses a `DROP TABLE [IF EXISTS] <name>` statement, having consumed `DROP`
 /// (so `pos` points just past it). Mirrors `parse_drop_table`; a malformed form
 /// yields `(None, pos)` so the caller falls back to the legacy parser.
-fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
-    if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
-        return (None, pos);
+    if pos >= toks.len() {
+        return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    if !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
+        return (None, pos, Some(ParseError::ExpectedToken(
+            Token::Keyword(Keyword::Table),
+            toks[pos].clone(),
+        )));
     }
     let mut cur = pos + 1;
 
@@ -1051,8 +1190,14 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
     let mut if_exists = false;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::If)) {
         cur = cur + 1;
-        if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Exists)) {
-            return (None, pos);
+        if cur >= toks.len() {
+            return (None, pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::Keyword(Keyword::Exists)) {
+            return (None, pos, Some(ParseError::ExpectedToken(
+                Token::Keyword(Keyword::Exists),
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
         if_exists = true;
@@ -1060,14 +1205,15 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
 
     // Table name (an identifier).
     if cur >= toks.len() {
-        return (None, pos);
+        return (None, pos, Some(ParseError::UnexpectedEof));
     }
     match &toks[cur] {
         Token::Ident(name) => (
             Some(ast::Statement::DropTable { name: name.clone(), if_exists }),
             cur + 1,
+            None,
         ),
-        _ => (None, pos),
+        _ => (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     }
 }
 
@@ -1076,11 +1222,12 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
 /// `READ ONLY` / `READ WRITE`, and an optional `AS OF SYSTEM TIME <number>`.
 /// Mirrors `parse_begin`; a malformed clause yields `(None, begin_pos)` so the
 /// caller falls back to the legacy parser for the specific error.
-fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+        r.0 is None ==> r.2 is Some,
 {
     // `pos` is just past BEGIN; on any malformed clause we return this position so
     // the caller's cursor is unchanged and legacy re-parses from BEGIN.
@@ -1097,7 +1244,7 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Read)) {
         cur = cur + 1;
         if cur >= toks.len() {
-            return (None, begin_pos);
+            return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
         match &toks[cur] {
             Token::Keyword(Keyword::Only) => {
@@ -1107,7 +1254,7 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
             Token::Keyword(Keyword::Write) => {
                 cur = cur + 1;
             },
-            _ => return (None, begin_pos),
+            _ => return (None, begin_pos, Some(ParseError::UnexpectedToken(toks[cur].clone()))),
         }
     }
 
@@ -1115,20 +1262,38 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
     let mut as_of: Option<u64> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As)) {
         cur = cur + 1;
-        if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Of)) {
-            return (None, begin_pos);
+        if cur >= toks.len() {
+            return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
-        cur = cur + 1;
-        if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::System)) {
-            return (None, begin_pos);
-        }
-        cur = cur + 1;
-        if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Time)) {
-            return (None, begin_pos);
+        if !matches!(toks[cur], Token::Keyword(Keyword::Of)) {
+            return (None, begin_pos, Some(ParseError::ExpectedToken(
+                Token::Keyword(Keyword::Of),
+                toks[cur].clone(),
+            )));
         }
         cur = cur + 1;
         if cur >= toks.len() {
-            return (None, begin_pos);
+            return (None, begin_pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::Keyword(Keyword::System)) {
+            return (None, begin_pos, Some(ParseError::ExpectedToken(
+                Token::Keyword(Keyword::System),
+                toks[cur].clone(),
+            )));
+        }
+        cur = cur + 1;
+        if cur >= toks.len() {
+            return (None, begin_pos, Some(ParseError::UnexpectedEof));
+        }
+        if !matches!(toks[cur], Token::Keyword(Keyword::Time)) {
+            return (None, begin_pos, Some(ParseError::ExpectedToken(
+                Token::Keyword(Keyword::Time),
+                toks[cur].clone(),
+            )));
+        }
+        cur = cur + 1;
+        if cur >= toks.len() {
+            return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
         match &toks[cur] {
             Token::Number(n) => match verified_integer::parse_u64(n.as_slice()) {
@@ -1136,13 +1301,13 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
                     as_of = Some(version);
                     cur = cur + 1;
                 },
-                None => return (None, begin_pos),
+                None => return (None, begin_pos, Some(ParseError::InvalidSystemTime(n.clone()))),
             },
-            _ => return (None, begin_pos),
+            _ => return (None, begin_pos, Some(ParseError::WantedNumber(toks[cur].clone()))),
         }
     }
 
-    (Some(ast::Statement::Begin { read_only, as_of }), cur)
+    (Some(ast::Statement::Begin { read_only, as_of }), cur, None)
 }
 
 } // verus!
