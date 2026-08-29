@@ -51,7 +51,7 @@ pub(crate) fn parse_expr_new(expr: &str) -> Result<Expression> {
 /// with an identical AST, or both reject. Error *messages* are not compared —
 /// only accept/reject and, on accept, AST equality.
 pub(crate) fn check_statement(sql: &str) {
-    let old = Parser::parse(sql);
+    let old = Parser::parse_legacy(sql);
     let new = parse_new(sql);
     match (old, new) {
         (Ok(old), Ok(new)) => assert_eq!(

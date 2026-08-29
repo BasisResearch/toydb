@@ -2,8 +2,10 @@ use std::ops::Add;
 
 #[cfg(test)]
 use super::stream::SliceTokenStream;
-use super::stream::{PeekStream, TokenStream};
-use super::{Keyword, Token, ast, float_trust, verified_integer};
+#[cfg(test)]
+use super::stream::TokenStream;
+use super::stream::{BufferedTokenStream, PeekStream};
+use super::{Keyword, Token, ast, float_trust, verified_integer, verified_precedence};
 use crate::errinput;
 use crate::error::Result;
 use crate::sql::types::DataType;
@@ -27,6 +29,22 @@ impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
+        // Buffered stream so `parse_expression` can run the Verus-verified
+        // position-based expression parser at the cursor (the cutover). Statement
+        // keywords and clause structure remain the retained recursive-descent code.
+        let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
+        let statement = parser.parse_statement()?;
+        parser.skip(Token::Semicolon);
+        if let Some(token) = parser.stream.next()? {
+            return errinput!("unexpected token {token}");
+        }
+        Ok(statement)
+    }
+
+    /// The legacy statement parser (streaming, fully recursive-descent
+    /// expressions), retained as the differential oracle for the cutover.
+    #[cfg(test)]
+    pub(crate) fn parse_legacy(statement: &str) -> Result<ast::Statement> {
         let mut parser = StreamingParser::new(TokenStream::new(statement));
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
@@ -658,6 +676,24 @@ impl<S: PeekStream> StreamingParser<S> {
     ///   op = parse_infix_operator(prec=0) = None (end of expression)
     ///   return lhs = ((2 ^ (3 ^ 2)) - (4 * 3))
     fn parse_expression(&mut self) -> Result<ast::Expression> {
+        // Cutover: over a buffered stream, parse the expression at the cursor with
+        // the Verus-verified position-based precedence parser and advance the
+        // cursor by what it consumed. `parse_expression_at` stops at the first
+        // token that cannot extend the expression (a clause keyword, `)`, `,`, …),
+        // matching the legacy streaming parser (the differential harness gates it).
+        let verified = if let Some((tokens, pos)) = self.stream.buffer() {
+            let fuel = 2usize.saturating_mul(tokens.len().saturating_sub(pos)).saturating_add(3);
+            Some(verified_precedence::parse_expression_at(tokens, pos, 0, fuel))
+        } else {
+            None
+        };
+        if let Some((Some(expression), consumed)) = verified {
+            self.stream.set_pos(consumed);
+            return Ok(expression);
+        }
+        // Streaming source, or the verified parser found no expression at the
+        // cursor (it rejects exactly where legacy does): use the legacy path,
+        // which also produces the specific rejection error.
         self.parse_expression_at(0)
     }
 
