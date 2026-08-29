@@ -1,16 +1,18 @@
-//! Verified concrete parser for the statement kinds the cutover has reached —
-//! `BEGIN` / `COMMIT` / `ROLLBACK` (control), `CREATE TABLE` / `DROP TABLE`
-//! (DDL, with full column definitions), and the row-carrying DML `DELETE` /
-//! `INSERT` / `UPDATE` / `SELECT` (whose predicates, values, and clause
-//! expressions are parsed by the verified expression parser). `SELECT` covers
-//! the full clause set: select list with aliases, the `FROM` join tree
-//! (INNER/LEFT/RIGHT/CROSS, left-deep folded), `WHERE`, `GROUP BY`, `HAVING`,
-//! `ORDER BY` (with direction), `LIMIT`, and `OFFSET`. See
-//! `verus-parser-roundtrip-plan.md`. Each entry is a 1:1 port of the
-//! corresponding `parser.rs` routine, producing the production `ast::Statement`
-//! over `super::Token` and returning the position past the consumed tokens (so
-//! the statement parser can check for a trailing semicolon / end of input,
-//! exactly like the legacy path).
+//! Verified concrete parser for the **complete** toyDB statement grammar. Every
+//! kind the legacy `parse_statement` dispatches is covered: `BEGIN` / `COMMIT` /
+//! `ROLLBACK` (control), `CREATE TABLE` / `DROP TABLE` (DDL, with full column
+//! definitions), the row-carrying DML `DELETE` / `INSERT` / `UPDATE` / `SELECT`
+//! (whose predicates, values, and clause expressions are parsed by the verified
+//! expression parser), and `EXPLAIN <statement>` (recursing through the entry
+//! point, rejecting nested EXPLAIN). `SELECT` covers the full clause set: select
+//! list with aliases, the `FROM` join tree (INNER/LEFT/RIGHT/CROSS, left-deep
+//! folded), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (with direction), `LIMIT`,
+//! and `OFFSET`. See `verus-parser-roundtrip-plan.md`. Each entry is a 1:1 port
+//! of the corresponding `parser.rs` routine, producing the production
+//! `ast::Statement` over `super::Token` and returning the position past the
+//! consumed tokens (so the caller can check for a trailing semicolon / end of
+//! input, exactly like the legacy path); on any malformed form it returns
+//! `(None, pos)` and the retained legacy parser re-parses to own the error text.
 //!
 //! Verus proves no panic, no arithmetic overflow, and termination: every `Vec`
 //! index is bounds-guarded, every `cur + 1` is bounded by the token count, and
@@ -34,15 +36,20 @@ use std::collections::BTreeMap;
 
 verus! {
 
-/// Parses a control statement (`BEGIN` / `COMMIT` / `ROLLBACK`) at `pos`,
-/// returning it and the position past its tokens, or `(None, pos)` if the token
-/// at `pos` does not begin a control statement (or the `BEGIN` clauses are
-/// malformed). Mirrors the `Begin`/`Commit`/`Rollback` arms of `parse_statement`.
+/// Parses a statement at `pos`, dispatching on the leading keyword, and returns
+/// it with the position past its tokens — or `(None, pos)` if the token at `pos`
+/// does not begin a statement, or the statement is malformed (so the caller
+/// falls back to the legacy parser, which owns the specific error). This is the
+/// module's entry point; it now covers every statement kind the legacy
+/// `parse_statement` dispatches. The `decreases` measure pairs with
+/// `parse_explain_at` for their mutual recursion (`EXPLAIN <statement>`): the
+/// second component orders the two functions at an equal token position.
 pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
+    decreases toks.len() - pos, 0int,
 {
     if pos >= toks.len() {
         return (None, pos);
@@ -57,7 +64,33 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Update) => parse_update_at(toks, pos + 1),
         Token::Keyword(Keyword::Create) => parse_create_at(toks, pos + 1),
         Token::Keyword(Keyword::Select) => parse_select_at(toks, pos + 1),
+        Token::Keyword(Keyword::Explain) => parse_explain_at(toks, pos + 1),
         _ => (None, pos),
+    }
+}
+
+/// Parses an `EXPLAIN <statement>` statement, having consumed `EXPLAIN`. The
+/// inner statement is parsed by `parse_control_at`; a nested `EXPLAIN` is
+/// rejected here (like the legacy parser, which errors) by yielding
+/// `(None, pos)`. Mirrors `parse_explain`. The `decreases` second component
+/// (`1int` vs `parse_control_at`'s `0int`) breaks the equal-position mutual
+/// recursion: `parse_explain_at(pos)` calls `parse_control_at(pos)` at the same
+/// `pos`, and `1int > 0int` makes that call strictly smaller.
+fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+    decreases toks.len() - pos, 1int,
+{
+    // Nested EXPLAIN is disallowed; defer to legacy for the specific error.
+    if pos < toks.len() && matches!(toks[pos], Token::Keyword(Keyword::Explain)) {
+        return (None, pos);
+    }
+    let (opt, newpos) = parse_control_at(toks, pos);
+    match opt {
+        Some(inner) => (Some(ast::Statement::Explain(Box::new(inner))), newpos),
+        None => (None, pos),
     }
 }
 
