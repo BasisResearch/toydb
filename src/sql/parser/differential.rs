@@ -24,8 +24,7 @@
 #![cfg(test)]
 
 use super::ast::{self, Expression, Literal, Operator, Statement};
-use super::{Lexer, Parser, Token, verified_precedence};
-use crate::errinput;
+use super::{Parser, Token};
 use crate::error::Result;
 
 /// The verified-path statement parser under test.
@@ -36,20 +35,17 @@ pub(crate) fn parse_new(sql: &str) -> Result<Statement> {
     Parser::parse(sql)
 }
 
-/// The verified-path expression parser under test: lex with the production
-/// lexer, then run the Verus-verified precedence-climbing parser
-/// ([`verified_precedence`]). Requires the whole token vector to be consumed.
+/// The verified-path expression parser under test: the production
+/// [`Parser::parse_expr`], which runs the Verus-verified precedence parser and
+/// renders its structured `ParseError`.
 pub(crate) fn parse_expr_new(expr: &str) -> Result<Expression> {
-    let tokens: Vec<Token> = Lexer::new(expr).collect::<Result<_>>()?;
-    match verified_precedence::parse_expression(&tokens) {
-        Some(expression) => Ok(expression),
-        None => errinput!("failed to parse expression: {expr}"),
-    }
+    Parser::parse_expr(expr)
 }
 
-/// Asserts the legacy and verified-path parsers agree on `sql`: both accept
-/// with an identical AST, or both reject. Error *messages* are not compared —
-/// only accept/reject and, on accept, AST equality.
+/// Asserts the legacy and verified-path parsers agree on `sql`: both accept with
+/// an identical AST, or both reject with an identical error *message* (the
+/// verified parser now produces the rejection error itself, so the cutover must
+/// reproduce legacy's message exactly).
 pub(crate) fn check_statement(sql: &str) {
     let old = Parser::parse_legacy(sql);
     let new = parse_new(sql);
@@ -58,7 +54,11 @@ pub(crate) fn check_statement(sql: &str) {
             old, new,
             "verified parser produced a different AST\n  sql: {sql:?}\n  old: {old:?}\n  new: {new:?}"
         ),
-        (Err(_), Err(_)) => {}
+        (Err(old), Err(new)) => assert_eq!(
+            old.to_string(),
+            new.to_string(),
+            "verified parser produced a different error\n  sql: {sql:?}\n  old: {old}\n  new: {new}"
+        ),
         (Ok(old), Err(err)) => panic!(
             "legacy accepted but verified rejected\n  sql: {sql:?}\n  ast: {old:?}\n  err: {err}"
         ),
@@ -69,8 +69,9 @@ pub(crate) fn check_statement(sql: &str) {
 }
 
 /// Expression-level counterpart to [`check_statement`]. `Parser::parse_expr` is
-/// now the verified parser (the cutover); the legacy recursive-descent parser is
-/// retained as `Parser::parse_expr_legacy`, the oracle.
+/// the verified parser (the cutover); the legacy recursive-descent parser is
+/// retained as `Parser::parse_expr_legacy`, the oracle. Errors are compared by
+/// message too.
 pub(crate) fn check_expression(expr: &str) {
     let old = Parser::parse_expr_legacy(expr);
     let new = parse_expr_new(expr);
@@ -79,7 +80,11 @@ pub(crate) fn check_expression(expr: &str) {
             old, new,
             "verified parser produced a different expression AST\n  sql: {expr:?}\n  old: {old:?}\n  new: {new:?}"
         ),
-        (Err(_), Err(_)) => {}
+        (Err(old), Err(new)) => assert_eq!(
+            old.to_string(),
+            new.to_string(),
+            "verified parser produced a different error\n  sql: {expr:?}\n  old: {old}\n  new: {new}"
+        ),
         (Ok(old), Err(err)) => panic!(
             "legacy accepted but verified rejected\n  sql: {expr:?}\n  ast: {old:?}\n  err: {err}"
         ),
