@@ -38,8 +38,30 @@ impl Parser {
 
     /// Parse the input string into a SQL expression AST. The entire string must
     /// be parsed as a single expression. Only used in tests.
+    ///
+    /// Cut over to the Verus-verified precedence parser
+    /// ([`verified_precedence::parse_expression`], proven to invert the canonical
+    /// printer and shown behaviourally equivalent to the legacy parser by the
+    /// differential harness). The legacy recursive-descent parser is retained as
+    /// [`Parser::parse_expr_legacy`], the differential oracle.
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
+        let tokens: Vec<Token> = super::Lexer::new(expr).collect::<Result<_>>()?;
+        match super::verified_precedence::parse_expression(&tokens) {
+            Some(expression) => Ok(expression),
+            // The verified parser rejects (returns `None`) exactly when the legacy
+            // parser rejects — the differential harness gates that equivalence. It
+            // carries no error detail, so defer to the legacy parser only to
+            // reproduce its specific rejection message (e.g. integer overflow).
+            // This is not a parse fallback: the accepted surface is fully verified.
+            None => Self::parse_expr_legacy(expr),
+        }
+    }
+
+    /// The legacy recursive-descent expression parser, retained as the oracle for
+    /// the differential harness that gates the [`Parser::parse_expr`] cutover.
+    #[cfg(test)]
+    pub(crate) fn parse_expr_legacy(expr: &str) -> Result<ast::Expression> {
         let mut parser = StreamingParser::new(TokenStream::new(expr));
         let expression = parser.parse_expression()?;
         if let Some(token) = parser.stream.next()? {

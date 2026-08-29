@@ -68,9 +68,11 @@ pub(crate) fn check_statement(sql: &str) {
     }
 }
 
-/// Expression-level counterpart to [`check_statement`].
+/// Expression-level counterpart to [`check_statement`]. `Parser::parse_expr` is
+/// now the verified parser (the cutover); the legacy recursive-descent parser is
+/// retained as `Parser::parse_expr_legacy`, the oracle.
 pub(crate) fn check_expression(expr: &str) {
-    let old = Parser::parse_expr(expr);
+    let old = Parser::parse_expr_legacy(expr);
     let new = parse_expr_new(expr);
     match (old, new) {
         (Ok(old), Ok(new)) => assert_eq!(

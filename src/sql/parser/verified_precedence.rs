@@ -34,13 +34,15 @@ use vstd::prelude::*;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_expression::{BinaryTag, UnaryTag};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::verified_roundtrip::{
-    binary_tag_exec, build_binary, build_unary, parse_literal_exec, prefix_op_exec, IsLit, SExpr,
-};
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_production::TokenView;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::{ast, float_trust, verified_expression, verified_integer, verified_production, Keyword, Token};
+use super::verified_roundtrip::{
+    IsLit, SExpr, binary_tag_exec, build_binary, build_unary, parse_literal_exec, prefix_op_exec,
+};
+#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+use super::{
+    Keyword, Token, ast, float_trust, verified_expression, verified_integer, verified_production,
+};
 
 verus! {
 
