@@ -1,8 +1,8 @@
 //! Verified concrete parser for the simple keyword-driven statements the cutover
 //! has reached so far — `BEGIN` / `COMMIT` / `ROLLBACK` (control), `DROP TABLE`
-//! (DDL), and the row-carrying DML `DELETE` and `INSERT` (whose predicates and
-//! row values are parsed by the verified expression parser). These are the
-//! statement-structure cutover's first bricks
+//! (DDL), and the row-carrying DML `DELETE` / `INSERT` / `UPDATE` (whose
+//! predicates and values are parsed by the verified expression parser). These
+//! are the statement-structure cutover's first bricks
 //! (see `verus-parser-roundtrip-plan.md`). Each is a 1:1 port of the
 //! corresponding `parser.rs` routine, producing the production `ast::Statement`
 //! over `super::Token` and returning the position past the consumed tokens (so
@@ -25,6 +25,7 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
+use std::collections::BTreeMap;
 
 verus! {
 
@@ -48,8 +49,117 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
         Token::Keyword(Keyword::Drop) => parse_drop_at(toks, pos + 1),
         Token::Keyword(Keyword::Delete) => parse_delete_at(toks, pos + 1),
         Token::Keyword(Keyword::Insert) => parse_insert_at(toks, pos + 1),
+        Token::Keyword(Keyword::Update) => parse_update_at(toks, pos + 1),
         _ => (None, pos),
     }
+}
+
+/// Parses an `UPDATE <table> SET <col> = <expr|DEFAULT> [, ...] [WHERE <expr>]`
+/// statement, having consumed `UPDATE`. Assignment values and the optional
+/// `WHERE` predicate are parsed by the verified expression parser; `DEFAULT`
+/// maps to `None`. A duplicate column, like any malformed form, yields
+/// `(None, pos)` so the caller falls back to the legacy parser (which also
+/// carries the specific error text). Mirrors `parse_update`.
+fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize))
+    requires
+        pos <= toks.len(),
+    ensures
+        pos <= r.1 <= toks.len(),
+{
+    // Table name.
+    if pos >= toks.len() {
+        return (None, pos);
+    }
+    let table = match &toks[pos] {
+        Token::Ident(name) => name.clone(),
+        _ => return (None, pos),
+    };
+    let mut cur = pos + 1;
+
+    // SET
+    if cur >= toks.len() || !matches!(toks[cur], Token::Keyword(Keyword::Set)) {
+        return (None, pos);
+    }
+    cur = cur + 1;
+
+    // One or more comma-separated `<col> = <value>` assignments.
+    let mut set: BTreeMap<String, Option<ast::Expression>> = BTreeMap::new();
+    loop
+        invariant
+            pos <= cur,
+            cur <= toks.len(),
+        decreases toks.len() - cur,
+    {
+        // Column name.
+        if cur >= toks.len() {
+            return (None, pos);
+        }
+        let column = match &toks[cur] {
+            Token::Ident(name) => name.clone(),
+            _ => return (None, pos),
+        };
+        cur = cur + 1;
+
+        // `=`
+        if cur >= toks.len() || !matches!(toks[cur], Token::Equal) {
+            return (None, pos);
+        }
+        cur = cur + 1;
+
+        // Value: the `DEFAULT` keyword maps to `None`; otherwise an expression.
+        let value: Option<ast::Expression>;
+        if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Default)) {
+            cur = cur + 1;
+            value = None;
+        } else {
+            let n = toks.len() - cur;
+            if n > (usize::MAX - 3) / 2 {
+                return (None, pos);
+            }
+            let fuel = 2 * n + 3;
+            let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+            match opt {
+                Some(expr) => {
+                    value = Some(expr);
+                    cur = consumed;
+                },
+                None => return (None, pos),
+            }
+        }
+
+        // Reject a column set twice (legacy owns the error text).
+        if set.contains_key(&column) {
+            return (None, pos);
+        }
+        set.insert(column, value);
+
+        if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Optional WHERE <expr>.
+    let mut where_clause: Option<ast::Expression> = None;
+    if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
+        cur = cur + 1;
+        let n = toks.len() - cur;
+        if n > (usize::MAX - 3) / 2 {
+            return (None, pos);
+        }
+        let fuel = 2 * n + 3;
+        let (opt, consumed) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
+        match opt {
+            Some(expr) => {
+                where_clause = Some(expr);
+                cur = consumed;
+            },
+            None => return (None, pos),
+        }
+    }
+
+    (Some(ast::Statement::Update { table, set, where_clause }), cur)
 }
 
 /// Parses an `INSERT INTO <table> [(<col>, ...)] VALUES (<expr>, ...), ...`
