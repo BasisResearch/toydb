@@ -39,7 +39,9 @@ suite). New strategy and progress:
   (Brick 2, commit `ada869a`) + composition (`parse_expression` refinement `ensures`
   + `lemma_prec`, fuel `2*len+3`). `verify.sh` green; `cargo build` clean. Brick
   details below (historical):
-- **Phase 3 (production cutover) — STARTED (2026-08-29).**
+- **Phase 3 (production cutover) — COMPLETE (2026-08-29).** Expressions and every
+  statement kind now run on the verified parser in production; legacy is retained
+  only as the differential oracle and for malformed-input error text.
   - **`Parser::parse_expr` CUT OVER (commit `f25e31b`).** It now parses via
     `verified_precedence::parse_expression`; the legacy recursive-descent parser is
     retained as `Parser::parse_expr_legacy` (the differential oracle). Rejection
@@ -59,14 +61,27 @@ suite). New strategy and progress:
     full `cargo test` (317 lib + queries/isolation/anomalies goldenscripts) green, fmt
     + clippy clean, build warning-free. So the verified precedence parser now runs in
     production for EVERY expression (bare and inside every statement kind).
-  - **REMAINING — statement STRUCTURE cutover (the multi-week tail).** `Parser::parse`
-    still uses the legacy recursive-descent code for statement keywords/clauses (only
-    the *expressions* are verified). Cutting the statement structure over needs a
-    verified CONCRETE statement parser — analogous to `verified_precedence` for
-    expressions, but for the full production statement grammar (all clauses, join
-    types, etc.). Note `verified_stmt.rs`'s `parse_stmt_full_exec` is over the MIRROR
-    types + domain-restricted to `printable_stmt` (the canonical roundtrip), NOT the
-    full concrete grammar, so it is not a drop-in. This is a large new build.
+  - **STATEMENT STRUCTURE CUTOVER — COMPLETE (2026-08-29, `verified_control.rs`, 27
+    verified / 0 errors).** `Parser::parse` now routes EVERY statement kind through a
+    verified concrete statement parser. `verified_control::parse_control_at(toks, pos)`
+    is the entry point; `parse_statement` tries it over the buffered token stream and
+    advances by the consumed count, falling to legacy only for a malformed form's error
+    text (zero untracked accept-path fallbacks). Ports landed one kind per commit:
+    BEGIN/COMMIT/ROLLBACK (`29c5ca2`-era control), DROP TABLE (`2902403`), DELETE
+    (`5698157`), INSERT (`f63c386`), UPDATE (`1ea2aae`, BTreeMap via vstd
+    contains_key/insert), CREATE TABLE (`ad5bd9d`, full column defs), SELECT
+    (`de862aa`, full clause set + FROM join tree), EXPLAIN (`5634993`, mutually
+    recursive with the entry point via a lexicographic `(len-pos, phase)` measure).
+    Each is a 1:1 port of its `parser.rs` routine, proven no-panic / no-overflow /
+    terminating (bounded clause loops `decreases toks.len()-cur`), with all embedded
+    expressions parsed by `verified_precedence::parse_expression_at` under a guarded
+    fuel computation. Equivalence is differential (proptest over all kinds incl. joins
+    + Explain nesting, plus the concrete-syntax corpus), same contract as
+    `verified_precedence`. Gates: 633 verified across all modules, 317 lib + 5
+    goldenscript integration tests, differential harness, fmt + clippy clean.
+    (`verified_stmt.rs`'s `parse_stmt_full_exec` — over the MIRROR types,
+    domain-restricted to `printable_stmt` — was the canonical roundtrip proof, NOT this
+    concrete-grammar cutover; the two are independent.)
   - **Brick 1 DONE — spec model.** `sparse_prec` / `sparse_atom` /
     `sparse_infix_loop` / `sparse_postfix_loop` / `sparse_fn_args[_nonempty]`: a
     pure-recursion model of the hybrid exec (whose 3 inner `while` loops terminate
