@@ -28,11 +28,35 @@ suite). New strategy and progress:
   at it, so it now parses every expression under test. Green: 26 expr
   goldenscripts (incl. op_precedence), 256-case proptest, 35 concrete cases;
   verify.sh 19 modules / 0 errors. Added `float_trust::infinity()`.
-- **Phase 2.2 (hard goal, user-promoted, NOT started):** roundtrip-(a) for the
-  precedence parser — `parse(print(e))==e`. Spec parser `sparse_prec` +
-  refinement at `view_expr` + precedence-climbing induction. Note the naive
-  `parse(sprint(e)+tail)==(e,tail)` is false in lhs positions (the infix loop
-  legitimately continues), so the full precedence invariant is required.
+- **Phase 2.2 (hard goal, user-promoted, IN PROGRESS 2026-08-28):** roundtrip-(a)
+  for the precedence parser — `parse(print(e))==e`. Decomposed into 3 bricks; the
+  two hardest (the spec model + the precedence-climbing induction) are DONE and
+  committed green in `verified_precedence.rs` (30 verified / 0 errors, axiom-free;
+  commits `1358ffd`, `53cbed7`, `6f7f6fd`):
+  - **Brick 1 DONE — spec model.** `sparse_prec` / `sparse_atom` /
+    `sparse_infix_loop` / `sparse_postfix_loop` / `sparse_fn_args[_nonempty]`: a
+    pure-recursion model of the hybrid exec (whose 3 inner `while` loops terminate
+    on token count, not fuel). Lexicographic `(fuel, phase)` measure. Added spec
+    twins of the precedence tables + `float_trust::spec_infinity`.
+  - **Brick 3 (spec half) DONE — the precedence induction.** `lemma_atom`
+    (primary, `decreases e`) + `lemma_prec` + `lemma_fn_args[_nonempty]` +
+    `infix_step_binary` / `postfix_step_*` + halt lemmas prove
+    `sparse_prec(sprint(e)+tail) == (Some(e), tail)` for a prec-boundary tail. Key
+    fact confirming the plan's warning: an operand's tail is always `)` / `,` /
+    `!` / `IS` / a single operator, so each loop does ≤1 productive step and
+    precedence never diverges — the naive tail statement is false only for *atom*
+    lhs positions, handled by splitting `lemma_atom` (weaker `boundary` tail, loops
+    may fire) from `lemma_prec` (`prec_boundary` tail, loops halt). Fuel bounds are
+    print-length-based (`fuel >= sprint(e).len()[+1]`) so they compose with the
+    exec's `toks.len()+1`. `lemma_atom` carries `spinoff_prover` + `rlimit(20000)`.
+  - **Brick 2 REMAINING — exec→spec refinement.** Add `ensures` to
+    `parse_expression_at` / `parse_atom` / `parse_function_call` relating them to
+    `sparse_prec` / `sparse_atom` / `sparse_fn_args` at the `view_expr` /
+    `token_views` level (the `parse_expr_exec` pattern), with loop invariants
+    `sparse_<loop>(view(lhs_cur), views(cur..), mp) == final` (resumption
+    invariance: each exec step = one spec unfold, exit = halt). Then compose with
+    `print_expr_exec` for the exec headline `parse_expression(print(e)) == Some(e)`.
+    Fuel already lines up (`toks.len()+1 == sprint.len()+1 == lemma_prec's bound`).
 - **Phases 3+:** per statement kind route `parse_new` off legacy (with logged,
   tracked fallback), close surface variants (bare aliases, join types, optional
   keywords), then flip `Parser::parse`/`parse_expr`; zero untracked fallbacks.
