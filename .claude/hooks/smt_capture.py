@@ -18,6 +18,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -103,7 +104,7 @@ def _find_int_key(obj, keys, depth=0):
     return None
 
 
-def _verdict(tool_response, texts):
+def _verdict(docs, texts):
     """Best-effort success/verified/errors/exit_code from a tool response.
 
     MCP verify/check: the structured result dict. Bash: verify.sh
@@ -112,7 +113,11 @@ def _verdict(tool_response, texts):
     when nothing recognisable is present; absent keys mean "unknown", which
     the dashboard stores as NULL rather than failure."""
     out = {}
-    d = _find_verdict_dict(tool_response)
+    d = None
+    for doc in docs:
+        d = _find_verdict_dict(doc)
+        if d is not None:
+            break
     if d is not None:
         out["success"] = bool(d.get("success"))
         summary = d.get("summary") if isinstance(d.get("summary"), dict) else d
@@ -121,14 +126,7 @@ def _verdict(tool_response, texts):
             if isinstance(v, int) and not isinstance(v, bool):
                 out[key] = v
     else:
-        for t in texts:
-            t = t.strip()
-            if not t.startswith("{"):
-                continue
-            try:
-                doc = json.loads(t)
-            except ValueError:
-                continue
+        for doc in docs:
             vr = doc.get("verification-results") if isinstance(doc, dict) else None
             if isinstance(vr, dict):
                 out["success"] = bool(vr.get("success"))
@@ -137,10 +135,34 @@ def _verdict(tool_response, texts):
                     if isinstance(v, int) and not isinstance(v, bool):
                         out[key] = v
                 break
-    ec = _find_int_key(tool_response, ("exitCode", "exit_code", "returnCode"))
+    ec = None
+    for doc in docs:
+        ec = _find_int_key(doc, ("exitCode", "exit_code", "returnCode"))
+        if ec is not None:
+            break
     if ec is not None:
         out["exit_code"] = ec
     return out
+
+
+_SMT_DIR_JSON_RE = re.compile(r'"smt_log_dir"\s*:\s*"([^"]+)"')
+
+
+def _parsed_docs(tool_response, texts):
+    """The response plus every JSON document hiding in its strings.
+
+    MCP tool results reach PostToolUse as JSON *text* (a content block whose
+    payload is the serialized structured result), so key lookups must also
+    search parsed string content, not just the response object itself."""
+    docs = [tool_response]
+    for t in texts:
+        t = t.strip()
+        if t.startswith("{") or t.startswith("["):
+            try:
+                docs.append(json.loads(t))
+            except ValueError:
+                pass
+    return docs
 
 
 def _invocation(tool_name, tool_input):
@@ -159,11 +181,22 @@ def handle_post_tool_use(hook_input):
     tool_response = hook_input.get("tool_response")
     tool_input = hook_input.get("tool_input") or {}
 
-    # Locate the producer's log dir: the MCP result's structured field, or
-    # the verify.sh stderr marker anywhere in the response.
+    # Locate the producer's log dir: the MCP result's `smt_log_dir` field
+    # (which reaches us serialized as JSON text, hence the parsed-docs pass
+    # and the regex fallback for truncated JSON), or the verify.sh stderr
+    # marker anywhere in the response.
     texts = []
     _strings(tool_response, texts)
-    log_dir = _find_key(tool_response, "smt_log_dir")
+    docs = _parsed_docs(tool_response, texts)
+    log_dir = None
+    for doc in docs:
+        log_dir = _find_key(doc, "smt_log_dir")
+        if log_dir:
+            break
+    if not log_dir:
+        m = _SMT_DIR_JSON_RE.search("\n".join(texts))
+        if m:
+            log_dir = m.group(1)
     if not log_dir:
         log_dir = _smt.find_log_dir("\n".join(texts))
     if not log_dir:
@@ -190,7 +223,7 @@ def handle_post_tool_use(hook_input):
     # The tool's own verdict (success/verified/errors/exit_code): what makes
     # a pre-SMT failure (type error, VIR error: zero queries, few artifacts)
     # distinguishable from "nothing to verify" on the dashboard.
-    meta.update(_verdict(tool_response, texts))
+    meta.update(_verdict(docs, texts))
     dest = _smt.collect(log_dir, session_id, tool_use_id, meta)
     if dest is None:
         # Empty producer dir: cargo considered the crate fresh, Verus never

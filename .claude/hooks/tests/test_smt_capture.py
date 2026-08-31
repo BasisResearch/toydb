@@ -292,6 +292,61 @@ class SmtHookTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(self.tmp, "sess-hook", "toolu_MCP")))
 
+    def test_mcp_json_string_response_capture(self):
+        # The REAL wire shape (observed in a live session transcript): the
+        # MCP result reaches PostToolUse serialized as JSON text inside a
+        # content block, NOT as a structured dict.
+        prod = self._producer({"m.smt2": "q"})
+        payload = json.dumps({
+            "duration_ms": 713, "errors": [],
+            "raw_stdout_tail": "verification results:: 17 verified, 0 errors",
+            "smt_log_dir": prod, "success": True,
+            "summary": {"errors": 0, "verified": 17},
+            "verus_version": "0.2026.08.23",
+        })
+        r = self._run_hook({
+            "session_id": "sjson", "tool_use_id": "tj1",
+            "tool_name": "mcp__verus__verify",
+            "tool_input": {"path": "src/x.rs"},
+            "tool_response": [{"type": "tool_result", "content": payload}],
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dest = os.path.join(self.tmp, "sjson", "tj1")
+        self.assertTrue(os.path.isdir(dest), r.stderr)
+        with open(os.path.join(dest, "meta.json")) as fh:
+            meta = json.load(fh)
+        self.assertIs(meta["success"], True)
+        self.assertEqual(meta["verified"], 17)
+
+    def test_mcp_bare_string_response_capture(self):
+        prod = self._producer({"m.smt2": "q"})
+        payload = json.dumps({"success": False, "summary": {"verified": 1, "errors": 2},
+                              "smt_log_dir": prod})
+        r = self._run_hook({
+            "session_id": "sjson", "tool_use_id": "tj2",
+            "tool_name": "mcp__verus__verify",
+            "tool_input": {"path": "src/x.rs"},
+            "tool_response": payload,
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp, "sjson", "tj2")), r.stderr)
+
+    def test_mcp_truncated_json_regex_fallback(self):
+        prod = self._producer({"m.smt2": "q"})
+        # Valid JSON up to a cut: json.loads fails, the regex still finds it.
+        text = '{"errors": [], "smt_log_dir": "%s", "raw_stdout_tail": "veri' % prod
+        r = self._run_hook({
+            "session_id": "sjson", "tool_use_id": "tj3",
+            "tool_name": "mcp__verus__verify",
+            "tool_input": {"path": "src/x.rs"},
+            "tool_response": text,
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp, "sjson", "tj3")), r.stderr)
+
     def test_non_verus_bash_is_ignored(self):
         r = self._run_hook({
             "session_id": "s", "tool_use_id": "t", "tool_name": "Bash",
