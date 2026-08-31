@@ -36,7 +36,7 @@ use super::parse_error::ParseError;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::{verified_production, verified_stmt, verified_stmt_prec};
+use super::{verified_production, verified_roundtrip, verified_stmt, verified_stmt_prec};
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 
@@ -1125,7 +1125,7 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
-        ({
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_stmt_prec::sparse_control_delete(input);
             match r.0 {
@@ -1206,16 +1206,32 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 /// Parses a `DROP TABLE [IF EXISTS] <name>` statement, having consumed `DROP`
 /// (so `pos` points just past it). Mirrors `parse_drop_table`; a malformed form
 /// yields `(None, pos)` so the caller falls back to the legacy parser.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40000)]
 fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_drop(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
     if pos >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
     if !matches!(toks[pos], Token::Keyword(Keyword::Table)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::Table),
@@ -1227,10 +1243,12 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
     // Optional IF EXISTS.
     let mut if_exists = false;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::If)) {
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
         if cur >= toks.len() {
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); verified_roundtrip::token_views_suffix(toks@, (pos + 1) as int); verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::Keyword(Keyword::Exists)) {
             return (None, pos, Some(ParseError::ExpectedToken(
                 Token::Keyword(Keyword::Exists),
@@ -1239,12 +1257,18 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
         }
         cur = cur + 1;
         if_exists = true;
+    } else {
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
+        if cur < toks.len() {
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+        }
     }
 
     // Table name (an identifier).
     if cur >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     match &toks[cur] {
         Token::Ident(name) => (
             Some(ast::Statement::DropTable { name: name.clone(), if_exists }),
@@ -1260,30 +1284,54 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
 /// `READ ONLY` / `READ WRITE`, and an optional `AS OF SYSTEM TIME <number>`.
 /// Mirrors `parse_begin`; a malformed clause yields `(None, begin_pos)` so the
 /// caller falls back to the legacy parser for the specific error.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(80000)]
 fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_begin(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
     // `pos` is just past BEGIN; on any malformed clause we return this position so
     // the caller's cursor is unchanged and legacy re-parses from BEGIN.
     let begin_pos = pos;
     let mut cur = pos;
 
     // Optional TRANSACTION.
+    if cur < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Transaction)) {
         cur = cur + 1;
     }
+    // Ghost: `r0` = spec suffix just past the optional TRANSACTION.
+    let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
 
     // Optional READ ONLY / READ WRITE.
     let mut read_only = false;
+    if cur < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Read)) {
         cur = cur + 1;
         if cur >= toks.len() {
             return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         match &toks[cur] {
             Token::Keyword(Keyword::Only) => {
                 read_only = true;
@@ -1295,14 +1343,20 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
             _ => return (None, begin_pos, Some(ParseError::UnexpectedToken(toks[cur].clone()))),
         }
     }
+    // Ghost: `r2` = spec suffix just past the optional READ clause.
+    let ghost r2 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
 
     // Optional AS OF SYSTEM TIME <number>.
     let mut as_of: Option<u64> = None;
+    if cur < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As)) {
         cur = cur + 1;
         if cur >= toks.len() {
             return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::Keyword(Keyword::Of)) {
             return (None, begin_pos, Some(ParseError::ExpectedToken(
                 Token::Keyword(Keyword::Of),
@@ -1313,6 +1367,7 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
         if cur >= toks.len() {
             return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::Keyword(Keyword::System)) {
             return (None, begin_pos, Some(ParseError::ExpectedToken(
                 Token::Keyword(Keyword::System),
@@ -1323,6 +1378,7 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
         if cur >= toks.len() {
             return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::Keyword(Keyword::Time)) {
             return (None, begin_pos, Some(ParseError::ExpectedToken(
                 Token::Keyword(Keyword::Time),
@@ -1333,6 +1389,7 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
         if cur >= toks.len() {
             return (None, begin_pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         match &toks[cur] {
             Token::Number(n) => match verified_integer::parse_u64(n.as_slice()) {
                 Some(version) => {

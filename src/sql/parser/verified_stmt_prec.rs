@@ -90,4 +90,119 @@ pub open spec fn sparse_control_delete(input: Seq<TokenView>) -> (Option<SStmt>,
     }
 }
 
+// ===========================================================================
+// DROP  (spec twin of `verified_control::parse_drop_at`)
+//
+// `input` is the suffix just past `DROP`. Grammar: `TABLE [IF EXISTS] <ident>`.
+// ===========================================================================
+
+/// `TABLE [IF EXISTS] <ident>`, with `input` positioned just past `DROP`.
+pub open spec fn sparse_control_drop(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::Table) {
+        (None, input)
+    } else {
+        // Optional IF EXISTS. `IF` present but not followed by `EXISTS` errors.
+        let has_if = input.len() >= 2 && input[1] == TokenView::Keyword(Keyword::If);
+        let has_if_exists = input.len() >= 3
+            && input[1] == TokenView::Keyword(Keyword::If)
+            && input[2] == TokenView::Keyword(Keyword::Exists);
+        if has_if && !has_if_exists {
+            (None, input)
+        } else {
+            let if_exists = has_if_exists;
+            let r = if has_if_exists {
+                input.drop_first().drop_first().drop_first()
+            } else {
+                input.drop_first()
+            };
+            if r.len() < 1 {
+                (None, input)
+            } else {
+                match r[0] {
+                    TokenView::Ident(name) => (
+                        Some(SStmt::DropTable { name, if_exists }),
+                        r.drop_first(),
+                    ),
+                    _ => (None, input),
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// BEGIN  (spec twin of `verified_control::parse_begin_at`)
+//
+// `input` is the suffix just past `BEGIN`. Grammar: `[TRANSACTION]
+// [READ ONLY | READ WRITE] [AS OF SYSTEM TIME <number>]`. Note this differs
+// from `verified_stmt::sparse_begin`, which omits TRANSACTION and READ WRITE.
+// ===========================================================================
+
+/// `[TRANSACTION] [READ ONLY|WRITE] [AS OF SYSTEM TIME <num>]`, past `BEGIN`.
+pub open spec fn sparse_control_begin(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    // Optional TRANSACTION.
+    let r0 = if input.len() >= 1 && input[0] == TokenView::Keyword(Keyword::Transaction) {
+        input.drop_first()
+    } else {
+        input
+    };
+    // Optional READ ONLY / READ WRITE.
+    let read_res: Option<(bool, Seq<TokenView>)> =
+        if r0.len() >= 1 && r0[0] == TokenView::Keyword(Keyword::Read) {
+            let r1 = r0.drop_first();
+            if r1.len() < 1 {
+                None
+            } else if r1[0] == TokenView::Keyword(Keyword::Only) {
+                Some((true, r1.drop_first()))
+            } else if r1[0] == TokenView::Keyword(Keyword::Write) {
+                Some((false, r1.drop_first()))
+            } else {
+                None
+            }
+        } else {
+            Some((false, r0))
+        };
+    match read_res {
+        None => (None, input),
+        Some((read_only, r2)) => {
+            // Optional AS OF SYSTEM TIME <number>.
+            if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::As) {
+                let r3 = r2.drop_first();
+                if r3.len() < 1 || r3[0] != TokenView::Keyword(Keyword::Of) {
+                    (None, input)
+                } else {
+                    let r4 = r3.drop_first();
+                    if r4.len() < 1 || r4[0] != TokenView::Keyword(Keyword::System) {
+                        (None, input)
+                    } else {
+                        let r5 = r4.drop_first();
+                        if r5.len() < 1 || r5[0] != TokenView::Keyword(Keyword::Time) {
+                            (None, input)
+                        } else {
+                            let r6 = r5.drop_first();
+                            if r6.len() < 1 {
+                                (None, input)
+                            } else {
+                                match r6[0] {
+                                    TokenView::Number(bytes) =>
+                                        match super::verified_integer::parse_digits_spec(bytes) {
+                                            Some(version) => (
+                                                Some(SStmt::Begin { read_only, as_of: Some(version) }),
+                                                r6.drop_first(),
+                                            ),
+                                            None => (None, input),
+                                        },
+                                    _ => (None, input),
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                (Some(SStmt::Begin { read_only, as_of: None }), r2)
+            }
+        },
+    }
+}
+
 } // verus!
