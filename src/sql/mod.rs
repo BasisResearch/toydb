@@ -207,6 +207,11 @@ mod tests {
             let input = &command.name;
             let mut tags = context.tags.clone();
 
+            // Differential-test the verified-parser cutover against every SQL
+            // statement the suite exercises: assert the legacy and
+            // verified-path parsers agree (identical AST, or both reject).
+            super::parser::differential::check_statement(input);
+
             // Output the plan if requested.
             if tags.remove("plan") {
                 let ast = Parser::parse(input)?;
@@ -316,6 +321,10 @@ mod tests {
             }
             let input = &command.name;
             let mut tags = context.tags.clone();
+
+            // Differential-test the verified-parser cutover against every
+            // expression the suite exercises.
+            super::parser::differential::check_expression(input);
 
             // Parse and build the expression.
             let ast = Parser::parse_expr(input)?;
