@@ -577,4 +577,480 @@ pub proof fn lemma_group_list_last(cur: Seq<TokenView>, e: SExpr, r: Seq<TokenVi
 {
 }
 
+// ===========================================================================
+// CREATE TABLE  (spec twins of `verified_control::parse_create_column_at` and
+// `parse_create_at`).
+//
+// Grammar (`input` positioned just past `CREATE`):
+//   `TABLE <ident> ( <column> (, <column>)* )`
+// where a `<column>` is `<name> <datatype> <constraint>*` and each
+// `<constraint>` is one of the keyword-led clauses `PRIMARY KEY`, `NULL`,
+// `NOT NULL`, `DEFAULT <expr>`, `UNIQUE`, `INDEX`, `REFERENCES <ident>`, parsed
+// in *any order* by a loop that ends at the first non-keyword token. `DEFAULT`'s
+// expression position is `sparse_prec` at the fuel the exec code passes
+// (`2 * suffix.len() + 3`). Unlike `verified_stmt::sparse_column`, this mirror
+// (a) accepts constraints in any order, and (b) uses the precedence grammar for
+// `DEFAULT`, matching the live parser exactly.
+// ===========================================================================
+
+/// The datatype a column-definition keyword denotes, mirroring the `match` in
+/// `parse_create_column_at` (with all the accepted aliases). `None` for any
+/// token that does not begin a datatype.
+pub open spec fn parse_column_datatype_kw(t: TokenView) -> Option<DataType> {
+    match t {
+        TokenView::Keyword(Keyword::Bool) => Some(DataType::Boolean),
+        TokenView::Keyword(Keyword::Boolean) => Some(DataType::Boolean),
+        TokenView::Keyword(Keyword::Float) => Some(DataType::Float),
+        TokenView::Keyword(Keyword::Double) => Some(DataType::Float),
+        TokenView::Keyword(Keyword::Int) => Some(DataType::Integer),
+        TokenView::Keyword(Keyword::Integer) => Some(DataType::Integer),
+        TokenView::Keyword(Keyword::String) => Some(DataType::String),
+        TokenView::Keyword(Keyword::Text) => Some(DataType::String),
+        TokenView::Keyword(Keyword::Varchar) => Some(DataType::String),
+        _ => None,
+    }
+}
+
+/// The mutable constraint accumulator threaded through the column loop: the six
+/// constraint fields of `SColumn` (name and datatype are fixed once parsed).
+pub struct ColAcc {
+    pub primary_key: bool,
+    pub nullable: Option<bool>,
+    pub default: Option<SExpr>,
+    pub unique: bool,
+    pub index: bool,
+    pub references: Option<String>,
+}
+
+/// Assemble the finished `SColumn` from the fixed name/datatype and the
+/// constraint accumulator.
+pub open spec fn col_from_acc(name: String, datatype: DataType, acc: ColAcc) -> SColumn {
+    SColumn {
+        name,
+        datatype,
+        primary_key: acc.primary_key,
+        nullable: acc.nullable,
+        default: acc.default,
+        unique: acc.unique,
+        index: acc.index,
+        references: acc.references,
+    }
+}
+
+/// Spec twin of the constraint loop in `parse_create_column_at`. `input` is the
+/// suffix at the current loop position (past name + datatype and any constraints
+/// already folded into `acc`); `name` is carried for the finished column. On the
+/// first non-keyword token (or EOF) the loop stops and returns
+/// `(Some(col_from_acc(...)), input)`; a malformed constraint rejects with
+/// `(None, input)` where `input` is *this* suffix (the exec code returns `pos`,
+/// but every reject unwinds all the way up to `parse_create_column_at`'s `pos` —
+/// this local reject is lifted to the column's `pos` by the caller-side proof,
+/// matching how the list bridges route rejection through `whole`).
+///
+/// Terminates on `input.len()`: every accepted constraint drops at least the
+/// leading keyword (and `DEFAULT` never grows its input, by `lemma_prec_slen`),
+/// so the recursive suffix is strictly shorter.
+pub open spec fn sparse_control_col_constraints(
+    input: Seq<TokenView>,
+    name: String,
+    datatype: DataType,
+    acc: ColAcc,
+) -> (Option<SColumn>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_col_constraints_decreases
+{
+    if input.len() < 1 {
+        (Some(col_from_acc(name, datatype, acc)), input)
+    } else {
+        match input[0] {
+            TokenView::Keyword(k) => {
+                let r = input.drop_first();
+                if k == Keyword::Primary {
+                    if r.len() < 1 || r[0] != TokenView::Keyword(Keyword::Key) {
+                        (None, input)
+                    } else {
+                        sparse_control_col_constraints(
+                            r.drop_first(), name, datatype,
+                            ColAcc { primary_key: true, ..acc })
+                    }
+                } else if k == Keyword::Null {
+                    if acc.nullable is Some {
+                        (None, input)
+                    } else {
+                        sparse_control_col_constraints(
+                            r, name, datatype,
+                            ColAcc { nullable: Some(true), ..acc })
+                    }
+                } else if k == Keyword::Not {
+                    if r.len() < 1 || r[0] != TokenView::Keyword(Keyword::Null) {
+                        (None, input)
+                    } else if acc.nullable is Some {
+                        (None, input)
+                    } else {
+                        sparse_control_col_constraints(
+                            r.drop_first(), name, datatype,
+                            ColAcc { nullable: Some(false), ..acc })
+                    }
+                } else if k == Keyword::Default {
+                    match sparse_prec(r, 0, expr_fuel(r)) {
+                        (Some(e), r6) => sparse_control_col_constraints(
+                            r6, name, datatype,
+                            ColAcc { default: Some(e), ..acc }),
+                        (None, _) => (None, input),
+                    }
+                } else if k == Keyword::Unique {
+                    sparse_control_col_constraints(
+                        r, name, datatype, ColAcc { unique: true, ..acc })
+                } else if k == Keyword::Index {
+                    sparse_control_col_constraints(
+                        r, name, datatype, ColAcc { index: true, ..acc })
+                } else if k == Keyword::References {
+                    if r.len() < 1 {
+                        (None, input)
+                    } else {
+                        match r[0] {
+                            TokenView::Ident(n) => sparse_control_col_constraints(
+                                r.drop_first(), name, datatype,
+                                ColAcc { references: Some(n), ..acc }),
+                            _ => (None, input),
+                        }
+                    }
+                } else {
+                    (None, input)
+                }
+            },
+            // Non-keyword token ends the column definition.
+            _ => (Some(col_from_acc(name, datatype, acc)), input),
+        }
+    }
+}
+
+/// Termination witness for `sparse_control_col_constraints`: every recursive
+/// suffix is strictly shorter than `input`. All arms drop at least the leading
+/// keyword; `DEFAULT` recurses on `sparse_prec`'s remainder, which never exceeds
+/// `r.len() < input.len()` (`lemma_prec_slen`).
+#[via_fn]
+proof fn sparse_control_col_constraints_decreases(
+    input: Seq<TokenView>,
+    name: String,
+    datatype: DataType,
+    acc: ColAcc,
+) {
+    if input.len() >= 1 {
+        let r = input.drop_first();
+        verified_precedence::lemma_prec_slen(r, 0, expr_fuel(r));
+    }
+}
+
+/// View of an optional default expression: `Some(view_expr(e))` / `None`.
+/// Used to relate the exec `Option<ast::Expression>` default local to the
+/// spec-level `Option<SExpr>` in `ColAcc` without a by-value `match` (which
+/// would move the non-`Copy` expression).
+pub open spec fn opt_view_expr(d: Option<ast::Expression>) -> Option<SExpr> {
+    match d {
+        Some(e) => Some(verified_roundtrip::view_expr(e)),
+        None => None,
+    }
+}
+
+/// The empty (freshly-initialised) constraint accumulator, matching the exec
+/// loop's locals before the first iteration.
+pub open spec fn col_acc_empty() -> ColAcc {
+    ColAcc {
+        primary_key: false,
+        nullable: None,
+        default: None,
+        unique: false,
+        index: false,
+        references: None,
+    }
+}
+
+/// Spec twin of `parse_create_column_at`. `input` is the suffix at the column's
+/// starting position. Grammar: `<name:ident> <datatype:kw> <constraint>*`.
+pub open spec fn sparse_control_column(input: Seq<TokenView>) -> (Option<SColumn>, Seq<TokenView>) {
+    if input.len() < 1 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                let r0 = input.drop_first();
+                if r0.len() < 1 {
+                    (None, input)
+                } else {
+                    match parse_column_datatype_kw(r0[0]) {
+                        Some(datatype) => {
+                            let r1 = r0.drop_first();
+                            match sparse_control_col_constraints(r1, name, datatype, col_acc_empty()) {
+                                (Some(c), rest) => (Some(c), rest),
+                                (None, _) => (None, input),
+                            }
+                        },
+                        None => (None, input),
+                    }
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+/// One-or-more comma-separated column definitions, terminated by the first token
+/// that is not a comma. Mirrors the column loop in `parse_create_at`. Recurses on
+/// `input.len()`: each accepted column consumes at least its name + datatype
+/// (`sparse_control_column` strictly advances on `Some`), and the comma step
+/// drops one more.
+pub open spec fn sparse_control_column_list(input: Seq<TokenView>)
+    -> (Option<Seq<SColumn>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_column_list_decreases
+{
+    match sparse_control_column(input) {
+        (Some(c), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_column_list(r.drop_first()) {
+                    (Some(more), r2) => (Some(seq![c] + more), r2),
+                    (None, _) => (None, input),
+                }
+            } else {
+                (Some(seq![c]), r)
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// Termination witness for `sparse_control_column_list`: `sparse_control_column`
+/// strictly advances on `Some` and never grows its input, so `r.drop_first()`
+/// (past the comma) is strictly shorter than `input`.
+#[via_fn]
+proof fn sparse_control_column_list_decreases(input: Seq<TokenView>) {
+    lemma_control_column_slen(input);
+}
+
+/// `sparse_control_column` never grows its input, and strictly shrinks it on a
+/// `Some` result (a column consumes at least its name and datatype). Mirrors
+/// `parse_create_column_at`'s `r.0 is Some ==> pos < r.1` postcondition.
+pub proof fn lemma_control_column_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_column(input).1.len() <= input.len(),
+        sparse_control_column(input).0 is Some ==> sparse_control_column(input).1.len() < input.len(),
+{
+    if input.len() >= 1 {
+        match input[0] {
+            TokenView::Ident(name) => {
+                let r0 = input.drop_first();
+                if r0.len() >= 1 {
+                    match parse_column_datatype_kw(r0[0]) {
+                        Some(datatype) => {
+                            let r1 = r0.drop_first();
+                            lemma_col_constraints_slen(r1, name, datatype, col_acc_empty());
+                        },
+                        None => {},
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// `sparse_control_col_constraints` never grows its input suffix. Used to show
+/// the whole column strictly advances.
+pub proof fn lemma_col_constraints_slen(
+    input: Seq<TokenView>,
+    name: String,
+    datatype: DataType,
+    acc: ColAcc,
+)
+    ensures
+        sparse_control_col_constraints(input, name, datatype, acc).1.len() <= input.len(),
+    decreases input.len(),
+{
+    if input.len() >= 1 {
+        match input[0] {
+            TokenView::Keyword(k) => {
+                let r = input.drop_first();
+                if k == Keyword::Primary {
+                    if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Key) {
+                        lemma_col_constraints_slen(r.drop_first(), name, datatype,
+                            ColAcc { primary_key: true, ..acc });
+                    }
+                } else if k == Keyword::Null {
+                    if !(acc.nullable is Some) {
+                        lemma_col_constraints_slen(r, name, datatype,
+                            ColAcc { nullable: Some(true), ..acc });
+                    }
+                } else if k == Keyword::Not {
+                    if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Null) && !(acc.nullable is Some) {
+                        lemma_col_constraints_slen(r.drop_first(), name, datatype,
+                            ColAcc { nullable: Some(false), ..acc });
+                    }
+                } else if k == Keyword::Default {
+                    verified_precedence::lemma_prec_slen(r, 0, expr_fuel(r));
+                    match sparse_prec(r, 0, expr_fuel(r)) {
+                        (Some(e), r6) => lemma_col_constraints_slen(r6, name, datatype,
+                            ColAcc { default: Some(e), ..acc }),
+                        (None, _) => {},
+                    }
+                } else if k == Keyword::Unique {
+                    lemma_col_constraints_slen(r, name, datatype, ColAcc { unique: true, ..acc });
+                } else if k == Keyword::Index {
+                    lemma_col_constraints_slen(r, name, datatype, ColAcc { index: true, ..acc });
+                } else if k == Keyword::References {
+                    if r.len() >= 1 {
+                        match r[0] {
+                            TokenView::Ident(n) => lemma_col_constraints_slen(r.drop_first(), name, datatype,
+                                ColAcc { references: Some(n), ..acc }),
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Prepend already-consumed `done` columns onto a tail column-list parse,
+/// routing `whole` through on rejection. Mirrors `group_list_prepend`.
+pub open spec fn column_list_prepend(
+    done: Seq<SColumn>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<SColumn>>, Seq<TokenView>),
+) -> (Option<Seq<SColumn>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// `verified_stmt::view_columns` distributes over sequence concatenation.
+pub proof fn lemma_view_columns_append(
+    a: Seq<ast::Column>,
+    b: Seq<ast::Column>,
+)
+    ensures
+        verified_stmt::view_columns(a + b)
+            == verified_stmt::view_columns(a) + verified_stmt::view_columns(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_stmt::view_columns, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_columns_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-item view: `view_columns(seq![c]) == seq![view_column(c)]`.
+pub proof fn lemma_view_columns_single(c: ast::Column)
+    ensures
+        verified_stmt::view_columns(seq![c]) == seq![verified_stmt::view_column(c)],
+{
+    reveal_with_fuel(verified_stmt::view_columns, 2);
+    let s = seq![c];
+    assert(s.len() == 1);
+    assert(s[0] == c);
+    assert(s.drop_first() =~= Seq::<ast::Column>::empty());
+    assert(verified_stmt::view_columns(s.drop_first()) =~= Seq::<SColumn>::empty());
+    assert(verified_stmt::view_columns(s) =~= seq![verified_stmt::view_column(c)]);
+}
+
+/// One-level unfold of `sparse_control_column_list(cur)` when a comma follows the
+/// head column `c`: rewrites to prepending `[c]` and recursing at the post-comma
+/// suffix. Mirrors `lemma_group_list_step`.
+pub proof fn lemma_column_list_step(cur: Seq<TokenView>, c: SColumn, r: Seq<TokenView>)
+    requires
+        sparse_control_column(cur) == (Some(c), r),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_column_list(cur)
+            == column_list_prepend(seq![c], cur, sparse_control_column_list(r.drop_first())),
+{
+    match sparse_control_column_list(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_column_list(cur) == (Some(seq![c] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_column_list(cur) == (None::<Seq<SColumn>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more column.
+/// Pure `column_list_prepend` algebra. Mirrors `lemma_group_list_resume_step`.
+pub proof fn lemma_column_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<SColumn>,
+    sc: SColumn,
+    whole: (Option<Seq<SColumn>>, Seq<TokenView>),
+)
+    requires
+        whole == column_list_prepend(done, ls, sparse_control_column_list(cur)),
+        sparse_control_column_list(cur)
+            == column_list_prepend(seq![sc], cur, sparse_control_column_list(cur1)),
+    ensures
+        whole == column_list_prepend(done + seq![sc], ls, sparse_control_column_list(cur1)),
+{
+    match sparse_control_column_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![sc] + more) == (done + seq![sc]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head column, so the list is the single item.
+pub proof fn lemma_column_list_last(cur: Seq<TokenView>, c: SColumn, r: Seq<TokenView>)
+    requires
+        sparse_control_column(cur) == (Some(c), r),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_column_list(cur) == (Some(seq![c]), r),
+{
+}
+
+/// Spec twin of `parse_create_at`. `input` is the suffix just past `CREATE`.
+/// Grammar: `TABLE <ident> ( <column-list> )`.
+pub open spec fn sparse_control_create(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::Table) {
+        (None, input)
+    } else {
+        let r0 = input.drop_first();
+        if r0.len() < 1 {
+            (None, input)
+        } else {
+            match r0[0] {
+                TokenView::Ident(name) => {
+                    let r1 = r0.drop_first();
+                    if r1.len() < 1 || r1[0] != TokenView::OpenParen {
+                        (None, input)
+                    } else {
+                        let r2 = r1.drop_first();
+                        match sparse_control_column_list(r2) {
+                            (Some(cols), r3) => {
+                                if r3.len() >= 1 && r3[0] == TokenView::CloseParen {
+                                    (Some(SStmt::CreateTable { name, columns: cols }), r3.drop_first())
+                                } else {
+                                    (None, input)
+                                }
+                            },
+                            (None, _) => (None, input),
+                        }
+                    }
+                },
+                _ => (None, input),
+            }
+        }
+    }
+}
+
 } // verus!
