@@ -45,14 +45,15 @@ impl Parser {
         //   * a *functional* specification (refinement to the `sparse_prec`
         //     precedence-climbing model) at the expression level, and — as of
         //     phase 2 (2026-08-31) — on a subset of the statement clause
-        //     parsers: `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, and
-        //     `parse_order_by_at` refine the `sparse_control_*` twins in
-        //     `verified_stmt_prec` up to `view_stmt` / `view_order_list`;
+        //     parsers: `parse_delete_at`, `parse_drop_at`, `parse_begin_at`,
+        //     `parse_order_by_at`, and `parse_group_by_at` refine the
+        //     `sparse_control_*` twins in `verified_stmt_prec` up to `view_stmt`
+        //     / `view_order_list` / `view_args`;
         //   * print/parse round-trip only on the fully-parenthesised range of
         //     the printer (see `verified_roundtrip`);
         //   * the top-level statement dispatch (`parse_control_at`) and the
-        //     remaining clause parsers (SELECT list, FROM join tree, GROUP BY,
-        //     INSERT rows, UPDATE assignments, CREATE columns) still have no
+        //     remaining clause parsers (SELECT list, FROM join tree, INSERT
+        //     rows, UPDATE assignments, CREATE columns, EXPLAIN) still have no
         //     functional spec — that they build the intended AST is pinned only
         //     by the goldenscript suite and the (test-only) differential harness
         //     against the legacy oracle.

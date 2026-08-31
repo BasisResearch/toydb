@@ -23,16 +23,17 @@
 //! parsers additionally carry a *full refinement* against the spec twins in
 //! `verified_stmt_prec`, whose expression positions are `sparse_prec` (unlike
 //! `verified_stmt::sparse_stmt`, which uses the fully-parenthesised grammar).
-//! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, and `parse_order_by_at`
-//! are proven to produce exactly the AST their spec twin
-//! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by`) computes, up to
-//! `verified_stmt::view_stmt` / `view_order_list`, with the leftover-token
-//! stream pinned — so e.g. mis-defaulting an `ORDER BY` direction or dropping
-//! `IF EXISTS` now breaks verification, not just the goldenscript suite. The
-//! remaining dispatch (`parse_control_at`) and clause parsers (SELECT list, FROM
-//! join tree, GROUP BY, INSERT rows, UPDATE assignments, CREATE columns) still
-//! carry only the no-panic/terminate/error-on-reject contract; their accepted
-//! ASTs and rejection errors are pinned by the goldenscript suite. Embedded
+//! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, `parse_order_by_at`,
+//! and `parse_group_by_at` are proven to produce exactly the AST their spec twin
+//! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` / `_group_by`)
+//! computes, up to `verified_stmt::view_stmt` / `view_order_list` /
+//! `verified_roundtrip::view_args`, with the leftover-token stream pinned — so
+//! e.g. mis-defaulting an `ORDER BY` direction or dropping `IF EXISTS` now breaks
+//! verification, not just the goldenscript suite. The remaining dispatch
+//! (`parse_control_at`) and clause parsers (SELECT list, FROM join tree, INSERT
+//! rows, UPDATE assignments, CREATE columns, EXPLAIN) still carry only the
+//! no-panic/terminate/error-on-reject contract; their accepted ASTs and
+//! rejection errors are pinned by the goldenscript suite. Embedded
 //! expressions are parsed by `verified_precedence`, which additionally carries a
 //! print/parse roundtrip proof. On rejection each parser returns a structured
 //! [`super::parse_error::ParseError`], rendered to the production error string.
