@@ -47,9 +47,16 @@ suite). New strategy and progress:
   concrete behaviour is verified: Verus proves no-panic / no-overflow /
   termination across the whole grammar, a functional spec (refinement to
   `sparse_prec`) at the *expression* level only, and print/parse round-trip only
-  on the fully-parenthesised range. The statement grammar has no functional spec;
-  its concrete behaviour is pinned only by the goldenscripts and the restored
-  differential oracle.
+  on the fully-parenthesised range. The statement grammar is **partially**
+  functionally specified as of 2026-08-31: `verified_stmt_prec` carries spec
+  twins (`sparse_control_*`) whose expression positions are `sparse_prec`, and
+  `parse_delete_at` / `parse_drop_at` / `parse_begin_at` / `parse_order_by_at`
+  are proven to refine their twins up to `view_stmt` / `view_order_list` (so
+  those clauses' concrete AST *is* verified, not just goldenscript-pinned). The
+  top-level dispatch `parse_control_at` and the remaining clause parsers
+  (SELECT list, FROM join tree, GROUP BY, INSERT rows, UPDATE assignments,
+  CREATE columns) still have no functional spec; their concrete behaviour is
+  pinned only by the goldenscripts and the restored differential oracle.
 
 - **Phase 4 (error production + legacy retirement) — COMPLETE (2026-08-29).** The
   verified parser now produces its own rejection errors and the legacy

@@ -43,12 +43,19 @@ impl Parser {
         //   * no panic, no arithmetic overflow, and termination — everywhere,
         //     across the whole statement + expression grammar;
         //   * a *functional* specification (refinement to the `sparse_prec`
-        //     precedence-climbing model) only at the expression level;
+        //     precedence-climbing model) at the expression level, and — as of
+        //     phase 2 (2026-08-31) — on a subset of the statement clause
+        //     parsers: `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, and
+        //     `parse_order_by_at` refine the `sparse_control_*` twins in
+        //     `verified_stmt_prec` up to `view_stmt` / `view_order_list`;
         //   * print/parse round-trip only on the fully-parenthesised range of
         //     the printer (see `verified_roundtrip`);
-        //   * nothing functional about the statement grammar itself — that it
-        //     builds the intended AST is pinned only by the goldenscript suite
-        //     and the (test-only) differential harness against the legacy oracle.
+        //   * the top-level statement dispatch (`parse_control_at`) and the
+        //     remaining clause parsers (SELECT list, FROM join tree, GROUP BY,
+        //     INSERT rows, UPDATE assignments, CREATE columns) still have no
+        //     functional spec — that they build the intended AST is pinned only
+        //     by the goldenscript suite and the (test-only) differential harness
+        //     against the legacy oracle.
         let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
