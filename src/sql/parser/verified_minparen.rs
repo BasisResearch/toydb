@@ -29,12 +29,29 @@
 //!
 //! # Status
 //!
-//! Task 1 of the phase (the printer + independent precedence table +
-//! `tables_agree`) is complete and verified here. The spec-level print/parse
-//! roundtrip over `sparse_prec` (task 2) and its lift to the live parser
-//! (task 3) are the intended continuation; see the phase report for the
-//! precise remaining proof obligation (the left-associative precedence-climbing
-//! fold and its inner-operand inertness threading).
+//! Tasks 1-3 of the phase are complete and verified here:
+//!
+//! - Task 1: the spec printer (`sprint_min` / `sprint_body`), the independent
+//!   precedence table (`bin_prec` / `bin_assoc` / `pre_prec`), `tables_agree`,
+//!   and the exec twin `print_min_expr` (a real `Vec<Token>` printer whose
+//!   token view refines `sprint_min(view_expr(e), 0)`).
+//! - Task 2: the spec-level print/parse roundtrip over `sparse_prec`
+//!   (`min_roundtrip`): `sparse_prec(sprint_min(e, 0), 0, fuel) == (Some(e),
+//!   empty)`. Its proof is the left-associative precedence-climbing fold
+//!   (`lemma_body_decomp` / `lemma_fold_step` / `lemma_run` / `lemma_bin_lhs`)
+//!   with continuation inertness threaded via the `inert` predicate and its
+//!   halting/monotonicity lemmas.
+//! - Task 3: the live-parser lift (`min_roundtrip_live`): the production
+//!   `verified_precedence::parse_expression_at` recovers `e` (up to
+//!   `view_expr`) from `print_min_expr(e)`, consuming every token.
+//!
+//! The residual — a CONSISTENT swap of all three precedence encodings still
+//! round-trips — is documented at the `min_roundtrip` site, along with the
+//! external guards (the `op_precedence` goldenscripts and the phase-0
+//! differential harness).
+//!
+//! Task 4 (a statement-level corollary) is intentionally deferred to a
+//! follow-up; it depends on parallel phase-2 work.
 
 // Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
@@ -2146,6 +2163,453 @@ pub proof fn min_roundtrip(e: SExpr, fuel: nat)
     boundary_inert(tail, 0);
     assert(sprint_min(e, 0) + tail =~= sprint_min(e, 0));
     lemma_min(e, 0, tail, fuel);
+}
+
+// ===========================================================================
+// Task 1 remainder — executable minimal-parenthesisation printer.
+//
+// `print_min_expr` produces a real `Vec<Token>` and is verified to refine
+// `sprint_min(view_expr(e), 0)` at the token-view level (`print_min_at` carries
+// the general `ctx` statement). `min_roundtrip_live` (task 3) chains it with
+// `verified_precedence::parse_expression_at`'s refinement of `sparse_prec`.
+// ===========================================================================
+
+/// Exec precedence of a node's top operator, refining `prec_min(view_expr(*e))`.
+pub fn prec_min_exec(e: &ast::Expression) -> (r: u8)
+    ensures
+        r == prec_min(super::verified_roundtrip::view_expr(*e)),
+{
+    reveal_with_fuel(super::verified_roundtrip::view_expr, 2);
+    match e {
+        ast::Expression::All => 11,
+        ast::Expression::Column(_, _) => 11,
+        ast::Expression::Literal(_) => 11,
+        ast::Expression::Function(_, _) => 11,
+        ast::Expression::Operator(op) => match op {
+            ast::Operator::Not(_) => 3,
+            ast::Operator::Identity(_) => 10,
+            ast::Operator::Negate(_) => 10,
+            ast::Operator::Factorial(_) => 9,
+            ast::Operator::Is(_, _) => 4,
+            ast::Operator::And(_, _) => 2,
+            ast::Operator::Or(_, _) => 1,
+            ast::Operator::Equal(_, _) => 4,
+            ast::Operator::NotEqual(_, _) => 4,
+            ast::Operator::Like(_, _) => 4,
+            ast::Operator::GreaterThan(_, _) => 5,
+            ast::Operator::GreaterThanOrEqual(_, _) => 5,
+            ast::Operator::LessThan(_, _) => 5,
+            ast::Operator::LessThanOrEqual(_, _) => 5,
+            ast::Operator::Add(_, _) => 6,
+            ast::Operator::Subtract(_, _) => 6,
+            ast::Operator::Multiply(_, _) => 7,
+            ast::Operator::Divide(_, _) => 7,
+            ast::Operator::Remainder(_, _) => 7,
+            ast::Operator::Exponentiate(_, _) => 8,
+        },
+    }
+}
+
+/// Wrap a token vector in parentheses, tracking the token view.
+pub fn wrap_parens(inner: Vec<super::Token>) -> (r: Vec<super::Token>)
+    ensures
+        verified_production::token_views(r@)
+            == seq![TokenView::OpenParen] + verified_production::token_views(inner@)
+                + seq![TokenView::CloseParen],
+{
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(super::Token::OpenParen);
+    let ghost open = r@;
+    let mut inner = inner;
+    let ghost inner_old = inner@;
+    r.append(&mut inner);
+    r.push(super::Token::CloseParen);
+    proof {
+        assert(open.drop_first() =~= Seq::<super::Token>::empty());
+        assert(r@ =~= open + inner_old + seq![super::Token::CloseParen]);
+        verified_production::token_views_concat(open + inner_old, seq![super::Token::CloseParen]);
+        verified_production::token_views_concat(open, inner_old);
+        assert(verified_production::token_views(open) =~= seq![TokenView::OpenParen]);
+        assert(verified_production::token_views(seq![super::Token::CloseParen])
+            =~= seq![TokenView::CloseParen]);
+    }
+    r
+}
+
+/// Exec minimal-parenthesisation printer at a context, refining
+/// `sprint_min(view_expr(*e), ctx)`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20000)]
+pub fn print_min_at(e: &ast::Expression, ctx: u8) -> (r: Vec<super::Token>)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+    ensures
+        verified_production::token_views(r@)
+            == sprint_min(super::verified_roundtrip::view_expr(*e), ctx),
+    decreases super::verified_roundtrip::sdepth(super::verified_roundtrip::view_expr(*e)), 2nat,
+{
+    reveal_with_fuel(sprint_min, 1);
+    let body = print_min_body(e);
+    let pm = prec_min_exec(e);
+    if pm < ctx {
+        wrap_parens(body)
+    } else {
+        body
+    }
+}
+
+/// Exec printer of a node body (children at their associativity-aware contexts),
+/// refining `sprint_body(view_expr(*e))`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30000)]
+pub fn print_min_body(e: &ast::Expression) -> (r: Vec<super::Token>)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+    ensures
+        verified_production::token_views(r@) == sprint_body(super::verified_roundtrip::view_expr(*e)),
+    decreases super::verified_roundtrip::sdepth(super::verified_roundtrip::view_expr(*e)), 1nat,
+{
+    reveal(super::verified_roundtrip::printable_se);
+    reveal_with_fuel(sprint_body, 1);
+    reveal_with_fuel(super::verified_roundtrip::view_expr, 2);
+    let ghost se = super::verified_roundtrip::view_expr(*e);
+    match e {
+        ast::Expression::All | ast::Expression::Column(_, _) | ast::Expression::Literal(_)
+        | ast::Expression::Function(_, _) => {
+            // Atom bodies coincide with the canonical printer's atom bodies.
+            print_min_atom(e)
+        },
+        ast::Expression::Operator(op) => {
+            let out = match op {
+                ast::Operator::Not(inner) =>
+                    prepend_tok(super::Token::Keyword(Keyword::Not), print_min_at(&**inner, 3)),
+                ast::Operator::Identity(inner) =>
+                    prepend_tok(super::Token::Plus, print_min_at(&**inner, 10)),
+                ast::Operator::Negate(inner) =>
+                    prepend_tok(super::Token::Minus, print_min_at(&**inner, 10)),
+                ast::Operator::Factorial(inner) =>
+                    append_tok(print_min_at(&**inner, 10), super::Token::Exclamation),
+                ast::Operator::Is(inner, lit) => {
+                    let is_tok = match lit {
+                        ast::Literal::Null => super::Token::Keyword(Keyword::Null),
+                        _ => super::Token::Keyword(Keyword::NaN),
+                    };
+                    append_is(print_min_at(&**inner, 10), is_tok)
+                },
+                // Left-assoc: left at bp, right at bp+1. Right-assoc `^` (assoc 0):
+                // left at bp+1, right at bp.
+                ast::Operator::Or(l, rr) =>
+                    mid_binary(print_min_at(&**l, 1), super::Token::Keyword(Keyword::Or), print_min_at(&**rr, 2)),
+                ast::Operator::And(l, rr) =>
+                    mid_binary(print_min_at(&**l, 2), super::Token::Keyword(Keyword::And), print_min_at(&**rr, 3)),
+                ast::Operator::Equal(l, rr) =>
+                    mid_binary(print_min_at(&**l, 4), super::Token::Equal, print_min_at(&**rr, 5)),
+                ast::Operator::NotEqual(l, rr) =>
+                    mid_binary(print_min_at(&**l, 4), super::Token::NotEqual, print_min_at(&**rr, 5)),
+                ast::Operator::Like(l, rr) =>
+                    mid_binary(print_min_at(&**l, 4), super::Token::Keyword(Keyword::Like), print_min_at(&**rr, 5)),
+                ast::Operator::GreaterThan(l, rr) =>
+                    mid_binary(print_min_at(&**l, 5), super::Token::GreaterThan, print_min_at(&**rr, 6)),
+                ast::Operator::GreaterThanOrEqual(l, rr) =>
+                    mid_binary(print_min_at(&**l, 5), super::Token::GreaterThanOrEqual, print_min_at(&**rr, 6)),
+                ast::Operator::LessThan(l, rr) =>
+                    mid_binary(print_min_at(&**l, 5), super::Token::LessThan, print_min_at(&**rr, 6)),
+                ast::Operator::LessThanOrEqual(l, rr) =>
+                    mid_binary(print_min_at(&**l, 5), super::Token::LessThanOrEqual, print_min_at(&**rr, 6)),
+                ast::Operator::Add(l, rr) =>
+                    mid_binary(print_min_at(&**l, 6), super::Token::Plus, print_min_at(&**rr, 7)),
+                ast::Operator::Subtract(l, rr) =>
+                    mid_binary(print_min_at(&**l, 6), super::Token::Minus, print_min_at(&**rr, 7)),
+                ast::Operator::Multiply(l, rr) =>
+                    mid_binary(print_min_at(&**l, 7), super::Token::Asterisk, print_min_at(&**rr, 8)),
+                ast::Operator::Divide(l, rr) =>
+                    mid_binary(print_min_at(&**l, 7), super::Token::Slash, print_min_at(&**rr, 8)),
+                ast::Operator::Remainder(l, rr) =>
+                    mid_binary(print_min_at(&**l, 7), super::Token::Percent, print_min_at(&**rr, 8)),
+                ast::Operator::Exponentiate(l, rr) =>
+                    mid_binary(print_min_at(&**l, 9), super::Token::Caret, print_min_at(&**rr, 8)),
+            };
+            out
+        },
+    }
+}
+
+/// Exec printer for atom bodies (All / Column / Literal / Function), whose bodies
+/// are identical to the canonical printer. Function arguments use the min-parens
+/// argument printer.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20000)]
+pub fn print_min_atom(e: &ast::Expression) -> (r: Vec<super::Token>)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+        !(e is Operator),
+    ensures
+        verified_production::token_views(r@) == sprint_body(super::verified_roundtrip::view_expr(*e)),
+    decreases super::verified_roundtrip::sdepth(super::verified_roundtrip::view_expr(*e)), 0nat,
+{
+    reveal(super::verified_roundtrip::printable_se);
+    reveal_with_fuel(sprint_body, 1);
+    reveal_with_fuel(super::verified_roundtrip::view_expr, 2);
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r: Vec<super::Token> = Vec::new();
+    match e {
+        ast::Expression::All => {
+            r.push(super::Token::Asterisk);
+            proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+            r
+        },
+        ast::Expression::Column(table, column) => match table {
+            Some(t) => {
+                r.push(super::Token::Ident(t.clone()));
+                r.push(super::Token::Period);
+                r.push(super::Token::Ident(column.clone()));
+                proof {
+                    reveal_with_fuel(verified_production::token_views, 4);
+                    assert(r@.drop_first().drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                }
+                r
+            },
+            None => {
+                r.push(super::Token::Ident(column.clone()));
+                proof { assert(r@.drop_first() =~= Seq::<super::Token>::empty()); }
+                r
+            },
+        },
+        ast::Expression::Literal(l) => super::verified_roundtrip::print_lit_exec(l),
+        ast::Expression::Function(name, args) => {
+            r.push(super::Token::Ident(name.clone()));
+            r.push(super::Token::OpenParen);
+            let ghost head = r@;
+            let mut body = print_min_args_slice(args.as_slice());
+            let ghost body_old = body@;
+            r.append(&mut body);
+            r.push(super::Token::CloseParen);
+            proof {
+                assert(r@ =~= head + body_old + seq![super::Token::CloseParen]);
+                verified_production::token_views_concat(head + body_old, seq![super::Token::CloseParen]);
+                verified_production::token_views_concat(head, body_old);
+                assert(head.drop_first().drop_first() =~= Seq::<super::Token>::empty());
+                assert(verified_production::token_views(head)
+                    =~= seq![TokenView::Ident(*name), TokenView::OpenParen]);
+            }
+            r
+        },
+        _ => { assert(false); Vec::new() },
+    }
+}
+
+/// Exec comma-list printer refining `sprint_min_args(view_args(s@))`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20000)]
+pub fn print_min_args_slice(s: &[ast::Expression]) -> (r: Vec<super::Token>)
+    requires
+        super::verified_roundtrip::all_printable_se(super::verified_roundtrip::view_args(s@)),
+    ensures
+        verified_production::token_views(r@)
+            == sprint_min_args(super::verified_roundtrip::view_args(s@)),
+    decreases super::verified_roundtrip::slist_depth(super::verified_roundtrip::view_args(s@)),
+{
+    reveal_with_fuel(sprint_min_args, 1);
+    reveal_with_fuel(verified_production::token_views, 1);
+    reveal(super::verified_roundtrip::all_printable_se);
+    let ghost va = super::verified_roundtrip::view_args(s@);
+    if s.len() == 0 {
+        let r: Vec<super::Token> = Vec::new();
+        proof { assert(super::verified_roundtrip::view_args(s@) =~= Seq::<SExpr>::empty()); }
+        r
+    } else if s.len() == 1 {
+        proof {
+            super::verified_roundtrip::view_args_step(s@);
+            super::verified_roundtrip::sdepth_positive(super::verified_roundtrip::view_args(s@)[0]);
+            assert(super::verified_roundtrip::view_args(s@.drop_first()) =~= Seq::<SExpr>::empty());
+            assert(sprint_min_args(super::verified_roundtrip::view_args(s@))
+                == sprint_min(super::verified_roundtrip::view_args(s@)[0], 0));
+            super::verified_roundtrip::slist_depth_head_decreases(s@);
+        }
+        print_min_at(&s[0], 0)
+    } else {
+        proof {
+            super::verified_roundtrip::view_args_len(s@);
+            super::verified_roundtrip::view_args_step(s@);
+            super::verified_roundtrip::sdepth_positive(super::verified_roundtrip::view_args(s@)[0]);
+            super::verified_roundtrip::slist_depth_head_decreases(s@);
+            super::verified_roundtrip::slist_depth_tail_decreases(s@);
+        }
+        let mut r = print_min_at(&s[0], 0);
+        let ghost p0 = r@;
+        r.push(super::Token::Comma);
+        let ghost head = r@;
+        let rest = vstd::slice::slice_subrange(s, 1, s.len());
+        proof { assert(rest@ =~= s@.drop_first()); }
+        let mut more = print_min_args_slice(rest);
+        let ghost more_old = more@;
+        r.append(&mut more);
+        proof {
+            reveal_with_fuel(verified_production::token_views, 2);
+            assert(head =~= p0 + seq![super::Token::Comma]);
+            assert(r@ =~= head + more_old);
+            verified_production::token_views_concat(head, more_old);
+            verified_production::token_views_concat(p0, seq![super::Token::Comma]);
+            assert(verified_production::token_views(seq![super::Token::Comma]) =~= seq![TokenView::Comma]);
+            assert(sprint_min_args(super::verified_roundtrip::view_args(s@))
+                =~= sprint_min(super::verified_roundtrip::view_args(s@)[0], 0) + seq![TokenView::Comma]
+                    + sprint_min_args(super::verified_roundtrip::view_args(s@).drop_first()));
+        }
+        r
+    }
+}
+
+/// `[tok] ++ inner`.
+pub fn prepend_tok(tok: super::Token, inner: Vec<super::Token>) -> (r: Vec<super::Token>)
+    ensures
+        verified_production::token_views(r@)
+            == seq![verified_production::token_view(tok)] + verified_production::token_views(inner@),
+{
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r: Vec<super::Token> = Vec::new();
+    r.push(tok);
+    let ghost head = r@;
+    let mut inner = inner;
+    let ghost inner_old = inner@;
+    r.append(&mut inner);
+    proof {
+        assert(r@ =~= head + inner_old);
+        verified_production::token_views_concat(head, inner_old);
+        assert(head.drop_first() =~= Seq::<super::Token>::empty());
+    }
+    r
+}
+
+/// `inner ++ [tok]`.
+pub fn append_tok(inner: Vec<super::Token>, tok: super::Token) -> (r: Vec<super::Token>)
+    ensures
+        verified_production::token_views(r@)
+            == verified_production::token_views(inner@) + seq![verified_production::token_view(tok)],
+{
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r = inner;
+    let ghost inner_old = r@;
+    r.push(tok);
+    proof {
+        assert(r@ =~= inner_old + seq![tok]);
+        verified_production::token_views_concat(inner_old, seq![tok]);
+        assert(verified_production::token_views(seq![tok]) =~= seq![verified_production::token_view(tok)]);
+    }
+    r
+}
+
+/// `inner ++ [IS, is_tok]`.
+pub fn append_is(inner: Vec<super::Token>, is_tok: super::Token) -> (r: Vec<super::Token>)
+    ensures
+        verified_production::token_views(r@)
+            == verified_production::token_views(inner@)
+                + seq![TokenView::Keyword(Keyword::Is), verified_production::token_view(is_tok)],
+{
+    reveal_with_fuel(verified_production::token_views, 3);
+    let mut r = inner;
+    let ghost inner_old = r@;
+    r.push(super::Token::Keyword(Keyword::Is));
+    r.push(is_tok);
+    proof {
+        assert(r@ =~= inner_old + seq![super::Token::Keyword(Keyword::Is), is_tok]);
+        verified_production::token_views_concat(inner_old,
+            seq![super::Token::Keyword(Keyword::Is), is_tok]);
+        assert(seq![super::Token::Keyword(Keyword::Is), is_tok].drop_first().drop_first()
+            =~= Seq::<super::Token>::empty());
+        assert(verified_production::token_view(super::Token::Keyword(Keyword::Is))
+            == TokenView::Keyword(Keyword::Is));
+        assert(verified_production::token_views(seq![super::Token::Keyword(Keyword::Is), is_tok])
+            =~= seq![TokenView::Keyword(Keyword::Is), verified_production::token_view(is_tok)]);
+    }
+    r
+}
+
+/// `left ++ [op] ++ right`.
+pub fn mid_binary(left: Vec<super::Token>, op: super::Token, right: Vec<super::Token>)
+    -> (r: Vec<super::Token>)
+    ensures
+        verified_production::token_views(r@)
+            == verified_production::token_views(left@) + seq![verified_production::token_view(op)]
+                + verified_production::token_views(right@),
+{
+    reveal_with_fuel(verified_production::token_views, 2);
+    let mut r = left;
+    let ghost left_old = r@;
+    r.push(op);
+    let ghost mid = r@;
+    let mut right = right;
+    let ghost right_old = right@;
+    r.append(&mut right);
+    proof {
+        assert(mid =~= left_old + seq![op]);
+        assert(r@ =~= mid + right_old);
+        verified_production::token_views_concat(mid, right_old);
+        verified_production::token_views_concat(left_old, seq![op]);
+        assert(verified_production::token_views(seq![op]) =~= seq![verified_production::token_view(op)]);
+    }
+    r
+}
+
+/// The executable min-parens printer: `print_min_at(e, 0)`. Its token view is
+/// `sprint_min(view_expr(e), 0)` — the spec printer at top-level context.
+pub fn print_min_expr(e: &ast::Expression) -> (r: Vec<super::Token>)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+    ensures
+        verified_production::token_views(r@)
+            == sprint_min(super::verified_roundtrip::view_expr(*e), 0),
+{
+    print_min_at(e, 0)
+}
+
+// ===========================================================================
+// Task 3 — live-parser roundtrip over the executable printer.
+// ===========================================================================
+
+/// The live parser recovers a printable expression from its minimal-
+/// parenthesisation print, up to `view_expr`, consuming all tokens:
+///
+///   parse_expression_at(print_min_expr(e), 0, 0, fuel)
+///       == (Some(e'), print_min_expr(e).len(), None)  with view_expr(e') == view_expr(e).
+///
+/// This lifts `min_roundtrip` (a `sparse_prec` fact) to the production parser
+/// via `verified_precedence::parse_expression_at`'s refinement of `sparse_prec`.
+/// It is the executable, end-to-end statement that the parser's precedence /
+/// associativity table matches the printer's — pinning the table a third time,
+/// against the live code path.
+#[verifier::rlimit(20000)]
+pub fn min_roundtrip_live(e: &ast::Expression, fuel: usize)
+    -> (r: (Option<ast::Expression>, usize, Option<super::parse_error::ParseError>))
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
+        fuel >= 2 * sprint_min(super::verified_roundtrip::view_expr(*e), 0).len() + 3,
+    ensures
+        r.0 is Some,
+        super::verified_roundtrip::view_expr(r.0->Some_0)
+            == super::verified_roundtrip::view_expr(*e),
+        r.1 == sprint_min(super::verified_roundtrip::view_expr(*e), 0).len(),
+{
+    let toks = print_min_expr(e);
+    let ghost se = super::verified_roundtrip::view_expr(*e);
+    proof {
+        super::verified_roundtrip::token_views_len(toks@);
+    }
+    let (opt, pos, err) = verified_precedence::parse_expression_at(&toks, 0, 0, fuel);
+    proof {
+        assert(toks@.subrange(0, toks@.len() as int) =~= toks@);
+        assert(verified_production::token_views(toks@.subrange(0, toks@.len() as int))
+            == sprint_min(se, 0));
+        min_roundtrip(se, fuel as nat);
+        assert(sparse_prec(sprint_min(se, 0), 0, fuel as nat)
+            == (Some(se), Seq::<TokenView>::empty()));
+        assert(opt is Some);
+        assert(super::verified_roundtrip::view_expr(opt->Some_0) == se);
+        super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        assert(verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))
+            == Seq::<TokenView>::empty());
+    }
+    (opt, pos, err)
 }
 
 } // verus!
