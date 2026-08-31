@@ -40,8 +40,16 @@ suite). New strategy and progress:
   + `lemma_prec`, fuel `2*len+3`). `verify.sh` green; `cargo build` clean. Brick
   details below (historical):
 - **Phase 3 (production cutover) — COMPLETE (2026-08-29).** Expressions and every
-  statement kind now run on the verified parser in production. **Legacy fully
-  retired (2026-08-29).**
+  statement kind now run on the verified parser in production. ~~**Legacy fully
+  retired (2026-08-29).**~~ **CORRECTED (Phase 0, 2026-08-31): the legacy parser
+  and differential harness were restored as `#[cfg(test)]` oracles** — see the
+  accuracy note under Phase 4. Running on the verified parser does *not* mean the
+  concrete behaviour is verified: Verus proves no-panic / no-overflow /
+  termination across the whole grammar, a functional spec (refinement to
+  `sparse_prec`) at the *expression* level only, and print/parse round-trip only
+  on the fully-parenthesised range. The statement grammar has no functional spec;
+  its concrete behaviour is pinned only by the goldenscripts and the restored
+  differential oracle.
 
 - **Phase 4 (error production + legacy retirement) — COMPLETE (2026-08-29).** The
   verified parser now produces its own rejection errors and the legacy
@@ -70,6 +78,19 @@ suite). New strategy and progress:
     parser on a few untested malformed corners (e.g. `a IS <bad>` halts + trailing
     error vs erroring inside), since only accept-equivalence + the tested error
     corpus were pinned; every goldenscript-exercised error string matches exactly.
+  - **CORRECTED (Phase 0, 2026-08-31).** The claim above — "then **deleted the
+    legacy parser** … the differential harness … `TokenStream`/`SliceTokenStream`"
+    — was reverted: the legacy recursive-descent parser (`parse_legacy` /
+    `parse_expr_legacy`), the differential harness, and the streaming/slice sources
+    are back as `#[cfg(test)]` oracles, and the goldenscript per-line hooks are
+    restored. Production is unchanged (`parse_control_at` is still the sole prod
+    parser). Reason: the verified parser's contract is only no-panic / termination
+    / error-on-reject plus an *expression-level* functional spec — a precedence
+    swap and a DESC-parses-as-Ascending bug both verify clean, and outside the
+    goldenscripts only the differential oracle catches them. The `a IS <bad>`
+    residual above is now the one explicitly-encoded, accepted error-message
+    exemption in the harness (`is_accepted_error_divergence`). The oracle stays
+    until stronger statement-level specs land (plan phases 2-3).
 
   Historical detail of the earlier (expression + statement) cutover follows.
   - **`Parser::parse_expr` CUT OVER (commit `f25e31b`).** It now parses via

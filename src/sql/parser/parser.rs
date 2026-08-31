@@ -31,9 +31,24 @@ impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        // Buffered stream so `parse_expression` can run the Verus-verified
-        // position-based expression parser at the cursor (the cutover). Statement
-        // keywords and clause structure remain the retained recursive-descent code.
+        // The input is lexed up front into a buffered token vector, and the
+        // Verus-verified concrete parser (`verified_control::parse_control_at`)
+        // runs at the cursor over every statement kind, clause, and expression;
+        // it also produces the rejection error. There is no recursive-descent
+        // fallback in production — the legacy `StreamingParser` methods are
+        // compiled only under `#[cfg(test)]`, as the differential oracle, and
+        // fire solely for the streaming/slice test token sources.
+        //
+        // What Verus actually proves about that parser (do not overstate it):
+        //   * no panic, no arithmetic overflow, and termination — everywhere,
+        //     across the whole statement + expression grammar;
+        //   * a *functional* specification (refinement to the `sparse_prec`
+        //     precedence-climbing model) only at the expression level;
+        //   * print/parse round-trip only on the fully-parenthesised range of
+        //     the printer (see `verified_roundtrip`);
+        //   * nothing functional about the statement grammar itself — that it
+        //     builds the intended AST is pinned only by the goldenscript suite
+        //     and the (test-only) differential harness against the legacy oracle.
         let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
