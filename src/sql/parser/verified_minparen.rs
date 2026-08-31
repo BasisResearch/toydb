@@ -49,6 +49,9 @@ use super::verified_expression::{BinaryTag, UnaryTag};
 use super::verified_production::TokenView;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_roundtrip::{IsLit, SExpr};
+// These are `spec fn`s (erased from non-Verus builds), so the import is gated to
+// Verus compilation; `tables_agree` — the only user — is itself inside `verus!`.
+#[cfg(verus_keep_ghost)]
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_precedence::{binary_assoc_s, binary_prec_s, prefix_prec_s};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
