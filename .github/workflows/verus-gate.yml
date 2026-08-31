@@ -67,4 +67,28 @@ jobs:
       - name: Verify opted-in modules (gating)
         run: |
           ulimit -u 65535 || true
-          ./scripts/verus/verify.sh
+          # Capture the --output-json func-details for the coverage join below;
+          # stdout is pure JSON (verify.sh sends its banner to stderr).
+          ./scripts/verus/verify.sh --output-json > "$RUNNER_TEMP/verus.json"
+
+      # --- verified-coverage gate ---------------------------------------------
+      # Flags any verified EXEC function that the lib test suite never executes
+      # (dynamic lens: cargo-llvm-cov joined against the func-details above). A
+      # committed allowlist (scripts/verus/verified_coverage_allow.txt) carries
+      # the currently-known dead twins, retired in phase 4; anything NEW that is
+      # verified but never run fails the PR. The static (call-graph) lens is
+      # advisory only until a real Verus call graph is wired, so --check uses the
+      # precise dynamic lens and does NOT pass --graph here.
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Measure lib-test coverage
+        run: |
+          cargo llvm-cov test --lib --json \
+            --output-path "$RUNNER_TEMP/llvm-cov.json"
+
+      - name: Gate on verified-but-unexecuted functions
+        run: |
+          python3 scripts/verus/verified_coverage.py --check \
+            --verus-json "$RUNNER_TEMP/verus.json" \
+            --llvm-cov "$RUNNER_TEMP/llvm-cov.json"

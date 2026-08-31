@@ -1,0 +1,72 @@
+# verified_coverage_allow.txt -- known-dead verified exec surface.
+#
+# One key per line, optionally followed by a free-form reason. A key is either a
+# module path (sql::parser::verified_stmt) or a module::function qualifier
+# (sql::parser::verified_roundtrip::parse_expr_exec). A flag is suppressed when
+# its own key OR its module is listed. `#` lines and blanks are ignored.
+#
+# Every entry is a verified twin/helper that neither production nor the lib test
+# suite executes. It is kept (not deleted) until phase 4 ("delete-twins") retires
+# the dead parsers and their oracle. Removing a line here WITHOUT deleting the
+# corresponding code makes `verified_coverage.py --check` fail, which is the
+# intended ratchet.
+#
+# The set below was produced on branch kg/parser-fix-phase-1-coverage from a real
+# `cargo llvm-cov test --lib` run joined against `verify.sh --output-json`
+# func-details; it is exactly the dynamic flag set. Cleared by: phase 4.
+
+# --- wholly-dead modules (every exec function is a twin production never calls) ---
+
+# The full round-trip-proven statement parser. parse_stmt_exec /
+# parse_stmt_full_exec are twins of verified_control::parse_control_at, which is
+# what production actually calls; the ~65 print_*/exec_* helpers only feed them.
+sql::parser::verified_stmt
+
+# The verified lexer. Production lexing goes through the hand-written `Lexer`
+# (super::Lexer::new). The only exec function it borrows is the self-contained
+# scan_symbol_bytes (lexer.rs:556) -- which IS covered, so it is never flagged.
+# Every other exec function here (lex_all_exec, lscan_token_exec,
+# classify_kw_exec, ...) is a dead twin of the hand-written scanner.
+sql::parser::verified_lexer
+
+# The standalone stream-based scanner/parser (next_token / PeekStream / parse_*
+# over &[u8]/&[Token]). Superseded by the verified_precedence + verified_control
+# production path; nothing calls it.
+sql::parser::verified
+
+# --- dead exec functions inside otherwise-live modules (function granularity) ---
+# These modules also carry spec/proof lemmas that production uses, so they are
+# allowlisted per-function, not per-module, to keep future regressions in their
+# live surface visible.
+
+# verified_roundtrip's executable layer exists to serve the dead statement parser
+# (verified_stmt) and the print_parse_roundtrip demo; production reaches this
+# module only for its spec/proof lemmas, never these exec functions.
+sql::parser::verified_roundtrip::parse_expr_exec
+sql::parser::verified_roundtrip::parse_args_exec
+sql::parser::verified_roundtrip::print_lit_exec
+sql::parser::verified_roundtrip::wrap_unary
+sql::parser::verified_roundtrip::wrap_binary
+sql::parser::verified_roundtrip::wrap_factorial
+sql::parser::verified_roundtrip::wrap_is
+sql::parser::verified_roundtrip::print_args_slice
+sql::parser::verified_roundtrip::print_expr_exec
+sql::parser::verified_roundtrip::roundtrip_exec
+sql::parser::verified_roundtrip::print_parse_roundtrip_exec
+
+# verified_function_list's exec layer (parse_exec / parse_args_exec) is called
+# only from the dead verified_stmt parser and its own roundtrip_demo.
+sql::parser::verified_function_list::parse_exec
+sql::parser::verified_function_list::parse_args_exec
+sql::parser::verified_function_list::roundtrip_demo
+
+# verified_precedence: production calls parse_expression_full (covered). These
+# three are the older single-shot demo variant and its local helper, unused.
+sql::parser::verified_precedence::parse_expression
+sql::parser::verified_precedence::all_digits_exec_local
+sql::parser::verified_precedence::print_parse_roundtrip
+
+# encoding::keycode: two verified codec helpers with no caller anywhere (dead
+# since they were proven; the bool path is inlined elsewhere).
+encoding::keycode::encode_bool_key
+encoding::keycode::decode_bool_key
