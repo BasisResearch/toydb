@@ -213,38 +213,49 @@ pub open spec fn sparse_control_begin(input: Seq<TokenView>) -> (Option<SStmt>, 
 // direction defaults to Ascending when neither `ASC` nor `DESC` is present.
 // ===========================================================================
 
-/// One-or-more `<expr> [ASC|DESC]` comma-separated items. `fuel` bounds the list
-/// length (the caller passes the token count, which strictly decreases per item
-/// since each item consumes at least one expression token).
-pub open spec fn sparse_control_order_list(input: Seq<TokenView>, fuel: nat)
+/// One-or-more `<expr> [ASC|DESC]` comma-separated items. Recurses on the input
+/// length: the tail `r1.drop_first()` is always strictly shorter than `input`
+/// (`r1.len() <= sparse_prec(...).1.len() <= input.len()`, minus the dropped
+/// comma), so no fuel parameter is needed and fuel-stability never arises.
+pub open spec fn sparse_control_order_list(input: Seq<TokenView>)
     -> (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>)
-    decreases fuel,
+    decreases input.len(),
+    when true
+    via sparse_control_order_list_decreases
 {
-    if fuel == 0 {
-        (None, input)
-    } else {
-        match sparse_prec(input, 0, expr_fuel(input)) {
-            (Some(e), r) => {
-                // Optional direction; defaults to Ascending.
-                let (d, r1) = if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Asc) {
-                    (ast::Direction::Ascending, r.drop_first())
-                } else if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Desc) {
-                    (ast::Direction::Descending, r.drop_first())
-                } else {
-                    (ast::Direction::Ascending, r)
-                };
-                if r1.len() >= 1 && r1[0] == TokenView::Comma {
-                    match sparse_control_order_list(r1.drop_first(), (fuel - 1) as nat) {
-                        (Some(more), r2) => (Some(seq![(e, d)] + more), r2),
-                        (None, _) => (None, input),
-                    }
-                } else {
-                    (Some(seq![(e, d)]), r1)
+    match sparse_prec(input, 0, expr_fuel(input)) {
+        (Some(e), r) => {
+            // Optional direction; defaults to Ascending.
+            let (d, r1) = if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Asc) {
+                (ast::Direction::Ascending, r.drop_first())
+            } else if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Desc) {
+                (ast::Direction::Descending, r.drop_first())
+            } else {
+                (ast::Direction::Ascending, r)
+            };
+            if r1.len() >= 1 && r1[0] == TokenView::Comma {
+                match sparse_control_order_list(r1.drop_first()) {
+                    (Some(more), r2) => (Some(seq![(e, d)] + more), r2),
+                    (None, _) => (None, input),
                 }
-            },
-            (None, _) => (None, input),
-        }
+            } else {
+                (Some(seq![(e, d)]), r1)
+            }
+        },
+        (None, _) => (None, input),
     }
+}
+
+/// Termination witness for `sparse_control_order_list`: the recursive tail
+/// `r1.drop_first()` is strictly shorter than `input`, because `sparse_prec`
+/// never grows its input (`lemma_prec_slen`) and the direction/comma steps only
+/// drop tokens.
+#[via_fn]
+proof fn sparse_control_order_list_decreases(input: Seq<TokenView>) {
+    verified_precedence::lemma_prec_slen(input, 0, expr_fuel(input));
+    // r.len() <= input.len(); r1.len() <= r.len(); r1.drop_first().len() < input.len()
+    // when the recursive branch is taken (r1 non-empty), which the SMT derives
+    // from the length facts above.
 }
 
 /// `[ORDER BY <list>]`, with `input` at the (optional) `ORDER` keyword.
@@ -257,12 +268,145 @@ pub open spec fn sparse_control_order_by(input: Seq<TokenView>)
         (None, input)
     } else {
         let r = input.drop_first().drop_first();
-        // Token count is a safe termination bound for the list recursion.
-        match sparse_control_order_list(r, r.len()) {
+        match sparse_control_order_list(r) {
             (Some(items), rest) => (Some(items), rest),
             (None, _) => (None, input),
         }
     }
+}
+
+/// `verified_stmt::view_order_list` distributes over sequence concatenation.
+pub proof fn lemma_view_order_list_append(
+    a: Seq<(ast::Expression, ast::Direction)>,
+    b: Seq<(ast::Expression, ast::Direction)>,
+)
+    ensures
+        verified_stmt::view_order_list(a + b)
+            == verified_stmt::view_order_list(a) + verified_stmt::view_order_list(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_stmt::view_order_list, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_order_list_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-item view: `view_order_list(seq![(expr, d)]) == seq![(view_expr(expr), d)]`.
+pub proof fn lemma_view_order_list_single(expr: ast::Expression, d: ast::Direction)
+    ensures
+        verified_stmt::view_order_list(seq![(expr, d)])
+            == seq![(verified_roundtrip::view_expr(expr), d)],
+{
+    reveal_with_fuel(verified_stmt::view_order_list, 2);
+    let s = seq![(expr, d)];
+    assert(s.len() == 1);
+    assert(s[0] == (expr, d));
+    assert(s.drop_first() =~= Seq::<(ast::Expression, ast::Direction)>::empty());
+    assert(verified_stmt::view_order_list(s.drop_first())
+        =~= Seq::<(SExpr, ast::Direction)>::empty());
+    assert(verified_stmt::view_order_list(s)
+        =~= seq![(verified_roundtrip::view_expr(expr), d)]);
+}
+
+/// Prepend already-consumed `done` items onto a tail order-list parse, routing
+/// `whole` through on rejection (matching how `sparse_control_order_list`
+/// returns its top-level input on any inner reject).
+pub open spec fn order_list_prepend(
+    done: Seq<(SExpr, ast::Direction)>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>),
+) -> (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// Loop-resumption bridge for `parse_order_by_at`. Parsing the whole list from
+/// `start` equals prepending the `done` items already consumed onto the parse
+/// continuing at the current suffix `cur`, where `start` is (semantically) the
+/// tokens of `done` followed by `cur`. The exec loop maintains the antecedent
+/// `sparse_control_order_list(start) == order_list_prepend(done, start, P(cur))`
+/// and steps it; this lemma discharges the single inductive step, unfolding one
+/// level of `sparse_control_order_list(cur)`.
+///
+/// It is stated as: given the head item `(e, d)` parsed from `cur` and a comma,
+/// with `cur1` the suffix after the comma, one level of the recursion at `cur`
+/// rewrites to prepending `(e, d)` and recursing at `cur1`.
+pub proof fn lemma_order_list_step(cur: Seq<TokenView>, e: SExpr, d: ast::Direction, r: Seq<TokenView>, r1: Seq<TokenView>)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        (r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Asc)) ==> d == ast::Direction::Ascending && r1 == r.drop_first(),
+        (r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Desc)) ==> d == ast::Direction::Descending && r1 == r.drop_first(),
+        !(r.len() >= 1 && (r[0] == TokenView::Keyword(Keyword::Asc) || r[0] == TokenView::Keyword(Keyword::Desc)))
+            ==> d == ast::Direction::Ascending && r1 == r,
+        r1.len() >= 1,
+        r1[0] == TokenView::Comma,
+    ensures
+        sparse_control_order_list(cur)
+            == order_list_prepend(seq![(e, d)], cur, sparse_control_order_list(r1.drop_first())),
+{
+    // Unfold one level of `sparse_control_order_list(cur)`: its lhs phase is
+    // `sparse_prec(cur, ..) == (Some(e), r)` by hypothesis, the direction/comma
+    // steps land on `r1` with a leading comma, so it recurses on
+    // `r1.drop_first()`. The `order_list_prepend` shape then matches by def.
+    match sparse_control_order_list(r1.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_order_list(cur) == (Some(seq![(e, d)] + more), r2));
+            assert(seq![(e, d)] + more == seq![(e, d)] + more);
+        },
+        (None, _) => {
+            assert(sparse_control_order_list(cur) == (None::<Seq<(SExpr, ast::Direction)>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more item.
+/// Given the invariant at `cur` (`whole == prepend(done, ls, P(cur))`) and the
+/// single-step unfold (`P(cur) == prepend([(se,d)], cur, P(cur1))`), the
+/// invariant at `cur1` holds with `done ++ [(se,d)]`. Pure `order_list_prepend`
+/// algebra with sequence-append associativity.
+pub proof fn lemma_order_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<(SExpr, ast::Direction)>,
+    se: SExpr,
+    d: ast::Direction,
+    whole: (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>),
+)
+    requires
+        whole == order_list_prepend(done, ls, sparse_control_order_list(cur)),
+        sparse_control_order_list(cur)
+            == order_list_prepend(seq![(se, d)], cur, sparse_control_order_list(cur1)),
+    ensures
+        whole == order_list_prepend(done + seq![(se, d)], ls, sparse_control_order_list(cur1)),
+{
+    match sparse_control_order_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![(se, d)] + more) == (done + seq![(se, d)]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the (optional) direction, so the list is the
+/// single head item.
+pub proof fn lemma_order_list_last(cur: Seq<TokenView>, e: SExpr, d: ast::Direction, r: Seq<TokenView>, r1: Seq<TokenView>)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        (r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Asc)) ==> d == ast::Direction::Ascending && r1 == r.drop_first(),
+        (r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Desc)) ==> d == ast::Direction::Descending && r1 == r.drop_first(),
+        !(r.len() >= 1 && (r[0] == TokenView::Keyword(Keyword::Asc) || r[0] == TokenView::Keyword(Keyword::Desc)))
+            ==> d == ast::Direction::Ascending && r1 == r,
+        !(r1.len() >= 1 && r1[0] == TokenView::Comma),
+    ensures
+        sparse_control_order_list(cur) == (Some(seq![(e, d)]), r1),
+{
 }
 
 } // verus!

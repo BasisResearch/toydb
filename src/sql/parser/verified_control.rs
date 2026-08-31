@@ -560,9 +560,96 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
     (Some(group_by), cur, None)
 }
 
+/// Head facts for the `parse_order_by_at` input at `pos` when at least two
+/// tokens remain: relates `input[0]`/`input[1]` to the tokens and pins the
+/// list-start suffix. Factored out to keep both the reject and accept exits of
+/// `parse_order_by_at` small.
+proof fn order_by_input_head(toks: &Vec<Token>, pos: usize)
+    requires
+        pos + 2 <= toks.len(),
+    ensures
+        verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)).len() >= 2,
+        verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))[0]
+            == verified_production::token_view(toks@[pos as int]),
+        verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))[1]
+            == verified_production::token_view(toks@[(pos + 1) as int]),
+        verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))
+            .drop_first().drop_first()
+            == verified_production::token_views(toks@.subrange((pos + 2) as int, toks@.len() as int)),
+{
+    verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+    verified_roundtrip::token_views_suffix(toks@, pos as int);
+    verified_roundtrip::token_views_suffix(toks@, (pos + 1) as int);
+}
+
+/// Concludes the reject case of `parse_order_by_at`: given the `ORDER BY` head
+/// tokens and `whole` (the list parse from `list_start`) rejecting, the whole
+/// `sparse_control_order_by(input)` rejects. Isolated so the deeply-nested loop
+/// exit stays legible.
+proof fn order_by_conclude_none(
+    toks: &Vec<Token>,
+    pos: usize,
+    list_start: Seq<verified_production::TokenView>,
+    whole: (Option<Seq<(verified_roundtrip::SExpr, ast::Direction)>>, Seq<verified_production::TokenView>),
+)
+    requires
+        pos + 2 <= toks.len(),
+        toks@[pos as int] == Token::Keyword(Keyword::Order),
+        toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+        list_start == verified_production::token_views(
+            toks@.subrange((pos + 2) as int, toks@.len() as int)),
+        whole == verified_stmt_prec::sparse_control_order_list(list_start),
+        whole.0 is None,
+    ensures
+        verified_stmt_prec::sparse_control_order_by(
+            verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))).0 is None,
+{
+    let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    order_by_input_head(toks, pos);
+    reveal(verified_production::token_view);
+    assert(input[0] == verified_production::TokenView::Keyword(Keyword::Order));
+    assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+    assert(list_start == input.drop_first().drop_first());
+}
+
+/// Accept case: `sparse_control_order_by(input)` equals the final accumulated
+/// list result `(Some(items), rest)`.
+proof fn order_by_conclude_some(
+    toks: &Vec<Token>,
+    pos: usize,
+    cur: usize,
+    list_start: Seq<verified_production::TokenView>,
+    whole: (Option<Seq<(verified_roundtrip::SExpr, ast::Direction)>>, Seq<verified_production::TokenView>),
+    items: Seq<(verified_roundtrip::SExpr, ast::Direction)>,
+)
+    requires
+        pos + 2 <= toks.len(),
+        toks@[pos as int] == Token::Keyword(Keyword::Order),
+        toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+        list_start == verified_production::token_views(
+            toks@.subrange((pos + 2) as int, toks@.len() as int)),
+        whole == verified_stmt_prec::sparse_control_order_list(list_start),
+        whole == (Some(items),
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+    ensures
+        verified_stmt_prec::sparse_control_order_by(
+            verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)))
+            == (Some(items),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+{
+    let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    order_by_input_head(toks, pos);
+    reveal(verified_production::token_view);
+    assert(input[0] == verified_production::TokenView::Keyword(Keyword::Order));
+    assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+    assert(list_start == input.drop_first().drop_first());
+}
+
 /// Parses an optional `ORDER BY <expr> [ASC|DESC] [, ...]` clause. Returns
 /// `(Some(vec![]), pos)` when no `ORDER` keyword is present. Mirrors
 /// `parse_order_by_clause`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(100000)]
 fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
     Option<Vec<(ast::Expression, ast::Direction)>>,
     usize,
@@ -573,14 +660,32 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_order_by(input);
+            match r.0 {
+                Some(v) => sopt is Some
+                    && verified_stmt::view_order_list(v@) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
+    }
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Order)) {
         return (Some(Vec::new()), pos, None);
     }
     let mut cur = pos + 1;
     if cur >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     if !matches!(toks[cur], Token::Keyword(Keyword::By)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::By),
@@ -588,23 +693,103 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         )));
     }
     cur = cur + 1;
+    // Pin the `ORDER` / `BY` head tokens as structural facts (from the guards).
+    proof {
+        assert(toks@[pos as int] == Token::Keyword(Keyword::Order));
+        assert(toks@[(pos + 1) as int] == Token::Keyword(Keyword::By));
+    }
+    // `list_start` — the suffix just past `ORDER BY`, where the item list begins.
+    let ghost list_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost whole = verified_stmt_prec::sparse_control_order_list(list_start);
+    proof {
+        order_by_input_head(toks, pos);
+        assert(input[0] == verified_production::TokenView::Keyword(Keyword::Order));
+        assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+        assert(list_start == input.drop_first().drop_first());
+    }
     let mut order_by: Vec<(ast::Expression, ast::Direction)> = Vec::new();
     loop
-        invariant
-            pos < cur,
+        invariant_except_break
+            pos + 2 <= cur,
             cur <= toks.len(),
+            toks@[pos as int] == Token::Keyword(Keyword::Order),
+            toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 2) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_order_list(list_start),
+            // Resumption: the whole list equals what's been consumed (`order_by`)
+            // prepended onto the parse continuing at `cur`. Only meaningful on a
+            // realistically-sized input (where the expression parser refines).
+            // Holds each iteration but NOT at break (post-terminal-item `cur`
+            // would start a fresh parse); the break state is pinned by `ensures`.
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == verified_stmt_prec::order_list_prepend(
+                    verified_stmt::view_order_list(order_by@),
+                    list_start,
+                    verified_stmt_prec::sparse_control_order_list(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+                ),
+        ensures
+            pos + 2 <= cur,
+            cur <= toks.len(),
+            toks@[pos as int] == Token::Keyword(Keyword::Order),
+            toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 2) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_order_list(list_start),
+            // At break the accumulated list is final: the whole parse is exactly
+            // `(Some(view_order_list(order_by@)), suffix-at-cur)`.
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == (Some(verified_stmt::view_order_list(order_by@)),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_stmt::view_order_list(order_by@);
+        let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
         let expr = match opt {
             Some(e) => e,
-            None => return (None, pos, eerr),
+            None => {
+                // `sparse_prec(cur_v) is None`, so `sparse_control_order_list(cur_v)`
+                // is `(None, cur_v)`, hence `whole == (None, list_start)`, hence
+                // `sparse_control_order_by(input) is None`.
+                proof {
+                    if sized {
+                        reveal_with_fuel(verified_stmt_prec::sparse_control_order_list, 1);
+                        assert(verified_stmt_prec::sparse_control_order_list(cur_v).0 is None);
+                        assert(whole.0 is None);
+                        order_by_input_head(toks, pos);
+                        order_by_conclude_none(toks, pos, list_start, whole);
+                    }
+                }
+                return (None, pos, eerr);
+            },
         };
+        let ghost r_after_expr = verified_production::token_views(toks@.subrange(c as int, toks@.len() as int));
+        proof {
+            // parse_clause_expr_at's (gated) refinement pins the sparse_prec result.
+            if sized {
+                assert(verified_precedence::sparse_prec(cur_v, 0, verified_stmt_prec::expr_fuel(cur_v))
+                    == (Some(verified_roundtrip::view_expr(expr)), r_after_expr));
+            }
+            if sized && c < toks.len() {
+                verified_roundtrip::token_views_suffix(toks@, c as int);  // r_after_expr head
+            } else {
+                verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int));
+            }
+        }
         cur = c;
 
-        // Optional direction; defaults to ascending.
+        // Optional direction; defaults to ascending. `dir_consumed` records
+        // whether an ASC/DESC token was eaten, pinning `r1` for the spec lemmas.
         let mut direction = ast::Direction::Ascending;
+        let ghost c_head_is_dir: bool = r_after_expr.len() >= 1
+            && (r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Asc)
+                || r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Desc));
         if cur < toks.len() {
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
             match &toks[cur] {
                 Token::Keyword(Keyword::Asc) => {
                     direction = ast::Direction::Ascending;
@@ -616,13 +801,110 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
                 },
                 _ => {},
             }
+        } else {
+            proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         }
+        let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        proof {
+            // Pin the direction/`r1` relations that the step/last lemmas require.
+            // `r_after_expr[0] == token_view(toks[c])` (when c < len) drives the
+            // exec match, so the ghost direction-guards agree with the exec choice.
+            if sized {
+                if c_head_is_dir {
+                    // ASC or DESC was consumed: r1 == r_after_expr.drop_first().
+                    assert(r1 == r_after_expr.drop_first());
+                    assert(r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Asc)
+                        ==> direction == ast::Direction::Ascending);
+                    assert(r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Desc)
+                        ==> direction == ast::Direction::Descending);
+                } else {
+                    // No direction token: r1 == r_after_expr, direction default.
+                    assert(r1 == r_after_expr);
+                    assert(direction == ast::Direction::Ascending);
+                }
+            }
+        }
+        let ghost old_order = order_by@;
         order_by.push((expr, direction));
+        proof {
+            // order_by view distributes: done_v ++ [(view_expr(expr), direction)].
+            verified_stmt_prec::lemma_view_order_list_append(old_order, seq![(expr, direction)]);
+            verified_stmt_prec::lemma_view_order_list_single(expr, direction);
+            assert(order_by@ == old_order + seq![(expr, direction)]);
+            assert(verified_stmt::view_order_list(order_by@)
+                == done_v + seq![(verified_roundtrip::view_expr(expr), direction)]);
+        }
 
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                if sized {
+                    // Step: `sparse_control_order_list(cur_v)` prepends the item and
+                    // recurses at the post-comma suffix.
+                    verified_stmt_prec::lemma_order_list_step(
+                        cur_v, verified_roundtrip::view_expr(expr), direction, r_after_expr, r1);
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                assert(r1.drop_first() == verified_production::token_views(
+                    toks@.subrange(cur as int, toks@.len() as int)));
+                if sized {
+                    // Precondition #1 (entry invariant) and #2 (step lemma) for resume_step.
+                    assert(whole == verified_stmt_prec::order_list_prepend(
+                        done_v, list_start, verified_stmt_prec::sparse_control_order_list(cur_v)));
+                    assert(verified_stmt_prec::sparse_control_order_list(cur_v)
+                        == verified_stmt_prec::order_list_prepend(
+                            seq![(verified_roundtrip::view_expr(expr), direction)], cur_v,
+                            verified_stmt_prec::sparse_control_order_list(r1.drop_first())));
+                    // Re-establish the resumption invariant after appending one item.
+                    verified_stmt_prec::lemma_order_list_resume_step(
+                        list_start, cur_v, r1.drop_first(),
+                        done_v, verified_roundtrip::view_expr(expr), direction, whole);
+                    // Bridge the lemma's `done_v + [item]` to `view_order_list(order_by@)`
+                    // and `r1.drop_first()` to the new current suffix.
+                    assert(verified_stmt::view_order_list(order_by@)
+                        == done_v + seq![(verified_roundtrip::view_expr(expr), direction)]);
+                    assert(whole == verified_stmt_prec::order_list_prepend(
+                        verified_stmt::view_order_list(order_by@),
+                        list_start,
+                        verified_stmt_prec::sparse_control_order_list(
+                            verified_production::token_views(
+                                toks@.subrange(cur as int, toks@.len() as int)))));
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+                if sized {
+                    verified_stmt_prec::lemma_order_list_last(
+                        cur_v, verified_roundtrip::view_expr(expr), direction, r_after_expr, r1);
+                    // whole == prepend(done_v, ls, (Some([item]), r1)) == (Some(done_v+[item]), r1).
+                    assert(verified_stmt_prec::sparse_control_order_list(cur_v)
+                        == (Some(seq![(verified_roundtrip::view_expr(expr), direction)]), r1));
+                    assert(whole == (Some(done_v
+                        + seq![(verified_roundtrip::view_expr(expr), direction)]), r1));
+                    assert(verified_stmt::view_order_list(order_by@)
+                        == done_v + seq![(verified_roundtrip::view_expr(expr), direction)]);
+                    // These survive the break as path facts (cur is final here).
+                    assert(whole == (Some(verified_stmt::view_order_list(order_by@)),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                }
+            }
             break;
+        }
+    }
+    proof {
+        // `sparse_control_order_by` unfolds to `sparse_control_order_list(list_start)
+        // == whole`, which the break-ensures pinned to the final list result.
+        if toks.len() <= (usize::MAX - 3) / 2 {
+            order_by_conclude_some(toks, pos, cur, list_start, whole,
+                verified_stmt::view_order_list(order_by@));
         }
     }
     (Some(order_by), cur, None)
