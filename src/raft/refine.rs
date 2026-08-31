@@ -34,7 +34,9 @@
 //! safety, log matching, leader completeness, state machine safety,
 //! linearizable reads) hold in every invariant-satisfying state, so they
 //! apply to every reachable configuration of the implementation, provided
-//! the trusted assumptions below hold.
+//! the trusted assumptions below hold. The composition into a cluster-level
+//! statement is itself formal: see the "Cluster composition" section
+//! ([`cluster_bound`], `lemma_cluster_*`, [`thm_impl_safety`]).
 //!
 //! # Trusted assumptions
 //!
@@ -54,9 +56,16 @@
 //! 3. **Composition**: `host_refines_star` is a per-node statement. Reading
 //!    the per-node guarantees as a statement about the running cluster
 //!    assumes all nodes' ghost states are simultaneously bound to one model
-//!    state (`binds`) whose history contains every message ever sent. Each
-//!    node's steps then interleave into one model execution, which starts
-//!    from `init` (fresh cluster) and hence satisfies `inv` throughout.
+//!    state whose history contains every message ever sent. This binding is
+//!    stated formally by [`cluster_bound`], established for a fresh cluster
+//!    by `lemma_cluster_init` and maintained across every step function
+//!    call and crash-restart by `lemma_cluster_step` /
+//!    `lemma_cluster_restart` — the interleaving argument is machine-
+//!    checked. What this assumption still asserts is that those lemmas'
+//!    hypotheses track the real run: every mutation of a node's verified
+//!    state is one step function call (assumption 5), nodes recover per
+//!    assumption 2, and received messages' counterparts are in the bound
+//!    history (assumption 1).
 //! 4. **Cluster configuration**: all nodes agree on the member set (already
 //!    a documented requirement of `RawNode::peers`); ranks are positions in
 //!    the sorted member list, so they agree across nodes.
@@ -91,10 +100,10 @@
 use vstd::prelude::*;
 
 use super::log::{Entry, Fault, Index, Log, fault};
-#[allow(unused_imports)] // several are referenced only from ghost code
-use super::safety::{AEntry, CommitRec, GState, MHost, MRole, Msg, ReadRec, TStep};
-use super::{NodeID, Term};
 use crate::error::Result;
+#[allow(unused_imports)] // several are referenced only from ghost code
+use crate::raft::safety::{AEntry, CommitRec, GState, MHost, MRole, Msg, ReadRec, TStep};
+use crate::raft::{NodeID, Term};
 // Spec/proof items only exist under the Verus toolchain (a normal build
 // erases them), so their imports are gated the same way.
 #[cfg(verus_keep_ghost)]
@@ -102,11 +111,12 @@ use crate::error::Result;
 use super::log::{cmd_view, entries_view, entry_view};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
-use super::safety::{
-    inv, is_quorum, last_term, next, next_step, node_ids, prefix_eq, splice, splice_is_noop,
-    step_preserves_inv, t_become_leader, t_bump_term, t_campaign, t_collect_vote, t_confirm_read,
-    t_grant, t_leader_commit, t_propose, t_recv_append, t_recv_commit, t_send_ack, t_send_append,
-    t_send_commit, t_step_down, t_submit_read, thm_read_linearizable, up_to_date,
+use crate::raft::safety::{
+    init, init_host, init_implies_inv, inv, is_quorum, last_term, next, next_step, node_ids,
+    prefix_eq, splice, splice_is_noop, step_preserves_inv, t_become_leader, t_bump_term,
+    t_campaign, t_collect_vote, t_confirm_read, t_grant, t_leader_commit, t_propose, t_recv_append,
+    t_recv_commit, t_restart, t_send_ack, t_send_append, t_send_commit, t_step_down, t_submit_read,
+    thm_election_safety, thm_read_linearizable, thm_state_machine_safety, up_to_date,
 };
 
 verus! {
@@ -337,6 +347,263 @@ proof fn lemma_star_extend(
 }
 
 // ---------------------------------------------------------------------------
+// Cluster composition: the formal statement of trusted assumption 3
+// ---------------------------------------------------------------------------
+//
+// `host_refines_star` is a per-node statement. Reading the per-node
+// guarantees as a statement about the running cluster requires composing
+// them: all nodes' ghost states must be simultaneously bound to one model
+// state whose history contains every message ever sent, and the nodes'
+// steps must interleave into one model execution from `init`. The specs and
+// lemmas below state that argument formally:
+//
+// * `cluster_binds`/`cluster_state`/`cluster_bound` define the composition
+//   invariant — a reachable, invariant-satisfying model state binding every
+//   node's ghost state and evidence.
+// * `lemma_cluster_init` establishes it for a fresh cluster (every node in
+//   the state `Abs::recover` yields over an empty log, with no evidence).
+// * `lemma_cluster_step` maintains it across any step function call, from
+//   the step's `host_refines_star` and `evid_grows` postconditions plus the
+//   received counterparts being in the bound history (assumption 1).
+// * `lemma_cluster_restart` maintains it across a crash-restart via the
+//   model's `t_restart`; `recover_host` (assumption 2) is exactly the claim
+//   that the recovered ghost state is this lemma's post-state.
+// * `thm_cluster_safety` and `thm_impl_safety` instantiate the model's
+//   safety theorems against a bound cluster — the latter directly against
+//   the verified node states and the logs' verified views, i.e. against the
+//   implementation.
+//
+// What remains trusted is that these lemmas' hypotheses track the real run:
+// every node starts fresh or recovers per `recover_host`, every mutation of
+// a node's verified state is one step function call (assumption 5), and
+// `recv_msg` returns counterparts in the bound history (assumption 1). The
+// interleaving argument itself is machine-checked.
+
+/// `s` binds the whole cluster: node k's ghost abstract state is `habs[k]`
+/// and node k's ghost message evidence `evids[k]` is in the history.
+pub open spec fn cluster_binds(s: GState, n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>) -> bool {
+    &&& s.n == n as nat
+    &&& habs.len() == n as nat
+    &&& evids.len() == n as nat
+    &&& s.hosts == habs
+    &&& forall|k: int| 0 <= k < n as int ==> (#[trigger] evids[k]).subset_of(s.net)
+}
+
+/// A reachable, invariant-satisfying model state binding every node.
+pub open spec fn cluster_state(s: GState, n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>) -> bool {
+    &&& cluster_binds(s, n, habs, evids)
+    &&& inv(s)
+    &&& exists|s0: GState| #[trigger] init(s0) && reach(s0, s)
+}
+
+/// The composition invariant (trusted assumption 3, stated formally): some
+/// model state binds the cluster.
+pub open spec fn cluster_bound(n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>) -> bool {
+    exists|s: GState| #[trigger] cluster_state(s, n, habs, evids)
+}
+
+/// A fresh cluster is bound: every node in the initial host state (what
+/// `Abs::recover` yields over an empty log) with no evidence.
+pub proof fn lemma_cluster_init(n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>)
+    requires
+        n >= 1,
+        habs.len() == n as nat,
+        evids.len() == n as nat,
+        forall|k: int| 0 <= k < n as int ==> habs[k] == init_host(),
+        forall|k: int| 0 <= k < n as int ==> evids[k] == Set::<Msg>::empty(),
+    ensures
+        cluster_bound(n, habs, evids),
+{
+    let s0 = GState {
+        n: n as nat,
+        hosts: habs,
+        net: Set::empty(),
+        leader_log: Map::empty(),
+        leader_of: Map::empty(),
+        voters: Map::empty(),
+        elect_log: Map::empty(),
+        elect_votes: Map::empty(),
+        commits: Set::empty(),
+        reads: Set::empty(),
+        read_hwm: Map::empty(),
+    };
+    assert(init(s0));
+    init_implies_inv(s0);
+    assert(next_n(s0, s0, 0));
+    assert(reach(s0, s0));
+    assert(cluster_state(s0, n, habs, evids));
+}
+
+/// The composition invariant is maintained by any step function call: node
+/// `i` steps from `habs[i]` to `hpost` (its `host_refines_star`
+/// postcondition), its evidence grows only by the received and sent
+/// messages (its `evid_grows` postcondition), and the received messages'
+/// abstract counterparts are in the bound history (trusted assumption 1).
+/// The bound state advances by the step's transitions; every other node
+/// stays bound.
+pub proof fn lemma_cluster_step(
+    s: GState, n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>, i: int,
+    hpost: MHost, epost: Set<Msg>, recv: Set<Msg>, sent: Set<Msg>,
+)
+    requires
+        cluster_state(s, n, habs, evids),
+        0 <= i < n as int,
+        host_refines_star(i, n, habs[i], hpost, evids[i], sent),
+        evid_grows(evids[i], epost, recv, sent),
+        recv.subset_of(s.net),
+    ensures
+        exists|s2: GState| {
+            &&& cluster_state(s2, n, habs.update(i, hpost), evids.update(i, epost))
+            &&& #[trigger] reach(s, s2)
+        },
+{
+    assert(binds(s, i, n, habs[i], evids[i]));
+    let s2 = choose|s2: GState| {
+        &&& #[trigger] reach(s, s2)
+        &&& inv(s2)
+        &&& s2.n == s.n
+        &&& s2.hosts == s.hosts.update(i, hpost)
+        &&& s2.net == s.net.union(sent)
+    };
+    let habs2 = habs.update(i, hpost);
+    let evids2 = evids.update(i, epost);
+    assert(s2.hosts == habs2);
+    assert forall|k: int| 0 <= k < n as int implies (#[trigger] evids2[k]).subset_of(s2.net) by {
+        if k == i {
+            assert forall|m: Msg| epost.contains(m) implies s2.net.contains(m) by {
+                if evids[i].contains(m) {
+                    assert(s.net.contains(m));
+                } else if recv.contains(m) {
+                    assert(s.net.contains(m));
+                } else {
+                    assert(sent.contains(m));
+                }
+            }
+        } else {
+            assert(evids[k].subset_of(s.net));
+        }
+    }
+    let s0 = choose|s0: GState| #[trigger] init(s0) && reach(s0, s);
+    lemma_reach_trans(s0, s, s2);
+    assert(cluster_state(s2, n, habs2, evids2));
+}
+
+/// The composition invariant is maintained by a crash-restart of node `i`
+/// recovering commit index `c` (at most its pre-crash value; the entries,
+/// term and vote are fsynced and survive): the model's `t_restart`
+/// transition rebinds the recovered node. `recover_host` (trusted
+/// assumption 2) is exactly the claim that the state recovered from the
+/// durable log is this lemma's post-state for the node.
+pub proof fn lemma_cluster_restart(
+    s: GState, n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>, i: int, c: nat,
+)
+    requires
+        cluster_state(s, n, habs, evids),
+        0 <= i < n as int,
+        c <= habs[i].commit,
+    ensures
+        exists|s2: GState| {
+            &&& cluster_state(s2, n,
+                habs.update(i, MHost {
+                    role: MRole::Follower,
+                    commit: c,
+                    votes: Set::empty(),
+                    vote_logs: Map::empty(),
+                    read_seq: 0,
+                    ..habs[i]
+                }),
+                evids.update(i, Set::empty()))
+            &&& #[trigger] reach(s, s2)
+        },
+{
+    let hpost = MHost {
+        role: MRole::Follower,
+        commit: c,
+        votes: Set::empty(),
+        vote_logs: Map::empty(),
+        read_seq: 0,
+        ..habs[i]
+    };
+    let s2 = GState { hosts: s.hosts.update(i, hpost), ..s };
+    assert(t_restart(s, s2, i, c));
+    assert(next_step(s, s2, TStep::Restart { i, commit: c }));
+    assert(next(s, s2));
+    step_preserves_inv(s, s2, TStep::Restart { i, commit: c });
+    assert(next_n(s2, s2, 0));
+    assert(next_n(s, s2, 1));
+    assert(reach(s, s2));
+    let s0 = choose|s0: GState| #[trigger] init(s0) && reach(s0, s);
+    lemma_reach_trans(s0, s, s2);
+    assert(cluster_state(s2, n, habs.update(i, hpost), evids.update(i, Set::empty())));
+}
+
+/// The model's safety theorems instantiated for a bound cluster: election
+/// safety and state machine safety hold of the nodes' ghost states.
+pub proof fn thm_cluster_safety(n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>)
+    requires
+        cluster_bound(n, habs, evids),
+    ensures
+        forall|i: int, j: int|
+            #![trigger habs[i].role, habs[j].role]
+            0 <= i < n as int && 0 <= j < n as int
+            && habs[i].role is Leader && habs[j].role is Leader
+            && habs[i].term == habs[j].term ==> i == j,
+        forall|i: int, j: int, e: int|
+            #![trigger habs[i].log[e], habs[j].log[e]]
+            0 <= i < n as int && 0 <= j < n as int
+            && 0 <= e < habs[i].commit && e < habs[j].commit ==>
+            habs[i].log[e] == habs[j].log[e],
+{
+    let s = choose|s: GState| #[trigger] cluster_state(s, n, habs, evids);
+    assert forall|i: int, j: int|
+        0 <= i < n as int && 0 <= j < n as int
+        && habs[i].role is Leader && habs[j].role is Leader
+        && habs[i].term == habs[j].term implies i == j by {
+        thm_election_safety(s, i, j);
+    }
+    assert forall|i: int, j: int, e: int|
+        0 <= i < n as int && 0 <= j < n as int
+        && 0 <= e < habs[i].commit && e < habs[j].commit implies
+        habs[i].log[e] == habs[j].log[e] by {
+        thm_state_machine_safety(s, i, j, e);
+    }
+}
+
+/// The safety theorems instantiated against the implementation: for two
+/// verified node states bound in one cluster, at most one is leader per
+/// term, and the logs' verified views never disagree on a committed entry.
+/// This is the end-to-end statement about the running system, modulo the
+/// composition hypotheses above.
+pub proof fn thm_impl_safety(
+    n: u8, habs: Seq<MHost>, evids: Seq<Set<Msg>>,
+    a1: &Abs, l1: &Log, a2: &Abs, l2: &Log,
+)
+    requires
+        cluster_bound(n, habs, evids),
+        a1.inv(l1),
+        a2.inv(l2),
+        a1.n_spec() == n,
+        a2.n_spec() == n,
+        habs[a1.i()] == a1.habs(),
+        habs[a2.i()] == a2.habs(),
+    ensures
+        a1.is_leader() && a2.is_leader() && l1.term() == l2.term() ==> a1.i() == a2.i(),
+        forall|e: int| 0 <= e < l1.commit_index() && e < l2.commit_index() ==>
+            l1.view()[e] == l2.view()[e],
+{
+    let s = choose|s: GState| #[trigger] cluster_state(s, n, habs, evids);
+    a1.members.lemma_rank(a1.me);
+    a2.members.lemma_rank(a2.me);
+    if a1.is_leader() && a2.is_leader() && l1.term() == l2.term() {
+        thm_election_safety(s, a1.i(), a2.i());
+    }
+    assert forall|e: int| 0 <= e < l1.commit_index() && e < l2.commit_index() implies
+        l1.view()[e] == l2.view()[e] by {
+        thm_state_machine_safety(s, a1.i(), a2.i(), e);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Message abstraction
 // ---------------------------------------------------------------------------
 
@@ -420,10 +687,10 @@ pub open spec fn summarizes(m: Msg, s: MsgSummary) -> bool {
 /// TRUSTED (network non-forgery + angelic ghost recovery): every message the
 /// shell receives has an abstract counterpart in the model's message
 /// history; this returns that counterpart. The summarized fields are pinned;
-/// ghost payloads are whatever they truly were at the sender. Sound iff all
-/// nodes' ghost states are simultaneously bound to one model state whose
-/// history contains every message ever sent — the composition assumption
-/// (module doc, trusted assumptions 1 and 3).
+/// ghost payloads are whatever they truly were at the sender. Sound iff the
+/// returned counterpart is in the history of the model state binding the
+/// cluster (`cluster_bound`; the `recv` hypothesis of
+/// `lemma_cluster_step`) — trusted assumptions 1 and 3 in the module doc.
 #[verifier::external_body]
 fn recv_msg(s: &MsgSummary) -> (m: Ghost<Msg>)
     ensures
@@ -1294,12 +1561,13 @@ impl Abs {
 
     /// TRUSTED (storage integrity + composition): the abstract state of this
     /// node recovered from its durable log at startup. On a fresh start this
-    /// is the model's initial host state; after a crash it is the
-    /// `t_restart` post-state of the pre-crash host — term, vote and log are
-    /// fsynced, and the commit index (which is not) may have regressed,
-    /// which `t_restart` allows. Not covered: with `Log::enable_fsync`
-    /// disabled a crash can lose acknowledged entries, a state outside the
-    /// model.
+    /// is the model's initial host state (`init_host`, as
+    /// `lemma_cluster_init` binds it); after a crash it is the `t_restart`
+    /// post-state of the pre-crash host (as `lemma_cluster_restart` rebinds
+    /// it) — term, vote and log are fsynced, and the commit index (which is
+    /// not) may have regressed, which `t_restart` allows. Not covered: with
+    /// `Log::enable_fsync` disabled a crash can lose acknowledged entries, a
+    /// state outside the model.
     #[verifier::external_body]
     fn recover_host(members: &Members, rank: u8, log: &Log) -> (h: Ghost<MHost>)
         ensures

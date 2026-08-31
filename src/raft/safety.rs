@@ -19,12 +19,17 @@
 //!   the section 5.4.1 up-to-date vote check and the section 5.4.2 own-term
 //!   commit restriction in `maybe_commit_and_apply`.
 //! * **State machine safety** (`thm_state_machine_safety`): no two hosts ever
-//!   disagree on a committed (hence applied) entry.
+//!   disagree on a committed entry. (Nodes apply exactly the committed
+//!   prefix of the verified log view via `Log::read_committed`, so agreement
+//!   on committed entries carries to the commands each state machine is
+//!   fed; the state machines themselves are outside the verified perimeter.)
 //! * **Linearizable reads** (`thm_read_linearizable`): when the leader serves
 //!   a read — after quorum confirmation of the read sequence number and with
-//!   an own-term committed tail, `maybe_read`'s conditions — its applied
+//!   an own-term committed tail, `maybe_read`'s conditions — its committed
 //!   prefix contains every write that was committed anywhere in the cluster
-//!   when the read was submitted.
+//!   when the read was submitted. (`maybe_read` additionally gates on the
+//!   unverified applied index having caught up to the commit index, and the
+//!   response bytes come from the unverified state machine.)
 //!
 //! `thm_raft_safety` packages election safety and state machine safety over
 //! every state of every execution; `execution_implies_inv` transports the
@@ -869,12 +874,11 @@ pub open spec fn next(pre: GState, post: GState) -> bool {
     exists|step: TStep| next_step(pre, post, step)
 }
 
-/// The initial state: every node a leaderless follower at term 0 with an
-/// empty log (`Node::new` on a fresh cluster).
-pub open spec fn init(s: GState) -> bool {
-    &&& s.n >= 1
-    &&& s.hosts.len() == s.n
-    &&& forall|i: int| 0 <= i < s.n ==> s.hosts[i] == (MHost {
+/// The initial host state: a leaderless follower at term 0 with an empty
+/// log (`Node::new` on a fresh cluster; what `Abs::recover` yields over an
+/// empty log).
+pub open spec fn init_host() -> MHost {
+    MHost {
         term: 0,
         vote: None::<int>,
         role: MRole::Follower,
@@ -884,7 +888,14 @@ pub open spec fn init(s: GState) -> bool {
         vote_logs: Map::empty(),
         crec: CommitRec { term: 0, ci: 0, q: Map::empty() },
         read_seq: 0,
-    })
+    }
+}
+
+/// The initial state: every node in the initial host state.
+pub open spec fn init(s: GState) -> bool {
+    &&& s.n >= 1
+    &&& s.hosts.len() == s.n
+    &&& forall|i: int| 0 <= i < s.n ==> s.hosts[i] == init_host()
     &&& s.net == Set::<Msg>::empty()
     &&& s.leader_log == Map::<nat, Seq<AEntry>>::empty()
     &&& s.leader_of == Map::<nat, int>::empty()

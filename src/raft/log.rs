@@ -12,13 +12,15 @@
     clippy::question_mark
 )]
 
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
+#[cfg(test)]
+use std::ops::RangeBounds;
 
 use serde::{Deserialize, Serialize};
 
-use super::{NodeID, Term};
 use crate::encoding::{self, Key as _, Value as _, bincode};
 use crate::error::{Error, Result};
+use crate::raft::{NodeID, Term};
 use crate::storage;
 
 /// A log index (entry position). Starts at 1. 0 indicates no index.
@@ -87,10 +89,10 @@ impl encoding::Key<'_> for Key {}
 use vstd::prelude::*;
 
 #[allow(unused_imports)] // referenced only from ghost code
-use super::safety::AEntry;
+use crate::raft::safety::AEntry;
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
-use super::safety::{last_term, log_wf, splice, splice_is_noop, terms_le};
+use crate::raft::safety::{last_term, log_wf, splice, splice_is_noop, terms_le};
 
 /// The storage engine, boxed. Wrapped so that the verified `Log` can hold it
 /// as an opaque type; only the trusted engine rim below touches it.
@@ -116,6 +118,7 @@ pub enum Fault {
     SpliceNoTouch(Index),
     SpliceBelowCommit,
     CommandMismatch(Entry),
+    CommittedEntryMissing(Index),
     // Node step faults (raised by the verified step functions in
     // `raft::refine`, mirroring the shell's former assertions).
     UnknownNode(NodeID),
@@ -158,6 +161,7 @@ impl std::fmt::Display for Fault {
             Self::SpliceNoTouch(first) => write!(f, "first index {first} must touch existing log"),
             Self::SpliceBelowCommit => write!(f, "spliced entries below commit index"),
             Self::CommandMismatch(entry) => write!(f, "command mismatch at {entry:?}"),
+            Self::CommittedEntryMissing(index) => write!(f, "committed entry {index} missing"),
             Self::UnknownNode(id) => write!(f, "unknown node {id}"),
             Self::WrongRole => write!(f, "step function called in the wrong role"),
             Self::WrongTerm => write!(f, "step function called with a message from another term"),
@@ -927,7 +931,7 @@ impl Log {
     ///
     /// Panics (`fault`) iff the term is 0, regresses, or the vote changes
     /// within the term.
-    pub fn set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> (r: Result<()>)
+    pub(in crate::raft::verified) fn set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> (r: Result<()>)
         requires
             old(self).inv(),
         ensures
@@ -962,7 +966,7 @@ impl Log {
     /// Raft leader changes.
     ///
     /// Panics (`fault`) iff the term is 0 or the log is full.
-    pub fn append(&mut self, command: Option<Vec<u8>>) -> (r: Result<Index>)
+    pub(in crate::raft::verified) fn append(&mut self, command: Option<Vec<u8>>) -> (r: Result<Index>)
         requires
             old(self).inv(),
         ensures
@@ -1004,7 +1008,7 @@ impl Log {
     /// exist and be at or after the current commit index.
     ///
     /// Panics (`fault`) iff the entry does not exist or the index regresses.
-    pub fn commit(&mut self, index: Index) -> (r: Result<Index>)
+    pub(in crate::raft::verified) fn commit(&mut self, index: Index) -> (r: Result<Index>)
         requires
             old(self).inv(),
         ensures
@@ -1133,6 +1137,8 @@ impl Log {
     ///
     /// Panics (`fault`) iff an entry with matching index and term has a
     /// different command (a violation of the log-matching invariant).
+    #[verifier::spinoff_prover]
+    #[verifier::rlimit(240)]
     fn count_present(&mut self, es: &Vec<Entry>) -> (r: Result<usize>)
         requires
             old(self).inv(),
@@ -1200,8 +1206,11 @@ impl Log {
     /// The resulting view is the safety model's `splice` of the batch at its
     /// base index, i.e. the log is unchanged if the batch is already present,
     /// and otherwise equals the prefix before the batch followed by the batch.
-    #[verifier::rlimit(120)]
-    pub fn splice(&mut self, entries: Vec<Entry>) -> (r: Result<Index>)
+    // The generous rlimit is headroom, not need: this query is seed-sensitive
+    // (unrelated edits elsewhere in the module have flipped it at the default
+    // limit), but verifies quickly when it succeeds.
+    #[verifier::rlimit(600)]
+    pub(in crate::raft::verified) fn splice(&mut self, entries: Vec<Entry>) -> (r: Result<Index>)
         requires
             old(self).inv(),
         ensures
@@ -1374,6 +1383,77 @@ impl Log {
         }
         Ok(last_index)
     }
+
+    /// Reads up to `max` committed entries starting after `after` (i.e. from
+    /// index `after + 1`), stopping at the commit index: the next chunk of
+    /// the committed prefix of the log. Returns as many entries as are
+    /// available up to `max`, so the result is empty iff `after` is at or
+    /// beyond the commit index.
+    ///
+    /// This is the verified apply path: the returned entries are pinned to
+    /// the committed prefix of the log's ghost view, so a caller that feeds
+    /// them to the state machine in order applies exactly that prefix — the
+    /// prefix the safety model's state machine safety theorem is about.
+    ///
+    /// Panics (`fault`) iff the engine contradicts the storage-integrity
+    /// specification (a committed entry is missing), which the proof shows
+    /// cannot happen when that trusted specification holds.
+    pub fn read_committed(&mut self, after: Index, max: usize) -> (r: Result<Vec<Entry>>)
+        requires
+            old(self).inv(),
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(es) ==> {
+                &&& es@.len() <= max
+                &&& after >= old(self).commit_index() ==> es@.len() == 0
+                &&& after < old(self).commit_index() ==> {
+                    &&& after + es@.len() <= old(self).commit_index()
+                    &&& es@.len() == max || after + es@.len() == old(self).commit_index()
+                    &&& forall|j: int| 0 <= j < es@.len() ==>
+                        (#[trigger] es@[j]).index as int == after + 1 + j
+                    &&& entries_view(es@) == old(self).view().subrange(after as int, after + es@.len())
+                }
+            },
+    {
+        let mut es: Vec<Entry> = Vec::new();
+        let commit_index = self.state.commit_index;
+        if after >= commit_index {
+            return Ok(es);
+        }
+        let avail = commit_index - after;
+        let count: u64 = if (max as u64) < avail { max as u64 } else { avail };
+        let mut k: u64 = 0;
+        while k < count
+            invariant
+                self.inv(),
+                *self == *old(self),
+                commit_index == self.commit_index(),
+                after < commit_index,
+                count <= commit_index - after,
+                count <= max as u64,
+                k <= count,
+                k == es@.len(),
+                forall|j: int| 0 <= j < es@.len() ==>
+                    (#[trigger] es@[j]).index as int == after + 1 + j,
+                forall|j: int| 0 <= j < es@.len() ==>
+                    entry_view(#[trigger] es@[j]) == self.view()[after + j],
+            decreases count - k,
+        {
+            let index = after + 1 + k;
+            let e = match self.engine_get(index)? {
+                Some(e) => e,
+                // Unreachable: 1 <= index <= commit_index <= view().len() by
+                // `inv`, so the rim's specification puts the entry there.
+                None => fault(Fault::CommittedEntryMissing(index)),
+            };
+            es.push(e);
+            k += 1;
+        }
+        proof {
+            assert(entries_view(es@) =~= self.view().subrange(after as int, after + es@.len()));
+        }
+        Ok(es)
+    }
 }
 
 /// In a contiguous batch, entry k has index `first + k`.
@@ -1424,7 +1504,11 @@ impl Log {
         self.engine.0
     }
 
-    /// Returns an iterator over log entries in the given index range.
+    /// Returns an iterator over log entries in the given index range. Tests
+    /// only: the runtime apply path reads through the verified
+    /// `read_committed` instead, which pins the entries to the log's
+    /// verified view.
+    #[cfg(test)]
     pub fn scan(&mut self, range: impl RangeBounds<Index>) -> Iterator<'_> {
         let from = match range.start_bound() {
             Bound::Excluded(&index) => Bound::Excluded(Key::Entry(index).encode()),
@@ -1440,7 +1524,9 @@ impl Log {
     }
 
     /// Returns an iterator over entries that are ready to apply, starting after
-    /// the current applied index up to the commit index.
+    /// the current applied index up to the commit index. Tests only: see
+    /// `scan`.
+    #[cfg(test)]
     pub fn scan_apply(&mut self, applied_index: Index) -> Iterator<'_> {
         // NB: we don't assert that commit_index >= applied_index, because the
         // local commit index is not flushed to durable storage -- if lost on
@@ -1456,17 +1542,20 @@ impl Log {
         self.engine.0.status()
     }
 }
-/// A log entry iterator.
+/// A log entry iterator. Tests only: see `Log::scan`.
+#[cfg(test)]
 pub struct Iterator<'a> {
     inner: Box<dyn storage::ScanIterator + 'a>,
 }
 
+#[cfg(test)]
 impl<'a> Iterator<'a> {
     fn new(inner: Box<dyn storage::ScanIterator + 'a>) -> Self {
         Self { inner }
     }
 }
 
+#[cfg(test)]
 impl std::iter::Iterator for Iterator<'_> {
     type Item = Result<Entry>;
 

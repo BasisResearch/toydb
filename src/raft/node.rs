@@ -10,7 +10,7 @@ use super::log::{Index, Log};
 use super::message::{Envelope, Message, ReadSequence, Request, RequestID, Response, Status};
 use super::refine;
 use super::state::State;
-use super::{ELECTION_TIMEOUT_RANGE, HEARTBEAT_INTERVAL, MAX_APPEND_ENTRIES};
+use super::{APPLY_BATCH_SIZE, ELECTION_TIMEOUT_RANGE, HEARTBEAT_INTERVAL, MAX_APPEND_ENTRIES};
 use crate::errinput;
 use crate::error::{Error, Result};
 
@@ -535,15 +535,22 @@ impl RawNode<Follower> {
 
     /// Applies any pending log entries.
     fn maybe_apply(&mut self) -> Result<()> {
-        let mut iter = self.log.scan_apply(self.state.get_applied_index());
-        while let Some(entry) = iter.next().transpose()? {
-            debug!("Applying {entry:?}");
-            // Throw away the result, since only the leader responds to clients.
-            // This includes errors -- any non-deterministic errors (e.g. IO
-            // errors) must panic instead to avoid node divergence.
-            _ = self.state.apply(entry);
+        // The verified read_committed pins each batch to the committed prefix
+        // of the log's verified view, so the state machine is fed exactly
+        // that prefix, in order.
+        let mut after = self.state.get_applied_index();
+        loop {
+            let entries = self.log.read_committed(after, APPLY_BATCH_SIZE)?;
+            let Some(last) = entries.last() else { return Ok(()) };
+            after = last.index;
+            for entry in entries {
+                debug!("Applying {entry:?}");
+                // Throw away the result, since only the leader responds to clients.
+                // This includes errors -- any non-deterministic errors (e.g. IO
+                // errors) must panic instead to avoid node divergence.
+                _ = self.state.apply(entry);
+            }
         }
-        Ok(())
     }
 }
 
@@ -967,20 +974,27 @@ impl RawNode<Leader> {
             return Ok(old_index);
         };
 
-        // Apply entries and respond to clients.
+        // Apply entries and respond to clients. The verified read_committed
+        // pins each batch to the committed prefix of the log's verified view,
+        // so the state machine is fed exactly that prefix, in order.
         let term = self.term();
-        let mut iter = self.log.scan_apply(self.state.get_applied_index());
-        while let Some(entry) = iter.next().transpose()? {
-            debug!("Applying {entry:?}");
-            let write = self.role.writes.remove(&entry.index);
-            let result = self.state.apply(entry);
+        let mut after = self.state.get_applied_index();
+        loop {
+            let entries = self.log.read_committed(after, APPLY_BATCH_SIZE)?;
+            let Some(last) = entries.last() else { break };
+            after = last.index;
+            for entry in entries {
+                debug!("Applying {entry:?}");
+                let write = self.role.writes.remove(&entry.index);
+                let result = self.state.apply(entry);
 
-            if let Some(Write { id, from: to }) = write {
-                let message = Message::ClientResponse { id, response: result.map(Response::Write) };
-                Self::send_via(&self.tx, Envelope { from: self.id, term, to, message })?;
+                if let Some(Write { id, from: to }) = write {
+                    let message =
+                        Message::ClientResponse { id, response: result.map(Response::Write) };
+                    Self::send_via(&self.tx, Envelope { from: self.id, term, to, message })?;
+                }
             }
         }
-        drop(iter);
 
         // If the commit term changed, there may be pending reads waiting for us
         // to commit and apply an entry from our own term. Execute them.
@@ -1014,9 +1028,12 @@ impl RawNode<Leader> {
         //
         // Verified gate: a strict majority has confirmed the read's sequence
         // number (backed by confirmation evidence) and our committed tail is
-        // from our own term. By the model's thm_read_linearizable, the read
-        // then reflects every write that was committed anywhere in the
-        // cluster when it was submitted.
+        // from our own term. By the model's thm_read_linearizable, our
+        // committed prefix — which the applied-index check above says has
+        // been fed to the state machine, via the verified read_committed —
+        // then contains every write that was committed anywhere in the
+        // cluster when the read was submitted. The response bytes themselves
+        // come from the unverified state machine over that prefix.
         while let Some(read) = self.role.reads.front() {
             if !self.abs.leader_can_serve(&self.log, read.seq) {
                 break;

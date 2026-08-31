@@ -23,8 +23,8 @@ set -euo pipefail
 # (crate-relative, `::`-separated). Grows one line at a time.
 VERIFY_MODULES=(
   encoding::keycode
-  raft::log
-  raft::refine
+  raft::verified::log
+  raft::verified::refine
   raft::safety
   sql::types::value
   sql::parser::ast
