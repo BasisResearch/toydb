@@ -205,4 +205,64 @@ pub open spec fn sparse_control_begin(input: Seq<TokenView>) -> (Option<SStmt>, 
     }
 }
 
+// ===========================================================================
+// ORDER BY  (spec twin of `verified_control::parse_order_by_at`)
+//
+// `input` is the suffix at the position where the optional `ORDER BY` clause may
+// begin. Grammar: `[ORDER BY <expr> [ASC|DESC] (, <expr> [ASC|DESC])*]`. The
+// direction defaults to Ascending when neither `ASC` nor `DESC` is present.
+// ===========================================================================
+
+/// One-or-more `<expr> [ASC|DESC]` comma-separated items. `fuel` bounds the list
+/// length (the caller passes the token count, which strictly decreases per item
+/// since each item consumes at least one expression token).
+pub open spec fn sparse_control_order_list(input: Seq<TokenView>, fuel: nat)
+    -> (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>)
+    decreases fuel,
+{
+    if fuel == 0 {
+        (None, input)
+    } else {
+        match sparse_prec(input, 0, expr_fuel(input)) {
+            (Some(e), r) => {
+                // Optional direction; defaults to Ascending.
+                let (d, r1) = if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Asc) {
+                    (ast::Direction::Ascending, r.drop_first())
+                } else if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Desc) {
+                    (ast::Direction::Descending, r.drop_first())
+                } else {
+                    (ast::Direction::Ascending, r)
+                };
+                if r1.len() >= 1 && r1[0] == TokenView::Comma {
+                    match sparse_control_order_list(r1.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), r2) => (Some(seq![(e, d)] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![(e, d)]), r1)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+/// `[ORDER BY <list>]`, with `input` at the (optional) `ORDER` keyword.
+pub open spec fn sparse_control_order_by(input: Seq<TokenView>)
+    -> (Option<Seq<(SExpr, ast::Direction)>>, Seq<TokenView>)
+{
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::Order) {
+        (Some(Seq::<(SExpr, ast::Direction)>::empty()), input)
+    } else if input.len() < 2 || input[1] != TokenView::Keyword(Keyword::By) {
+        (None, input)
+    } else {
+        let r = input.drop_first().drop_first();
+        // Token count is a safe termination bound for the list recursion.
+        match sparse_control_order_list(r, r.len()) {
+            (Some(items), rest) => (Some(items), rest),
+            (None, _) => (None, input),
+        }
+    }
+}
+
 } // verus!

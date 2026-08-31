@@ -112,12 +112,26 @@ fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expre
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
         r.0 is None ==> r.2 is Some,
+        // On a realistically-sized input, refines `sparse_prec` at the fuel the
+        // caller (statement parser) always hands the expression parser.
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_precedence::sparse_prec(input, 0, verified_stmt_prec::expr_fuel(input));
+            match r.0 {
+                Some(e) => sopt is Some
+                    && verified_roundtrip::view_expr(e) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
     let n = toks.len() - pos;
     if n > (usize::MAX - 3) / 2 {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
     let fuel = 2 * n + 3;
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
     verified_precedence::parse_expression_at(toks, pos, 0, fuel)
 }
 
