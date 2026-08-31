@@ -50,10 +50,14 @@ use super::verified_production::TokenView;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::verified_roundtrip::{IsLit, SExpr};
 // These are `spec fn`s (erased from non-Verus builds), so the import is gated to
-// Verus compilation; `tables_agree` — the only user — is itself inside `verus!`.
+// Verus compilation; their users (`tables_agree` and the roundtrip lemmas below)
+// are all inside `verus!`.
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
-use super::verified_precedence::{binary_assoc_s, binary_prec_s, prefix_prec_s};
+use super::verified_precedence::{
+    binary_assoc_s, binary_prec_s, prefix_prec_s, sparse_atom, sparse_infix_loop,
+    sparse_postfix_loop, sparse_prec,
+};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, float_trust, verified_expression, verified_production};
 
@@ -234,6 +238,148 @@ pub open spec fn sprint_min_args(args: Seq<SExpr>) -> Seq<TokenView>
         sprint_min(args[0], 0)
     } else {
         sprint_min(args[0], 0) + seq![TokenView::Comma] + sprint_min_args(args.drop_first())
+    }
+}
+
+// ===========================================================================
+// Task 2 — spec-level minimal-parenthesisation roundtrip.
+//
+//   sparse_prec(sprint_min(e, ctx) ++ tail, ctx, fuel) == (Some(e), tail)
+//
+// for a `tail` that is *inert* at level `ctx` (see `inert` below) and adequate
+// `fuel`. Specialising to `ctx == 0`, `tail == empty` gives the headline
+// roundtrip `sparse_prec(sprint_min(e, 0), 0, fuel) == (Some(e), empty)`
+// (`min_roundtrip`). The lift to the live parser is `min_roundtrip_live` (task
+// 3), via `verified_precedence::parse_expression_at`'s refinement of
+// `sparse_prec`.
+//
+// Unlike the fully-parenthesised printer (`verified_roundtrip::sprint`, whose
+// operands are always followed by a boundary token so each continuation loop
+// takes at most one step), the min-parens printer emits bare infix spines like
+// `1 - 2 - 3`. The parser recovers those by precedence climbing: the infix loop
+// replays the whole left spine. The proof therefore threads a precedence-aware
+// notion of "the tail does not extend the current parse" — `inert(tail, level)`
+// — through both continuation loops, and decomposes a binary node into its
+// leftmost leaf plus a fold of `(op, right)` steps.
+// ===========================================================================
+
+/// `tail` cannot extend a parse running at min-precedence `level`: its head is
+/// neither a postfix operator whose precedence clears `level` (`!` at 9, `IS` at
+/// 4) nor a binary operator whose precedence clears `level`. Both continuation
+/// loops (`sparse_postfix_loop`, `sparse_infix_loop`) therefore halt on it
+/// immediately (`inert_halts`).
+pub open spec fn inert(tail: Seq<TokenView>, level: u8) -> bool {
+    tail.len() == 0 || {
+        &&& match verified_expression::binary_from_token(tail[0]) {
+            Some(tag) => binary_prec_s(tag) < level,
+            None => true,
+        }
+        &&& (tail[0] != TokenView::Exclamation || 9 < level)
+        &&& (tail[0] != TokenView::Keyword(Keyword::Is) || 4 < level)
+    }
+}
+
+/// An inert tail stops both continuation loops dead.
+pub proof fn inert_halts(lhs: SExpr, tail: Seq<TokenView>, level: u8, fuel: nat)
+    requires
+        inert(tail, level),
+    ensures
+        sparse_infix_loop(lhs, tail, level, fuel) == (Some(lhs), tail),
+        sparse_postfix_loop(lhs, tail, level) == (lhs, tail),
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+    reveal_with_fuel(sparse_postfix_loop, 1);
+    if tail.len() == 0 {
+    } else {
+        // Infix loop: either no binary op, or one below `level`.
+        assert(sparse_infix_loop(lhs, tail, level, fuel) == (Some(lhs), tail)) by {
+            match verified_expression::binary_from_token(tail[0]) {
+                Some(tag) => { assert(binary_prec_s(tag) < level); },
+                None => {},
+            }
+        }
+        // Postfix loop: head is not `!`/`IS`, or their precedence is below `level`.
+        assert(sparse_postfix_loop(lhs, tail, level) == (lhs, tail));
+    }
+}
+
+/// Inertness is monotone in the level: a tail inert at `level` is inert at any
+/// higher level (the guards only get harder to clear).
+pub proof fn inert_mono(tail: Seq<TokenView>, level: u8, level2: u8)
+    requires
+        inert(tail, level),
+        level <= level2,
+    ensures
+        inert(tail, level2),
+{
+}
+
+/// A prec-boundary tail (`)` / `,` / empty) is inert at every level: `)` and `,`
+/// are neither binary nor postfix operators.
+pub proof fn boundary_inert(tail: Seq<TokenView>, level: u8)
+    requires
+        tail.len() == 0 || tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma,
+    ensures
+        inert(tail, level),
+{
+    if tail.len() == 0 {
+    } else {
+        assert(verified_expression::binary_from_token(tail[0]) is None) by {
+            reveal(verified_expression::binary_from_token);
+        }
+    }
+}
+
+// ---- printer length bounds (fuel accounting) -------------------------------
+//
+// The parser lemmas require `fuel >= 2 * input.len() + k`. We express fuel
+// budgets in terms of the printed length; these facts let the recursion's
+// budget flow from the parent's.
+
+/// The wrapping decision only changes the length by the two parentheses.
+pub proof fn sprint_min_len(e: SExpr, ctx: u8)
+    ensures
+        sprint_min(e, ctx).len() == if prec_min(e) < ctx {
+            sprint_body(e).len() + 2
+        } else {
+            sprint_body(e).len()
+        },
+{
+    reveal_with_fuel(sprint_min, 1);
+    if prec_min(e) < ctx {
+        assert(sprint_min(e, ctx)
+            == seq![TokenView::OpenParen] + sprint_body(e) + seq![TokenView::CloseParen]);
+    }
+}
+
+/// `sprint_body(e)` is non-empty.
+pub proof fn sprint_body_nonempty(e: SExpr)
+    requires
+        super::verified_roundtrip::printable_se(e),
+    ensures
+        sprint_body(e).len() > 0,
+    decreases e,
+{
+    reveal_with_fuel(sprint_body, 1);
+    reveal(super::verified_roundtrip::printable_se);
+    match e {
+        SExpr::Literal(l) => {
+            reveal(verified_production::literal_views);
+            match l {
+                ast::Literal::Null => {},
+                ast::Literal::Boolean(_) => {},
+                ast::Literal::Integer(_) => {},
+                ast::Literal::Float(_) => {},
+                ast::Literal::String(_) => {},
+            }
+        },
+        SExpr::Factorial(inner) => {
+            sprint_body_nonempty(*inner);
+        },
+        SExpr::Is(inner, lit) => {
+            sprint_body_nonempty(*inner);
+        },
+        _ => {},
     }
 }
 
