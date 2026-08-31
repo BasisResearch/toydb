@@ -1109,6 +1109,12 @@ pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
 ))
     ensures
         r.0 is None ==> r.1 is Some,
+        ({
+            let input = verified_production::token_views(toks@.subrange(0, toks@.len() as int));
+            let (sopt, srest) = sparse_prec(input, 0, (2 * toks.len() + 3) as nat);
+            (toks.len() <= (usize::MAX - 3) / 2 && sopt is Some && srest.len() == 0)
+                ==> (r.0 is Some && super::verified_roundtrip::view_expr(r.0.unwrap()) == sopt.unwrap())
+        }),
 {
     if toks.len() > (usize::MAX - 3) / 2 {
         // Unreachable in practice (no such vector exists); reject defensively.
@@ -1116,6 +1122,12 @@ pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
     }
     let fuel = 2 * toks.len() + 3;
     let (opt, consumed, err) = parse_expression_at(toks, 0, 0, fuel);
+    proof {
+        if consumed <= toks.len() {
+            super::verified_roundtrip::token_views_len(
+                toks@.subrange(consumed as int, toks@.len() as int));
+        }
+    }
     match opt {
         Some(expr) => {
             if consumed == toks.len() {

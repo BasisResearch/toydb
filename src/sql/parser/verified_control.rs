@@ -35,6 +35,8 @@ use vstd::prelude::*;
 use super::parse_error::ParseError;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
+#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+use super::{verified_production, verified_stmt, verified_stmt_prec};
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 
@@ -1115,17 +1117,33 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 /// `DELETE`. The optional `WHERE` predicate is parsed by the Verus-verified
 /// expression parser. Mirrors `parse_delete`; a malformed form yields
 /// `(None, pos)` so the caller falls back to the legacy parser.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40000)]
 fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_delete(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     // FROM
     if pos >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
     if !matches!(toks[pos], Token::Keyword(Keyword::From)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::From),
@@ -1136,17 +1154,28 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 
     // Table name (an identifier).
     if cur >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     let table = match &toks[cur] {
         Token::Ident(name) => name.clone(),
         _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
 
+    // Position just past `FROM <ident>` — matches the spec twin's `r`.
+    let ghost r_spec = input.drop_first().drop_first();
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        verified_roundtrip::token_views_suffix(toks@, (pos + 1) as int);
+        assert(r_spec == verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
+    }
+
     // Optional WHERE <expr>, parsed by the verified expression parser.
     let mut where_clause: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
         // Fuel the verified parser needs (`2*(len-pos)+3`); guard the arithmetic.
         let n = toks.len() - cur;
@@ -1154,6 +1183,7 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
         let fuel = 2 * n + 3;
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         let (opt, consumed, werr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
         match opt {
             Some(expr) => {
@@ -1161,6 +1191,12 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 cur = consumed;
             },
             None => return (None, pos, werr),
+        }
+    } else {
+        if cur < toks.len() {
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+        } else {
+            proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         }
     }
 
