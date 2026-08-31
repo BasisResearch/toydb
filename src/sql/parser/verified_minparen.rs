@@ -383,4 +383,125 @@ pub proof fn sprint_body_nonempty(e: SExpr)
     }
 }
 
+// ---- leftmost-leaf / spine decomposition of a bare binary node ------------
+//
+// When a binary node prints unwrapped at context `ctx`, the parser's lhs phase
+// consumes only its *leftmost leaf* and the infix precedence-climbing loop
+// replays the rest of the spine. `lleaf(e, ctx)` is that leaf; `after_leaf(e,
+// ctx)` is the token stream between the leaf's print and the end of
+// `sprint_body(e)`. The two satisfy `sprint_body(e) == sprint_min(lleaf, llc)
+// ++ after_leaf` (`lemma_body_decomp`), where the leaf is printed at the
+// context it sits in.
+//
+// The descent rule: from `Binary(tag, L, R)` at context `ctx` (bp = bin_prec,
+// LC = bp+1-assoc) we descend into `L` only when `L` is itself a *bare* binary
+// node there — `L` is `Binary(..)` with `prec_min(L) >= LC`. Otherwise `L` is
+// the leaf (an atom, a prefix chain, a postfix node, or a parenthesised group).
+
+/// The leftmost leaf of a bare binary spine and the context it is printed at.
+pub open spec fn descends(l: SExpr, lc: u8) -> bool {
+    l is Binary && prec_min(l) >= lc
+}
+
+/// Leftmost leaf reached by descending bare-binary left children.
+pub open spec fn lleaf(e: SExpr, ctx: u8) -> SExpr
+    decreases e,
+{
+    match e {
+        SExpr::Binary(tag, left, right) => {
+            let lc = (bin_prec(tag) + 1 - bin_assoc(tag)) as u8;
+            if descends(*left, lc) {
+                lleaf(*left, lc)
+            } else {
+                *left
+            }
+        },
+        _ => e,
+    }
+}
+
+/// The context the leftmost leaf is printed at.
+pub open spec fn lleaf_ctx(e: SExpr, ctx: u8) -> u8
+    decreases e,
+{
+    match e {
+        SExpr::Binary(tag, left, right) => {
+            let lc = (bin_prec(tag) + 1 - bin_assoc(tag)) as u8;
+            if descends(*left, lc) {
+                lleaf_ctx(*left, lc)
+            } else {
+                lc
+            }
+        },
+        _ => ctx,
+    }
+}
+
+/// The spine tokens after the leftmost leaf's print, i.e. the `[op] ++
+/// sprint_min(right, rc)` productions from the leaf up to the root, innermost
+/// first (matching the left-to-right token order the infix loop consumes).
+pub open spec fn after_leaf(e: SExpr, ctx: u8) -> Seq<TokenView>
+    decreases e,
+{
+    match e {
+        SExpr::Binary(tag, left, right) => {
+            let lc = (bin_prec(tag) + 1 - bin_assoc(tag)) as u8;
+            let rc = (bin_prec(tag) + bin_assoc(tag)) as u8;
+            let here = seq![bin_tok(tag)] + sprint_min(*right, rc);
+            if descends(*left, lc) {
+                after_leaf(*left, lc) + here
+            } else {
+                here
+            }
+        },
+        _ => Seq::empty(),
+    }
+}
+
+/// The print of a bare binary node decomposes into its leftmost leaf's print
+/// (at the leaf's own context) followed by the spine tokens.
+pub proof fn lemma_body_decomp(e: SExpr, ctx: u8)
+    requires
+        e is Binary,
+    ensures
+        sprint_body(e) == sprint_min(lleaf(e, ctx), lleaf_ctx(e, ctx)) + after_leaf(e, ctx),
+    decreases e,
+{
+    reveal_with_fuel(sprint_body, 1);
+    let (tag, left, right) = match e {
+        SExpr::Binary(tag, left, right) => (tag, left, right),
+        _ => { return; },
+    };
+    let lc = (bin_prec(tag) + 1 - bin_assoc(tag)) as u8;
+    let rc = (bin_prec(tag) + bin_assoc(tag)) as u8;
+    let here = seq![bin_tok(tag)] + sprint_min(*right, rc);
+    assert(sprint_body(e) == sprint_min(*left, lc) + here);
+    if descends(*left, lc) {
+        lemma_body_decomp(*left, lc);
+        // sprint_min(*left, lc) = sprint_body(*left) since *left unwrapped at lc.
+        reveal_with_fuel(sprint_min, 1);
+        assert(prec_min(*left) >= lc);
+        assert(sprint_min(*left, lc) == sprint_body(*left));
+        assert(sprint_body(*left)
+            == sprint_min(lleaf(*left, lc), lleaf_ctx(*left, lc)) + after_leaf(*left, lc));
+        assert(lleaf(e, ctx) == lleaf(*left, lc));
+        assert(lleaf_ctx(e, ctx) == lleaf_ctx(*left, lc));
+        assert(after_leaf(e, ctx) == after_leaf(*left, lc) + here);
+        assert(sprint_min(lleaf(e, ctx), lleaf_ctx(e, ctx)) + after_leaf(e, ctx)
+            == (sprint_min(lleaf(*left, lc), lleaf_ctx(*left, lc)) + after_leaf(*left, lc)) + here);
+        assert(sprint_min(*left, lc) + here
+            == (sprint_min(lleaf(*left, lc), lleaf_ctx(*left, lc)) + after_leaf(*left, lc)) + here)
+            by {
+                assert(sprint_min(*left, lc)
+                    == sprint_min(lleaf(*left, lc), lleaf_ctx(*left, lc)) + after_leaf(*left, lc));
+            }
+        assert(sprint_body(e) =~= sprint_min(lleaf(e, ctx), lleaf_ctx(e, ctx)) + after_leaf(e, ctx));
+    } else {
+        assert(lleaf(e, ctx) == *left);
+        assert(lleaf_ctx(e, ctx) == lc);
+        assert(after_leaf(e, ctx) == here);
+        assert(sprint_body(e) =~= sprint_min(*left, lc) + here);
+    }
+}
+
 } // verus!
