@@ -24,14 +24,17 @@
 //! `verified_stmt_prec`, whose expression positions are `sparse_prec` (unlike
 //! `verified_stmt::sparse_stmt`, which uses the fully-parenthesised grammar).
 //! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, `parse_order_by_at`,
-//! and `parse_group_by_at` are proven to produce exactly the AST their spec twin
-//! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` / `_group_by`)
-//! computes, up to `verified_stmt::view_stmt` / `view_order_list` /
+//! `parse_group_by_at`, and the `CREATE TABLE` pair `parse_create_at` /
+//! `parse_create_column_at` are proven to produce exactly the AST their spec
+//! twin (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` /
+//! `_group_by` / `_create` / `_column`) computes, up to
+//! `verified_stmt::view_stmt` / `view_order_list` / `view_column` /
 //! `verified_roundtrip::view_args`, with the leftover-token stream pinned — so
-//! e.g. mis-defaulting an `ORDER BY` direction or dropping `IF EXISTS` now breaks
-//! verification, not just the goldenscript suite. The remaining dispatch
+//! e.g. mis-defaulting an `ORDER BY` direction, dropping `IF EXISTS`, or
+//! dropping a column's `PRIMARY KEY` / `NOT NULL` flag now breaks verification,
+//! not just the goldenscript suite. The remaining dispatch
 //! (`parse_control_at`) and clause parsers (SELECT list, FROM join tree, INSERT
-//! rows, UPDATE assignments, CREATE columns, EXPLAIN) still carry only the
+//! rows, UPDATE assignments, EXPLAIN) still carry only the
 //! no-panic/terminate/error-on-reject contract; their accepted ASTs and
 //! rejection errors are pinned by the goldenscript suite. Embedded
 //! expressions are parsed by `verified_precedence`, which additionally carries a

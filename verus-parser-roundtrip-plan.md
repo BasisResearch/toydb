@@ -51,11 +51,14 @@ suite). New strategy and progress:
   functionally specified as of 2026-08-31: `verified_stmt_prec` carries spec
   twins (`sparse_control_*`) whose expression positions are `sparse_prec`, and
   `parse_delete_at` / `parse_drop_at` / `parse_begin_at` / `parse_order_by_at` /
-  `parse_group_by_at` are proven to refine their twins up to `view_stmt` /
-  `view_order_list` / `view_args` (so those clauses' concrete AST *is* verified,
-  not just goldenscript-pinned). The top-level dispatch `parse_control_at` and
+  `parse_group_by_at` plus the `CREATE TABLE` pair `parse_create_at` /
+  `parse_create_column_at` (milestone 2b) are proven to refine their twins up to
+  `view_stmt` / `view_order_list` / `view_column` / `view_args` (so those
+  clauses' concrete AST *is* verified, not just goldenscript-pinned; e.g.
+  dropping a column's `PRIMARY KEY` / `NOT NULL` flag now breaks verification).
+  The top-level dispatch `parse_control_at` and
   the remaining clause parsers (SELECT list, FROM join tree, INSERT rows, UPDATE
-  assignments, CREATE columns, EXPLAIN) still have no functional spec; their
+  assignments, EXPLAIN) still have no functional spec; their
   concrete behaviour is pinned only by the goldenscripts and the restored
   differential oracle.
 
