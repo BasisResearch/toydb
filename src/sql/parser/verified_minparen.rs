@@ -2111,4 +2111,41 @@ pub proof fn binary_tok_tag(tag: BinaryTag)
     super::verified_roundtrip::binary_tok_roundtrip(tag);
 }
 
+// ===========================================================================
+// Headline spec roundtrip (task 2) and the residual (task 5).
+// ===========================================================================
+
+/// The minimal-parenthesisation print of any printable mirror expression
+/// re-parses to that expression, consuming all tokens:
+///
+///   sparse_prec(sprint_min(e, 0), 0, fuel) == (Some(e), empty)
+///
+/// for `fuel >= 2 * sprint_min(e, 0).len() + 3`. This is the phase's core
+/// guarantee: because the printer's parenthesisation decisions
+/// (`bin_prec` / `bin_assoc` / `pre_prec`, checked to agree with the parser's
+/// spec twins by `tables_agree`) encode the precedence/associativity table a
+/// third time — independently of the parser and its spec twin — the round trip
+/// FAILS unless parser, spec twin, and printer all agree on that table. A
+/// mutation of the parser's table that is not mirrored in the printer breaks
+/// this theorem (see the mutation check in the phase report).
+///
+/// Residual (task 5): a CONSISTENT swap of all three encodings (the exec table
+/// `verified_precedence::binary_prec`, its spec twin `binary_prec_s`, AND this
+/// module's `bin_prec`) still round-trips here — the theorem pins them to each
+/// other, not to an external ground truth. The guards against a consistent swap
+/// are the `op_precedence` goldenscripts and the differential harness restored
+/// in phase 0, which compare the parser against externally-fixed SQL semantics.
+pub proof fn min_roundtrip(e: SExpr, fuel: nat)
+    requires
+        super::verified_roundtrip::printable_se(e),
+        fuel >= 2 * sprint_min(e, 0).len() + 3,
+    ensures
+        sparse_prec(sprint_min(e, 0), 0, fuel) == (Some(e), Seq::<TokenView>::empty()),
+{
+    let tail = Seq::<TokenView>::empty();
+    boundary_inert(tail, 0);
+    assert(sprint_min(e, 0) + tail =~= sprint_min(e, 0));
+    lemma_min(e, 0, tail, fuel);
+}
+
 } // verus!
