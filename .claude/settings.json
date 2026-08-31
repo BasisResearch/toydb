@@ -38,7 +38,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|mcp__verus__verify",
+        "matcher": "Bash|mcp__verus__.*",
         "hooks": [
           {
             "type": "command",
