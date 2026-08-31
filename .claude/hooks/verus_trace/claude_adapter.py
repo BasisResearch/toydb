@@ -107,6 +107,9 @@ def parse_transcript(path):
                     tool_calls.append(call)
                     tuid = block.get("id")
                     if tuid:
+                        # The transcript's per-call id: the dashboard joins
+                        # SMT captures (and any per-call artifact) on it.
+                        call["tool_use_id"] = tuid
                         pending_calls[tuid] = call
                 elif block.get("type") == "tool_result":
                     tuid = block.get("tool_use_id")

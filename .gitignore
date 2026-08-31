@@ -13,3 +13,6 @@
 # Verus build byproducts dropped in the working tree
 /*.rlib
 *.long-type-*.txt
+
+# Verus --log-dir default output (SMT capture uses ~/.verus-trace instead)
+.verus-log/
