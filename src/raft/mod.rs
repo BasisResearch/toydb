@@ -247,10 +247,11 @@ mod node;
 // declares are ghost bookkeeping, hence the dead_code allowance).
 #[allow(dead_code)]
 mod safety;
-// The node-local refinement layer: verified step cores proving that the step
-// functions implement the safety model's transitions. Called from `node`.
-// (A normal build erases the ghost code, leaving the parameters that only
-// feed ghost state unused.)
+// The node-local refinement layer: the verified node state (member ranks,
+// candidate votes, leader progress) and one verified step function per
+// protocol input, each proving that the step implements the safety model's
+// transitions. `node` is the I/O shell around it. (A normal build erases the
+// ghost code, leaving the parameters that only feed ghost state unused.)
 #[allow(unused_variables)]
 mod refine;
 mod state;

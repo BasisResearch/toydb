@@ -1,10 +1,24 @@
+// The verified code below is written in Verus's exec idiom (explicit
+// `len() == 0` checks, `&Vec` parameters, verdict matches instead of `?`),
+// which trips several style lints.
+#![allow(
+    clippy::ptr_arg,
+    clippy::len_zero,
+    clippy::manual_unwrap_or,
+    clippy::manual_unwrap_or_default,
+    clippy::int_plus_one,
+    clippy::single_match,
+    clippy::manual_map,
+    clippy::question_mark
+)]
+
 use std::ops::{Bound, RangeBounds};
 
 use serde::{Deserialize, Serialize};
 
 use super::{NodeID, Term};
 use crate::encoding::{self, Key as _, Value as _, bincode};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::storage;
 
 /// A log index (entry position). Starts at 1. 0 indicates no index.
@@ -40,42 +54,206 @@ pub enum Key {
 
 impl encoding::Key<'_> for Key {}
 
-// --- Verus-verified core of the Raft log state machine ----------------------
+// --- Verus-verified Raft log ------------------------------------------------
 //
-// The documented log invariants (see the `Log` doc comment below) are enforced
-// by a small set of precondition checks and in-memory state transitions:
-// append always writes at `last_index + 1` in the current term, the commit
-// index never regresses, and splice rejects batches that are non-contiguous,
-// term-regressing, disconnected from the existing log, or below the commit
-// index. The functions below are that core, extracted into pure, verified
-// code over `LogState` (the mutable in-memory fields of `Log`):
+// `Log` is verified against a ghost *view* of the entries the storage engine
+// holds (`Log::view()`, a `Seq<AEntry>` in which entry k is impl index k+1).
+// The documented log invariants (see the `Log` doc comment below) are stated
+// over that view by `Log::inv` — contiguity is built into the sequence
+// representation, terms are nonzero and nondecreasing and at or below the
+// current term, the committed prefix is within the log and `commit_term` is
+// the term of the entry at `commit_index` — and every public method carries a
+// postcondition that pins its result and the new view in terms of the old
+// one: `append` pushes an entry of the current term, `splice` yields exactly
+// the safety model's `splice` of the batch (the "skip already-present
+// entries" scan included), `commit` moves the commit index forward to an
+// existing entry, and `has`/`get` answer according to the view.
 //
-// * Every checked precondition is proven to hold exactly when the verdict says
-//   so (e.g. `CommitCheck::Regression` is returned iff the index regresses),
-//   so the `Log` methods panic in precisely the documented cases.
-// * Every state transition is proven to compute the new state field-by-field:
-//   `append_state` yields index `last_index + 1` at term `term` (contiguity,
-//   current-term append), `commit_state` yields a strictly larger commit index
-//   (no commit regression), and `splice_state` refuses to touch entries at or
-//   below the commit index.
-// * Each transition preserves the state invariant `wf` — entry terms at or
-//   below the current term, and the commit index at or below the last index —
-//   where `wf` can be preserved. (`Log::new` loads state from disk, which is
-//   unverified: with fsync disabled a crash can legitimately leave the commit
-//   index ahead of the last index, so `wf` is preserved rather than assumed.)
+// The precondition checks that `Log` documents as panics are kept as panics,
+// raised through the single diverging function `fault`, and are proven to
+// fire exactly when documented.
 //
-// What stays unverified (and trusted): the storage engine, serialization, the
-// on-disk log contents, and the splice scan that skips already-present
-// entries. `Log` routes every in-memory state change through these functions,
-// so the bookkeeping the invariants are stated over is verified even though
-// disk I/O is not. `verus!` erases all specs and proofs to the plain `fn`
-// bodies under a normal `cargo build`.
+// What stays trusted is the *engine rim*: the handful of
+// `#[verifier::external_body]` functions below that perform the actual
+// engine I/O. Each carries an explicit specification stating what the engine
+// holds afterwards in terms of the view — this is the storage-integrity
+// assumption, and it is the only place it lives. `Log::open` (loading the
+// durable state at startup) is likewise trusted to yield a log satisfying
+// `inv`; see its comment for the fsync caveat. Serialization and the engines
+// themselves are outside the verified perimeter.
+//
+// `verus!` erases all specs and proofs to the plain `fn` bodies under a
+// normal `cargo build`.
 use vstd::prelude::*;
+
+#[allow(unused_imports)] // referenced only from ghost code
+use super::safety::AEntry;
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::safety::{last_term, log_wf, splice, splice_is_noop, terms_le};
+
+/// The storage engine, boxed. Wrapped so that the verified `Log` can hold it
+/// as an opaque type; only the trusted engine rim below touches it.
+pub struct EngineBox(pub Box<dyn storage::Engine>);
+
+/// A `Log` precondition violation. These are the documented panics of the log
+/// methods; the verified code raises them through `fault`.
+#[derive(Debug)]
+pub enum Fault {
+    // Log faults.
+    SetTermZero,
+    TermRegression(Term, Term),
+    VoteChange,
+    AppendTermZero,
+    IndexOverflow,
+    CommitMissing(Index),
+    CommitRegression(Index, Index),
+    SpliceZeroIndexOrTerm,
+    SpliceNonContiguous,
+    SpliceTermRegression,
+    SpliceTermBeyondCurrent(Term, Term),
+    SpliceBaseTermRegression(Term, Term),
+    SpliceNoTouch(Index),
+    SpliceBelowCommit,
+    CommandMismatch(Entry),
+    // Node step faults (raised by the verified step functions in
+    // `raft::refine`, mirroring the shell's former assertions).
+    UnknownNode(NodeID),
+    WrongRole,
+    WrongTerm,
+    FutureMatchIndex,
+    FutureReadSequence,
+    FutureRejectIndex,
+    CommitAfterLastIndex,
+    BaseIndexMismatch,
+    NoVoteQuorum,
+    TermOverflow,
+    ReadSequenceOverflow,
+    MissingBaseEntry,
+    CommitIndexMissing(Index),
+    LeaderLastTerm,
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetTermZero => write!(f, "can't set term 0"),
+            Self::TermRegression(cur, new) => write!(f, "term regression {cur} → {new}"),
+            Self::VoteChange => write!(f, "can't change vote"),
+            Self::AppendTermZero => write!(f, "can't append entry in term 0"),
+            Self::IndexOverflow => write!(f, "log index overflow"),
+            Self::CommitMissing(index) => write!(f, "commit index {index} does not exist"),
+            Self::CommitRegression(cur, new) => {
+                write!(f, "commit index regression {cur} → {new}")
+            }
+            Self::SpliceZeroIndexOrTerm => write!(f, "spliced entry has index or term 0"),
+            Self::SpliceNonContiguous => write!(f, "spliced entries are not contiguous"),
+            Self::SpliceTermRegression => write!(f, "spliced entries have term regression"),
+            Self::SpliceTermBeyondCurrent(last, cur) => {
+                write!(f, "splice term {last} beyond current {cur}")
+            }
+            Self::SpliceBaseTermRegression(base, first) => {
+                write!(f, "splice term regression {base} → {first}")
+            }
+            Self::SpliceNoTouch(first) => write!(f, "first index {first} must touch existing log"),
+            Self::SpliceBelowCommit => write!(f, "spliced entries below commit index"),
+            Self::CommandMismatch(entry) => write!(f, "command mismatch at {entry:?}"),
+            Self::UnknownNode(id) => write!(f, "unknown node {id}"),
+            Self::WrongRole => write!(f, "step function called in the wrong role"),
+            Self::WrongTerm => write!(f, "step function called with a message from another term"),
+            Self::FutureMatchIndex => write!(f, "future match index"),
+            Self::FutureReadSequence => write!(f, "future read sequence number"),
+            Self::FutureRejectIndex => write!(f, "future reject index"),
+            Self::CommitAfterLastIndex => write!(f, "commit_index after last_index"),
+            Self::BaseIndexMismatch => write!(f, "base index mismatch"),
+            Self::NoVoteQuorum => write!(f, "leadership without verified vote quorum"),
+            Self::TermOverflow => write!(f, "term overflow"),
+            Self::ReadSequenceOverflow => write!(f, "read sequence number overflow"),
+            Self::MissingBaseEntry => write!(f, "missing base entry"),
+            Self::CommitIndexMissing(index) => write!(f, "commit index {index} missing"),
+            Self::LeaderLastTerm => write!(f, "leader's last_term not in current term"),
+        }
+    }
+}
+
+/// Loads the durable log state from the engine (unverified: deserialization
+/// and engine scans). Called by the trusted `Log::open`.
+fn load_state(engine: &mut Box<dyn storage::Engine>) -> Result<LogState> {
+    let (term, vote) = engine
+        .get(&Key::TermVote.encode())?
+        .map(|v| bincode::deserialize(&v))
+        .transpose()?
+        .unwrap_or((0, None));
+    let (last_index, last_term) = engine
+        .scan_dyn((
+            Bound::Included(Key::Entry(0).encode()),
+            Bound::Included(Key::Entry(u64::MAX).encode()),
+        ))
+        .last()
+        .transpose()?
+        .map(|(_, v)| Entry::decode(&v))
+        .transpose()?
+        .map(|e| (e.index, e.term))
+        .unwrap_or((0, 0));
+    let (commit_index, commit_term) = engine
+        .get(&Key::CommitIndex.encode())?
+        .map(|v| bincode::deserialize(&v))
+        .transpose()?
+        .unwrap_or((0, 0));
+    Ok(LogState { term, vote, last_index, last_term, commit_index, commit_term })
+}
 
 verus! {
 
-/// The in-memory Raft log state: the mutable fields of `Log`. All `Log` state
-/// changes go through the verified transitions below.
+// Types from outside the verified perimeter that the verified code handles.
+// `EngineBox` and `Error` are opaque (never inspected); `Entry` and `Fault`
+// are transparent (their fields are visible to the specifications).
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)] // Verus type specification
+pub struct ExEngineBox(EngineBox);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)] // Verus type specification
+pub struct ExError(Error);
+
+#[verifier::external_type_specification]
+#[allow(dead_code)] // Verus type specification
+pub struct ExEntry(Entry);
+
+#[verifier::external_type_specification]
+#[allow(dead_code)] // Verus type specification
+pub struct ExFault(Fault);
+
+/// Panics with the fault's message. The only way verified code panics: a
+/// diverging function has a vacuous specification, so nothing is trusted
+/// here beyond "it does not return".
+#[verifier::external_body]
+pub fn fault(f: Fault) -> ! {
+    panic!("{f}")
+}
+
+/// The ghost view of a command payload.
+pub open spec fn cmd_view(c: Option<Vec<u8>>) -> Option<Seq<u8>> {
+    match c {
+        Some(v) => Some(v@),
+        None => None,
+    }
+}
+
+/// The abstract (safety model) view of an entry: its term and command.
+pub open spec fn entry_view(e: Entry) -> AEntry {
+    AEntry { term: e.term as nat, cmd: cmd_view(e.command) }
+}
+
+/// The abstract view of a batch of entries.
+pub open spec fn entries_view(es: Seq<Entry>) -> Seq<AEntry> {
+    es.map_values(|e: Entry| entry_view(e))
+}
+
+/// The in-memory summary of the durable log state (term, vote, last and
+/// commit index/term). Mutated only via the verified transitions below.
 pub struct LogState {
     /// The current term.
     pub term: Term,
@@ -91,9 +269,9 @@ pub struct LogState {
     pub commit_term: Term,
 }
 
-/// The state invariant: entry terms are at or below the current term, and the
-/// committed prefix is within the log. Every transition preserves this (see
-/// the caveat on `Log::new` in the section comment above).
+/// The summary's own invariant: entry terms are at or below the current term,
+/// and the committed prefix is within the log. `Log::inv` extends it to the
+/// ghost view of the entries.
 pub open spec fn wf(st: LogState) -> bool {
     &&& st.last_term <= st.term
     &&& st.commit_index <= st.last_index
@@ -131,7 +309,7 @@ pub fn set_term_vote_state(st: &LogState, term: Term, vote: Option<NodeID>) -> (
         TermVoteCheck::ZeroTerm => term == 0,
         TermVoteCheck::TermRegression => 0 < term < st.term,
         TermVoteCheck::VoteChange => term == st.term && st.vote is Some && vote != st.vote,
-        TermVoteCheck::Noop => term == st.term && vote == st.vote,
+        TermVoteCheck::Noop => term == st.term && vote == st.vote && term > 0,
         TermVoteCheck::Update(new) => {
             &&& term > 0
             &&& new.term == term && new.term >= st.term // term monotonicity
@@ -255,14 +433,14 @@ pub fn commit_state(st: &LogState, entry_index: Index, entry_term: Term) -> (r: 
     }
 }
 
-/// A spliced batch of (index, term) pairs has contiguous indexes.
-pub open spec fn entries_contiguous(pairs: Seq<(Index, Term)>) -> bool {
-    forall|i: int| #![trigger pairs[i]] 0 < i < pairs.len() ==> pairs[i].0 == pairs[i - 1].0 + 1
+/// A spliced batch has contiguous indexes.
+pub open spec fn entries_contiguous(es: Seq<Entry>) -> bool {
+    forall|i: int| #![trigger es[i]] 0 < i < es.len() ==> es[i].index == es[i - 1].index + 1
 }
 
-/// A spliced batch of (index, term) pairs has equal or increasing terms.
-pub open spec fn entries_terms_monotone(pairs: Seq<(Index, Term)>) -> bool {
-    forall|i: int| #![trigger pairs[i]] 0 < i < pairs.len() ==> pairs[i].1 >= pairs[i - 1].1
+/// A spliced batch has equal or increasing terms.
+pub open spec fn entries_terms_monotone(es: Seq<Entry>) -> bool {
+    forall|i: int| #![trigger es[i]] 0 < i < es.len() ==> es[i].term >= es[i - 1].term
 }
 
 /// The verdict of `check_splice_entries`.
@@ -279,56 +457,56 @@ pub enum SpliceEntriesCheck {
     WellFormed,
 }
 
-/// Verified well-formedness check for a spliced batch, as (index, term) pairs:
-/// nonzero first index and term, contiguous indexes, and monotone terms.
+/// Verified well-formedness check for a spliced batch: nonzero first index
+/// and term, contiguous indexes, and monotone terms.
 /// (Clippy allows: Verus wants `&Vec` and `len() == 0`, which vstd specs.)
 #[allow(clippy::ptr_arg, clippy::len_zero)]
-pub fn check_splice_entries(pairs: &Vec<(Index, Term)>) -> (r: SpliceEntriesCheck)
+pub fn check_splice_entries(es: &Vec<Entry>) -> (r: SpliceEntriesCheck)
     ensures match r {
-        SpliceEntriesCheck::Empty => pairs@.len() == 0,
+        SpliceEntriesCheck::Empty => es@.len() == 0,
         SpliceEntriesCheck::ZeroIndexOrTerm => {
-            pairs@.len() > 0 && (pairs@[0].0 == 0 || pairs@[0].1 == 0)
+            es@.len() > 0 && (es@[0].index == 0 || es@[0].term == 0)
         },
-        SpliceEntriesCheck::NonContiguous => !entries_contiguous(pairs@),
-        SpliceEntriesCheck::TermRegression => !entries_terms_monotone(pairs@),
+        SpliceEntriesCheck::NonContiguous => !entries_contiguous(es@),
+        SpliceEntriesCheck::TermRegression => !entries_terms_monotone(es@),
         SpliceEntriesCheck::WellFormed => {
-            &&& pairs@.len() > 0
-            &&& pairs@[0].0 > 0 && pairs@[0].1 > 0
-            &&& entries_contiguous(pairs@)
-            &&& entries_terms_monotone(pairs@)
+            &&& es@.len() > 0
+            &&& es@[0].index > 0 && es@[0].term > 0
+            &&& entries_contiguous(es@)
+            &&& entries_terms_monotone(es@)
         },
     },
 {
-    if pairs.len() == 0 {
+    if es.len() == 0 {
         return SpliceEntriesCheck::Empty;
     }
-    if pairs[0].0 == 0 || pairs[0].1 == 0 {
+    if es[0].index == 0 || es[0].term == 0 {
         return SpliceEntriesCheck::ZeroIndexOrTerm;
     }
     let mut i: usize = 1;
-    while i < pairs.len()
+    while i < es.len()
         invariant
-            1 <= i <= pairs@.len(),
-            forall|j: int| #![trigger pairs@[j]] 0 < j < i ==> pairs@[j].0 == pairs@[j - 1].0 + 1,
-        decreases pairs@.len() - i,
+            1 <= i <= es@.len(),
+            forall|j: int| #![trigger es@[j]] 0 < j < i ==> es@[j].index == es@[j - 1].index + 1,
+        decreases es@.len() - i,
     {
         // An index at u64::MAX can't have a successor, so the batch is not
         // contiguous (and computing `+ 1` would overflow).
-        if pairs[i - 1].0 == u64::MAX || pairs[i].0 != pairs[i - 1].0 + 1 {
-            assert(pairs@[i as int].0 != pairs@[i as int - 1].0 + 1);
+        if es[i - 1].index == u64::MAX || es[i].index != es[i - 1].index + 1 {
+            assert(es@[i as int].index != es@[i as int - 1].index + 1);
             return SpliceEntriesCheck::NonContiguous;
         }
         i += 1;
     }
     let mut i: usize = 1;
-    while i < pairs.len()
+    while i < es.len()
         invariant
-            1 <= i <= pairs@.len(),
-            forall|j: int| #![trigger pairs@[j]] 0 < j < i ==> pairs@[j].1 >= pairs@[j - 1].1,
-        decreases pairs@.len() - i,
+            1 <= i <= es@.len(),
+            forall|j: int| #![trigger es@[j]] 0 < j < i ==> es@[j].term >= es@[j - 1].term,
+        decreases es@.len() - i,
     {
-        if pairs[i].1 < pairs[i - 1].1 {
-            assert(pairs@[i as int].1 < pairs@[i as int - 1].1);
+        if es[i].term < es[i - 1].term {
+            assert(es@[i as int].term < es@[i as int - 1].term);
             return SpliceEntriesCheck::TermRegression;
         }
         i += 1;
@@ -433,7 +611,40 @@ pub fn splice_state(
     })
 }
 
-} // verus!
+/// Byte-vector equality.
+fn bytes_eq(a: &Vec<u8>, b: &Vec<u8>) -> (r: bool)
+    ensures r == (a@ == b@),
+{
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len()
+        invariant
+            i <= a@.len(),
+            a@.len() == b@.len(),
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases a@.len() - i,
+    {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    assert(a@ =~= b@);
+    true
+}
+
+/// Command equality.
+fn cmd_eq(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> (r: bool)
+    ensures r == (cmd_view(*a) == cmd_view(*b)),
+{
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => bytes_eq(x, y),
+        _ => false,
+    }
+}
 
 /// The Raft log stores a sequence of arbitrary commands (typically writes) that
 /// are replicated across nodes and applied sequentially to the local state
@@ -472,7 +683,9 @@ pub fn splice_state(
 /// indexes, then the uncommitted entries will be replaced with entries from the
 /// new leader once the old leader (or a follower) discovers it.
 ///
-/// The Raft log has the following invariants:
+/// The Raft log has the following invariants (the local ones are `Log::inv`,
+/// verified over the ghost view of the stored entries; the cross-node ones
+/// are theorems of the safety model in `raft::safety`):
 ///
 /// * Entry indexes are contiguous starting at 1 (no index gaps).
 /// * Entry terms never decrease from the previous entry.
@@ -487,11 +700,11 @@ pub fn splice_state(
 pub struct Log {
     /// The underlying storage engine. Uses a trait object instead of generics,
     /// to allow runtime selection of the engine and avoid propagating the
-    /// generic type parameters throughout Raft.
-    pub engine: Box<dyn storage::Engine>,
-    /// The in-memory state (term, vote, last and commit index/term). Only
-    /// mutated via the verified transitions in the `verus!` block above, which
-    /// enforce the log invariants over it.
+    /// generic type parameters throughout Raft. Only the trusted engine rim
+    /// touches it.
+    engine: EngineBox,
+    /// The in-memory summary of the durable state (term, vote, last and
+    /// commit index/term).
     state: LogState,
     /// If true, fsync entries to disk when appended. This is mandated by Raft,
     /// but comes with a hefty performance penalty (especially since we don't
@@ -500,82 +713,246 @@ pub struct Log {
     /// in some scenarios can cause log entries to become "uncommitted" and
     /// state machines diverging.
     fsync: bool,
+    /// Ghost (zero-sized, proof-only): the entries the engine holds, in
+    /// order; entry k is the entry at index k+1. Updated only by the trusted
+    /// engine rim, whose specifications state the storage-integrity
+    /// assumption.
+    #[allow(dead_code)] // read only by ghost code, erased in a normal build
+    view: Ghost<Seq<AEntry>>,
 }
 
 impl Log {
-    /// Initializes a log using the given storage engine.
-    pub fn new(mut engine: Box<dyn storage::Engine>) -> Result<Self> {
-        // Load some initial in-memory state from disk.
-        let (term, vote) = engine
-            .get(&Key::TermVote.encode())?
-            .map(|v| bincode::deserialize(&v))
-            .transpose()?
-            .unwrap_or((0, None));
-        let (last_index, last_term) = engine
-            .scan_dyn((
-                Bound::Included(Key::Entry(0).encode()),
-                Bound::Included(Key::Entry(u64::MAX).encode()),
-            ))
-            .last()
-            .transpose()?
-            .map(|(_, v)| Entry::decode(&v))
-            .transpose()?
-            .map(|e| (e.index, e.term))
-            .unwrap_or((0, 0));
-        let (commit_index, commit_term) = engine
-            .get(&Key::CommitIndex.encode())?
-            .map(|v| bincode::deserialize(&v))
-            .transpose()?
-            .unwrap_or((0, 0));
-
-        let fsync = true; // fsync by default
-        // NB: this state is loaded from unverified storage, so the verified
-        // transitions preserve the `wf` invariant rather than assume it: with
-        // fsync disabled, a crash can leave the commit index ahead of the log.
-        let state = LogState { term, vote, last_index, last_term, commit_index, commit_term };
-        Ok(Self { engine, state, fsync })
+    /// The abstract view of the stored entries.
+    pub closed spec fn view(&self) -> Seq<AEntry> {
+        self.view@
     }
+
+    /// The current term.
+    pub closed spec fn term(&self) -> Term {
+        self.state.term
+    }
+
+    /// The vote in the current term.
+    pub closed spec fn vote(&self) -> Option<NodeID> {
+        self.state.vote
+    }
+
+    /// The commit index.
+    pub closed spec fn commit_index(&self) -> Index {
+        self.state.commit_index
+    }
+
+    /// The log holds an entry with this index and term.
+    pub open spec fn has_spec(&self, index: Index, term: Term) -> bool {
+        1 <= index <= self.view().len() && self.view()[index - 1].term == term as nat
+    }
+
+    /// The log invariant: the summary matches the view, the committed prefix
+    /// is within the log and `commit_term` is the term of the entry at the
+    /// commit index, entry terms are nonzero, nondecreasing and at or below
+    /// the current term.
+    pub closed spec fn inv(&self) -> bool {
+        &&& self.state.last_index as nat == self.view@.len()
+        &&& self.state.last_term as nat == last_term(self.view@)
+        &&& self.state.commit_index as nat <= self.view@.len()
+        &&& self.state.commit_index >= 1 ==>
+            self.state.commit_term as nat == self.view@[self.state.commit_index - 1].term
+        &&& log_wf(self.view@)
+        &&& terms_le(self.view@, self.state.term as nat)
+    }
+
+    // --- TRUSTED: the engine rim ---------------------------------------
+    //
+    // Each function performs one kind of engine I/O and states, as its
+    // postcondition, what the engine holds afterwards in terms of the ghost
+    // view. These specifications are the storage-integrity assumption. On an
+    // I/O error nothing is guaranteed (the error propagates and the node is
+    // discarded).
+
+    /// TRUSTED (storage integrity): opens the log over an engine, loading the
+    /// durable summary. The result satisfies `inv`: the entries on disk are
+    /// contiguous from 1, well-formed, and consistent with the summary
+    /// (they were written by this module before the restart). Not covered:
+    /// with `enable_fsync(false)` a crash can lose appended entries while
+    /// keeping a commit index beyond them, a state outside the invariant.
+    #[verifier::external_body]
+    pub fn open(engine: EngineBox) -> (r: Result<Log>)
+        ensures
+            r matches Ok(log) ==> log.inv(),
+    {
+        let mut engine = engine;
+        let state = load_state(&mut engine.0)?;
+        Ok(Log { engine, state, fsync: true, view: Ghost::assume_new() })
+    }
+
+    /// TRUSTED (storage integrity): reads the entry at `index`; the engine
+    /// holds exactly the entries in the view.
+    #[verifier::external_body]
+    fn engine_get(&mut self, index: Index) -> (r: Result<Option<Entry>>)
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(Some(e)) ==> {
+                &&& 1 <= index <= old(self).view().len()
+                &&& e.index == index
+                &&& entry_view(e) == old(self).view()[index - 1]
+            },
+            r matches Ok(None) ==> !(1 <= index <= old(self).view().len()),
+    {
+        self.engine.0.get(&Key::Entry(index).encode())?.map(|v| Entry::decode(&v)).transpose()
+    }
+
+    /// TRUSTED (storage integrity): writes an entry at its index, which is at
+    /// most one past the last; the engine then holds it there.
+    #[verifier::external_body]
+    fn engine_set_entry(&mut self, e: &Entry) -> (r: Result<()>)
+        requires
+            1 <= e.index <= old(self).view().len() + 1,
+        ensures
+            r is Ok ==> {
+                &&& final(self).state == old(self).state
+                &&& final(self).fsync == old(self).fsync
+                &&& final(self).view() == (if e.index <= old(self).view().len() {
+                    old(self).view().update(e.index - 1, entry_view(*e))
+                } else {
+                    old(self).view().push(entry_view(*e))
+                })
+            },
+    {
+        self.engine.0.set(&Key::Entry(e.index).encode(), e.encode())
+    }
+
+    /// TRUSTED (storage integrity): deletes the entries from `from` through
+    /// the last index (in increasing order); the engine then holds the
+    /// entries before `from`.
+    #[verifier::external_body]
+    fn engine_truncate(&mut self, from: Index) -> (r: Result<()>)
+        requires
+            1 <= from <= old(self).view().len() + 1,
+            old(self).state.last_index as nat == old(self).view().len(),
+        ensures
+            r is Ok ==> {
+                &&& final(self).state == old(self).state
+                &&& final(self).fsync == old(self).fsync
+                &&& final(self).view() == old(self).view().take(from - 1)
+            },
+    {
+        let mut index = from;
+        while index <= self.state.last_index {
+            self.engine.0.delete(&Key::Entry(index).encode())?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// TRUSTED (storage integrity): flushes the engine; entries unchanged.
+    #[verifier::external_body]
+    fn engine_flush(&mut self) -> (r: Result<()>)
+        ensures
+            r is Ok ==> *final(self) == *old(self),
+    {
+        self.engine.0.flush()
+    }
+
+    /// TRUSTED (storage integrity): persists the term and vote; entries
+    /// unchanged.
+    #[verifier::external_body]
+    fn engine_set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> (r: Result<()>)
+        ensures
+            r is Ok ==> *final(self) == *old(self),
+    {
+        self.engine.0.set(&Key::TermVote.encode(), bincode::serialize(&(term, vote)))
+    }
+
+    /// TRUSTED (storage integrity): persists the commit index and term;
+    /// entries unchanged.
+    #[verifier::external_body]
+    fn engine_set_commit(&mut self, index: Index, term: Term) -> (r: Result<()>)
+        ensures
+            r is Ok ==> *final(self) == *old(self),
+    {
+        self.engine.0.set(&Key::CommitIndex.encode(), bincode::serialize(&(index, term)))
+    }
+
+    // --- Verified methods ----------------------------------------------
 
     /// Controls whether to fsync writes. Disabling this may violate Raft
     /// guarantees, see comment on fsync attribute.
-    pub fn enable_fsync(&mut self, fsync: bool) {
+    pub fn enable_fsync(&mut self, fsync: bool)
+        ensures
+            final(self).view() == old(self).view(),
+            final(self).term() == old(self).term(),
+            final(self).vote() == old(self).vote(),
+            final(self).commit_index() == old(self).commit_index(),
+            old(self).inv() ==> final(self).inv(),
+    {
         self.fsync = fsync
     }
 
-    /// Returns the commit index and term.
-    pub fn get_commit_index(&self) -> (Index, Term) {
+    /// Returns the commit index and term. The term is the term of the entry
+    /// at the commit index (if any).
+    pub fn get_commit_index(&self) -> (r: (Index, Term))
+        requires
+            self.inv(),
+        ensures
+            r.0 == self.commit_index(),
+            r.0 <= self.view().len(),
+            r.0 >= 1 ==> r.1 as nat == self.view()[r.0 - 1].term,
+    {
         (self.state.commit_index, self.state.commit_term)
     }
 
     /// Returns the last log index and term.
-    pub fn get_last_index(&self) -> (Index, Term) {
+    pub fn get_last_index(&self) -> (r: (Index, Term))
+        requires
+            self.inv(),
+        ensures
+            r.0 as nat == self.view().len(),
+            r.1 as nat == last_term(self.view()),
+    {
         (self.state.last_index, self.state.last_term)
     }
 
     /// Returns the current term (0 if none) and vote.
-    pub fn get_term_vote(&self) -> (Term, Option<NodeID>) {
+    pub fn get_term_vote(&self) -> (r: (Term, Option<NodeID>))
+        ensures
+            r.0 == self.term(),
+            r.1 == self.vote(),
+    {
         (self.state.term, self.state.vote)
     }
 
     /// Stores the current term and cast vote (if any). Enforces that the term
     /// does not regress, and that we only vote for one node in a term. append()
     /// will use this term, and splice() can't write entries beyond it.
-    pub fn set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> Result<()> {
-        // The verified transition enforces term/vote invariants.
+    ///
+    /// Panics (`fault`) iff the term is 0, regresses, or the vote changes
+    /// within the term.
+    pub fn set_term_vote(&mut self, term: Term, vote: Option<NodeID>) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            r is Ok ==> {
+                &&& final(self).inv()
+                &&& final(self).view() == old(self).view()
+                &&& final(self).commit_index() == old(self).commit_index()
+                &&& final(self).term() == term
+                &&& final(self).vote() == vote
+                &&& term >= 1 && term >= old(self).term()
+                &&& term == old(self).term() ==> old(self).vote() is None || vote == old(self).vote()
+            },
+    {
         let state = match set_term_vote_state(&self.state, term, vote) {
-            TermVoteCheck::ZeroTerm => panic!("can't set term 0"),
-            TermVoteCheck::TermRegression => {
-                panic!("term regression {} → {}", self.state.term, term)
-            }
-            TermVoteCheck::VoteChange => panic!("can't change vote"),
+            TermVoteCheck::ZeroTerm => fault(Fault::SetTermZero),
+            TermVoteCheck::TermRegression => fault(Fault::TermRegression(self.state.term, term)),
+            TermVoteCheck::VoteChange => fault(Fault::VoteChange),
             TermVoteCheck::Noop => return Ok(()),
             TermVoteCheck::Update(state) => state,
         };
-        self.engine.set(&Key::TermVote.encode(), bincode::serialize(&(term, vote)))?;
+        self.engine_set_term_vote(term, vote)?;
         // Always fsync, even with Log::fsync = false. Term changes are rare, so
         // this doesn't materially affect performance, and double voting could
         // lead to multiple leaders and split brain which is really bad.
-        self.engine.flush()?;
+        self.engine_flush()?;
         self.state = state;
         Ok(())
     }
@@ -583,38 +960,76 @@ impl Log {
     /// Appends a command to the log at the current term, and flushes it to
     /// disk, returning its index. None implies a noop command, typically after
     /// Raft leader changes.
-    pub fn append(&mut self, command: Option<Vec<u8>>) -> Result<Index> {
-        // The verified transition guarantees the entry is at last_index + 1
-        // (index contiguity) in the current term (term monotonicity).
+    ///
+    /// Panics (`fault`) iff the term is 0 or the log is full.
+    pub fn append(&mut self, command: Option<Vec<u8>>) -> (r: Result<Index>)
+        requires
+            old(self).inv(),
+        ensures
+            r matches Ok(index) ==> {
+                &&& final(self).inv()
+                &&& index as nat == old(self).view().len() + 1
+                &&& final(self).view() == old(self).view().push(AEntry {
+                    term: old(self).term() as nat,
+                    cmd: cmd_view(command),
+                })
+                &&& final(self).term() == old(self).term()
+                &&& final(self).vote() == old(self).vote()
+                &&& final(self).commit_index() == old(self).commit_index()
+                &&& old(self).term() >= 1
+            },
+    {
         let (index, state) = match append_state(&self.state) {
-            AppendCheck::ZeroTerm => panic!("can't append entry in term 0"),
-            AppendCheck::IndexOverflow => panic!("log index overflow"),
+            AppendCheck::ZeroTerm => fault(Fault::AppendTermZero),
+            AppendCheck::IndexOverflow => fault(Fault::IndexOverflow),
             AppendCheck::Append(index, state) => (index, state),
         };
+        let ghost cmd = cmd_view(command);
         let entry = Entry { index, term: state.last_term, command };
-        self.engine.set(&Key::Entry(entry.index).encode(), entry.encode())?;
+        self.engine_set_entry(&entry)?;
         if self.fsync {
-            self.engine.flush()?;
+            self.engine_flush()?;
         }
         self.state = state;
-        Ok(entry.index)
+        proof {
+            let v = self.view@;
+            assert(v.len() >= 1);
+            assert(last_term(v) == v[v.len() - 1].term);
+            assert(v[v.len() - 1] == AEntry { term: state.term as nat, cmd });
+        }
+        Ok(index)
     }
 
     /// Commits entries up to and including the given index. The index must
     /// exist and be at or after the current commit index.
-    pub fn commit(&mut self, index: Index) -> Result<Index> {
-        let Some(entry) = self.get(index)? else {
-            panic!("commit index {index} does not exist");
+    ///
+    /// Panics (`fault`) iff the entry does not exist or the index regresses.
+    pub fn commit(&mut self, index: Index) -> (r: Result<Index>)
+        requires
+            old(self).inv(),
+        ensures
+            r matches Ok(i) ==> {
+                &&& i == index
+                &&& final(self).inv()
+                &&& final(self).view() == old(self).view()
+                &&& final(self).term() == old(self).term()
+                &&& final(self).vote() == old(self).vote()
+                &&& final(self).commit_index() == index
+                &&& old(self).commit_index() <= index <= old(self).view().len()
+            },
+    {
+        let entry = match self.engine_get(index)? {
+            Some(entry) => entry,
+            None => fault(Fault::CommitMissing(index)),
         };
-        // The verified transition guarantees the commit index never regresses.
         let state = match commit_state(&self.state, entry.index, entry.term) {
             CommitCheck::Regression => {
-                panic!("commit index regression {} → {}", self.state.commit_index, entry.index)
+                fault(Fault::CommitRegression(self.state.commit_index, entry.index))
             }
             CommitCheck::Noop => return Ok(index),
             CommitCheck::Commit(state) => state,
         };
-        self.engine.set(&Key::CommitIndex.encode(), bincode::serialize(&(index, entry.term)))?;
+        self.engine_set_commit(index, entry.term)?;
         // NB: the commit index doesn't need to be fsynced, since the entries
         // are fsynced and the commit index can be recovered from the quorum.
         self.state = state;
@@ -622,21 +1037,391 @@ impl Log {
     }
 
     /// Fetches an entry at an index, or None if it does not exist.
-    pub fn get(&mut self, index: Index) -> Result<Option<Entry>> {
-        self.engine.get(&Key::Entry(index).encode())?.map(|v| Entry::decode(&v)).transpose()
+    pub fn get(&mut self, index: Index) -> (r: Result<Option<Entry>>)
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(Some(e)) ==> {
+                &&& 1 <= index <= old(self).view().len()
+                &&& e.index == index
+                &&& entry_view(e) == old(self).view()[index - 1]
+            },
+            r matches Ok(None) ==> !(1 <= index <= old(self).view().len()),
+    {
+        self.engine_get(index)
     }
 
     /// Checks if the log contains an entry with the given index and term.
-    pub fn has(&mut self, index: Index, term: Term) -> Result<bool> {
+    pub fn has(&mut self, index: Index, term: Term) -> (r: Result<bool>)
+        requires
+            old(self).inv(),
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(b) ==> b == old(self).has_spec(index, term),
+    {
         // Fast path: check against last_index. This is the common case when
         // followers process appends or heartbeats.
         if index == 0 || index > self.state.last_index {
             return Ok(false);
         }
-        if (index, term) == (self.state.last_index, self.state.last_term) {
+        if index == self.state.last_index && term == self.state.last_term {
             return Ok(true);
         }
-        Ok(self.get(index)?.map(|e| e.term == term).unwrap_or(false))
+        match self.engine_get(index)? {
+            Some(e) => Ok(e.term == term),
+            None => Ok(false),
+        }
+    }
+
+    /// Reads up to `max` consecutive entries starting at `from` (which must
+    /// be at least 1), stopping at the end of the log: a window of the log
+    /// starting at `from`.
+    pub fn read_range(&mut self, from: Index, max: usize) -> (r: Result<Vec<Entry>>)
+        requires
+            old(self).inv(),
+            from >= 1,
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(es) ==> {
+                &&& es@.len() <= max
+                &&& forall|j: int| 0 <= j < es@.len() ==> (#[trigger] es@[j]).index as int == from + j
+                &&& from - 1 + es@.len() <= old(self).view().len()
+                    || (es@.len() == 0 && from - 1 > old(self).view().len())
+                &&& from - 1 <= old(self).view().len() ==> entries_view(es@)
+                    == old(self).view().subrange(from - 1, from - 1 + es@.len())
+            },
+    {
+        let mut es: Vec<Entry> = Vec::new();
+        let mut off: usize = 0;
+        while off < max
+            invariant
+                self.inv(),
+                *self == *old(self),
+                from >= 1,
+                off == es@.len(),
+                off <= max,
+                off > 0 ==> from - 1 + off <= self.view().len(),
+                forall|j: int| 0 <= j < es@.len() ==> (#[trigger] es@[j]).index as int == from + j,
+                forall|j: int| 0 <= j < es@.len() ==>
+                    entry_view(#[trigger] es@[j]) == self.view()[from - 1 + j],
+            decreases max - off,
+        {
+            if off as u64 > u64::MAX - from {
+                break;
+            }
+            let index = from + off as u64;
+            if index > self.state.last_index {
+                break;
+            }
+            let e = match self.engine_get(index)? {
+                Some(e) => e,
+                None => break,
+            };
+            es.push(e);
+            off += 1;
+        }
+        proof {
+            if from - 1 <= self.view().len() {
+                assert(entries_view(es@) =~= self.view().subrange(from - 1, from - 1 + es@.len()));
+            }
+        }
+        Ok(es)
+    }
+
+    /// The number of leading entries of the batch that are already in the
+    /// log with the same term (and, checked at runtime, the same command).
+    /// The batch is contiguous with nonzero first index.
+    ///
+    /// Panics (`fault`) iff an entry with matching index and term has a
+    /// different command (a violation of the log-matching invariant).
+    fn count_present(&mut self, es: &Vec<Entry>) -> (r: Result<usize>)
+        requires
+            old(self).inv(),
+            es@.len() > 0,
+            es@[0].index >= 1,
+            entries_contiguous(es@),
+        ensures
+            *final(self) == *old(self),
+            r matches Ok(skip) ==> {
+                let b = es@[0].index - 1;
+                &&& skip <= es@.len()
+                &&& forall|j: int| 0 <= j < skip ==>
+                    b + j < old(self).view().len() && old(self).view()[b + j] == entry_view(#[trigger] es@[j])
+                &&& skip < es@.len() ==> b + skip >= old(self).view().len()
+                    || old(self).view()[b + skip].term != es@[skip as int].term as nat
+            },
+    {
+        let ghost b = es@[0].index - 1;
+        let mut k: usize = 0;
+        while k < es.len()
+            invariant
+                self.inv(),
+                *self == *old(self),
+                es@.len() > 0,
+                es@[0].index >= 1,
+                entries_contiguous(es@),
+                k <= es@.len(),
+                b == es@[0].index - 1,
+                forall|j: int| 0 <= j < k ==>
+                    b + j < self.view().len() && self.view()[b + j] == entry_view(#[trigger] es@[j]),
+            decreases es@.len() - k,
+        {
+            proof {
+                lemma_contiguous_index(es@, k as int);
+            }
+            let e = &es[k];
+            match self.engine_get(e.index)? {
+                Some(existing) => {
+                    if existing.term != e.term {
+                        return Ok(k);
+                    }
+                    if !cmd_eq(&existing.command, &e.command) {
+                        fault(Fault::CommandMismatch(existing));
+                    }
+                    k += 1;
+                }
+                None => return Ok(k),
+            }
+        }
+        Ok(k)
+    }
+
+    /// Splices a set of entries into the log and flushes it to disk. New
+    /// indexes will be appended. Overlapping indexes with the same term must be
+    /// equal and will be ignored. Overlapping indexes with different terms will
+    /// truncate the existing log at the first conflict and then splice the new
+    /// entries.
+    ///
+    /// The entries must have contiguous indexes and equal/increasing terms, and
+    /// the first entry must be in the range [1,last_index+1] with a term at or
+    /// above the previous (base) entry's term and at or below the current term;
+    /// otherwise this panics (`fault`), as it does for a batch that would
+    /// write at or below the commit index.
+    ///
+    /// The resulting view is the safety model's `splice` of the batch at its
+    /// base index, i.e. the log is unchanged if the batch is already present,
+    /// and otherwise equals the prefix before the batch followed by the batch.
+    #[verifier::rlimit(120)]
+    pub fn splice(&mut self, entries: Vec<Entry>) -> (r: Result<Index>)
+        requires
+            old(self).inv(),
+        ensures
+            r matches Ok(last) ==> {
+                &&& final(self).inv()
+                &&& final(self).term() == old(self).term()
+                &&& final(self).vote() == old(self).vote()
+                &&& final(self).commit_index() == old(self).commit_index()
+                &&& last as nat == final(self).view().len()
+                &&& entries@.len() == 0 ==> final(self).view() == old(self).view()
+                &&& entries@.len() > 0 ==> {
+                    &&& entries_contiguous(entries@)
+                    &&& entries@[0].index >= 1
+                    &&& entries@[0].index - 1 <= old(self).view().len()
+                    &&& final(self).view() == splice(old(self).view(), (entries@[0].index - 1) as nat, entries_view(entries@))
+                }
+            },
+    {
+        if entries.len() == 0 {
+            return Ok(self.state.last_index); // empty input is noop
+        }
+
+        // Check that the entries are well-formed (nonzero first index/term,
+        // contiguous indexes, monotone terms).
+        match check_splice_entries(&entries) {
+            SpliceEntriesCheck::Empty => fault(Fault::SpliceZeroIndexOrTerm), // unreachable
+            SpliceEntriesCheck::ZeroIndexOrTerm => fault(Fault::SpliceZeroIndexOrTerm),
+            SpliceEntriesCheck::NonContiguous => fault(Fault::SpliceNonContiguous),
+            SpliceEntriesCheck::TermRegression => fault(Fault::SpliceTermRegression),
+            SpliceEntriesCheck::WellFormed => {}
+        }
+        let first_index = entries[0].index;
+        let first_term = entries[0].term;
+        let last_index = entries[entries.len() - 1].index;
+        let lterm = entries[entries.len() - 1].term;
+        let ghost b = (first_index - 1) as nat;
+        let ghost old_view = self.view@;
+        let ghost aentries = entries_view(entries@);
+        proof {
+            lemma_contiguous_index(entries@, entries@.len() - 1);
+            assert(aentries.len() == entries@.len());
+        }
+
+        // Check that the entries connect to the existing log (if any), and that
+        // the term doesn't regress. first_index - 1 can't underflow since
+        // first_index > 0.
+        let base_term = match self.engine_get(first_index - 1)? {
+            Some(base) => Some(base.term),
+            None => None,
+        };
+        match check_splice_connect(&self.state, first_index, first_term, lterm, base_term) {
+            SpliceConnectCheck::TermBeyondCurrent => {
+                fault(Fault::SpliceTermBeyondCurrent(lterm, self.state.term))
+            }
+            SpliceConnectCheck::BaseTermRegression => {
+                let bt = match base_term {
+                    Some(bt) => bt,
+                    None => 0, // unreachable
+                };
+                fault(Fault::SpliceBaseTermRegression(bt, first_term))
+            }
+            SpliceConnectCheck::NoTouch => fault(Fault::SpliceNoTouch(first_index)),
+            SpliceConnectCheck::Connects => {}
+        }
+        assert(b <= old_view.len());
+
+        // Skip entries that are already in the log.
+        let skip = self.count_present(&entries)?;
+
+        // If all entries already exist then we're done.
+        if skip == entries.len() {
+            proof {
+                assert(splice_is_noop(old_view, b, aentries));
+            }
+            return Ok(self.state.last_index);
+        }
+        proof {
+            lemma_contiguous_index(entries@, skip as int);
+            assert(!splice_is_noop(old_view, b, aentries)) by {
+                if b + aentries.len() <= old_view.len() {
+                    assert(old_view[b + skip] != aentries[skip as int]);
+                }
+            }
+        }
+        let write_from = entries[skip].index;
+
+        // The transition refuses to write below the commit index, since
+        // committed entries must be immutable.
+        let state = match splice_state(&self.state, write_from, last_index, lterm) {
+            None => fault(Fault::SpliceBelowCommit),
+            Some(state) => state,
+        };
+
+        // Write the entries that weren't already in the log.
+        let mut k: usize = skip;
+        while k < entries.len()
+            invariant
+                skip <= k <= entries@.len(),
+                entries@.len() > 0,
+                entries_contiguous(entries@),
+                b == entries@[0].index - 1,
+                b <= old_view.len(),
+                aentries == entries_view(entries@),
+                self.state == old(self).state,
+                self.fsync == old(self).fsync,
+                b + k > old_view.len() ==> self.view().len() == b + k,
+                b + k <= old_view.len() ==> self.view().len() == old_view.len(),
+                forall|p: int| 0 <= p < b + skip ==> #[trigger] self.view()[p] == old_view[p],
+                forall|j: int| 0 <= j < skip ==> b + j < old_view.len() && old_view[b + j] == #[trigger] aentries[j],
+                forall|j: int| skip <= j < k ==> self.view()[b + j] == #[trigger] aentries[j],
+                forall|p: int| b + k <= p < old_view.len() ==> #[trigger] self.view()[p] == old_view[p],
+            decreases entries@.len() - k,
+        {
+            proof {
+                lemma_contiguous_index(entries@, k as int);
+            }
+            self.engine_set_entry(&entries[k])?;
+            k += 1;
+        }
+
+        // Remove the tail of the old log if any.
+        if last_index < self.state.last_index {
+            self.engine_truncate(last_index + 1)?;
+        }
+        if self.fsync {
+            self.engine_flush()?;
+        }
+        self.state = state;
+        proof {
+            let n = aentries.len();
+            assert(self.view@.len() == b + n);
+            assert forall|p: int| 0 <= p < b + n implies #[trigger] self.view@[p] == (old_view.subrange(0, b as int) + aentries)[p] by {
+                if p < b {
+                    assert(self.view@[p] == old_view[p]);
+                } else {
+                    assert(self.view@[p] == aentries[p - b]);
+                }
+            }
+            assert(self.view@ =~= old_view.subrange(0, b as int) + aentries);
+            assert(self.view@ == splice(old_view, b, aentries));
+            // The invariant: last term, term bounds, monotonicity.
+            assert(self.view@[b + n - 1].term == lterm as nat) by {
+                assert(aentries[n - 1] == entry_view(entries@[n - 1]));
+            }
+            assert(last_term(self.view@) == lterm as nat);
+            assert forall|j: int| 0 <= j < self.view@.len() implies (#[trigger] self.view@[j]).term >= 1 by {
+                if j >= b {
+                    lemma_monotone_terms(entries@, 0, j - b);
+                }
+            }
+            assert forall|j1: int, j2: int| 0 <= j1 <= j2 < self.view@.len() implies
+                (#[trigger] self.view@[j1]).term <= (#[trigger] self.view@[j2]).term by {
+                if j1 >= b {
+                    lemma_monotone_terms(entries@, j1 - b, j2 - b);
+                } else if j2 >= b {
+                    // j1 is in the old prefix, j2 in the batch: the base
+                    // entry (if any) is at most the first term.
+                    lemma_monotone_terms(entries@, 0, j2 - b);
+                    if b >= 1 {
+                        assert(old_view[j1].term <= old_view[b - 1].term);
+                        assert(old_view[b - 1].term == base_term.unwrap() as nat);
+                    }
+                }
+            }
+            assert forall|j: int| 0 <= j < self.view@.len() implies (#[trigger] self.view@[j]).term <= self.state.term as nat by {
+                if j >= b {
+                    lemma_monotone_terms(entries@, j - b, n - 1);
+                }
+            }
+        }
+        Ok(last_index)
+    }
+}
+
+/// In a contiguous batch, entry k has index `first + k`.
+pub proof fn lemma_contiguous_index(es: Seq<Entry>, k: int)
+    requires
+        entries_contiguous(es),
+        0 <= k < es.len(),
+    ensures
+        es[k].index == es[0].index + k,
+    decreases k,
+{
+    if k > 0 {
+        lemma_contiguous_index(es, k - 1);
+    }
+}
+
+/// In a term-monotone batch, terms are nondecreasing across any two positions.
+proof fn lemma_monotone_terms(es: Seq<Entry>, j1: int, j2: int)
+    requires
+        entries_terms_monotone(es),
+        0 <= j1 <= j2 < es.len(),
+    ensures
+        es[j1].term <= es[j2].term,
+    decreases j2 - j1,
+{
+    if j1 < j2 {
+        lemma_monotone_terms(es, j1, j2 - 1);
+    }
+}
+
+} // verus!
+
+impl Log {
+    /// Initializes a log using the given storage engine.
+    pub fn new(engine: Box<dyn storage::Engine>) -> Result<Self> {
+        Self::open(EngineBox(engine))
+    }
+
+    /// Returns the storage engine, for tests.
+    #[cfg(test)]
+    pub fn engine_mut(&mut self) -> &mut Box<dyn storage::Engine> {
+        &mut self.engine.0
+    }
+
+    /// Consumes the log, returning its storage engine, for tests.
+    #[cfg(test)]
+    pub fn into_engine(self) -> Box<dyn storage::Engine> {
+        self.engine.0
     }
 
     /// Returns an iterator over log entries in the given index range.
@@ -651,7 +1436,7 @@ impl Log {
             Bound::Included(&index) => Bound::Included(Key::Entry(index).encode()),
             Bound::Unbounded => Bound::Included(Key::Entry(Index::MAX).encode()),
         };
-        Iterator::new(self.engine.scan_dyn((from, to)))
+        Iterator::new(self.engine.0.scan_dyn((from, to)))
     }
 
     /// Returns an iterator over entries that are ready to apply, starting after
@@ -666,96 +1451,11 @@ impl Log {
         self.scan(applied_index + 1..=self.state.commit_index)
     }
 
-    /// Splices a set of entries into the log and flushes it to disk. New
-    /// indexes will be appended. Overlapping indexes with the same term must be
-    /// equal and will be ignored. Overlapping indexes with different terms will
-    /// truncate the existing log at the first conflict and then splice the new
-    /// entries.
-    ///
-    /// The entries must have contiguous indexes and equal/increasing terms, and
-    /// the first entry must be in the range [1,last_index+1] with a term at or
-    /// above the previous (base) entry's term and at or below the current term.
-    pub fn splice(&mut self, entries: Vec<Entry>) -> Result<Index> {
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Ok(self.state.last_index); // empty input is noop
-        };
-
-        // Check that the entries are well-formed (nonzero first index/term,
-        // contiguous indexes, monotone terms), using the verified checker.
-        let pairs: Vec<(Index, Term)> = entries.iter().map(|e| (e.index, e.term)).collect();
-        match check_splice_entries(&pairs) {
-            SpliceEntriesCheck::Empty => unreachable!(), // handled above
-            SpliceEntriesCheck::ZeroIndexOrTerm => panic!("spliced entry has index or term 0"),
-            SpliceEntriesCheck::NonContiguous => panic!("spliced entries are not contiguous"),
-            SpliceEntriesCheck::TermRegression => panic!("spliced entries have term regression"),
-            SpliceEntriesCheck::WellFormed => {}
-        }
-
-        // Check that the entries connect to the existing log (if any), and that
-        // the term doesn't regress, using the verified checker. The base entry
-        // (just before the first spliced index) is fetched from unverified
-        // storage; first.index - 1 can't underflow since first.index > 0.
-        let base_term = self.get(first.index - 1)?.map(|base| base.term);
-        match check_splice_connect(&self.state, first.index, first.term, last.term, base_term) {
-            SpliceConnectCheck::TermBeyondCurrent => {
-                panic!("splice term {} beyond current {}", last.term, self.state.term)
-            }
-            SpliceConnectCheck::BaseTermRegression => {
-                panic!("splice term regression {} → {}", base_term.unwrap(), first.term)
-            }
-            SpliceConnectCheck::NoTouch => {
-                panic!("first index {} must touch existing log", first.index)
-            }
-            SpliceConnectCheck::Connects => {}
-        }
-
-        // Skip entries that are already in the log.
-        let mut entries = entries.as_slice();
-        let mut scan = self.scan(first.index..=last.index);
-        while let Some(entry) = scan.next().transpose()? {
-            // [0] is ok, because the scan has the same size as entries.
-            assert!(entry.index == entries[0].index, "index mismatch at {entry:?}");
-            if entry.term != entries[0].term {
-                break;
-            }
-            assert!(entry.command == entries[0].command, "command mismatch at {entry:?}");
-            entries = &entries[1..];
-        }
-        drop(scan);
-
-        // If all entries already exist then we're done.
-        let Some(first) = entries.first() else {
-            return Ok(self.state.last_index);
-        };
-
-        // The verified transition refuses to write below the commit index,
-        // since committed entries must be immutable.
-        let Some(state) = splice_state(&self.state, first.index, last.index, last.term) else {
-            panic!("spliced entries below commit index");
-        };
-
-        // Write the entries that weren't already in the log, and remove the
-        // tail of the old log if any.
-        for entry in entries {
-            self.engine.set(&Key::Entry(entry.index).encode(), entry.encode())?;
-        }
-        for index in last.index + 1..=self.state.last_index {
-            self.engine.delete(&Key::Entry(index).encode())?;
-        }
-        if self.fsync {
-            self.engine.flush()?;
-        }
-
-        self.state = state;
-        Ok(self.state.last_index)
-    }
-
     /// Returns log engine status.
     pub fn status(&mut self) -> Result<storage::Status> {
-        self.engine.status()
+        self.engine.0.status()
     }
 }
-
 /// A log entry iterator.
 pub struct Iterator<'a> {
     inner: Box<dyn storage::ScanIterator + 'a>,
@@ -968,7 +1668,7 @@ mod tests {
 
                 Command::Dump => {
                     let range = (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-                    let mut scan = self.log.engine.scan_dyn(range);
+                    let mut scan = self.log.engine_mut().scan_dyn(range);
                     while let Some((key, value)) = scan.next().transpose()? {
                         let fmtkv = format::Raft::<format::Raw>::key_value(&key, &value);
                         let rawkv = format::Raw::key_value(&key, &value);
@@ -1004,7 +1704,7 @@ mod tests {
                     // To get owned access to the inner engine, temporarily
                     // replace it with an empty memory engine.
                     let engine =
-                        std::mem::replace(&mut self.log.engine, Box::new(storage::Memory::new()));
+                        std::mem::replace(self.log.engine_mut(), Box::new(storage::Memory::new()));
                     self.log = Log::new(engine)?;
                 }
 
