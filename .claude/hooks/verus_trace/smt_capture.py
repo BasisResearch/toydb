@@ -211,6 +211,9 @@ def upload(dest, url=None, token=None):
         "exit_code": meta.get("exit_code"),
         "duration_ms": meta.get("duration_ms"),
         "ts": meta.get("ts"),
+        "success": meta.get("success"),
+        "verified": meta.get("verified"),
+        "errors": meta.get("errors"),
         "meta": meta,
     }
 

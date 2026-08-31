@@ -115,6 +115,7 @@ jobs:
             RC=$?
             echo "verus exit code: $RC"
             echo "verus_ran=true" >> "$GITHUB_OUTPUT"
+            echo "verus_rc=$RC" >> "$GITHUB_OUTPUT"
           else
             : > .verus-out/verus.out
             echo "verus_ran=false" >> "$GITHUB_OUTPUT"
@@ -165,6 +166,7 @@ jobs:
           CI_BRANCH: ${{ steps.gitmeta.outputs.branch }}
           CI_SHA: ${{ steps.gitmeta.outputs.commit_sha }}
           CI_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+          CI_RC: ${{ steps.run_verus.outputs.verus_rc }}
         run: |
           # Same capture library the agent hooks use (single source of truth
           # for kinds/batching). source=ci + a synthetic session id keyed by
@@ -191,6 +193,20 @@ jobs:
               "commit_sha": os.environ.get("CI_SHA"),
               "ts": _env.iso_now(),
           }
+          # Verdict: verify.sh --output-json wrote verification-results to
+          # .verus-out/verus.out; the run step exported the exit code.
+          try:
+              import json
+              vr = json.load(open(".verus-out/verus.out")).get("verification-results") or {}
+              meta["success"] = bool(vr.get("success"))
+              for key in ("verified", "errors"):
+                  if isinstance(vr.get(key), int):
+                      meta[key] = vr[key]
+          except Exception as exc:
+              print("no verdict from verus.out:", exc)
+          rc = os.environ.get("CI_RC")
+          if rc and rc.isdigit():
+              meta["exit_code"] = int(rc)
           dest = smt.collect(dirs[-1], sid, tuid, meta, root=".verus-out/smt-capture")
           if dest is None:
               print("capture dir empty; nothing to upload")

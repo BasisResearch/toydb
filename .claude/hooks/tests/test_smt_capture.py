@@ -144,7 +144,8 @@ class SmtCaptureLibTest(unittest.TestCase):
     def _collected(self, tuid="tu_1", content="Q" * 100):
         prod = self._producer_dir({"m.smt2": content, "m.smt_transcript": content})
         return smt.collect(prod, "sess-up", tuid,
-                           {"branch": "yl/x", "commit_sha": "cafe", "source": "agent"},
+                           {"branch": "yl/x", "commit_sha": "cafe", "source": "agent",
+                            "success": False, "verified": 5, "errors": 1},
                            root=self.tmp)
 
     def test_upload_posts_and_marks(self):
@@ -159,6 +160,8 @@ class SmtCaptureLibTest(unittest.TestCase):
         self.assertEqual(body["tool_use_id"], "tu_1")
         self.assertEqual(body["source"], "agent")
         self.assertEqual(body["branch"], "yl/x")
+        self.assertIs(body["success"], False)
+        self.assertEqual(body["verified"], 5)
         self.assertEqual(len(body["files"]), 2)
         f = body["files"][0]
         raw = gzip.decompress(base64.b64decode(f["data_b64"]))
@@ -330,6 +333,63 @@ class SmtHookTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "s3")))
         self.assertTrue(os.path.exists(prod))  # untouched
+
+    def test_bash_verdict_from_output_json(self):
+        prod = self._producer({"m.smt2": "q"})
+        stdout = json.dumps({
+            "func-details": {},
+            "verification-results": {
+                "success": False, "verified": 2, "errors": 1,
+                "encountered-error": True,
+            },
+        })
+        r = self._run_hook({
+            "session_id": "sv", "tool_use_id": "tv1", "tool_name": "Bash",
+            "tool_input": {"command": "./scripts/verus/verify.sh --output-json"},
+            "tool_response": {"stdout": stdout, "exitCode": 0,
+                              "stderr": "verus-smt-log-dir: %s\n" % prod},
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.tmp, "sv", "tv1", "meta.json")) as fh:
+            meta = json.load(fh)
+        self.assertIs(meta["success"], False)
+        self.assertEqual(meta["verified"], 2)
+        self.assertEqual(meta["errors"], 1)
+        self.assertEqual(meta["exit_code"], 0)  # 0 must survive extraction
+
+    def test_mcp_verdict_from_structured_result(self):
+        prod = self._producer({"m.smt2": "q"})
+        r = self._run_hook({
+            "session_id": "sv", "tool_use_id": "tv2",
+            "tool_name": "mcp__verus__verify",
+            "tool_input": {"path": "t.rs"},
+            "tool_response": {"structuredContent": {
+                "success": True, "summary": {"verified": 558, "errors": 0},
+                "smt_log_dir": prod, "verus_version": "0.2026"}},
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.tmp, "sv", "tv2", "meta.json")) as fh:
+            meta = json.load(fh)
+        self.assertIs(meta["success"], True)
+        self.assertEqual(meta["verified"], 558)
+        self.assertEqual(meta["errors"], 0)
+
+    def test_no_verdict_means_absent_not_failed(self):
+        prod = self._producer({"m.smt2": "q"})
+        r = self._run_hook({
+            "session_id": "sv", "tool_use_id": "tv3", "tool_name": "Bash",
+            "tool_input": {"command": "./scripts/verus/verify.sh"},
+            "tool_response": {"stdout": "truncated garbage",
+                              "stderr": "verus-smt-log-dir: %s\n" % prod},
+            "cwd": HOOKS_DIR,
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.tmp, "sv", "tv3", "meta.json")) as fh:
+            meta = json.load(fh)
+        self.assertNotIn("success", meta)
+        self.assertNotIn("verified", meta)
 
     def test_malformed_stdin_fails_soft(self):
         r = subprocess.run(

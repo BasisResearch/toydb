@@ -61,6 +61,88 @@ def _find_key(obj, key, depth=0):
     return None
 
 
+def _find_verdict_dict(obj, depth=0):
+    """A dict carrying a Verus tool verdict: MCP verify's VerifyResult
+    ({success, summary:{verified,errors}, ...}) or check's CheckResult
+    ({success, verified, errors, ...}), anywhere in the response."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        if "success" in obj and ("summary" in obj or "verified" in obj):
+            return obj
+        for v in obj.values():
+            found = _find_verdict_dict(v, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_verdict_dict(v, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_int_key(obj, keys, depth=0):
+    """First int value under any of `keys` (0 counts, unlike _find_key)."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+        for v in obj.values():
+            found = _find_int_key(v, keys, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_int_key(v, keys, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _verdict(tool_response, texts):
+    """Best-effort success/verified/errors/exit_code from a tool response.
+
+    MCP verify/check: the structured result dict. Bash: verify.sh
+    --output-json prints a JSON doc with `verification-results` on stdout
+    (a truncated response simply yields no verdict — fail-soft). Returns {}
+    when nothing recognisable is present; absent keys mean "unknown", which
+    the dashboard stores as NULL rather than failure."""
+    out = {}
+    d = _find_verdict_dict(tool_response)
+    if d is not None:
+        out["success"] = bool(d.get("success"))
+        summary = d.get("summary") if isinstance(d.get("summary"), dict) else d
+        for key in ("verified", "errors"):
+            v = summary.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                out[key] = v
+    else:
+        for t in texts:
+            t = t.strip()
+            if not t.startswith("{"):
+                continue
+            try:
+                doc = json.loads(t)
+            except ValueError:
+                continue
+            vr = doc.get("verification-results") if isinstance(doc, dict) else None
+            if isinstance(vr, dict):
+                out["success"] = bool(vr.get("success"))
+                for key in ("verified", "errors"):
+                    v = vr.get(key)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        out[key] = v
+                break
+    ec = _find_int_key(tool_response, ("exitCode", "exit_code", "returnCode"))
+    if ec is not None:
+        out["exit_code"] = ec
+    return out
+
+
 def _invocation(tool_name, tool_input):
     if tool_name == "Bash" and isinstance(tool_input, dict):
         return str(tool_input.get("command") or "")[:2000]
@@ -79,10 +161,10 @@ def handle_post_tool_use(hook_input):
 
     # Locate the producer's log dir: the MCP result's structured field, or
     # the verify.sh stderr marker anywhere in the response.
+    texts = []
+    _strings(tool_response, texts)
     log_dir = _find_key(tool_response, "smt_log_dir")
     if not log_dir:
-        texts = []
-        _strings(tool_response, texts)
         log_dir = _smt.find_log_dir("\n".join(texts))
     if not log_dir:
         return
@@ -105,6 +187,10 @@ def handle_post_tool_use(hook_input):
         "commit_sha": _env.commit_sha(root),
         "ts": _env.iso_now(),
     }
+    # The tool's own verdict (success/verified/errors/exit_code): what makes
+    # a pre-SMT failure (type error, VIR error: zero queries, few artifacts)
+    # distinguishable from "nothing to verify" on the dashboard.
+    meta.update(_verdict(tool_response, texts))
     dest = _smt.collect(log_dir, session_id, tool_use_id, meta)
     if dest is None:
         # Empty producer dir: cargo considered the crate fresh, Verus never
