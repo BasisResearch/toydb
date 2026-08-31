@@ -409,4 +409,172 @@ pub proof fn lemma_order_list_last(cur: Seq<TokenView>, e: SExpr, d: ast::Direct
 {
 }
 
+// ===========================================================================
+// GROUP BY  (spec twin of `verified_control::parse_group_by_at`)
+//
+// `input` is the suffix at the position where the optional `GROUP BY` clause may
+// begin. Grammar: `[GROUP BY <expr> (, <expr>)*]`. This is the ORDER BY list
+// minus the ASC/DESC direction: a plain comma-separated list of expressions,
+// viewed through `verified_roundtrip::view_args` (`Seq<ast::Expression>` ->
+// `Seq<SExpr>`), which the live parser accumulates as a `Vec<ast::Expression>`.
+// ===========================================================================
+
+/// One-or-more comma-separated `<expr>` items. Recurses on the input length: the
+/// tail `r.drop_first()` (past the comma) is strictly shorter than `input`
+/// (`r.len() <= sparse_prec(...).1.len() <= input.len()`, minus the dropped
+/// comma), so no fuel parameter is needed. Mirrors `sparse_control_order_list`.
+pub open spec fn sparse_control_group_list(input: Seq<TokenView>)
+    -> (Option<Seq<SExpr>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_group_list_decreases
+{
+    match sparse_prec(input, 0, expr_fuel(input)) {
+        (Some(e), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_group_list(r.drop_first()) {
+                    (Some(more), r2) => (Some(seq![e] + more), r2),
+                    (None, _) => (None, input),
+                }
+            } else {
+                (Some(seq![e]), r)
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// Termination witness for `sparse_control_group_list`: `r.drop_first()` is
+/// strictly shorter than `input`, because `sparse_prec` never grows its input
+/// (`lemma_prec_slen`) and the comma step drops one more token.
+#[via_fn]
+proof fn sparse_control_group_list_decreases(input: Seq<TokenView>) {
+    verified_precedence::lemma_prec_slen(input, 0, expr_fuel(input));
+}
+
+/// `[GROUP BY <list>]`, with `input` at the (optional) `GROUP` keyword. Returns
+/// the empty list (no consumption) when no `GROUP` keyword is present, and
+/// rejects a bare `GROUP` without a following `BY`. Mirrors `parse_group_by_at`.
+pub open spec fn sparse_control_group_by(input: Seq<TokenView>)
+    -> (Option<Seq<SExpr>>, Seq<TokenView>)
+{
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::Group) {
+        (Some(Seq::<SExpr>::empty()), input)
+    } else if input.len() < 2 || input[1] != TokenView::Keyword(Keyword::By) {
+        (None, input)
+    } else {
+        let r = input.drop_first().drop_first();
+        match sparse_control_group_list(r) {
+            (Some(items), rest) => (Some(items), rest),
+            (None, _) => (None, input),
+        }
+    }
+}
+
+/// `verified_roundtrip::view_args` distributes over sequence concatenation.
+pub proof fn lemma_view_args_append(
+    a: Seq<ast::Expression>,
+    b: Seq<ast::Expression>,
+)
+    ensures
+        verified_roundtrip::view_args(a + b)
+            == verified_roundtrip::view_args(a) + verified_roundtrip::view_args(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_roundtrip::view_args, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_args_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-item view: `view_args(seq![expr]) == seq![view_expr(expr)]`.
+pub proof fn lemma_view_args_single(expr: ast::Expression)
+    ensures
+        verified_roundtrip::view_args(seq![expr]) == seq![verified_roundtrip::view_expr(expr)],
+{
+    reveal_with_fuel(verified_roundtrip::view_args, 2);
+    let s = seq![expr];
+    assert(s.len() == 1);
+    assert(s[0] == expr);
+    assert(s.drop_first() =~= Seq::<ast::Expression>::empty());
+    assert(verified_roundtrip::view_args(s.drop_first()) =~= Seq::<SExpr>::empty());
+    assert(verified_roundtrip::view_args(s) =~= seq![verified_roundtrip::view_expr(expr)]);
+}
+
+/// Prepend already-consumed `done` items onto a tail group-list parse, routing
+/// `whole` through on rejection (matching how `sparse_control_group_list`
+/// returns its top-level input on any inner reject).
+pub open spec fn group_list_prepend(
+    done: Seq<SExpr>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<SExpr>>, Seq<TokenView>),
+) -> (Option<Seq<SExpr>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_group_list(cur)` when a comma follows the
+/// head item `e`: rewrites to prepending `[e]` and recursing at the post-comma
+/// suffix. Mirrors `lemma_order_list_step`.
+pub proof fn lemma_group_list_step(cur: Seq<TokenView>, e: SExpr, r: Seq<TokenView>)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_group_list(cur)
+            == group_list_prepend(seq![e], cur, sparse_control_group_list(r.drop_first())),
+{
+    match sparse_control_group_list(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_group_list(cur) == (Some(seq![e] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_group_list(cur) == (None::<Seq<SExpr>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more item.
+/// Pure `group_list_prepend` algebra with sequence-append associativity. Mirrors
+/// `lemma_order_list_resume_step`.
+pub proof fn lemma_group_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<SExpr>,
+    se: SExpr,
+    whole: (Option<Seq<SExpr>>, Seq<TokenView>),
+)
+    requires
+        whole == group_list_prepend(done, ls, sparse_control_group_list(cur)),
+        sparse_control_group_list(cur)
+            == group_list_prepend(seq![se], cur, sparse_control_group_list(cur1)),
+    ensures
+        whole == group_list_prepend(done + seq![se], ls, sparse_control_group_list(cur1)),
+{
+    match sparse_control_group_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![se] + more) == (done + seq![se]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head item, so the list is the single item.
+pub proof fn lemma_group_list_last(cur: Seq<TokenView>, e: SExpr, r: Seq<TokenView>)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_group_list(cur) == (Some(seq![e]), r),
+{
+}
+
 } // verus!

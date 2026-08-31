@@ -528,20 +528,40 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
 /// Parses an optional `GROUP BY <expr> [, ...]` clause. Returns
 /// `(Some(vec![]), pos)` when no `GROUP` keyword is present. Mirrors
 /// `parse_group_by_clause`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(100000)]
 fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expression>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_group_by(input);
+            match r.0 {
+                Some(v) => sopt is Some
+                    && verified_roundtrip::view_args(v@) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
+    }
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::Group)) {
         return (Some(Vec::new()), pos, None);
     }
     let mut cur = pos + 1;
     if cur >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     if !matches!(toks[cur], Token::Keyword(Keyword::By)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::By),
@@ -549,25 +569,151 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
         )));
     }
     cur = cur + 1;
+    proof {
+        assert(toks@[pos as int] == Token::Keyword(Keyword::Group));
+        assert(toks@[(pos + 1) as int] == Token::Keyword(Keyword::By));
+    }
+    let ghost list_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost whole = verified_stmt_prec::sparse_control_group_list(list_start);
+    proof {
+        order_by_input_head(toks, pos);
+        assert(input[0] == verified_production::TokenView::Keyword(Keyword::Group));
+        assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+        assert(list_start == input.drop_first().drop_first());
+    }
     let mut group_by: Vec<ast::Expression> = Vec::new();
     loop
-        invariant
-            pos < cur,
+        invariant_except_break
+            pos + 2 <= cur,
             cur <= toks.len(),
+            toks@[pos as int] == Token::Keyword(Keyword::Group),
+            toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 2) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_group_list(list_start),
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == verified_stmt_prec::group_list_prepend(
+                    verified_roundtrip::view_args(group_by@),
+                    list_start,
+                    verified_stmt_prec::sparse_control_group_list(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+                ),
+        ensures
+            pos + 2 <= cur,
+            cur <= toks.len(),
+            toks@[pos as int] == Token::Keyword(Keyword::Group),
+            toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 2) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_group_list(list_start),
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == (Some(verified_roundtrip::view_args(group_by@)),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_roundtrip::view_args(group_by@);
+        let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
-        match opt {
-            Some(e) => {
-                group_by.push(e);
-                cur = c;
+        let expr = match opt {
+            Some(e) => e,
+            None => {
+                proof {
+                    if sized {
+                        reveal_with_fuel(verified_stmt_prec::sparse_control_group_list, 1);
+                        assert(verified_stmt_prec::sparse_control_group_list(cur_v).0 is None);
+                        assert(whole.0 is None);
+                        order_by_input_head(toks, pos);
+                        group_by_conclude_none(toks, pos, list_start, whole);
+                    }
+                }
+                return (None, pos, eerr);
             },
-            None => return (None, pos, eerr),
+        };
+        let ghost r_after_expr = verified_production::token_views(toks@.subrange(c as int, toks@.len() as int));
+        proof {
+            if sized {
+                assert(verified_precedence::sparse_prec(cur_v, 0, verified_stmt_prec::expr_fuel(cur_v))
+                    == (Some(verified_roundtrip::view_expr(expr)), r_after_expr));
+            }
+            if sized && c < toks.len() {
+                verified_roundtrip::token_views_suffix(toks@, c as int);
+            } else {
+                verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int));
+            }
         }
+        cur = c;
+        let ghost old_group = group_by@;
+        group_by.push(expr);
+        proof {
+            verified_stmt_prec::lemma_view_args_append(old_group, seq![expr]);
+            verified_stmt_prec::lemma_view_args_single(expr);
+            assert(group_by@ == old_group + seq![expr]);
+            assert(verified_roundtrip::view_args(group_by@)
+                == done_v + seq![verified_roundtrip::view_expr(expr)]);
+        }
+
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                if sized {
+                    verified_stmt_prec::lemma_group_list_step(
+                        cur_v, verified_roundtrip::view_expr(expr), r_after_expr);
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                assert(r_after_expr.drop_first() == verified_production::token_views(
+                    toks@.subrange(cur as int, toks@.len() as int)));
+                if sized {
+                    assert(whole == verified_stmt_prec::group_list_prepend(
+                        done_v, list_start, verified_stmt_prec::sparse_control_group_list(cur_v)));
+                    assert(verified_stmt_prec::sparse_control_group_list(cur_v)
+                        == verified_stmt_prec::group_list_prepend(
+                            seq![verified_roundtrip::view_expr(expr)], cur_v,
+                            verified_stmt_prec::sparse_control_group_list(r_after_expr.drop_first())));
+                    verified_stmt_prec::lemma_group_list_resume_step(
+                        list_start, cur_v, r_after_expr.drop_first(),
+                        done_v, verified_roundtrip::view_expr(expr), whole);
+                    assert(verified_roundtrip::view_args(group_by@)
+                        == done_v + seq![verified_roundtrip::view_expr(expr)]);
+                    assert(whole == verified_stmt_prec::group_list_prepend(
+                        verified_roundtrip::view_args(group_by@),
+                        list_start,
+                        verified_stmt_prec::sparse_control_group_list(
+                            verified_production::token_views(
+                                toks@.subrange(cur as int, toks@.len() as int)))));
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+                if sized {
+                    verified_stmt_prec::lemma_group_list_last(
+                        cur_v, verified_roundtrip::view_expr(expr), r_after_expr);
+                    assert(verified_stmt_prec::sparse_control_group_list(cur_v)
+                        == (Some(seq![verified_roundtrip::view_expr(expr)]), r_after_expr));
+                    assert(whole == (Some(done_v
+                        + seq![verified_roundtrip::view_expr(expr)]), r_after_expr));
+                    assert(verified_roundtrip::view_args(group_by@)
+                        == done_v + seq![verified_roundtrip::view_expr(expr)]);
+                    assert(whole == (Some(verified_roundtrip::view_args(group_by@)),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                }
+            }
             break;
+        }
+    }
+    proof {
+        if toks.len() <= (usize::MAX - 3) / 2 {
+            group_by_conclude_some(toks, pos, cur, list_start, whole,
+                verified_roundtrip::view_args(group_by@));
         }
     }
     (Some(group_by), cur, None)
@@ -654,6 +800,68 @@ proof fn order_by_conclude_some(
     order_by_input_head(toks, pos);
     reveal(verified_production::token_view);
     assert(input[0] == verified_production::TokenView::Keyword(Keyword::Order));
+    assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+    assert(list_start == input.drop_first().drop_first());
+}
+
+/// Concludes the reject case of `parse_group_by_at`: given the `GROUP BY` head
+/// tokens and `whole` (the list parse from `list_start`) rejecting, the whole
+/// `sparse_control_group_by(input)` rejects. Mirrors `order_by_conclude_none`.
+proof fn group_by_conclude_none(
+    toks: &Vec<Token>,
+    pos: usize,
+    list_start: Seq<verified_production::TokenView>,
+    whole: (Option<Seq<verified_roundtrip::SExpr>>, Seq<verified_production::TokenView>),
+)
+    requires
+        pos + 2 <= toks.len(),
+        toks@[pos as int] == Token::Keyword(Keyword::Group),
+        toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+        list_start == verified_production::token_views(
+            toks@.subrange((pos + 2) as int, toks@.len() as int)),
+        whole == verified_stmt_prec::sparse_control_group_list(list_start),
+        whole.0 is None,
+    ensures
+        verified_stmt_prec::sparse_control_group_by(
+            verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int))).0 is None,
+{
+    let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    order_by_input_head(toks, pos);
+    reveal(verified_production::token_view);
+    assert(input[0] == verified_production::TokenView::Keyword(Keyword::Group));
+    assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
+    assert(list_start == input.drop_first().drop_first());
+}
+
+/// Accept case: `sparse_control_group_by(input)` equals the final accumulated
+/// list result `(Some(items), rest)`. Mirrors `order_by_conclude_some`.
+proof fn group_by_conclude_some(
+    toks: &Vec<Token>,
+    pos: usize,
+    cur: usize,
+    list_start: Seq<verified_production::TokenView>,
+    whole: (Option<Seq<verified_roundtrip::SExpr>>, Seq<verified_production::TokenView>),
+    items: Seq<verified_roundtrip::SExpr>,
+)
+    requires
+        pos + 2 <= toks.len(),
+        toks@[pos as int] == Token::Keyword(Keyword::Group),
+        toks@[(pos + 1) as int] == Token::Keyword(Keyword::By),
+        list_start == verified_production::token_views(
+            toks@.subrange((pos + 2) as int, toks@.len() as int)),
+        whole == verified_stmt_prec::sparse_control_group_list(list_start),
+        whole == (Some(items),
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+    ensures
+        verified_stmt_prec::sparse_control_group_by(
+            verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)))
+            == (Some(items),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+{
+    let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    order_by_input_head(toks, pos);
+    reveal(verified_production::token_view);
+    assert(input[0] == verified_production::TokenView::Keyword(Keyword::Group));
     assert(input[1] == verified_production::TokenView::Keyword(Keyword::By));
     assert(list_start == input.drop_first().drop_first());
 }
