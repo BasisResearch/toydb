@@ -25,17 +25,23 @@
 //! `verified_stmt::sparse_stmt`, which uses the fully-parenthesised grammar).
 //! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, `parse_order_by_at`,
 //! `parse_group_by_at`, the `CREATE TABLE` pair `parse_create_at` /
-//! `parse_create_column_at`, the `SELECT` list `parse_select_list_at`, and
-//! `parse_insert_at` are proven to produce exactly the AST their spec twin
+//! `parse_create_column_at`, the `SELECT` list `parse_select_list_at`,
+//! `parse_insert_at`, and the `FROM` join tree `parse_from_clause_at` /
+//! `parse_from_table_at` are proven to produce exactly the AST their spec twin
 //! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` / `_group_by` /
-//! `_create` / `_column` / `_select_list` / `_insert`) computes, up to
-//! `verified_stmt::view_stmt` / `view_order_list` / `view_select_list` /
-//! `view_rows` / `view_column` / `verified_roundtrip::view_args`, with the
-//! leftover-token stream pinned — so e.g. mis-defaulting an `ORDER BY`
-//! direction, dropping `IF EXISTS`, dropping a column's `PRIMARY KEY` /
-//! `NOT NULL` flag, swapping a `SELECT` alias, or dropping an `INSERT` row now
-//! breaks verification, not just the goldenscript suite. The remaining dispatch
-//! (`parse_control_at`) and clause parsers (FROM join tree, UPDATE assignments,
+//! `_create` / `_column` / `_select_list` / `_insert` / `_from` / `_from_table`)
+//! computes, up to `verified_stmt::view_stmt` / `view_order_list` /
+//! `view_select_list` / `view_rows` / `view_column` / `view_froms` /
+//! `verified_roundtrip::view_args`, with the leftover-token stream pinned — so
+//! e.g. mis-defaulting an `ORDER BY` direction, dropping `IF EXISTS`, dropping a
+//! column's `PRIMARY KEY` / `NOT NULL` flag, swapping a `SELECT` alias, dropping
+//! an `INSERT` row, confusing a join type, or dropping a join's `ON` predicate
+//! now breaks verification, not just the goldenscript suite. The `FROM` twin
+//! reuses the printer's left-deep decomposition (`fold_joins` / `apply_step` /
+//! `SJoinStep`): the exec inner join loop folds each parsed join onto its
+//! accumulator exactly as `apply_step`, and the twin's
+//! `sparse_control_from_joins` recursion mirrors that fold. The remaining
+//! dispatch (`parse_control_at`) and clause parsers (UPDATE assignments,
 //! EXPLAIN) still carry only the
 //! no-panic/terminate/error-on-reject contract; their accepted ASTs and
 //! rejection errors are pinned by the goldenscript suite. Embedded
@@ -473,57 +479,210 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
 /// Parses an optional `FROM` clause: a comma-separated list of join trees.
 /// Returns `(Some(vec![]), pos)` when no `FROM` keyword is present. Mirrors
 /// `parse_from_clause` (including the left-deep join folding).
+#[verifier::spinoff_prover]
+#[verifier::rlimit(900000)]
 fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::From>>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_from(input);
+            match r.0 {
+                Some(v) => sopt is Some
+                    && verified_stmt::view_froms(v@) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
+    if pos < toks.len() {
+        proof { verified_roundtrip::token_views_suffix(toks@, pos as int); reveal(verified_production::token_view); }
+    }
     if pos >= toks.len() || !matches!(toks[pos], Token::Keyword(Keyword::From)) {
-        return (Some(Vec::new()), pos, None);
+        let empty: Vec<ast::From> = Vec::new();
+        proof {
+            reveal_with_fuel(verified_stmt::view_froms, 1);
+            assert(empty@ =~= Seq::<ast::From>::empty());
+            assert(verified_stmt::view_froms(empty@) =~= Seq::<verified_stmt::SFrom>::empty());
+        }
+        return (Some(empty), pos, None);
+    }
+    // Head is `FROM`; the comma-separated from-item list begins at `pos + 1`.
+    let ghost list_start = verified_production::token_views(toks@.subrange((pos + 1) as int, toks@.len() as int));
+    let ghost whole = verified_stmt_prec::sparse_control_from_list(list_start);
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        assert(input[0] == verified_production::TokenView::Keyword(Keyword::From));
+        assert(list_start == input.drop_first());
     }
     let mut cur = pos + 1;
     let mut from: Vec<ast::From> = Vec::new();
     loop
-        invariant
+        invariant_except_break
             pos < cur,
             cur <= toks.len(),
+            sized == (toks.len() <= (usize::MAX - 3) / 2),
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Keyword(Keyword::From),
+            list_start == input.drop_first(),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 1) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_from_list(list_start),
+            sized ==>
+                whole == verified_stmt_prec::from_list_prepend(
+                    verified_stmt::view_froms(from@),
+                    list_start,
+                    verified_stmt_prec::sparse_control_from_list(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+                ),
+        ensures
+            pos < cur,
+            cur <= toks.len(),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Keyword(Keyword::From),
+            list_start == input.drop_first(),
+            list_start == verified_production::token_views(
+                toks@.subrange((pos + 1) as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_from_list(list_start),
+            sized ==>
+                whole == (Some(verified_stmt::view_froms(from@)),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost outer_start = cur;
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_stmt::view_froms(from@);
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         // Base table for this from-item.
         let (topt, tc, terr) = parse_from_table_at(toks, cur);
         let mut from_item = match topt {
             Some(t) => t,
-            None => return (None, pos, terr),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_from_table(cur_v).0 is None);
+                        assert(verified_stmt_prec::sparse_control_from_item(cur_v).0 is None);
+                        assert(verified_stmt_prec::sparse_control_from_list(cur_v).0 is None);
+                        assert(whole.0 is None);
+                        assert(verified_stmt_prec::sparse_control_from(input)
+                            == verified_stmt_prec::sparse_control_from_list(list_start));
+                    }
+                }
+                return (None, pos, terr);
+            },
         };
+        // `view_from(from_item)` is the base of the fold; `cur_v` bridges to the
+        // spec twin's `sparse_control_from_item`, which folds joins onto it.
+        let ghost base_v = verified_stmt::view_from(from_item);
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_from_table(cur_v)
+                    == (Some(base_v), verified_production::token_views(
+                        toks@.subrange(tc as int, toks@.len() as int))));
+            }
+        }
+        // Record the outer resumption in terms of `cur_v` (= views at
+        // `outer_start`) *before* mutating `cur`, so it survives into the inner
+        // loop invariant (which references the fixed `outer_start`).
+        proof {
+            if sized {
+                assert(whole == verified_stmt_prec::from_list_prepend(
+                    done_v, list_start, verified_stmt_prec::sparse_control_from_list(cur_v)));
+            }
+        }
         cur = tc;
+        proof {
+            assert(cur_v == verified_production::token_views(
+                toks@.subrange(outer_start as int, toks@.len() as int)));
+        }
 
         // Snapshot the post-base-table position: the join loop only advances
         // `cur`, so the outer from-list loop's `decreases` sees strict progress.
         let ghost item_start = cur;
         // Fold any joins into a left-deep tree.
         loop
-            invariant
-                pos < item_start <= cur,
+            invariant_except_break
+                pos < cur,
+                outer_start < item_start <= cur,
                 cur <= toks.len(),
+                sized == (toks.len() <= (usize::MAX - 3) / 2),
+                // Stable outer facts needed by the reject helpers.
+                input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+                input.len() >= 1,
+                input[0] == verified_production::TokenView::Keyword(Keyword::From),
+                list_start == input.drop_first(),
+                whole == verified_stmt_prec::sparse_control_from_list(list_start),
+                sized ==> whole == verified_stmt_prec::from_list_prepend(
+                    done_v, list_start,
+                    verified_stmt_prec::sparse_control_from_list(
+                        verified_production::token_views(toks@.subrange(outer_start as int, toks@.len() as int)))),
+                sized ==> verified_stmt_prec::sparse_control_from_table(
+                    verified_production::token_views(toks@.subrange(outer_start as int, toks@.len() as int)))
+                    == (Some(base_v), verified_production::token_views(
+                        toks@.subrange(item_start as int, toks@.len() as int))),
+                sized ==>
+                    verified_stmt_prec::sparse_control_from_joins(
+                        base_v,
+                        verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int)))
+                    == verified_stmt_prec::sparse_control_from_joins(
+                        verified_stmt::view_from(from_item),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+            ensures
+                pos < cur,
+                outer_start < item_start <= cur,
+                cur <= toks.len(),
+                sized ==> verified_stmt_prec::sparse_control_from_table(
+                    verified_production::token_views(toks@.subrange(outer_start as int, toks@.len() as int)))
+                    == (Some(base_v), verified_production::token_views(
+                        toks@.subrange(item_start as int, toks@.len() as int))),
+                sized ==>
+                    verified_stmt_prec::sparse_control_from_joins(
+                        base_v,
+                        verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int)))
+                    == (Some(verified_stmt::view_from(from_item)),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
             decreases toks.len() - cur,
         {
+            let ghost jcur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+            proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
             if cur >= toks.len() {
+                proof {
+                    if sized {
+                        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                        assert(jcur_v.len() == 0);
+                        assert(!verified_stmt_prec::is_join_start(jcur_v));
+                        verified_stmt_prec::lemma_from_joins_stop(verified_stmt::view_from(from_item), jcur_v);
+                    }
+                }
                 break;
             }
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); }
+            let ghost jt_v: ast::JoinType;
+            let ghost needs_on_v: bool;
             let join_type: ast::JoinType;
             let jc: usize;
             match &toks[cur] {
                 Token::Keyword(Keyword::Join) => {
                     join_type = ast::JoinType::Inner;
                     jc = cur + 1;
+                    proof { jt_v = ast::JoinType::Inner; needs_on_v = true; }
                 },
                 Token::Keyword(Keyword::Cross) => {
                     if cur + 1 >= toks.len() {
+                        proof { if sized { verified_roundtrip::token_views_suffix(toks@, cur as int); verified_roundtrip::token_views_len(toks@.subrange((cur + 1) as int, toks@.len() as int)); assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::UnexpectedEof));
                     }
+                    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); verified_roundtrip::token_views_suffix(toks@, (cur + 1) as int); reveal(verified_production::token_view); }
                     if !matches!(toks[cur + 1], Token::Keyword(Keyword::Join)) {
+                        proof { if sized { assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::ExpectedToken(
                             Token::Keyword(Keyword::Join),
                             toks[cur + 1].clone(),
@@ -531,12 +690,16 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     }
                     join_type = ast::JoinType::Cross;
                     jc = cur + 2;
+                    proof { jt_v = ast::JoinType::Cross; needs_on_v = false; }
                 },
                 Token::Keyword(Keyword::Inner) => {
                     if cur + 1 >= toks.len() {
+                        proof { if sized { verified_roundtrip::token_views_suffix(toks@, cur as int); verified_roundtrip::token_views_len(toks@.subrange((cur + 1) as int, toks@.len() as int)); assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::UnexpectedEof));
                     }
+                    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); verified_roundtrip::token_views_suffix(toks@, (cur + 1) as int); reveal(verified_production::token_view); }
                     if !matches!(toks[cur + 1], Token::Keyword(Keyword::Join)) {
+                        proof { if sized { assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::ExpectedToken(
                             Token::Keyword(Keyword::Join),
                             toks[cur + 1].clone(),
@@ -544,16 +707,25 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     }
                     join_type = ast::JoinType::Inner;
                     jc = cur + 2;
+                    proof { jt_v = ast::JoinType::Inner; needs_on_v = true; }
                 },
                 Token::Keyword(Keyword::Left) => {
+                    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); }
                     let mut c = cur + 1;
+                    // `r2_start` tracks where the spec's `r2` begins (past an
+                    // optional `OUTER`), so `views(c..) == r2` throughout.
+                    proof { if c < toks.len() { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); } }
                     if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
                         c = c + 1;
+                        proof { if c <= toks.len() { verified_roundtrip::token_views_suffix(toks@, (c - 1) as int); if c < toks.len() { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); } } }
                     }
                     if c >= toks.len() {
+                        proof { if sized { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::UnexpectedEof));
                     }
+                    proof { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); }
                     if !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        proof { if sized { assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::ExpectedToken(
                             Token::Keyword(Keyword::Join),
                             toks[c].clone(),
@@ -561,16 +733,23 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     }
                     join_type = ast::JoinType::Left;
                     jc = c + 1;
+                    proof { jt_v = ast::JoinType::Left; needs_on_v = true; }
                 },
                 Token::Keyword(Keyword::Right) => {
+                    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); }
                     let mut c = cur + 1;
+                    proof { if c < toks.len() { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); } }
                     if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
                         c = c + 1;
+                        proof { if c <= toks.len() { verified_roundtrip::token_views_suffix(toks@, (c - 1) as int); if c < toks.len() { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); } } }
                     }
                     if c >= toks.len() {
+                        proof { if sized { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::UnexpectedEof));
                     }
+                    proof { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); }
                     if !matches!(toks[c], Token::Keyword(Keyword::Join)) {
+                        proof { if sized { assert(verified_stmt_prec::sparse_control_join_head(jcur_v) is None); from_kw_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input); } }
                         return (None, pos, Some(ParseError::ExpectedToken(
                             Token::Keyword(Keyword::Join),
                             toks[c].clone(),
@@ -578,41 +757,124 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     }
                     join_type = ast::JoinType::Right;
                     jc = c + 1;
+                    proof { jt_v = ast::JoinType::Right; needs_on_v = true; }
                 },
-                _ => break, // no join keyword: this from-item is complete
+                _ => {
+                    // no join-start keyword: this from-item is complete
+                    proof {
+                        if sized {
+                            assert(!verified_stmt_prec::is_join_start(jcur_v));
+                            verified_stmt_prec::lemma_from_joins_stop(verified_stmt::view_from(from_item), jcur_v);
+                        }
+                    }
+                    break;
+                },
+            }
+            // The join keyword-sequence parsed: `join_head(jcur_v) == Some((jt_v, needs_on_v, views(jc..)))`.
+            let ghost after_kw_v = verified_production::token_views(toks@.subrange(jc as int, toks@.len() as int));
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_join_head(jcur_v)
+                        == Some((jt_v, needs_on_v, after_kw_v)));
+                    assert(join_type == jt_v);
+                }
             }
 
             // Right table of the join.
+            proof { verified_roundtrip::token_views_len(toks@.subrange(jc as int, toks@.len() as int)); }
             let (ropt, rc, rerr) = parse_from_table_at(toks, jc);
             let right = match ropt {
                 Some(t) => t,
-                None => return (None, pos, rerr),
+                None => {
+                    proof {
+                        if sized {
+                            assert(verified_stmt_prec::sparse_control_from_table(after_kw_v).0 is None);
+                            assert(verified_stmt_prec::sparse_control_from_step(jcur_v) is None);
+                            assert(verified_stmt_prec::is_join_start(jcur_v));
+                            from_joins_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input);
+                        }
+                    }
+                    return (None, pos, rerr);
+                },
             };
+            let ghost right_v = verified_stmt::view_from(right);
+            let ghost after_table_v = verified_production::token_views(toks@.subrange(rc as int, toks@.len() as int));
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_from_table(after_kw_v)
+                        == (Some(right_v), after_table_v));
+                }
+            }
             let mut cur2 = rc;
 
             // ON <predicate>, except for CROSS joins.
             let mut predicate: Option<ast::Expression> = None;
+            let ghost pred_v: Option<verified_roundtrip::SExpr>;
+            let ghost after_pred_v: Seq<verified_production::TokenView>;
             if !matches!(join_type, ast::JoinType::Cross) {
+                proof { if cur2 < toks.len() { verified_roundtrip::token_views_suffix(toks@, cur2 as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(cur2 as int, toks@.len() as int)); } }
                 if cur2 >= toks.len() {
+                    proof {
+                        if sized {
+                            assert(verified_stmt_prec::sparse_control_from_step(jcur_v) is None);
+                            assert(verified_stmt_prec::is_join_start(jcur_v));
+                            from_joins_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input);
+                        }
+                    }
                     return (None, pos, Some(ParseError::UnexpectedEof));
                 }
                 if !matches!(toks[cur2], Token::Keyword(Keyword::On)) {
+                    proof {
+                        if sized {
+                            assert(verified_stmt_prec::sparse_control_from_step(jcur_v) is None);
+                            assert(verified_stmt_prec::is_join_start(jcur_v));
+                            from_joins_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input);
+                        }
+                    }
                     return (None, pos, Some(ParseError::ExpectedToken(
                         Token::Keyword(Keyword::On),
                         toks[cur2].clone(),
                     )));
                 }
+                proof { verified_roundtrip::token_views_suffix(toks@, cur2 as int); reveal(verified_production::token_view); }
                 cur2 = cur2 + 1;
+                let ghost after_on_v = verified_production::token_views(toks@.subrange(cur2 as int, toks@.len() as int));
+                proof {
+                    verified_roundtrip::token_views_suffix(toks@, (cur2 - 1) as int);
+                    assert(after_on_v == after_table_v.drop_first());
+                    verified_roundtrip::token_views_len(toks@.subrange(cur2 as int, toks@.len() as int));
+                }
                 let (opt, c, perr) = parse_clause_expr_at(toks, cur2);
                 match opt {
                     Some(e) => {
                         predicate = Some(e);
+                        proof {
+                            pred_v = Some(verified_roundtrip::view_expr(e));
+                            after_pred_v = verified_production::token_views(toks@.subrange(c as int, toks@.len() as int));
+                            if sized {
+                                assert(verified_precedence::sparse_prec(after_on_v, 0, verified_stmt_prec::expr_fuel(after_on_v))
+                                    == (Some(verified_roundtrip::view_expr(e)), after_pred_v));
+                            }
+                        }
                         cur2 = c;
                     },
-                    None => return (None, pos, perr),
+                    None => {
+                        proof {
+                            if sized {
+                                assert(verified_stmt_prec::sparse_control_from_step(jcur_v) is None);
+                                assert(verified_stmt_prec::is_join_start(jcur_v));
+                                from_joins_reject_here(toks, from_item, item_start, cur, base_v, outer_start, list_start, done_v, whole, input);
+                            }
+                        }
+                        return (None, pos, perr);
+                    },
                 }
+            } else {
+                proof { pred_v = None; after_pred_v = after_table_v; }
             }
 
+            let ghost old_from_item = from_item;
+            let ghost step_v = verified_stmt::SJoinStep { join_type, right: right_v, predicate: pred_v };
             from_item = ast::From::Join {
                 left: Box::new(from_item),
                 right: Box::new(right),
@@ -620,16 +882,219 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 predicate,
             };
             cur = cur2;
+            proof {
+                if sized {
+                    // `view_from(Join{..}) == apply_step(view_from(old), step_v)`.
+                    reveal_with_fuel(verified_stmt::view_from, 2);
+                    assert(verified_stmt::view_from(from_item)
+                        == verified_stmt::apply_step(verified_stmt::view_from(old_from_item), step_v));
+                    // The step twin at `jcur_v` yields `(step_v, after_pred_v)`.
+                    assert(verified_stmt_prec::sparse_control_from_step(jcur_v)
+                        == Some((step_v, after_pred_v)));
+                    assert(after_pred_v == verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int)));
+                    verified_stmt_prec::lemma_from_joins_step(
+                        verified_stmt::view_from(old_from_item), jcur_v, step_v, after_pred_v);
+                    // Combine with the loop invariant (resumption).
+                    assert(verified_stmt_prec::sparse_control_from_joins(
+                        verified_stmt::view_from(old_from_item), jcur_v)
+                        == verified_stmt_prec::sparse_control_from_joins(
+                            verified_stmt::view_from(from_item),
+                            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                }
+            }
+        }
+        // Inner loop done: `from_item` is the folded tree; establish the outer
+        // from-list resumption after pushing it.
+        let ghost item_v = verified_stmt::view_from(from_item);
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_from_item(cur_v)
+                    == verified_stmt_prec::sparse_control_from_joins(base_v,
+                        verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int))));
+                assert(verified_stmt_prec::sparse_control_from_item(cur_v)
+                    == (Some(item_v), verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int))));
+            }
+        }
+        let ghost old_from = from@;
+        from.push(from_item);
+        proof {
+            verified_stmt_prec::lemma_view_froms_append(old_from, seq![from_item]);
+            verified_stmt_prec::lemma_view_froms_single(from_item);
+            assert(from@ == old_from + seq![from_item]);
+            assert(verified_stmt::view_froms(from@) == done_v + seq![item_v]);
         }
 
-        from.push(from_item);
+        proof { if cur < toks.len() { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); } }
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                if sized {
+                    verified_stmt_prec::lemma_from_list_step(cur_v, item_v,
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                if sized {
+                    verified_stmt_prec::lemma_from_list_resume_step(
+                        list_start, cur_v,
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)),
+                        done_v, item_v, whole);
+                    assert(verified_stmt::view_froms(from@) == done_v + seq![item_v]);
+                }
+            }
         } else {
+            proof {
+                if sized {
+                    verified_stmt_prec::lemma_from_list_last(cur_v, item_v,
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
+                    assert(verified_stmt_prec::sparse_control_from_list(cur_v)
+                        == (Some(seq![item_v]), verified_production::token_views(
+                            toks@.subrange(cur as int, toks@.len() as int))));
+                    assert(whole == (Some(done_v + seq![item_v]),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                    assert(verified_stmt::view_froms(from@) == done_v + seq![item_v]);
+                }
+            }
             break;
         }
     }
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_from(input)
+                == verified_stmt_prec::sparse_control_from_list(list_start));
+        }
+    }
     (Some(from), cur, None)
+}
+
+/// Reject helper for the inner join loop: when the current join step is
+/// malformed (`sparse_control_from_joins` at `cur` rejects), the whole
+/// `from`-list parse (`whole`) rejects too. Chains: the rejecting fold at `cur`
+/// (via the inner loop-resumption invariant) makes the fold from the base table
+/// reject; that makes `sparse_control_from_item(cur_v)` reject; via the outer
+/// loop-resumption invariant `whole` then rejects. Isolated so the deeply-nested
+/// loop exits stay legible.
+proof fn from_joins_reject_here(
+    toks: &Vec<Token>,
+    from_item: ast::From,
+    item_start: usize,
+    cur: usize,
+    base_v: verified_stmt::SFrom,
+    cur_start: usize,
+    list_start: Seq<verified_production::TokenView>,
+    done_v: Seq<verified_stmt::SFrom>,
+    whole: (Option<Seq<verified_stmt::SFrom>>, Seq<verified_production::TokenView>),
+    input: Seq<verified_production::TokenView>,
+)
+    requires
+        cur_start <= item_start <= cur <= toks.len(),
+        toks.len() <= (usize::MAX - 3) / 2,
+        // Head-`FROM` facts linking `input` to `list_start` and `whole`.
+        input.len() >= 1,
+        input[0] == verified_production::TokenView::Keyword(Keyword::From),
+        list_start == input.drop_first(),
+        whole == verified_stmt_prec::sparse_control_from_list(list_start),
+        // `item_start` is where the base table's suffix begins (post-base-table).
+        verified_stmt_prec::sparse_control_from_table(
+            verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int)))
+            == (Some(base_v), verified_production::token_views(
+                toks@.subrange(item_start as int, toks@.len() as int))),
+        // Inner resumption: the fold from the base equals the fold at `cur`.
+        verified_stmt_prec::sparse_control_from_joins(
+            base_v,
+            verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int)))
+        == verified_stmt_prec::sparse_control_from_joins(
+            verified_stmt::view_from(from_item),
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+        // A join-start keyword is present at `cur` but the step is malformed, so
+        // the fold at `cur` rejects.
+        verified_stmt_prec::is_join_start(
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+        verified_stmt_prec::sparse_control_from_step(
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))) is None,
+        // Outer resumption: `whole` is `done_v` prepended onto the parse at `cur_start`.
+        whole == verified_stmt_prec::from_list_prepend(
+            done_v, list_start,
+            verified_stmt_prec::sparse_control_from_list(
+                verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int)))),
+    ensures
+        whole.0 is None,
+        verified_stmt_prec::sparse_control_from(input).0 is None,
+{
+    let cur_v = verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int));
+    // The malformed join step makes the fold at `cur` reject...
+    verified_stmt_prec::lemma_from_joins_reject(
+        verified_stmt::view_from(from_item),
+        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
+    // ...hence the fold from the base rejects (inner resumption), so the
+    // from-item rejects.
+    assert(verified_stmt_prec::sparse_control_from_item(cur_v).0 is None);
+    // A rejecting from-item makes the from-list at `cur_v` reject.
+    assert(verified_stmt_prec::sparse_control_from_list(cur_v).0 is None);
+    // And `from_list_prepend` routes the None through `whole`.
+    // `sparse_control_from(input)` unfolds (head is `FROM`) to the list at
+    // `input.drop_first() == list_start`, which is `whole`.
+    assert(verified_stmt_prec::sparse_control_from(input)
+        == verified_stmt_prec::sparse_control_from_list(list_start));
+}
+
+/// Reject helper for a malformed *join keyword* (a join-start keyword — `CROSS` /
+/// `INNER` / `LEFT` / `RIGHT` — not followed by `JOIN`). Such a head makes
+/// `sparse_control_join_head` (hence the step) `None` while `is_join_start`
+/// holds, so the fold rejects; the rest of the chain to `whole` is
+/// `from_joins_reject_here`. Distinct from that helper only in that the caller
+/// need not have parsed the join keyword-sequence to establish the step is None.
+proof fn from_kw_reject_here(
+    toks: &Vec<Token>,
+    from_item: ast::From,
+    item_start: usize,
+    cur: usize,
+    base_v: verified_stmt::SFrom,
+    cur_start: usize,
+    list_start: Seq<verified_production::TokenView>,
+    done_v: Seq<verified_stmt::SFrom>,
+    whole: (Option<Seq<verified_stmt::SFrom>>, Seq<verified_production::TokenView>),
+    input: Seq<verified_production::TokenView>,
+)
+    requires
+        cur_start <= item_start <= cur <= toks.len(),
+        toks.len() <= (usize::MAX - 3) / 2,
+        input.len() >= 1,
+        input[0] == verified_production::TokenView::Keyword(Keyword::From),
+        list_start == input.drop_first(),
+        whole == verified_stmt_prec::sparse_control_from_list(list_start),
+        verified_stmt_prec::sparse_control_from_table(
+            verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int)))
+            == (Some(base_v), verified_production::token_views(
+                toks@.subrange(item_start as int, toks@.len() as int))),
+        verified_stmt_prec::sparse_control_from_joins(
+            base_v,
+            verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int)))
+        == verified_stmt_prec::sparse_control_from_joins(
+            verified_stmt::view_from(from_item),
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+        // A join-start keyword is present, but no `JOIN` follows, so
+        // `sparse_control_join_head` (and hence the step) is None.
+        verified_stmt_prec::is_join_start(
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+        verified_stmt_prec::sparse_control_join_head(
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))) is None,
+        whole == verified_stmt_prec::from_list_prepend(
+            done_v, list_start,
+            verified_stmt_prec::sparse_control_from_list(
+                verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int)))),
+    ensures
+        whole.0 is None,
+        verified_stmt_prec::sparse_control_from(input).0 is None,
+{
+    // `join_head` None implies the step is None; delegate the rest.
+    assert(verified_stmt_prec::sparse_control_from_step(
+        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))) is None);
+    from_joins_reject_here(toks, from_item, item_start, cur, base_v, cur_start,
+        list_start, done_v, whole, input);
 }
 
 /// Parses a `FROM` table (`<name> [[AS] <alias>]`), strictly advancing on
@@ -641,26 +1106,61 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
         r.0 is None ==> r.2 is Some,
+        ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_from_table(input);
+            match r.0 {
+                Some(f) => sopt is Some
+                    && verified_stmt::view_from(f) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
     if pos >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
     let name = match &toks[pos] {
         Token::Ident(n) => n.clone(),
         _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone()))),
     };
+    proof { reveal(verified_production::token_view); }
     let mut cur = pos + 1;
+    // `input.drop_first()` — the suffix past the table name.
+    let ghost r_after_name = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        assert(r_after_name == input.drop_first());
+    }
 
     // Optional alias: `AS <ident>` or a bare `<ident>`.
     let is_as = cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As));
     let is_ident = cur < toks.len() && matches!(toks[cur], Token::Ident(_));
+    proof {
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
+        } else {
+            verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+        }
+    }
     let mut alias: Option<String> = None;
     if is_as || is_ident {
         if is_as {
             cur = cur + 1;
             if cur >= toks.len() {
+                proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
+            proof { verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int); }
+        }
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
         }
         match &toks[cur] {
             Token::Ident(n) => {
@@ -668,6 +1168,13 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
                 cur = cur + 1;
             },
             _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
+        }
+    }
+    proof {
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+        } else {
+            verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
         }
     }
     (Some(ast::From::Table { name, alias }), cur, None)

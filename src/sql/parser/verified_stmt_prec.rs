@@ -1633,4 +1633,473 @@ pub open spec fn sparse_control_insert(input: Seq<TokenView>) -> (Option<SStmt>,
     }
 }
 
+// ===========================================================================
+// FROM  (spec twin of `verified_control::parse_from_clause_at` /
+//        `parse_from_table_at`)
+//
+// `input` is the token-view suffix at the position where the optional `FROM`
+// clause may begin (i.e. `parse_from_clause_at`'s `pos`). Grammar:
+//   `FROM <from-item> (, <from-item>)*`
+// where a `<from-item>` is a base table `<ident> [[AS] <ident>]` with any number
+// of joins folded left-deep:
+//   `<jointype> <right-table> [ON <expr>]`  (no ON for CROSS).
+// The view targets `Seq<SFrom>` through `verified_stmt::view_froms`; the
+// left-deep fold is `verified_stmt::fold_joins` over `verified_stmt::SJoinStep`
+// (already defined for the printer). When no `FROM` keyword is present the twin
+// yields `(Some(empty), input)`, matching the exec's `(Some(vec![]), pos)`.
+// ===========================================================================
+
+/// A base `FROM` table `<ident> [[AS] <ident>]`. Yields an `SFrom::Table`, or
+/// `None` on a non-identifier where the table name is required, EOF after `AS`,
+/// or a non-identifier where the alias name is required. Mirrors
+/// `parse_from_table_at`.
+pub open spec fn sparse_control_from_table(input: Seq<TokenView>)
+    -> (Option<SFrom>, Seq<TokenView>) {
+    if input.len() < 1 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                let r = input.drop_first();
+                let is_as = r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::As);
+                let is_ident = r.len() >= 1 && (match r[0] {
+                    TokenView::Ident(_) => true,
+                    _ => false,
+                });
+                if is_as {
+                    let r1 = r.drop_first();
+                    if r1.len() < 1 {
+                        (None, input)
+                    } else {
+                        match r1[0] {
+                            TokenView::Ident(a) =>
+                                (Some(SFrom::Table { name, alias: Some(a) }), r1.drop_first()),
+                            _ => (None, input),
+                        }
+                    }
+                } else if is_ident {
+                    match r[0] {
+                        TokenView::Ident(a) =>
+                            (Some(SFrom::Table { name, alias: Some(a) }), r.drop_first()),
+                        _ => (None, input),
+                    }
+                } else {
+                    (Some(SFrom::Table { name, alias: None }), r)
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+/// Whether the head token begins a join clause (`JOIN` / `CROSS` / `INNER` /
+/// `LEFT` / `RIGHT`). The exec inner join loop `break`s (stops folding) only on a
+/// non-join-start head; a join-start keyword that is then malformed is a *reject*,
+/// not a stop. Mirrors the `_ => break` arm of `parse_from_clause_at`'s dispatch.
+pub open spec fn is_join_start(input: Seq<TokenView>) -> bool {
+    input.len() >= 1 && (
+        input[0] == TokenView::Keyword(Keyword::Join)
+        || input[0] == TokenView::Keyword(Keyword::Cross)
+        || input[0] == TokenView::Keyword(Keyword::Inner)
+        || input[0] == TokenView::Keyword(Keyword::Left)
+        || input[0] == TokenView::Keyword(Keyword::Right)
+    )
+}
+
+/// One join keyword-sequence at the head of `input`. Returns the parsed
+/// `ast::JoinType` and the suffix positioned at the right table, or `None` if the
+/// head is not a join keyword (or a join keyword is not followed by `JOIN`).
+/// Mirrors the `match &toks[cur]` join dispatch of `parse_from_clause_at`.
+/// The `bool` in the `Some` payload records whether this join takes an `ON`
+/// predicate (false for `CROSS`).
+pub open spec fn sparse_control_join_head(input: Seq<TokenView>)
+    -> Option<(ast::JoinType, bool, Seq<TokenView>)> {
+    if input.len() < 1 {
+        None
+    } else {
+        match input[0] {
+            TokenView::Keyword(Keyword::Join) =>
+                Some((ast::JoinType::Inner, true, input.drop_first())),
+            TokenView::Keyword(Keyword::Cross) => {
+                let r = input.drop_first();
+                if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Join) {
+                    Some((ast::JoinType::Cross, false, r.drop_first()))
+                } else {
+                    None
+                }
+            },
+            TokenView::Keyword(Keyword::Inner) => {
+                let r = input.drop_first();
+                if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Join) {
+                    Some((ast::JoinType::Inner, true, r.drop_first()))
+                } else {
+                    None
+                }
+            },
+            TokenView::Keyword(Keyword::Left) => {
+                let r = input.drop_first();
+                let r2 = if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Outer) {
+                    r.drop_first()
+                } else {
+                    r
+                };
+                if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::Join) {
+                    Some((ast::JoinType::Left, true, r2.drop_first()))
+                } else {
+                    None
+                }
+            },
+            TokenView::Keyword(Keyword::Right) => {
+                let r = input.drop_first();
+                let r2 = if r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::Outer) {
+                    r.drop_first()
+                } else {
+                    r
+                };
+                if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::Join) {
+                    Some((ast::JoinType::Right, true, r2.drop_first()))
+                } else {
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+}
+
+/// One complete join step at the head of `input`: the join keyword-sequence, the
+/// right base table, and (unless CROSS) an `ON <expr>` predicate. Returns the
+/// `SJoinStep` and the remaining suffix, or `None` if the head is not a join, a
+/// join keyword is malformed, the right table is malformed, or a required `ON`
+/// predicate is missing/malformed. Mirrors one iteration of the inner join loop
+/// of `parse_from_clause_at`.
+pub open spec fn sparse_control_from_step(input: Seq<TokenView>)
+    -> Option<(verified_stmt::SJoinStep, Seq<TokenView>)> {
+    match sparse_control_join_head(input) {
+        None => None,
+        Some((join_type, needs_on, r)) => {
+            match sparse_control_from_table(r) {
+                (None, _) => None,
+                (Some(right), r1) => {
+                    if needs_on {
+                        if r1.len() < 1 || r1[0] != TokenView::Keyword(Keyword::On) {
+                            None
+                        } else {
+                            match sparse_prec(r1.drop_first(), 0, expr_fuel(r1.drop_first())) {
+                                (Some(e), r2) => Some((verified_stmt::SJoinStep {
+                                    join_type, right, predicate: Some(e) }, r2)),
+                                (None, _) => None,
+                            }
+                        }
+                    } else {
+                        Some((verified_stmt::SJoinStep {
+                            join_type, right, predicate: None }, r1))
+                    }
+                },
+            }
+        },
+    }
+}
+
+/// Zero-or-more join steps folded left-deep onto `acc`. Recurses on the input
+/// length: each step consumes at least the join keyword. Returns the folded
+/// `SFrom` and the suffix, or `None` if a step is started (join keyword present)
+/// but is malformed. When the head is not a join keyword, folding stops and
+/// `acc` is returned unchanged. Mirrors the inner join loop of
+/// `parse_from_clause_at`, whose accumulator is `apply_step`-folded.
+pub open spec fn sparse_control_from_joins(acc: SFrom, input: Seq<TokenView>)
+    -> (Option<SFrom>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_from_joins_decreases
+{
+    match sparse_control_from_step(input) {
+        None => {
+            // Distinguish "no join-start keyword" (stop, success) from "malformed
+            // join" (reject). The exec loop `break`s only on a non-join-start
+            // head; a join-start keyword (`CROSS`/`INNER`/... — even one not
+            // followed by `JOIN`) that fails to parse a step is a reject.
+            if is_join_start(input) {
+                (None, input)
+            } else {
+                (Some(acc), input)
+            }
+        },
+        Some((step, r)) => {
+            sparse_control_from_joins(verified_stmt::apply_step(acc, step), r)
+        },
+    }
+}
+
+/// Termination witness for `sparse_control_from_joins`: a parsed step's suffix is
+/// strictly shorter than `input` (the join keyword consumes >= 1 token, the right
+/// table >= 1, and `sparse_prec` never grows the input).
+#[via_fn]
+proof fn sparse_control_from_joins_decreases(acc: SFrom, input: Seq<TokenView>) {
+    match sparse_control_from_step(input) {
+        Some((step, r)) => {
+            lemma_from_step_slen(input);
+        },
+        None => {},
+    }
+}
+
+/// `sparse_control_from_table` strictly shrinks (or rejects): on `Some` the
+/// suffix is strictly shorter than the input (a table always consumes its name).
+pub proof fn lemma_from_table_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_from_table(input).0 is Some ==>
+            sparse_control_from_table(input).1.len() < input.len(),
+{
+}
+
+/// A parsed join step strictly shrinks the input: the join keyword and right
+/// table each consume >= 1 token, and `sparse_prec` (the ON predicate) never
+/// grows its input.
+pub proof fn lemma_from_step_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_from_step(input) is Some ==>
+            sparse_control_from_step(input)->Some_0.1.len() < input.len(),
+{
+    match sparse_control_join_head(input) {
+        Some((join_type, needs_on, r)) => {
+            // `r.len() < input.len()`: a join keyword consumes >= 1 token.
+            assert(r.len() < input.len());
+            lemma_from_table_slen(r);
+            match sparse_control_from_table(r) {
+                (Some(right), r1) => {
+                    if needs_on && r1.len() >= 1 && r1[0] == TokenView::Keyword(Keyword::On) {
+                        verified_precedence::lemma_prec_slen(
+                            r1.drop_first(), 0, expr_fuel(r1.drop_first()));
+                    }
+                },
+                (None, _) => {},
+            }
+        },
+        None => {},
+    }
+}
+
+/// One unfold of the join fold when a step parses at the head: fold continues
+/// from `apply_step(acc, step)` at the step's suffix. Definitional.
+pub proof fn lemma_from_joins_step(acc: SFrom, cur: Seq<TokenView>, step: verified_stmt::SJoinStep, r: Seq<TokenView>)
+    requires
+        sparse_control_from_step(cur) == Some((step, r)),
+    ensures
+        sparse_control_from_joins(acc, cur)
+            == sparse_control_from_joins(verified_stmt::apply_step(acc, step), r),
+{
+}
+
+/// The join fold stops (success) when the head is not a join-start keyword: the
+/// fold yields the accumulator unchanged. A non-join-start head means
+/// `sparse_control_join_head` (hence the step) is None *and* `is_join_start` is
+/// false, so the fold takes the stop branch. Mirrors the exec `_ => break`.
+pub proof fn lemma_from_joins_stop(acc: SFrom, cur: Seq<TokenView>)
+    requires
+        !is_join_start(cur),
+    ensures
+        sparse_control_from_joins(acc, cur) == (Some(acc), cur),
+{
+    assert(sparse_control_join_head(cur) is None);
+    assert(sparse_control_from_step(cur) is None);
+}
+
+/// The join fold rejects when a join-start keyword is present but the step is
+/// malformed (e.g. `CROSS` not followed by `JOIN`, a bad right table, or a
+/// missing/malformed `ON` predicate). Definitional. Mirrors the exec error
+/// returns inside the inner join loop.
+pub proof fn lemma_from_joins_reject(acc: SFrom, cur: Seq<TokenView>)
+    requires
+        is_join_start(cur),
+        sparse_control_from_step(cur) is None,
+    ensures
+        sparse_control_from_joins(acc, cur) == (None::<SFrom>, cur),
+{
+}
+
+/// A base table followed by its left-deep join fold. Mirrors one outer-loop
+/// from-item of `parse_from_clause_at`. On success yields the folded tree.
+pub open spec fn sparse_control_from_item(input: Seq<TokenView>)
+    -> (Option<SFrom>, Seq<TokenView>) {
+    match sparse_control_from_table(input) {
+        (None, _) => (None, input),
+        (Some(base), r) => sparse_control_from_joins(base, r),
+    }
+}
+
+/// One-or-more comma-separated from-items. Recurses on the input length: a
+/// successful item consumes at least the base table's name, and the comma step
+/// drops one more. Mirrors the outer comma loop of `parse_from_clause_at`.
+pub open spec fn sparse_control_from_list(input: Seq<TokenView>)
+    -> (Option<Seq<SFrom>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_from_list_decreases
+{
+    match sparse_control_from_item(input) {
+        (None, _) => (None, input),
+        (Some(item), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_from_list(r.drop_first()) {
+                    (Some(more), r2) => (Some(seq![item] + more), r2),
+                    (None, _) => (None, input),
+                }
+            } else {
+                (Some(seq![item]), r)
+            }
+        },
+    }
+}
+
+/// Termination witness for `sparse_control_from_list`: a from-item consumes at
+/// least the base table's name, so the post-comma tail is strictly shorter.
+#[via_fn]
+proof fn sparse_control_from_list_decreases(input: Seq<TokenView>) {
+    lemma_from_item_slen(input);
+}
+
+/// A parsed from-item strictly shrinks the input.
+pub proof fn lemma_from_item_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_from_item(input).0 is Some ==>
+            sparse_control_from_item(input).1.len() < input.len(),
+{
+    lemma_from_table_slen(input);
+    match sparse_control_from_table(input) {
+        (Some(base), r) => {
+            lemma_from_joins_slen(base, r);
+        },
+        (None, _) => {},
+    }
+}
+
+/// The join fold never grows its input.
+pub proof fn lemma_from_joins_slen(acc: SFrom, input: Seq<TokenView>)
+    ensures
+        sparse_control_from_joins(acc, input).1.len() <= input.len(),
+    decreases input.len(),
+{
+    match sparse_control_from_step(input) {
+        Some((step, r)) => {
+            lemma_from_step_slen(input);
+            lemma_from_joins_slen(verified_stmt::apply_step(acc, step), r);
+        },
+        None => {},
+    }
+}
+
+/// Optional `FROM` clause wrapper. When the head is not `FROM`, yields the empty
+/// from-list; otherwise parses the comma-separated from-item list. Mirrors
+/// `parse_from_clause_at` (the top-level entry).
+pub open spec fn sparse_control_from(input: Seq<TokenView>)
+    -> (Option<Seq<SFrom>>, Seq<TokenView>) {
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::From) {
+        (Some(Seq::<SFrom>::empty()), input)
+    } else {
+        sparse_control_from_list(input.drop_first())
+    }
+}
+
+// -- from-list bridging lemmas (mirror the select-list family) ---------------
+
+/// `verified_stmt::view_froms` distributes over sequence concatenation.
+pub proof fn lemma_view_froms_append(a: Seq<ast::From>, b: Seq<ast::From>)
+    ensures
+        verified_stmt::view_froms(a + b)
+            == verified_stmt::view_froms(a) + verified_stmt::view_froms(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_stmt::view_froms, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_froms_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-item view: `view_froms(seq![f]) == seq![view_from(f)]`.
+pub proof fn lemma_view_froms_single(f: ast::From)
+    ensures
+        verified_stmt::view_froms(seq![f]) == seq![verified_stmt::view_from(f)],
+{
+    reveal_with_fuel(verified_stmt::view_froms, 2);
+    let s = seq![f];
+    assert(s.len() == 1);
+    assert(s[0] == f);
+    assert(s.drop_first() =~= Seq::<ast::From>::empty());
+    assert(verified_stmt::view_froms(s.drop_first()) =~= Seq::<SFrom>::empty());
+    assert(verified_stmt::view_froms(s) =~= seq![verified_stmt::view_from(f)]);
+}
+
+/// Prepend already-consumed from-items onto a tail from-list parse, routing
+/// `whole` through on rejection.
+pub open spec fn from_list_prepend(
+    done: Seq<SFrom>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<SFrom>>, Seq<TokenView>),
+) -> (Option<Seq<SFrom>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_from_list(cur)` when a comma follows the
+/// head item. Mirrors `lemma_select_list_step`.
+pub proof fn lemma_from_list_step(cur: Seq<TokenView>, item: SFrom, r: Seq<TokenView>)
+    requires
+        sparse_control_from_item(cur) == (Some(item), r),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_from_list(cur)
+            == from_list_prepend(seq![item], cur, sparse_control_from_list(r.drop_first())),
+{
+    match sparse_control_from_list(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_from_list(cur) == (Some(seq![item] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_from_list(cur) == (None::<Seq<SFrom>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more item.
+pub proof fn lemma_from_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<SFrom>,
+    item: SFrom,
+    whole: (Option<Seq<SFrom>>, Seq<TokenView>),
+)
+    requires
+        whole == from_list_prepend(done, ls, sparse_control_from_list(cur)),
+        sparse_control_from_list(cur)
+            == from_list_prepend(seq![item], cur, sparse_control_from_list(cur1)),
+    ensures
+        whole == from_list_prepend(done + seq![item], ls, sparse_control_from_list(cur1)),
+{
+    match sparse_control_from_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![item] + more) == (done + seq![item]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head item, so the list is the single item.
+pub proof fn lemma_from_list_last(cur: Seq<TokenView>, item: SFrom, r: Seq<TokenView>)
+    requires
+        sparse_control_from_item(cur) == (Some(item), r),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_from_list(cur) == (Some(seq![item]), r),
+{
+}
+
 } // verus!
