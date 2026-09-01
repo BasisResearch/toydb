@@ -24,17 +24,19 @@
 //! `verified_stmt_prec`, whose expression positions are `sparse_prec` (unlike
 //! `verified_stmt::sparse_stmt`, which uses the fully-parenthesised grammar).
 //! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, `parse_order_by_at`,
-//! `parse_group_by_at`, and the `CREATE TABLE` pair `parse_create_at` /
-//! `parse_create_column_at` are proven to produce exactly the AST their spec
-//! twin (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` /
-//! `_group_by` / `_create` / `_column`) computes, up to
-//! `verified_stmt::view_stmt` / `view_order_list` / `view_column` /
-//! `verified_roundtrip::view_args`, with the leftover-token stream pinned — so
-//! e.g. mis-defaulting an `ORDER BY` direction, dropping `IF EXISTS`, or
-//! dropping a column's `PRIMARY KEY` / `NOT NULL` flag now breaks verification,
-//! not just the goldenscript suite. The remaining dispatch
-//! (`parse_control_at`) and clause parsers (SELECT list, FROM join tree, INSERT
-//! rows, UPDATE assignments, EXPLAIN) still carry only the
+//! `parse_group_by_at`, the `CREATE TABLE` pair `parse_create_at` /
+//! `parse_create_column_at`, the `SELECT` list `parse_select_list_at`, and
+//! `parse_insert_at` are proven to produce exactly the AST their spec twin
+//! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` / `_group_by` /
+//! `_create` / `_column` / `_select_list` / `_insert`) computes, up to
+//! `verified_stmt::view_stmt` / `view_order_list` / `view_select_list` /
+//! `view_rows` / `view_column` / `verified_roundtrip::view_args`, with the
+//! leftover-token stream pinned — so e.g. mis-defaulting an `ORDER BY`
+//! direction, dropping `IF EXISTS`, dropping a column's `PRIMARY KEY` /
+//! `NOT NULL` flag, swapping a `SELECT` alias, or dropping an `INSERT` row now
+//! breaks verification, not just the goldenscript suite. The remaining dispatch
+//! (`parse_control_at`) and clause parsers (FROM join tree, UPDATE assignments,
+//! EXPLAIN) still carry only the
 //! no-panic/terminate/error-on-reject contract; their accepted ASTs and
 //! rejection errors are pinned by the goldenscript suite. Embedded
 //! expressions are parsed by `verified_precedence`, which additionally carries a
@@ -2346,17 +2348,34 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 /// statement, having consumed `INSERT`. The row values are parsed by the
 /// verified expression parser. Mirrors `parse_insert`; a malformed form yields
 /// `(None, pos)` so the caller falls back to the legacy parser.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(200000)]
 fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_insert(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
     // INTO
     if pos >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
     if !matches!(toks[pos], Token::Keyword(Keyword::Into)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::Into),
@@ -2364,61 +2383,220 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         )));
     }
     let mut cur = pos + 1;
+    // r0 — suffix just past `INTO`.
+    let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        assert(r0 == input.drop_first());
+    }
 
     // Table name.
     if cur >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     let table = match &toks[cur] {
         Token::Ident(name) => name.clone(),
         _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
+    // r1 — suffix just past `INTO <ident>`.
+    let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+        assert(r1 == r0.drop_first());
+        assert(r0[0] == verified_production::TokenView::Ident(table));
+    }
 
     // Optional parenthesised column list.
     let mut columns: Option<Vec<String>> = None;
     if cur < toks.len() && matches!(toks[cur], Token::OpenParen) {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
+        // list_start for the ident list.
+        let ghost cl_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost cl_whole = verified_stmt_prec::sparse_control_ident_list(cl_start);
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r1.len() >= 1);
+            assert(r1[0] == verified_production::TokenView::OpenParen);
+            assert(cl_start == r1.drop_first());
+        }
         let mut cols: Vec<String> = Vec::new();
         loop
-            invariant
-                pos <= cur,
+            invariant_except_break
+                pos < cur,
                 cur <= toks.len(),
+                input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+                input.len() >= 1,
+                input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+                r0 == input.drop_first(),
+                r0.len() >= 1,
+                r0[0] == verified_production::TokenView::Ident(table),
+                r1 == r0.drop_first(),
+                r1.len() >= 1,
+                r1[0] == verified_production::TokenView::OpenParen,
+                cl_start == r1.drop_first(),
+                cl_whole == verified_stmt_prec::sparse_control_ident_list(cl_start),
+                cl_whole == verified_stmt_prec::ident_list_prepend(
+                    cols@,
+                    cl_start,
+                    verified_stmt_prec::sparse_control_ident_list(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))),
+            ensures
+                pos < cur,
+                cur <= toks.len(),
+                cl_whole == verified_stmt_prec::sparse_control_ident_list(cl_start),
+                cl_whole == (Some(cols@),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
             decreases toks.len() - cur,
         {
+            let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+            let ghost done_v = cols@;
             if cur >= toks.len() {
+                proof {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                    assert(verified_stmt_prec::sparse_control_ident_list(cur_v).0 is None);
+                    assert(cl_whole.0 is None);
+                    assert(verified_stmt_prec::sparse_control_opt_columns(r1).is_none());
+                    insert_conclude_none_cols(input, r0, r1, cl_start, table);
+                }
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
-            match &toks[cur] {
-                Token::Ident(name) => {
-                    cols.push(name.clone());
-                    cur = cur + 1;
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
+            let name = match &toks[cur] {
+                Token::Ident(name) => name.clone(),
+                _ => {
+                    proof {
+                        assert(verified_stmt_prec::sparse_control_ident_list(cur_v).0 is None);
+                        assert(cl_whole.0 is None);
+                        assert(verified_stmt_prec::sparse_control_opt_columns(r1).is_none());
+                        insert_conclude_none_cols(input, r0, r1, cl_start, table);
+                    }
+                    return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone())));
                 },
-                _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
+            };
+            proof { assert(cur_v[0] == verified_production::TokenView::Ident(name)); }
+            let ghost r_after_name = verified_production::token_views(toks@.subrange((cur + 1) as int, toks@.len() as int));
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                assert(r_after_name == cur_v.drop_first());
+            }
+            let ghost old_cols = cols@;
+            cols.push(name);
+            cur = cur + 1;
+            proof {
+                assert(cols@ == old_cols + seq![name]);
             }
             if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+                proof {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                    verified_stmt_prec::lemma_ident_list_step(cur_v, name, r_after_name);
+                }
                 cur = cur + 1;
+                proof {
+                    verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                    assert(r_after_name.drop_first() == verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int)));
+                    verified_stmt_prec::lemma_ident_list_resume_step(
+                        cl_start, cur_v, r_after_name.drop_first(), done_v, name, cl_whole);
+                    assert(cols@ == done_v + seq![name]);
+                }
             } else {
+                proof {
+                    if cur < toks.len() {
+                        verified_roundtrip::token_views_suffix(toks@, cur as int);
+                    } else {
+                        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                    }
+                    verified_stmt_prec::lemma_ident_list_last(cur_v, name, r_after_name);
+                    assert(verified_stmt_prec::sparse_control_ident_list(cur_v)
+                        == (Some(seq![name]), r_after_name));
+                    assert(cl_whole == (Some(done_v + seq![name]), r_after_name));
+                    assert(cols@ == done_v + seq![name]);
+                }
                 break;
             }
         }
+        // rc — spec suffix after the ident list (matches cl_whole.1).
+        let ghost rc = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         if cur >= toks.len() {
+            proof {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                assert(rc.len() == 0);
+                // Ident list succeeded (`cl_whole.0 is Some`) but no `)` follows, so
+                // the spec column helper rejects, so the whole INSERT rejects.
+                assert(cl_whole == (Some(cols@), rc));
+                assert(verified_stmt_prec::sparse_control_opt_columns(r1).is_none());
+                insert_conclude_none_cols(input, r0, r1, cl_start, table);
+            }
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::CloseParen) {
+            proof {
+                assert(rc[0] != verified_production::TokenView::CloseParen);
+                assert(cl_whole == (Some(cols@), rc));
+                assert(verified_stmt_prec::sparse_control_opt_columns(r1).is_none());
+                insert_conclude_none_cols(input, r0, r1, cl_start, table);
+            }
             return (None, pos, Some(ParseError::ExpectedToken(
                 Token::CloseParen,
                 toks[cur].clone(),
             )));
         }
+        proof { assert(rc[0] == verified_production::TokenView::CloseParen); }
         cur = cur + 1;
         columns = Some(cols);
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            // The spec column helper agrees: it opened at `(`, the ident list
+            // (`cl_whole`) matched `cols@`, `rc` began with `)`, and the suffix at
+            // `cur` is just past that `)`.
+            assert(cl_start == r1.drop_first());
+            assert(verified_stmt_prec::sparse_control_ident_list(r1.drop_first()) == cl_whole);
+            assert(rc == cl_whole.1);
+            assert(verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))
+                == rc.drop_first());
+            assert(verified_stmt_prec::sparse_control_opt_columns(r1)
+                == Some((Some(cols@),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))));
+        }
+    } else {
+        proof {
+            if cur < toks.len() {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+            } else {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+            }
+            // No `(` opened: the spec helper returns `Some((None, r1))` and the
+            // suffix at `cur` is exactly `r1` (cur unchanged in this branch).
+            assert(verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)) == r1);
+            assert(!(r1.len() >= 1 && r1[0] == verified_production::TokenView::OpenParen));
+            assert(verified_stmt_prec::sparse_control_opt_columns(r1)
+                == Some((None::<Seq<String>>,
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))));
+        }
+    }
+    // r2 — spec suffix at the (mandatory) `VALUES` keyword, matching the spec's
+    // `r2` regardless of whether a column list was present.
+    let ghost r2 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost cols_view: Option<Seq<String>> = match columns {
+        Some(ref v) => Some(v@),
+        None => None,
+    };
+    // Merge the two column-branch outcomes into the single spec-helper equation.
+    proof {
+        assert(verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)));
     }
 
     // VALUES
     if cur >= toks.len() {
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     if !matches!(toks[cur], Token::Keyword(Keyword::Values)) {
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::Values),
@@ -2426,73 +2604,564 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         )));
     }
     cur = cur + 1;
+    // vals_start — suffix just past `VALUES`, where the row list begins.
+    let ghost vals_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost vals_whole = verified_stmt_prec::sparse_control_values(vals_start);
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+        assert(vals_start == r2.drop_first());
+        // Entry resumption: with no rows consumed, `view_rows([]) == []` and the
+        // suffix at `cur` is `vals_start`, so `values_prepend([], vals_start, vals_whole)
+        // == vals_whole` (whether `vals_whole` accepts or rejects, since on reject
+        // `sparse_control_values` returns its input `vals_start`).
+        reveal_with_fuel(verified_stmt::view_rows, 1);
+        assert(verified_stmt::view_rows(Seq::<Vec<ast::Expression>>::empty())
+            == Seq::<Seq<verified_roundtrip::SExpr>>::empty());
+        match vals_whole.0 {
+            Some(m) => { assert(Seq::<Seq<verified_roundtrip::SExpr>>::empty() + m == m); },
+            None => {},
+        }
+    }
 
     // One or more comma-separated parenthesised rows of expressions.
     let mut values: Vec<Vec<ast::Expression>> = Vec::new();
     loop
-        invariant
-            pos <= cur,
+        invariant_except_break
+            pos < cur,
             cur <= toks.len(),
+            sized == (toks.len() <= (usize::MAX - 3) / 2),
+            // Structural head facts, constant across the loop, needed to conclude
+            // `sparse_control_insert` on any exit.
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+            r0 == input.drop_first(),
+            r0.len() >= 1,
+            r0[0] == verified_production::TokenView::Ident(table),
+            r1 == r0.drop_first(),
+            verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+            r2.len() >= 1,
+            r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+            vals_start == r2.drop_first(),
+            vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+            sized ==>
+                vals_whole == verified_stmt_prec::values_prepend(
+                    verified_stmt::view_rows(values@),
+                    vals_start,
+                    verified_stmt_prec::sparse_control_values(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))),
+        ensures
+            pos < cur,
+            cur <= toks.len(),
+            sized == (toks.len() <= (usize::MAX - 3) / 2),
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+            r0 == input.drop_first(),
+            r0.len() >= 1,
+            r0[0] == verified_production::TokenView::Ident(table),
+            r1 == r0.drop_first(),
+            verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+            r2.len() >= 1,
+            r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+            vals_start == r2.drop_first(),
+            vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+            sized ==>
+                vals_whole == (Some(verified_stmt::view_rows(values@)),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_stmt::view_rows(values@);
         if cur >= toks.len() {
+            proof {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
+                assert(verified_stmt_prec::sparse_control_row(cur_v).0 is None);
+                assert(verified_stmt_prec::sparse_control_values(cur_v).0 is None);
+                if sized {
+                    assert(vals_whole.0 is None);
+                    insert_conclude_none(input, r0, r1, r2, vals_start, vals_whole, table, cols_view);
+                }
+            }
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::OpenParen) {
+            proof {
+                reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
+                assert(cur_v[0] != verified_production::TokenView::OpenParen);
+                assert(verified_stmt_prec::sparse_control_row(cur_v).0 is None);
+                assert(verified_stmt_prec::sparse_control_values(cur_v).0 is None);
+                if sized {
+                    assert(vals_whole.0 is None);
+                    insert_conclude_none(input, r0, r1, r2, vals_start, vals_whole, table, cols_view);
+                }
+            }
             return (None, pos, Some(ParseError::ExpectedToken(
                 Token::OpenParen,
                 toks[cur].clone(),
             )));
         }
+        proof { assert(cur_v[0] == verified_production::TokenView::OpenParen); }
+        // `cur_v_outer` — the values-loop suffix at this row's opening `(`, kept
+        // across the inner loop (which shadows `cur_v`) for the reject/accept
+        // bridge lemmas. `done_v_outer` — `view_rows` of the rows consumed so far.
+        let ghost cur_v_outer = cur_v;
+        let ghost done_v_outer = done_v;
         cur = cur + 1;
         // Snapshot the post-`(` position: the inner loop only advances `cur`, so
         // the outer loop's `decreases` sees strict progress across a row.
         let ghost row_start = cur;
+        // rstart_v — suffix just past `(`, where the row's expression list begins.
+        let ghost rstart_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost row_whole = verified_stmt_prec::sparse_control_group_list(rstart_v);
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(rstart_v == cur_v.drop_first());
+        }
         let mut row: Vec<ast::Expression> = Vec::new();
         loop
-            invariant
-                pos <= row_start <= cur,
+            invariant_except_break
+                pos < row_start <= cur,
                 cur <= toks.len(),
+                sized == (toks.len() <= (usize::MAX - 3) / 2),
+                cur_v_outer.len() >= 1,
+                cur_v_outer[0] == verified_production::TokenView::OpenParen,
+                rstart_v == cur_v_outer.drop_first(),
+                rstart_v == verified_production::token_views(
+                    toks@.subrange(row_start as int, toks@.len() as int)),
+                row_whole == verified_stmt_prec::sparse_control_group_list(rstart_v),
+                // Structural head facts (constant), so a row-level reject can invoke
+                // `insert_conclude_none`.
+                input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+                input.len() >= 1,
+                input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+                r0 == input.drop_first(),
+                r0.len() >= 1,
+                r0[0] == verified_production::TokenView::Ident(table),
+                r1 == r0.drop_first(),
+                verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+                r2.len() >= 1,
+                r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+                vals_start == r2.drop_first(),
+                // Carry the outer values-loop resumption (constant across this inner
+                // loop) so a row-level reject can conclude the whole values reject.
+                vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+                sized ==>
+                    vals_whole == verified_stmt_prec::values_prepend(
+                        done_v_outer, vals_start,
+                        verified_stmt_prec::sparse_control_values(cur_v_outer)),
+                sized ==>
+                    row_whole == verified_stmt_prec::group_list_prepend(
+                        verified_roundtrip::view_args(row@),
+                        rstart_v,
+                        verified_stmt_prec::sparse_control_group_list(
+                            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))),
+            ensures
+                pos < row_start <= cur,
+                cur <= toks.len(),
+                sized == (toks.len() <= (usize::MAX - 3) / 2),
+                cur_v_outer.len() >= 1,
+                cur_v_outer[0] == verified_production::TokenView::OpenParen,
+                rstart_v == cur_v_outer.drop_first(),
+                rstart_v == verified_production::token_views(
+                    toks@.subrange(row_start as int, toks@.len() as int)),
+                row_whole == verified_stmt_prec::sparse_control_group_list(rstart_v),
+                input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+                input.len() >= 1,
+                input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+                r0 == input.drop_first(),
+                r0.len() >= 1,
+                r0[0] == verified_production::TokenView::Ident(table),
+                r1 == r0.drop_first(),
+                verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+                r2.len() >= 1,
+                r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+                vals_start == r2.drop_first(),
+                vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+                cur_v_outer.len() >= 1,
+                cur_v_outer[0] == verified_production::TokenView::OpenParen,
+                rstart_v == cur_v_outer.drop_first(),
+                sized ==>
+                    vals_whole == verified_stmt_prec::values_prepend(
+                        done_v_outer, vals_start,
+                        verified_stmt_prec::sparse_control_values(cur_v_outer)),
+                sized ==>
+                    row_whole == (Some(verified_roundtrip::view_args(row@)),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
             decreases toks.len() - cur,
         {
+            let ghost rcur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+            let ghost rdone_v = verified_roundtrip::view_args(row@);
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
+                // Only reachable when `!sized`, so the refinement postcondition is
+                // vacuous; nothing to prove about `vals_whole`.
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
+            proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
             let (opt, consumed, verr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
-            match opt {
-                Some(expr) => {
-                    row.push(expr);
-                    cur = consumed;
+            let expr = match opt {
+                Some(e) => e,
+                None => {
+                    proof {
+                        reveal_with_fuel(verified_stmt_prec::sparse_control_group_list, 1);
+                        assert(verified_precedence::sparse_prec(rcur_v, 0, fuel as nat).0 is None);
+                        assert(verified_stmt_prec::sparse_control_group_list(rcur_v).0 is None);
+                        if sized {
+                            // The row's expr list rejects, so `row_whole` rejects, so
+                            // the enclosing row rejects, so the values list rejects.
+                            assert(row_whole.0 is None);
+                            insert_row_whole_reject(rstart_v, cur_v_outer, row_whole);
+                            reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
+                            assert(verified_stmt_prec::sparse_control_values(cur_v_outer).0 is None);
+                            assert(vals_whole.0 is None);
+                            insert_conclude_none(input, r0, r1, r2, vals_start, vals_whole, table, cols_view);
+                        }
+                    }
+                    return (None, pos, verr);
                 },
-                None => return (None, pos, verr),
+            };
+            let ghost r_after_expr = verified_production::token_views(toks@.subrange(consumed as int, toks@.len() as int));
+            proof {
+                assert(fuel as nat == verified_stmt_prec::expr_fuel(rcur_v));
+                assert(verified_precedence::sparse_prec(rcur_v, 0, verified_stmt_prec::expr_fuel(rcur_v))
+                    == (Some(verified_roundtrip::view_expr(expr)), r_after_expr));
+            }
+            let ghost old_row = row@;
+            row.push(expr);
+            cur = consumed;
+            proof {
+                verified_stmt_prec::lemma_view_args_append(old_row, seq![expr]);
+                verified_stmt_prec::lemma_view_args_single(expr);
+                assert(row@ == old_row + seq![expr]);
+                assert(verified_roundtrip::view_args(row@)
+                    == rdone_v + seq![verified_roundtrip::view_expr(expr)]);
             }
             if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+                proof {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                    if sized {
+                        verified_stmt_prec::lemma_group_list_step(
+                            rcur_v, verified_roundtrip::view_expr(expr), r_after_expr);
+                    }
+                }
                 cur = cur + 1;
+                proof {
+                    verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                    assert(r_after_expr.drop_first() == verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int)));
+                    if sized {
+                        verified_stmt_prec::lemma_group_list_resume_step(
+                            rstart_v, rcur_v, r_after_expr.drop_first(),
+                            rdone_v, verified_roundtrip::view_expr(expr), row_whole);
+                        assert(verified_roundtrip::view_args(row@)
+                            == rdone_v + seq![verified_roundtrip::view_expr(expr)]);
+                    }
+                }
             } else {
+                proof {
+                    if cur < toks.len() {
+                        verified_roundtrip::token_views_suffix(toks@, cur as int);
+                    } else {
+                        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                    }
+                    if sized {
+                        verified_stmt_prec::lemma_group_list_last(
+                            rcur_v, verified_roundtrip::view_expr(expr), r_after_expr);
+                        assert(verified_stmt_prec::sparse_control_group_list(rcur_v)
+                            == (Some(seq![verified_roundtrip::view_expr(expr)]), r_after_expr));
+                        assert(row_whole == (Some(rdone_v
+                            + seq![verified_roundtrip::view_expr(expr)]), r_after_expr));
+                        assert(verified_roundtrip::view_args(row@)
+                            == rdone_v + seq![verified_roundtrip::view_expr(expr)]);
+                    }
+                }
                 break;
             }
         }
+        // At the end of the inner loop, `row_whole == (Some(view_args(row@)), suffix-at-cur)`.
+        let ghost r_after_row_exprs = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         if cur >= toks.len() {
+            proof {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                assert(r_after_row_exprs.len() == 0);
+                if sized {
+                    insert_row_reject(rstart_v, cur_v_outer, verified_roundtrip::view_args(row@), r_after_row_exprs);
+                    assert(verified_stmt_prec::sparse_control_row(cur_v_outer).0 is None);
+                    reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
+                    assert(verified_stmt_prec::sparse_control_values(cur_v_outer).0 is None);
+                    assert(vals_whole.0 is None);
+                    insert_conclude_none(input, r0, r1, r2, vals_start, vals_whole, table, cols_view);
+                }
+            }
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::CloseParen) {
+            proof {
+                assert(r_after_row_exprs[0] != verified_production::TokenView::CloseParen);
+                if sized {
+                    insert_row_reject(rstart_v, cur_v_outer, verified_roundtrip::view_args(row@), r_after_row_exprs);
+                    assert(verified_stmt_prec::sparse_control_row(cur_v_outer).0 is None);
+                    reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
+                    assert(verified_stmt_prec::sparse_control_values(cur_v_outer).0 is None);
+                    assert(vals_whole.0 is None);
+                    insert_conclude_none(input, r0, r1, r2, vals_start, vals_whole, table, cols_view);
+                }
+            }
             return (None, pos, Some(ParseError::ExpectedToken(
                 Token::CloseParen,
                 toks[cur].clone(),
             )));
         }
+        proof { assert(r_after_row_exprs[0] == verified_production::TokenView::CloseParen); }
         cur = cur + 1;
+        let ghost old_values = values@;
         values.push(row);
+        // r_after_row — spec suffix just past the row's closing paren.
+        let ghost r_after_row = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost row_view = verified_roundtrip::view_args(row@);
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r_after_row == r_after_row_exprs.drop_first());
+            verified_stmt_prec::lemma_view_rows_append(old_values, seq![row]);
+            verified_stmt_prec::lemma_view_rows_single(row);
+            assert(values@ == old_values + seq![row]);
+            assert(verified_stmt::view_rows(values@)
+                == done_v + seq![row_view]);
+            if sized {
+                // `sparse_control_row(cur_v_outer) == (Some(view_args(row@)), r_after_row)`.
+                insert_row_accept(rstart_v, cur_v_outer, row_view, r_after_row_exprs, r_after_row);
+            }
+        }
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                if sized {
+                    verified_stmt_prec::lemma_values_step(cur_v_outer, row_view, r_after_row);
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                assert(r_after_row.drop_first() == verified_production::token_views(
+                    toks@.subrange(cur as int, toks@.len() as int)));
+                if sized {
+                    verified_stmt_prec::lemma_values_resume_step(
+                        vals_start, cur_v_outer, r_after_row.drop_first(),
+                        done_v, row_view, vals_whole);
+                    assert(verified_stmt::view_rows(values@) == done_v + seq![row_view]);
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+                if sized {
+                    verified_stmt_prec::lemma_values_last(cur_v_outer, row_view, r_after_row);
+                    assert(verified_stmt_prec::sparse_control_values(cur_v_outer)
+                        == (Some(seq![row_view]), r_after_row));
+                    assert(vals_whole == (Some(done_v + seq![row_view]), r_after_row));
+                    assert(verified_stmt::view_rows(values@) == done_v + seq![row_view]);
+                }
+            }
             break;
         }
     }
-
+    let ghost r3 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            insert_conclude(toks, pos, cur, input, r0, r1, r2, vals_start, vals_whole,
+                table, cols_view, verified_stmt::view_rows(values@));
+            // Bridge `view_stmt(Insert{..})` to `SStmt::Insert{table, cols_view, rows}`:
+            // `view_stmt`'s Insert arm maps `columns` through the same `Option`-map
+            // and `values` through `view_rows`, matching `cols_view` / the produced
+            // rows exactly.
+            assert(cols_view == match columns {
+                Some(ref v) => Some(v@),
+                None => None::<Seq<String>>,
+            });
+            assert(verified_stmt::view_stmt(ast::Statement::Insert { table, columns, values })
+                == verified_stmt::SStmt::Insert {
+                    table,
+                    columns: cols_view,
+                    values: verified_stmt::view_rows(values@),
+                });
+        }
+    }
     (Some(ast::Statement::Insert { table, columns, values }), cur, None)
+}
+
+/// A row parse fails because its inner expression list itself rejects: given
+/// `sparse_control_group_list(rstart_v)` rejects, `sparse_control_row(cur_v)`
+/// rejects. `cur_v` opens with `(` and `rstart_v == cur_v.drop_first()`.
+proof fn insert_row_whole_reject(
+    rstart_v: Seq<verified_production::TokenView>,
+    cur_v: Seq<verified_production::TokenView>,
+    row_whole: (Option<Seq<verified_roundtrip::SExpr>>, Seq<verified_production::TokenView>),
+)
+    requires
+        cur_v.len() >= 1,
+        cur_v[0] == verified_production::TokenView::OpenParen,
+        rstart_v == cur_v.drop_first(),
+        row_whole == verified_stmt_prec::sparse_control_group_list(rstart_v),
+        row_whole.0 is None,
+    ensures
+        verified_stmt_prec::sparse_control_row(cur_v).0 is None,
+{
+}
+
+/// A row parse fails: given the inner expression list result at `rstart_v`
+/// (`(Some(exprs), r)` where the head is not a close paren, or EOF), the row
+/// parse `sparse_control_row(cur_v)` rejects. `cur_v` opens with `(` and
+/// `rstart_v == cur_v.drop_first()`.
+proof fn insert_row_reject(
+    rstart_v: Seq<verified_production::TokenView>,
+    cur_v: Seq<verified_production::TokenView>,
+    exprs: Seq<verified_roundtrip::SExpr>,
+    r: Seq<verified_production::TokenView>,
+)
+    requires
+        cur_v.len() >= 1,
+        cur_v[0] == verified_production::TokenView::OpenParen,
+        rstart_v == cur_v.drop_first(),
+        verified_stmt_prec::sparse_control_group_list(rstart_v) == (Some(exprs), r),
+        !(r.len() >= 1 && r[0] == verified_production::TokenView::CloseParen),
+    ensures
+        verified_stmt_prec::sparse_control_row(cur_v).0 is None,
+{
+}
+
+/// A row parse succeeds: given the inner expression list result at `rstart_v`
+/// (`(Some(exprs), r)` with a leading close paren), the row parse
+/// `sparse_control_row(cur_v)` yields `(Some(exprs), r.drop_first())`.
+proof fn insert_row_accept(
+    rstart_v: Seq<verified_production::TokenView>,
+    cur_v: Seq<verified_production::TokenView>,
+    exprs: Seq<verified_roundtrip::SExpr>,
+    r: Seq<verified_production::TokenView>,
+    r_next: Seq<verified_production::TokenView>,
+)
+    requires
+        cur_v.len() >= 1,
+        cur_v[0] == verified_production::TokenView::OpenParen,
+        rstart_v == cur_v.drop_first(),
+        verified_stmt_prec::sparse_control_group_list(rstart_v) == (Some(exprs), r),
+        r.len() >= 1,
+        r[0] == verified_production::TokenView::CloseParen,
+        r_next == r.drop_first(),
+    ensures
+        verified_stmt_prec::sparse_control_row(cur_v) == (Some(exprs), r_next),
+{
+}
+
+/// Concludes `parse_insert_at`: from the head tokens (`INTO <ident>`), the
+/// optional column list result, the `VALUES` keyword, and the final values-loop
+/// result (`vals_whole == (Some(rows), suffix-at-cur)`), the whole
+/// `sparse_control_insert(input)` equals the produced INSERT statement's view.
+proof fn insert_conclude(
+    toks: &Vec<Token>,
+    pos: usize,
+    cur: usize,
+    input: Seq<verified_production::TokenView>,
+    r0: Seq<verified_production::TokenView>,
+    r1: Seq<verified_production::TokenView>,
+    r2: Seq<verified_production::TokenView>,
+    vals_start: Seq<verified_production::TokenView>,
+    vals_whole: (Option<Seq<Seq<verified_roundtrip::SExpr>>>, Seq<verified_production::TokenView>),
+    table: String,
+    cols_view: Option<Seq<String>>,
+    rows: Seq<Seq<verified_roundtrip::SExpr>>,
+)
+    requires
+        pos < cur <= toks.len(),
+        input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+        input.len() >= 1,
+        input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+        r0 == input.drop_first(),
+        r0.len() >= 1,
+        r0[0] == verified_production::TokenView::Ident(table),
+        r1 == r0.drop_first(),
+        // The spec column helper's outcome (see `sparse_control_opt_columns`).
+        verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+        r2.len() >= 1,
+        r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+        vals_start == r2.drop_first(),
+        vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+        vals_whole == (Some(rows),
+            verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+    ensures
+        verified_stmt_prec::sparse_control_insert(input)
+            == (Some(verified_stmt::SStmt::Insert { table, columns: cols_view, values: rows }),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+{
+}
+
+/// Reject-case conclusion for a malformed column list: given the head tokens
+/// (`INTO <ident>`) and the spec column helper rejecting
+/// (`sparse_control_opt_columns(r1) is None`), the whole INSERT rejects.
+proof fn insert_conclude_none_cols(
+    input: Seq<verified_production::TokenView>,
+    r0: Seq<verified_production::TokenView>,
+    r1: Seq<verified_production::TokenView>,
+    cl_start: Seq<verified_production::TokenView>,
+    table: String,
+)
+    requires
+        input.len() >= 1,
+        input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+        r0 == input.drop_first(),
+        r0.len() >= 1,
+        r0[0] == verified_production::TokenView::Ident(table),
+        r1 == r0.drop_first(),
+        verified_stmt_prec::sparse_control_opt_columns(r1).is_none(),
+    ensures
+        verified_stmt_prec::sparse_control_insert(input).0 is None,
+{
+}
+
+/// Reject-case conclusion: given the structural head facts and the values list
+/// rejecting (`vals_whole.0 is None`), the whole `sparse_control_insert(input)`
+/// rejects.
+proof fn insert_conclude_none(
+    input: Seq<verified_production::TokenView>,
+    r0: Seq<verified_production::TokenView>,
+    r1: Seq<verified_production::TokenView>,
+    r2: Seq<verified_production::TokenView>,
+    vals_start: Seq<verified_production::TokenView>,
+    vals_whole: (Option<Seq<Seq<verified_roundtrip::SExpr>>>, Seq<verified_production::TokenView>),
+    table: String,
+    cols_view: Option<Seq<String>>,
+)
+    requires
+        input.len() >= 1,
+        input[0] == verified_production::TokenView::Keyword(Keyword::Into),
+        r0 == input.drop_first(),
+        r0.len() >= 1,
+        r0[0] == verified_production::TokenView::Ident(table),
+        r1 == r0.drop_first(),
+        verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
+        r2.len() >= 1,
+        r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
+        vals_start == r2.drop_first(),
+        vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
+        vals_whole.0 is None,
+    ensures
+        verified_stmt_prec::sparse_control_insert(input).0 is None,
+{
+    // Unfold `sparse_control_insert`: INTO ✓, Ident branch ✓, opt-columns Some,
+    // then the VALUES match lands on the `(None, _)` arm because `vals_whole`
+    // (the values parse) rejects.
+    assert(verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)));
+    assert(verified_stmt_prec::sparse_control_values(r2.drop_first()) == vals_whole);
+    assert(verified_stmt_prec::sparse_control_insert(input)
+        == (None::<verified_stmt::SStmt>, input));
 }
 
 /// Parses a `DELETE FROM <table> [WHERE <expr>]` statement, having consumed

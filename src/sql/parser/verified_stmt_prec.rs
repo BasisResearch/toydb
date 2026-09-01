@@ -1269,4 +1269,368 @@ pub proof fn lemma_select_list_last(
 {
 }
 
+// ===========================================================================
+// INSERT  (spec twin of `verified_control::parse_insert_at`)
+//
+// `input` is the suffix just past the leading `INSERT` keyword. Grammar:
+//   `INTO <ident> [ ( <ident-list> ) ] VALUES <row> (, <row>)*`
+// where a `<row>` is `( <expr> (, <expr>)* )` — a parenthesised, comma-
+// separated expression list. The row's inner expression list is exactly the
+// GROUP BY list grammar (`sparse_control_group_list`: one-or-more `sparse_prec`
+// expressions), so that spec twin is reused for each row. The view targets
+// `SStmt::Insert { table, columns: Option<Seq<String>>, values: Seq<Seq<SExpr>> }`
+// through `verified_stmt::view_stmt` (`columns` unchanged, `values` via
+// `view_rows` = per-row `view_args`).
+// ===========================================================================
+
+/// One-or-more comma-separated bare `<ident>` column names. Recurses on the
+/// input length: the tail past the comma is strictly shorter. Mirrors the
+/// optional column-name loop of `parse_insert_at`.
+pub open spec fn sparse_control_ident_list(input: Seq<TokenView>)
+    -> (Option<Seq<String>>, Seq<TokenView>)
+    decreases input.len(),
+{
+    if input.len() < 1 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                let r = input.drop_first();
+                if r.len() >= 1 && r[0] == TokenView::Comma {
+                    match sparse_control_ident_list(r.drop_first()) {
+                        (Some(more), r2) => (Some(seq![name] + more), r2),
+                        (None, _) => (None, input),
+                    }
+                } else {
+                    (Some(seq![name]), r)
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+/// Prepend already-consumed ident `done` items onto a tail ident-list parse,
+/// routing `whole` through on rejection.
+pub open spec fn ident_list_prepend(
+    done: Seq<String>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<String>>, Seq<TokenView>),
+) -> (Option<Seq<String>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_ident_list(cur)` when a comma follows the
+/// head ident `name`. Mirrors `lemma_group_list_step`.
+pub proof fn lemma_ident_list_step(cur: Seq<TokenView>, name: String, r: Seq<TokenView>)
+    requires
+        cur.len() >= 1,
+        cur[0] == TokenView::Ident(name),
+        r == cur.drop_first(),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_ident_list(cur)
+            == ident_list_prepend(seq![name], cur, sparse_control_ident_list(r.drop_first())),
+{
+    match sparse_control_ident_list(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_ident_list(cur) == (Some(seq![name] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_ident_list(cur) == (None::<Seq<String>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more ident.
+pub proof fn lemma_ident_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<String>,
+    name: String,
+    whole: (Option<Seq<String>>, Seq<TokenView>),
+)
+    requires
+        whole == ident_list_prepend(done, ls, sparse_control_ident_list(cur)),
+        sparse_control_ident_list(cur)
+            == ident_list_prepend(seq![name], cur, sparse_control_ident_list(cur1)),
+    ensures
+        whole == ident_list_prepend(done + seq![name], ls, sparse_control_ident_list(cur1)),
+{
+    match sparse_control_ident_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![name] + more) == (done + seq![name]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head ident, so the list is the single item.
+pub proof fn lemma_ident_list_last(cur: Seq<TokenView>, name: String, r: Seq<TokenView>)
+    requires
+        cur.len() >= 1,
+        cur[0] == TokenView::Ident(name),
+        r == cur.drop_first(),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_ident_list(cur) == (Some(seq![name]), r),
+{
+}
+
+/// Parse one `( <expr> (, <expr>)* )` row: an open paren, a one-or-more
+/// expression list (the GROUP BY grammar), then a close paren. Rejects a
+/// missing paren or a malformed inner expression. Returns the row expressions
+/// and the suffix past the closing paren.
+pub open spec fn sparse_control_row(input: Seq<TokenView>)
+    -> (Option<Seq<SExpr>>, Seq<TokenView>) {
+    if input.len() < 1 || input[0] != TokenView::OpenParen {
+        (None, input)
+    } else {
+        match sparse_control_group_list(input.drop_first()) {
+            (Some(exprs), r) => {
+                if r.len() >= 1 && r[0] == TokenView::CloseParen {
+                    (Some(exprs), r.drop_first())
+                } else {
+                    (None, input)
+                }
+            },
+            (None, _) => (None, input),
+        }
+    }
+}
+
+/// One-or-more comma-separated `<row>`s (the `VALUES` body). Recurses on the
+/// input length: each row consumes at least the two parens, and the comma step
+/// drops one more. Mirrors the outer VALUES loop of `parse_insert_at`.
+pub open spec fn sparse_control_values(input: Seq<TokenView>)
+    -> (Option<Seq<Seq<SExpr>>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_values_decreases
+{
+    match sparse_control_row(input) {
+        (Some(row), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_values(r.drop_first()) {
+                    (Some(more), r2) => (Some(seq![row] + more), r2),
+                    (None, _) => (None, input),
+                }
+            } else {
+                (Some(seq![row]), r)
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// Termination witness for `sparse_control_values`: a successful row consumes
+/// the open paren, a non-negative-length expression list (`sparse_prec` never
+/// grows the input), and the close paren, so `r` is strictly shorter than
+/// `input`; the comma step drops one more.
+#[via_fn]
+proof fn sparse_control_values_decreases(input: Seq<TokenView>) {
+    if input.len() >= 1 && input[0] == TokenView::OpenParen {
+        let after_open = input.drop_first();
+        match sparse_control_group_list(after_open) {
+            (Some(exprs), r) => {
+                lemma_group_list_slen(after_open);
+            },
+            (None, _) => {},
+        }
+    }
+}
+
+/// `sparse_control_group_list` never grows its input: the returned suffix is no
+/// longer than the argument. Follows from `sparse_prec`'s length bound, applied
+/// inductively across the comma recursion.
+pub proof fn lemma_group_list_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_group_list(input).1.len() <= input.len(),
+    decreases input.len(),
+{
+    verified_precedence::lemma_prec_slen(input, 0, expr_fuel(input));
+    match sparse_prec(input, 0, expr_fuel(input)) {
+        (Some(e), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_group_list(r.drop_first()) {
+                    (Some(more), r2) => {
+                        lemma_group_list_slen(r.drop_first());
+                    },
+                    (None, _) => {},
+                }
+            }
+        },
+        (None, _) => {},
+    }
+}
+
+/// Prepend already-consumed `done` rows onto a tail values parse.
+pub open spec fn values_prepend(
+    done: Seq<Seq<SExpr>>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<Seq<SExpr>>>, Seq<TokenView>),
+) -> (Option<Seq<Seq<SExpr>>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_values(cur)` when a comma follows the
+/// head row. Mirrors `lemma_group_list_step`.
+pub proof fn lemma_values_step(cur: Seq<TokenView>, row: Seq<SExpr>, r: Seq<TokenView>)
+    requires
+        sparse_control_row(cur) == (Some(row), r),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_values(cur)
+            == values_prepend(seq![row], cur, sparse_control_values(r.drop_first())),
+{
+    match sparse_control_values(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_values(cur) == (Some(seq![row] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_values(cur) == (None::<Seq<Seq<SExpr>>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more row.
+pub proof fn lemma_values_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<Seq<SExpr>>,
+    row: Seq<SExpr>,
+    whole: (Option<Seq<Seq<SExpr>>>, Seq<TokenView>),
+)
+    requires
+        whole == values_prepend(done, ls, sparse_control_values(cur)),
+        sparse_control_values(cur)
+            == values_prepend(seq![row], cur, sparse_control_values(cur1)),
+    ensures
+        whole == values_prepend(done + seq![row], ls, sparse_control_values(cur1)),
+{
+    match sparse_control_values(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![row] + more) == (done + seq![row]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head row, so the list is the single row.
+pub proof fn lemma_values_last(cur: Seq<TokenView>, row: Seq<SExpr>, r: Seq<TokenView>)
+    requires
+        sparse_control_row(cur) == (Some(row), r),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_values(cur) == (Some(seq![row]), r),
+{
+}
+
+/// `verified_stmt::view_rows` distributes over sequence concatenation of raw
+/// row vectors. Stated at the `Seq<Vec<..>>` level to match how the exec loop
+/// accumulates `values: Vec<Vec<..>>`.
+pub proof fn lemma_view_rows_append(
+    a: Seq<Vec<ast::Expression>>,
+    b: Seq<Vec<ast::Expression>>,
+)
+    ensures
+        verified_stmt::view_rows(a + b)
+            == verified_stmt::view_rows(a) + verified_stmt::view_rows(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_stmt::view_rows, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_rows_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-row view: `view_rows(seq![row]) == seq![view_args(row@)]`.
+pub proof fn lemma_view_rows_single(row: Vec<ast::Expression>)
+    ensures
+        verified_stmt::view_rows(seq![row]) == seq![verified_roundtrip::view_args(row@)],
+{
+    reveal_with_fuel(verified_stmt::view_rows, 2);
+    let s = seq![row];
+    assert(s.len() == 1);
+    assert(s[0] == row);
+    assert(s.drop_first() =~= Seq::<Vec<ast::Expression>>::empty());
+    assert(verified_stmt::view_rows(s.drop_first()) =~= Seq::<Seq<SExpr>>::empty());
+    assert(verified_stmt::view_rows(s) =~= seq![verified_roundtrip::view_args(row@)]);
+}
+
+/// The optional parenthesised column list of an INSERT. `r1` is the suffix just
+/// past `INTO <ident>`. Returns `Some((cols, r2))` — where `cols` is `None` when
+/// no `(` opened and `Some(names)` when a well-formed `( <ident-list> )` was
+/// consumed, and `r2` the suffix just past it — or `None` when a `(` opened but
+/// the list or its closing `)` was malformed. Mirrors the column block of
+/// `parse_insert_at`.
+pub open spec fn sparse_control_opt_columns(r1: Seq<TokenView>)
+    -> Option<(Option<Seq<String>>, Seq<TokenView>)> {
+    if r1.len() >= 1 && r1[0] == TokenView::OpenParen {
+        match sparse_control_ident_list(r1.drop_first()) {
+            (Some(names), rc) => {
+                if rc.len() >= 1 && rc[0] == TokenView::CloseParen {
+                    Some((Some(names), rc.drop_first()))
+                } else {
+                    None
+                }
+            },
+            (None, _) => None,
+        }
+    } else {
+        Some((None, r1))
+    }
+}
+
+/// Spec twin of `parse_insert_at`. `input` is the suffix just past `INSERT`.
+pub open spec fn sparse_control_insert(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    // INTO
+    if input.len() < 1 || input[0] != TokenView::Keyword(Keyword::Into) {
+        (None, input)
+    } else {
+        let r0 = input.drop_first();
+        // Table name.
+        if r0.len() < 1 {
+            (None, input)
+        } else {
+            match r0[0] {
+                TokenView::Ident(table) => {
+                    let r1 = r0.drop_first();
+                    // Optional parenthesised column list.
+                    match sparse_control_opt_columns(r1) {
+                        Some((cols, r2)) => {
+                            // VALUES
+                            if r2.len() < 1 || r2[0] != TokenView::Keyword(Keyword::Values) {
+                                (None, input)
+                            } else {
+                                match sparse_control_values(r2.drop_first()) {
+                                    (Some(rows), r3) =>
+                                        (Some(SStmt::Insert { table, columns: cols, values: rows }), r3),
+                                    (None, _) => (None, input),
+                                }
+                            }
+                        },
+                        None => (None, input),
+                    }
+                },
+                _ => (None, input),
+            }
+        }
+    }
+}
+
 } // verus!
