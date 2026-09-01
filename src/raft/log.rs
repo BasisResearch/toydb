@@ -672,12 +672,12 @@ fn cmd_eq(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> (r: bool)
 /// along with a few other metadata keys (e.g. who we voted for in this term).
 ///
 /// In the steady state, the log is append-only: when a client submits a
-/// command, the leader appends it to its own log (via [`Log::append`]) and
+/// command, the leader appends it to its own log (via `Log::append`) and
 /// replicates it to followers who append it to their logs (via
-/// [`Log::splice`]). When an index has been replicated to a majority of nodes
+/// `Log::splice`). When an index has been replicated to a majority of nodes
 /// it becomes committed, making the log immutable up to that index and
 /// guaranteeing that all nodes will eventually contain it. Nodes keep track of
-/// the commit index via [`Log::commit`] and apply committed commands to the
+/// the commit index via `Log::commit` and apply committed commands to the
 /// state machine.
 ///
 /// However, uncommitted entries can be replaced or removed. A leader may append
