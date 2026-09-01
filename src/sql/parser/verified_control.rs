@@ -267,6 +267,8 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 /// Parses the `SELECT` list (one or more `<expr> [[AS] <alias>]`, comma
 /// separated), having consumed the `SELECT` keyword. `*` (the `All`
 /// expression) cannot be aliased. Mirrors `parse_select_clause`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(80000)]
 fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
     Option<Vec<(ast::Expression, Option<String>)>>,
     usize,
@@ -277,20 +279,83 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_select_list(input);
+            match r.0 {
+                Some(v) => sopt is Some
+                    && verified_stmt::view_select_list(v@) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    // `list_start` — the suffix at `pos`, where the select list begins. Since
+    // there is no leading clause keyword, the whole clause parse IS the list.
+    let ghost list_start = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost whole = verified_stmt_prec::sparse_control_select_list(list_start);
     let mut select: Vec<(ast::Expression, Option<String>)> = Vec::new();
     let mut cur = pos;
     loop
-        invariant
+        invariant_except_break
             pos <= cur,
             cur <= toks.len(),
+            list_start == verified_production::token_views(
+                toks@.subrange(pos as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_select_list(list_start),
+            // Resumption: the whole list equals what's been consumed (`select`)
+            // prepended onto the parse continuing at `cur`. Only meaningful on a
+            // realistically-sized input (where the expression parser refines).
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == verified_stmt_prec::select_list_prepend(
+                    verified_stmt::view_select_list(select@),
+                    list_start,
+                    verified_stmt_prec::sparse_control_select_list(
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
+                ),
+        ensures
+            pos <= cur,
+            cur <= toks.len(),
+            list_start == verified_production::token_views(
+                toks@.subrange(pos as int, toks@.len() as int)),
+            whole == verified_stmt_prec::sparse_control_select_list(list_start),
+            // At break the accumulated list is final.
+            toks.len() <= (usize::MAX - 3) / 2 ==>
+                whole == (Some(verified_stmt::view_select_list(select@)),
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_stmt::view_select_list(select@);
+        let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         let (opt, c, eerr) = parse_clause_expr_at(toks, cur);
         let expr = match opt {
             Some(e) => e,
-            None => return (None, pos, eerr),
+            None => {
+                proof {
+                    if sized {
+                        reveal_with_fuel(verified_stmt_prec::sparse_control_select_list, 1);
+                        assert(verified_stmt_prec::sparse_control_select_list(cur_v).0 is None);
+                        assert(whole.0 is None);
+                    }
+                }
+                return (None, pos, eerr);
+            },
         };
+        let ghost r_after_expr = verified_production::token_views(toks@.subrange(c as int, toks@.len() as int));
+        proof {
+            if sized {
+                assert(verified_precedence::sparse_prec(cur_v, 0, verified_stmt_prec::expr_fuel(cur_v))
+                    == (Some(verified_roundtrip::view_expr(expr)), r_after_expr));
+            }
+            if sized && c < toks.len() {
+                verified_roundtrip::token_views_suffix(toks@, c as int);
+            } else {
+                verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int));
+            }
+        }
         cur = c;
 
         // Optional alias: `AS <ident>` or a bare `<ident>`.
@@ -304,8 +369,13 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             if is_as {
                 cur = cur + 1;
                 if cur >= toks.len() {
+                    proof {
+                        verified_roundtrip::token_views_len(
+                            toks@.subrange(cur as int, toks@.len() as int));
+                    }
                     return (None, pos, Some(ParseError::UnexpectedEof));
                 }
+                proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
             }
             match &toks[cur] {
                 Token::Ident(name) => {
@@ -315,11 +385,83 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
                 _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
             }
         }
+        // `r1` — the suffix after the (optional) alias was consumed. Pin it to
+        // the spec twin's `sparse_control_select_alias` result.
+        let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        proof {
+            if sized {
+                // `r_after_expr[0] == token_view(toks[c])` (when c < len) drives the
+                // exec `is_as`/`is_ident` guards, so the spec alias resolution agrees
+                // with the exec choice and lands on `r1`.
+                reveal(verified_production::token_view);
+                assert(verified_stmt_prec::sparse_control_select_alias(
+                    verified_roundtrip::view_expr(expr), r_after_expr)
+                    == Some((alias, r1)));
+            }
+        }
+        let ghost old_select = select@;
         select.push((expr, alias));
+        proof {
+            verified_stmt_prec::lemma_view_select_list_append(old_select, seq![(expr, alias)]);
+            verified_stmt_prec::lemma_view_select_list_single(expr, alias);
+            assert(select@ == old_select + seq![(expr, alias)]);
+            assert(verified_stmt::view_select_list(select@)
+                == done_v + seq![(verified_roundtrip::view_expr(expr), alias)]);
+        }
 
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                if sized {
+                    verified_stmt_prec::lemma_select_list_step(
+                        cur_v, verified_roundtrip::view_expr(expr), alias, r_after_expr, r1);
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                assert(r1.drop_first() == verified_production::token_views(
+                    toks@.subrange(cur as int, toks@.len() as int)));
+                if sized {
+                    assert(whole == verified_stmt_prec::select_list_prepend(
+                        done_v, list_start, verified_stmt_prec::sparse_control_select_list(cur_v)));
+                    assert(verified_stmt_prec::sparse_control_select_list(cur_v)
+                        == verified_stmt_prec::select_list_prepend(
+                            seq![(verified_roundtrip::view_expr(expr), alias)], cur_v,
+                            verified_stmt_prec::sparse_control_select_list(r1.drop_first())));
+                    verified_stmt_prec::lemma_select_list_resume_step(
+                        list_start, cur_v, r1.drop_first(),
+                        done_v, verified_roundtrip::view_expr(expr), alias, whole);
+                    assert(verified_stmt::view_select_list(select@)
+                        == done_v + seq![(verified_roundtrip::view_expr(expr), alias)]);
+                    assert(whole == verified_stmt_prec::select_list_prepend(
+                        verified_stmt::view_select_list(select@),
+                        list_start,
+                        verified_stmt_prec::sparse_control_select_list(
+                            verified_production::token_views(
+                                toks@.subrange(cur as int, toks@.len() as int)))));
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+                if sized {
+                    verified_stmt_prec::lemma_select_list_last(
+                        cur_v, verified_roundtrip::view_expr(expr), alias, r_after_expr, r1);
+                    assert(verified_stmt_prec::sparse_control_select_list(cur_v)
+                        == (Some(seq![(verified_roundtrip::view_expr(expr), alias)]), r1));
+                    assert(whole == (Some(done_v
+                        + seq![(verified_roundtrip::view_expr(expr), alias)]), r1));
+                    assert(verified_stmt::view_select_list(select@)
+                        == done_v + seq![(verified_roundtrip::view_expr(expr), alias)]);
+                    assert(whole == (Some(verified_stmt::view_select_list(select@)),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                }
+            }
             break;
         }
     }

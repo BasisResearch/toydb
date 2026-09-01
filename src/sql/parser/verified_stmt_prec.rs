@@ -1053,4 +1053,220 @@ pub open spec fn sparse_control_create(input: Seq<TokenView>) -> (Option<SStmt>,
     }
 }
 
+// ===========================================================================
+// SELECT list  (spec twin of `verified_control::parse_select_list_at`)
+//
+// `input` is the suffix just past the leading `SELECT` keyword, where the
+// comma-separated select list begins. Each item is `<expr> [[AS] <ident>]`:
+// an expression (`sparse_prec`) followed by an optional alias, which is either
+// `AS <ident>` or a bare `<ident>`. Aliasing `*` (the `SExpr::All` expression)
+// is rejected. The view type mirrors `verified_stmt::view_select_list`:
+// `Seq<(SExpr, Option<String>)>` — the alias string is carried unchanged.
+// ===========================================================================
+
+/// Resolve the optional alias that may follow a parsed select-list expression.
+/// `e` is the expression already parsed, `r` the suffix just past it. Returns
+/// `(Some((alias_opt, rest)))` on success, or `None` on a malformed alias
+/// (aliasing `*`, EOF after `AS`, or a non-identifier where an alias name was
+/// required). Mirrors the alias block of `parse_select_list_at`.
+pub open spec fn sparse_control_select_alias(e: SExpr, r: Seq<TokenView>)
+    -> Option<(Option<String>, Seq<TokenView>)> {
+    let is_as = r.len() >= 1 && r[0] == TokenView::Keyword(Keyword::As);
+    let is_ident = r.len() >= 1 && (match r[0] {
+        TokenView::Ident(_) => true,
+        _ => false,
+    });
+    if is_as || is_ident {
+        // Cannot alias `*`.
+        if e == SExpr::All {
+            None
+        } else if is_as {
+            // Consume `AS`; the next token must be an identifier.
+            let r1 = r.drop_first();
+            if r1.len() < 1 {
+                None
+            } else {
+                match r1[0] {
+                    TokenView::Ident(name) => Some((Some(name), r1.drop_first())),
+                    _ => None,
+                }
+            }
+        } else {
+            // Bare identifier alias.
+            match r[0] {
+                TokenView::Ident(name) => Some((Some(name), r.drop_first())),
+                _ => None,
+            }
+        }
+    } else {
+        Some((None, r))
+    }
+}
+
+/// One-or-more comma-separated `<expr> [[AS] <ident>]` select-list items.
+/// Recurses on the input length: the tail past the comma is strictly shorter
+/// (`sparse_prec` never grows the input; the alias/comma steps only drop
+/// tokens). Mirrors `sparse_control_order_list`.
+pub open spec fn sparse_control_select_list(input: Seq<TokenView>)
+    -> (Option<Seq<(SExpr, Option<String>)>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_select_list_decreases
+{
+    match sparse_prec(input, 0, expr_fuel(input)) {
+        (Some(e), r) => {
+            match sparse_control_select_alias(e, r) {
+                Some((alias, r1)) => {
+                    if r1.len() >= 1 && r1[0] == TokenView::Comma {
+                        match sparse_control_select_list(r1.drop_first()) {
+                            (Some(more), r2) => (Some(seq![(e, alias)] + more), r2),
+                            (None, _) => (None, input),
+                        }
+                    } else {
+                        (Some(seq![(e, alias)]), r1)
+                    }
+                },
+                None => (None, input),
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// Termination witness for `sparse_control_select_list`: the recursive tail
+/// (`r1.drop_first()`) is strictly shorter than `input`. `sparse_prec` never
+/// grows its input (`lemma_prec_slen`); the alias resolution returns a suffix
+/// no longer than `r`; and the comma step drops one more token.
+#[via_fn]
+proof fn sparse_control_select_list_decreases(input: Seq<TokenView>) {
+    verified_precedence::lemma_prec_slen(input, 0, expr_fuel(input));
+}
+
+/// `verified_stmt::view_select_list` distributes over sequence concatenation.
+pub proof fn lemma_view_select_list_append(
+    a: Seq<(ast::Expression, Option<String>)>,
+    b: Seq<(ast::Expression, Option<String>)>,
+)
+    ensures
+        verified_stmt::view_select_list(a + b)
+            == verified_stmt::view_select_list(a) + verified_stmt::view_select_list(b),
+    decreases a.len(),
+{
+    reveal_with_fuel(verified_stmt::view_select_list, 1);
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert((a + b).drop_first() == a.drop_first() + b);
+        lemma_view_select_list_append(a.drop_first(), b);
+        assert((a + b)[0] == a[0]);
+    }
+}
+
+/// Single-item view: `view_select_list(seq![(expr, alias)]) ==
+/// seq![(view_expr(expr), alias)]`.
+pub proof fn lemma_view_select_list_single(expr: ast::Expression, alias: Option<String>)
+    ensures
+        verified_stmt::view_select_list(seq![(expr, alias)])
+            == seq![(verified_roundtrip::view_expr(expr), alias)],
+{
+    reveal_with_fuel(verified_stmt::view_select_list, 2);
+    let s = seq![(expr, alias)];
+    assert(s.len() == 1);
+    assert(s[0] == (expr, alias));
+    assert(s.drop_first() =~= Seq::<(ast::Expression, Option<String>)>::empty());
+    assert(verified_stmt::view_select_list(s.drop_first())
+        =~= Seq::<(SExpr, Option<String>)>::empty());
+    assert(verified_stmt::view_select_list(s)
+        =~= seq![(verified_roundtrip::view_expr(expr), alias)]);
+}
+
+/// Prepend already-consumed `done` items onto a tail select-list parse, routing
+/// `whole` through on rejection (matching how `sparse_control_select_list`
+/// returns its top-level input on any inner reject).
+pub open spec fn select_list_prepend(
+    done: Seq<(SExpr, Option<String>)>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<(SExpr, Option<String>)>>, Seq<TokenView>),
+) -> (Option<Seq<(SExpr, Option<String>)>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_select_list(cur)` when a comma follows
+/// the head item `(e, alias)`: rewrites to prepending `[(e, alias)]` and
+/// recursing at the post-comma suffix. Mirrors `lemma_order_list_step`.
+pub proof fn lemma_select_list_step(
+    cur: Seq<TokenView>,
+    e: SExpr,
+    alias: Option<String>,
+    r: Seq<TokenView>,
+    r1: Seq<TokenView>,
+)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        sparse_control_select_alias(e, r) == Some((alias, r1)),
+        r1.len() >= 1,
+        r1[0] == TokenView::Comma,
+    ensures
+        sparse_control_select_list(cur)
+            == select_list_prepend(seq![(e, alias)], cur, sparse_control_select_list(r1.drop_first())),
+{
+    match sparse_control_select_list(r1.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_select_list(cur) == (Some(seq![(e, alias)] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_select_list(cur)
+                == (None::<Seq<(SExpr, Option<String>)>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more item.
+/// Pure `select_list_prepend` algebra with sequence-append associativity.
+/// Mirrors `lemma_order_list_resume_step`.
+pub proof fn lemma_select_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<(SExpr, Option<String>)>,
+    se: SExpr,
+    alias: Option<String>,
+    whole: (Option<Seq<(SExpr, Option<String>)>>, Seq<TokenView>),
+)
+    requires
+        whole == select_list_prepend(done, ls, sparse_control_select_list(cur)),
+        sparse_control_select_list(cur)
+            == select_list_prepend(seq![(se, alias)], cur, sparse_control_select_list(cur1)),
+    ensures
+        whole == select_list_prepend(done + seq![(se, alias)], ls, sparse_control_select_list(cur1)),
+{
+    match sparse_control_select_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![(se, alias)] + more) == (done + seq![(se, alias)]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the (aliased) head item, so the list is the
+/// single item. Mirrors `lemma_order_list_last`.
+pub proof fn lemma_select_list_last(
+    cur: Seq<TokenView>,
+    e: SExpr,
+    alias: Option<String>,
+    r: Seq<TokenView>,
+    r1: Seq<TokenView>,
+)
+    requires
+        sparse_prec(cur, 0, expr_fuel(cur)) == (Some(e), r),
+        sparse_control_select_alias(e, r) == Some((alias, r1)),
+        !(r1.len() >= 1 && r1[0] == TokenView::Comma),
+    ensures
+        sparse_control_select_list(cur) == (Some(seq![(e, alias)]), r1),
+{
+}
+
 } // verus!
