@@ -156,6 +156,33 @@ it never breaks the user's agent session. The server-side MCP trace records
 the envelope's `tool_calls` by **tool name + timestamp-window overlap**, folding
 verus/Z3 timing onto the matching call without a shared session id.
 
+**SMT query capture (fail-soft).** Every Verus run also logs its full
+diagnostics (`--log-all`: SMT-LIB queries, solver transcripts, AIR, VIR,
+triggers, call graphs — not the huge Z3 trace profiles) and ships them to the
+dashboard keyed to the exact tool call:
+
+1. `scripts/verus/verify.sh` logs into a fresh dir under
+   `~/.verus-trace/smt/pending/` and prints `verus-smt-log-dir: <path>` on
+   stderr (opt out: `VERUS_SMT_LOG_DISABLE=1`).
+2. The `PostToolUse` hook (`smt_capture.py`, matcher `Bash|mcp__verus__verify`)
+   finds that marker — or an `smt_log_dir` field in the MCP verify result — in
+   `tool_response`, moves the dir to
+   `~/.verus-trace/smt/<session_id>/<tool_use_id>/`, stamps `meta.json`
+   (invocation, cwd, branch, commit), and spawns a **detached** background
+   upload (`POST /verus/ingest/smt`, gzip'd, batched under the 32 MB ingest
+   cap) so the agent loop never waits on the network.
+3. The `Stop` hook retries anything still pending (`upload_pending()`); the
+   server upserts by `(session_id, tool_use_id, filename)`, so retries and
+   re-runs are idempotent. `tool_use_id` — now persisted on every envelope
+   tool_call by the adapters — is the join key the dashboard uses to attach
+   captures to transcript entries exactly (no timestamp heuristics).
+
+The library lives in `verus_trace/smt_capture.py` and is shared by the
+`verus-verify` CI workflow, which uploads the same capture per commit with
+`source=ci` under a synthetic `ci:<run>` session. An empty log dir (cargo
+considered the crate fresh, Verus never ran) is silently dropped; producer
+dirs nothing collected are pruned after 7 days.
+
 **Gating (fail-closed).** An agent must not run on toyDB unless the Verus MCP
 server is connected. On any doubt — probe error, timeout, unhealthy server — the
 session is denied, never allowed through.
@@ -223,6 +250,13 @@ refused; marks never rename or delete the branch.
   ref and per-ref cache location (`.claude/bin/verus-mcp`).
 - `VERUS_GATE_DISABLE=1` — disable the gate (telemetry-development escape hatch;
   off by default so a fresh clone is gated).
+- `VERUS_SMT_LOG_DISABLE=1` — disable SMT query capture (both the verify.sh
+  `--log-all` producer and the PostToolUse collector).
+- `VERUS_SMT_LOG_ROOT` — where verify.sh creates producer log dirs (default
+  `~/.verus-trace/smt/pending`; CI points it into the workspace).
+- `VERUS_SMT_CAPTURE_ROOT` — keyed capture root (default `~/.verus-trace/smt`).
+- `VERUS_SMT_INGEST_URL` — override the SMT ingest endpoint (default derived
+  from `VERUS_INGEST_URL`: `.../ingest/session` -> `.../ingest/smt`).
 
 ## Codex one-time setup
 
@@ -240,6 +274,7 @@ root via `git rev-parse`, so it works in any clone without editing the file.
 
 ```sh
 python3 .claude/hooks/tests/test_adapters.py
+python3 .claude/hooks/tests/test_smt_capture.py
 ```
 
 Runs each adapter against a checked-in fixture (Claude transcript, Codex rollout,

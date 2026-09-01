@@ -59,8 +59,30 @@ done
 # To stderr: stdout carries the --output-json payload that the telemetry
 # pipeline parses, so it must stay pure JSON.
 echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}" >&2
+
+# SMT query capture: by default every run logs the full Verus diagnostics
+# (--log-all: .smt2 queries, .smt_transcript solver exchanges, AIR, VIR,
+# triggers, call graphs — NOT the gigantic Z3 trace profiles) into a fresh
+# directory. The `verus-smt-log-dir:` stderr marker is how the capture layer
+# (.claude/hooks/smt_capture.py on the agent side, the CI workflow on the CI
+# side) finds the directory to key, compress, and upload to the dashboard.
+# Logging costs little (~1s and ~500 MB of scratch on a full run) and the
+# directory is inert if nothing collects it. Opt out: VERUS_SMT_LOG_DISABLE=1.
+# Override the parent dir with VERUS_SMT_LOG_ROOT (CI does).
+smt_log_args=()
+if [[ "${VERUS_SMT_LOG_DISABLE:-0}" != "1" ]]; then
+  smt_root="${VERUS_SMT_LOG_ROOT:-$HOME/.verus-trace/smt/pending}"
+  if mkdir -p "$smt_root" 2>/dev/null       && smt_dir="$(mktemp -d "$smt_root/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX" 2>/dev/null)"; then
+    smt_log_args=(--log-all --log-dir "$smt_dir")
+    echo "verus-smt-log-dir: $smt_dir" >&2
+  else
+    echo "verus: smt log dir creation failed; running without --log-all" >&2
+  fi
+fi
+
 # `--lib` scopes to the library target; the four binaries carry no verified
 # modules and would otherwise fail `--verify-module`. Pass-through args ("$@",
 # e.g. --output-json) go AFTER `--` so they reach Verus, not `cargo check`
-# (which rejects unknown flags).
-exec cargo verus focus --lib -- "${module_args[@]}" "$@"
+# (which rejects unknown flags). Caller args come last so they can override
+# the defaults (e.g. a different --log-dir).
+exec cargo verus focus --lib -- "${module_args[@]}" "${smt_log_args[@]}" "$@"

@@ -63,6 +63,22 @@ def main():
         envelope.post_envelope(env_doc)
     except Exception as exc:
         sys.stderr.write("[verus-trace] capture failed (fail-soft): %s\n" % exc)
+
+    # SMT capture catch-up: upload any of this session's capture dirs whose
+    # detached background upload (smt_capture.py PostToolUse hook) did not
+    # finish. Server-side upserts make retries idempotent.
+    try:
+        from verus_trace import smt_capture
+
+        session_id = hook_input.get("session_id") or ""
+        uploaded, failed = smt_capture.upload_pending(session_id=session_id or None)
+        if uploaded or failed:
+            sys.stderr.write(
+                "[verus-smt] catch-up: %d uploaded, %d still pending\n"
+                % (uploaded, failed)
+            )
+    except Exception as exc:
+        sys.stderr.write("[verus-smt] catch-up failed (fail-soft): %s\n" % exc)
     return 0
 
 
