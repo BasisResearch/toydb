@@ -738,3 +738,100 @@ fn not_equal_lt_gt_spelling_regression_guard() {
     check_statement("UPDATE t SET x = 1 WHERE a <> b");
     check_statement("SELECT * FROM t WHERE a <> b");
 }
+
+// ---- exhaustive precedence differential ------------------------------------
+//
+// Precedence/associativity equivalence to the legacy toyDB parser is not
+// proven (the min-parens tables are proved equal to each other, not to SQL).
+// It rests on this differential. Precedence is a FINITE relation: it is fully
+// determined by how each ordered PAIR of operators associates, plus each
+// operator's self-associativity and its interaction with the prefix/postfix
+// operators. So we enumerate that relation EXHAUSTIVELY rather than sampling —
+// every pair and triple of binary operators, every associativity chain, and
+// every prefix/postfix x binary combination — asserting the verified and
+// legacy parsers build the identical AST (or reject identically) on each.
+
+#[cfg(test)]
+const PREC_BINARY: &[&str] =
+    &["AND", "OR", "=", "!=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "^", "LIKE"];
+#[cfg(test)]
+const PREC_PREFIX: &[&str] = &["NOT", "-", "+"];
+#[cfg(test)]
+const PREC_POSTFIX: &[&str] = &["!", "IS NULL", "IS NOT NULL", "IS NAN", "IS NOT NAN"];
+
+#[test]
+fn precedence_all_binary_pairs_agree() {
+    for &op1 in PREC_BINARY {
+        for &op2 in PREC_BINARY {
+            check_expression(&format!("a {} b {} c", op1, op2));
+        }
+    }
+}
+
+#[test]
+fn precedence_all_binary_triples_agree() {
+    for &op1 in PREC_BINARY {
+        for &op2 in PREC_BINARY {
+            for &op3 in PREC_BINARY {
+                check_expression(&format!("a {} b {} c {} d", op1, op2, op3));
+            }
+        }
+    }
+}
+
+#[test]
+fn precedence_associativity_chains_agree() {
+    for &op in PREC_BINARY {
+        check_expression(&format!("a {0} b {0} c {0} d {0} e", op));
+    }
+}
+
+#[test]
+fn precedence_prefix_x_binary_agree() {
+    for &p in PREC_PREFIX {
+        for &op in PREC_BINARY {
+            check_expression(&format!("{} a {} b", p, op));
+            check_expression(&format!("a {} {} b", op, p));
+            check_expression(&format!("{} a {} {} b", p, op, p));
+        }
+    }
+    // Prefix chains.
+    for &p1 in PREC_PREFIX {
+        for &p2 in PREC_PREFIX {
+            check_expression(&format!("{} {} a", p1, p2));
+        }
+    }
+}
+
+#[test]
+fn precedence_postfix_x_binary_agree() {
+    for &pf in PREC_POSTFIX {
+        for &op in PREC_BINARY {
+            check_expression(&format!("a {} {} b", pf, op));
+            check_expression(&format!("a {} b {}", op, pf));
+        }
+    }
+    // Postfix after prefix, and stacked postfix.
+    for &pf in PREC_POSTFIX {
+        for &p in PREC_PREFIX {
+            check_expression(&format!("{} a {}", p, pf));
+        }
+        check_expression(&format!("a {} {}", pf, pf));
+    }
+}
+
+#[test]
+fn precedence_all_binary_quadruples_agree() {
+    // 16^4 = 65,536 four-operator expressions. Precedence-climbing parses are
+    // determined by pairwise decisions, so pairs already pin the relation;
+    // quadruples are exhaustive belt-and-suspenders on deep composition.
+    for &op1 in PREC_BINARY {
+        for &op2 in PREC_BINARY {
+            for &op3 in PREC_BINARY {
+                for &op4 in PREC_BINARY {
+                    check_expression(&format!("a {} b {} c {} d {} e", op1, op2, op3, op4));
+                }
+            }
+        }
+    }
+}
