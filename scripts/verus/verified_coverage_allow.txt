@@ -31,3 +31,7 @@ sql::parser::verified_minparen::prepend_tok
 sql::parser::verified_minparen::append_tok
 sql::parser::verified_minparen::append_is
 sql::parser::verified_minparen::min_roundtrip_live
+# (2026-09-02, phase 7.) min_normalize_live is the exec-carried normalisation
+# theorem (any accepted stream parses equal to its min-parens normal form);
+# same category and same phase-5 follow-up as min_roundtrip_live above.
+sql::parser::verified_minparen::min_normalize_live
