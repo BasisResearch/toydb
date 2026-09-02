@@ -1719,4 +1719,57 @@ mod tests {
             .is_none()
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 3 minimal-parenthesisation printer: associativity acceptance.
+    //
+    // The fully-parenthesised printer emits `( ... )` around every operator,
+    // so it can never exhibit `1 - 2 - 3` or `2 ^ 3 ^ 2` unbracketed. The
+    // min-parens printer (`verified_minparen::print_min_expr`) drops the
+    // parens its associativity-aware contexts prove redundant, and the live
+    // parser recovers the original nesting. These tests pin the observable
+    // behaviour the `min_roundtrip` / `min_roundtrip_live` theorems assert.
+    // ---------------------------------------------------------------------
+
+    fn int(value: i64) -> Expression {
+        Expression::Literal(Literal::Integer(value))
+    }
+
+    #[test]
+    fn min_parens_left_assoc_subtract_unbracketed_reparses_left_nested() {
+        use crate::sql::parser::verified_minparen::print_min_expr;
+        // `1 - 2 - 3` is left-associative: (1 - 2) - 3.
+        let expr = Expression::Operator(Operator::Subtract(
+            boxed(Expression::Operator(Operator::Subtract(boxed(int(1)), boxed(int(2))))),
+            boxed(int(3)),
+        ));
+        let tokens = print_min_expr(&expr);
+        // No parentheses: left-associativity makes them all redundant.
+        assert!(
+            !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
+            "1 - 2 - 3 should print with no parentheses, got {tokens:?}"
+        );
+        // Re-parsing the bracket-free token stream recovers the left nesting.
+        let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
+        assert_eq!(parsed, expr);
+    }
+
+    #[test]
+    fn min_parens_right_assoc_exponent_unbracketed_reparses_right_nested() {
+        use crate::sql::parser::verified_minparen::print_min_expr;
+        // `2 ^ 3 ^ 2` is right-associative: 2 ^ (3 ^ 2).
+        let expr = Expression::Operator(Operator::Exponentiate(
+            boxed(int(2)),
+            boxed(Expression::Operator(Operator::Exponentiate(boxed(int(3)), boxed(int(2))))),
+        ));
+        let tokens = print_min_expr(&expr);
+        // No parentheses: right-associativity makes them all redundant.
+        assert!(
+            !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
+            "2 ^ 3 ^ 2 should print with no parentheses, got {tokens:?}"
+        );
+        // Re-parsing the bracket-free token stream recovers the right nesting.
+        let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
+        assert_eq!(parsed, expr);
+    }
 }
