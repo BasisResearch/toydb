@@ -165,7 +165,16 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
             && values.len() >= 1 && printable_rows(values)
         },
         SStmt::Update { table, set, where_clause } => {
-            set.len() == 1 && printable_opt_se(set[0].1) && printable_opt_se(where_clause)
+            // Multi-assignment is supported end to end. The assignment set must be
+            // in the *sorted-key canonical form* the printer/parser agree on: keys
+            // distinct and in ascending `String` order (`increasing_seq`), matching
+            // the executable printer's sorted `BTreeMap::iter()` walk. `view_stmt`
+            // satisfies this because the parser records `order@ == sorted_keys(dom)`
+            // (see `view_update_arm` / `parse_update_at`).
+            set.len() >= 1
+                && verified_stmt_prec::assign_keys_distinct(set)
+                && vstd::std_specs::btree::increasing_seq(verified_stmt_prec::assign_keys(set))
+                && printable_assigns(set) && printable_opt_se(where_clause)
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
             select.len() >= 1 && printable_select_items(select)
@@ -404,6 +413,60 @@ pub open spec fn sprint_assign(a: (String, Option<SExpr>)) -> Seq<TokenView> {
         })
 }
 
+/// Print an assignment list as comma-separated `col = val` in list order.
+pub open spec fn sprint_assign_list(items: Seq<(String, Option<SExpr>)>) -> Seq<TokenView>
+    decreases items.len(),
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else if items.len() == 1 {
+        sprint_assign(items[0])
+    } else {
+        sprint_assign(items[0]) + seq![TokenView::Comma] + sprint_assign_list(items.drop_first())
+    }
+}
+
+/// Every assigned value is printable.
+pub open spec fn printable_assigns(items: Seq<(String, Option<SExpr>)>) -> bool {
+    forall|i: int| 0 <= i < items.len() ==> #[trigger] printable_opt_se(items[i].1)
+}
+
+/// Appending one assignment to a non-empty list appends `, col = val`; appending
+/// to the empty list is just `col = val`. Lets the executable printer accumulate
+/// the assignment tokens one pair at a time in `set.iter()` (sorted) order.
+pub proof fn lemma_sprint_assign_list_snoc(
+    items: Seq<(String, Option<SExpr>)>,
+    a: (String, Option<SExpr>),
+)
+    ensures
+        sprint_assign_list(items.push(a)) == (if items.len() == 0 {
+            sprint_assign(a)
+        } else {
+            sprint_assign_list(items) + seq![TokenView::Comma] + sprint_assign(a)
+        }),
+    decreases items.len(),
+{
+    if items.len() == 0 {
+        assert(items.push(a) =~= seq![a]);
+        assert(items.push(a).len() == 1);
+    } else if items.len() == 1 {
+        assert(items.push(a).len() == 2);
+        assert(items.push(a)[0] == items[0]);
+        assert(items.push(a).drop_first() =~= seq![a]);
+        assert(sprint_assign_list(seq![a]) == sprint_assign(a));
+    } else {
+        let tail = items.drop_first();
+        lemma_sprint_assign_list_snoc(tail, a);
+        assert(items.push(a).drop_first() =~= tail.push(a));
+        assert(items.push(a)[0] == items[0]);
+        assert(items.push(a).len() >= 2);
+        assert(sprint_assign_list(items.push(a))
+            == sprint_assign(items[0]) + seq![TokenView::Comma] + sprint_assign_list(tail.push(a)));
+        assert(sprint_assign_list(items)
+            == sprint_assign(items[0]) + seq![TokenView::Comma] + sprint_assign_list(tail));
+    }
+}
+
 pub open spec fn sprint_begin_body(read_only: bool, as_of: Option<u64>) -> Seq<TokenView> {
     (if read_only { seq![kwv(Keyword::Read), kwv(Keyword::Only)] } else { Seq::empty() })
     + (match as_of {
@@ -470,7 +533,7 @@ pub open spec fn sprint_min_stmt(s: SStmt) -> Seq<TokenView>
         },
         SStmt::Update { table, set, where_clause } => {
             seq![kwv(Keyword::Update), TokenView::Ident(table), kwv(Keyword::Set)]
-                + (if set.len() >= 1 { sprint_assign(set[0]) } else { Seq::empty() })
+                + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause)
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
@@ -1699,6 +1762,108 @@ pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
 }
 
 
+/// As `lemma_assign_rt`, but only requires the trailing tokens to be `inert`
+/// for the value-expression parser (so `rest` may begin with a comma). Used to
+/// step through a multi-assignment list, where each assignment is followed by a
+/// comma before the next.
+pub proof fn lemma_assign_rt_inert(a: (String, Option<SExpr>), rest: Seq<TokenView>)
+    requires
+        printable_opt_se(a.1),
+        inert(rest, 0),
+    ensures
+        verified_stmt_prec::sparse_control_assign(sprint_assign(a) + rest) == (Some(a), rest),
+{
+    let input = sprint_assign(a) + rest;
+    match a.1 {
+        Some(e) => {
+            assert(input =~= seq![TokenView::Ident(a.0), TokenView::Equal]
+                + (sprint_min(e, 0) + rest));
+            assert(input.len() >= 2);
+            assert(input[0] == TokenView::Ident(a.0));
+            assert(input[1] == TokenView::Equal);
+            let e_in = input.drop_first().drop_first();
+            assert(e_in =~= sprint_min(e, 0) + rest);
+            sprint_min_head_not_default(e, 0);
+            assert(e_in[0] == sprint_min(e, 0)[0]);
+            assert(!(e_in.len() >= 1 && e_in[0] == kwv(Keyword::Default)));
+            lemma_min(e, 0, rest, expr_fuel(e_in));
+            assert(sparse_prec(e_in, 0, expr_fuel(e_in)) == (Some(e), rest));
+            assert((a.0, Some(e)) == a);
+        },
+        None => {
+            assert(input =~= seq![TokenView::Ident(a.0), TokenView::Equal]
+                + (seq![kwv(Keyword::Default)] + rest));
+            assert(input.len() >= 2);
+            assert(input[0] == TokenView::Ident(a.0));
+            assert(input[1] == TokenView::Equal);
+            let e_in = input.drop_first().drop_first();
+            assert(e_in =~= seq![kwv(Keyword::Default)] + rest);
+            assert(e_in[0] == kwv(Keyword::Default));
+            assert(e_in.drop_first() =~= rest);
+            assert((a.0, None::<SExpr>) == a);
+        },
+    }
+}
+
+/// Round-trip for a whole (multi-)assignment list: printing `items` and parsing
+/// it back with `sparse_control_assign_list` reproduces exactly `items`, leaving
+/// `rest` untouched. `rest` must be inert for the value parser and not itself
+/// start a further assignment continuation (`rest[0] != Comma`).
+pub proof fn lemma_assign_list_rt(items: Seq<(String, Option<SExpr>)>, rest: Seq<TokenView>)
+    requires
+        items.len() >= 1,
+        printable_assigns(items),
+        inert(rest, 0),
+        rest.len() == 0 || rest[0] != TokenView::Comma,
+    ensures
+        verified_stmt_prec::sparse_control_assign_list(sprint_assign_list(items) + rest)
+            == (Some(items), rest),
+    decreases items.len(),
+{
+    let a = items[0];
+    assert(printable_opt_se(a.1)) by {
+        assert(printable_opt_se(items[0].1));
+    }
+    if items.len() == 1 {
+        let input = sprint_assign_list(items) + rest;
+        assert(input =~= sprint_assign(a) + rest);
+        lemma_assign_rt_inert(a, rest);
+        assert(verified_stmt_prec::sparse_control_assign(input) == (Some(a), rest));
+        assert(!(rest.len() >= 1 && rest[0] == TokenView::Comma));
+        assert(verified_stmt_prec::sparse_control_assign_list(input) == (Some(seq![a]), rest));
+        assert(seq![a] =~= items);
+    } else {
+        let tail = items.drop_first();
+        let comma_rest = seq![TokenView::Comma] + (sprint_assign_list(tail) + rest);
+        let input = sprint_assign_list(items) + rest;
+        assert(input =~= sprint_assign(a) + comma_rest) by {
+            assert(sprint_assign_list(items)
+                =~= sprint_assign(a) + seq![TokenView::Comma] + sprint_assign_list(tail));
+        }
+        // The head of comma_rest is a comma, which is inert for the value parser.
+        assert(inert(comma_rest, 0)) by {
+            assert(comma_rest[0] == TokenView::Comma);
+        }
+        lemma_assign_rt_inert(a, comma_rest);
+        assert(verified_stmt_prec::sparse_control_assign(input) == (Some(a), comma_rest));
+        // Continue: comma_rest starts with a comma, so recurse on `tail`.
+        assert(comma_rest[0] == TokenView::Comma);
+        assert(comma_rest.drop_first() =~= sprint_assign_list(tail) + rest);
+        assert(printable_assigns(tail)) by {
+            assert forall|i: int| 0 <= i < tail.len() implies #[trigger] printable_opt_se(tail[i].1) by {
+                assert(tail[i] == items[i + 1]);
+                assert(printable_opt_se(items[i + 1].1));
+            }
+        }
+        lemma_assign_list_rt(tail, rest);
+        assert(verified_stmt_prec::sparse_control_assign_list(sprint_assign_list(tail) + rest)
+            == (Some(tail), rest));
+        assert(verified_stmt_prec::sparse_control_assign_list(input)
+            == (Some(seq![a] + tail), rest));
+        assert(seq![a] + tail =~= items);
+    }
+}
+
 pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
     ensures
         verified_stmt_prec::sparse_control_begin(sprint_begin_body(read_only, as_of))
@@ -1903,29 +2068,46 @@ pub proof fn lemma_insert_body_rt(
         == (Some(values), Seq::<TokenView>::empty()));
 }
 
+#[verifier::spinoff_prover]
+#[verifier::rlimit(200000)]
 pub proof fn lemma_update_body_rt(
     table: String,
     set: Seq<(String, Option<SExpr>)>,
     where_clause: Option<SExpr>,
 )
     requires
-        set.len() == 1,
-        printable_opt_se(set[0].1),
+        set.len() >= 1,
+        verified_stmt_prec::assign_keys_distinct(set),
+        vstd::std_specs::btree::increasing_seq(verified_stmt_prec::assign_keys(set)),
+        printable_assigns(set),
         printable_opt_se(where_clause),
     ensures
         verified_stmt_prec::sparse_control_update(
-            seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0])
+            seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause),
         ) == (Some(SStmt::Update { table, set, where_clause }), Seq::<TokenView>::empty()),
 {
     let wpart = sprint_kw_expr(Keyword::Where, where_clause);
-    let input = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0]) + wpart;
+    let input = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set) + wpart;
     assert(input[0] == TokenView::Ident(table));
     let r0 = input.drop_first();
     assert(r0[0] == kwv(Keyword::Set));
     let r1 = r0.drop_first();
-    assert(r1 =~= sprint_assign(set[0]) + wpart);
-    assert(wpart.len() == 0 || (neutral_head(wpart[0]) && wpart[0] != TokenView::Comma)) by {
+    assert(r1 =~= sprint_assign_list(set) + wpart);
+    // `wpart` is inert for the value parser and does not start a comma
+    // continuation.
+    assert(inert(wpart, 0)) by {
+        match where_clause {
+            Some(e) => {
+                assert(wpart[0] == kwv(Keyword::Where));
+                assert(neutral_head(wpart[0]));
+            },
+            None => {
+                assert(wpart.len() == 0);
+            },
+        }
+    }
+    assert(wpart.len() == 0 || wpart[0] != TokenView::Comma) by {
         match where_clause {
             Some(e) => {
                 assert(wpart[0] == kwv(Keyword::Where));
@@ -1933,19 +2115,8 @@ pub proof fn lemma_update_body_rt(
             None => {},
         }
     }
-    lemma_assign_rt(set[0], wpart);
-    assert(verified_stmt_prec::sparse_control_assign(r1) == (Some(set[0]), wpart));
-    assert(!(wpart.len() >= 1 && wpart[0] == TokenView::Comma)) by {
-        match where_clause {
-            Some(e) => {
-                assert(wpart[0] == kwv(Keyword::Where));
-            },
-            None => {},
-        }
-    }
-    assert(verified_stmt_prec::sparse_control_assign_list(r1) == (Some(seq![set[0]]), wpart));
-    let items = seq![set[0]];
-    assert(verified_stmt_prec::assign_keys_distinct(items));
+    lemma_assign_list_rt(set, wpart);
+    assert(verified_stmt_prec::sparse_control_assign_list(r1) == (Some(set), wpart));
     match where_clause {
         Some(e) => {
             assert(wpart =~= seq![kwv(Keyword::Where)] + sprint_min(e, 0));
@@ -1961,12 +2132,10 @@ pub proof fn lemma_update_body_rt(
             assert(wpart.len() == 0);
         },
     }
-    assert(verified_stmt_prec::assign_list_to_sstmt(table, items, where_clause)
-        == SStmt::Update { table, set, where_clause }) by {
-        assert(items[0] == set[0]);
-        assert((items[0].0, items[0].1) == set[0]);
-        assert(seq![(items[0].0, items[0].1)] =~= set);
-    }
+    verified_stmt_prec::lemma_assign_canon_sorted(set);
+    assert(verified_stmt_prec::assign_canon(set) == set);
+    assert(verified_stmt_prec::assign_list_to_sstmt(table, set, where_clause)
+        == SStmt::Update { table, set, where_clause });
 }
 
 #[verifier::spinoff_prover]
@@ -2217,11 +2386,15 @@ pub proof fn stmt_min_roundtrip(s: SStmt)
             lemma_insert_body_rt(table, columns, values);
         },
         SStmt::Update { table, set, where_clause } => {
-            let body = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0])
+            let body = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause);
             assert(toks =~= seq![kwv(Keyword::Update)] + body);
             assert(toks[0] == kwv(Keyword::Update));
             assert(toks.drop_first() =~= body);
+            assert(set.len() >= 1);
+            assert(verified_stmt_prec::assign_keys_distinct(set));
+            assert(vstd::std_specs::btree::increasing_seq(verified_stmt_prec::assign_keys(set)));
+            assert(printable_assigns(set));
             lemma_update_body_rt(table, set, where_clause);
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
@@ -2919,91 +3092,217 @@ fn print_from_items_slice(s: &[ast::From]) -> (r: Vec<Token>)
 fn print_min_update_stmt(
     table: &String,
     set: &BTreeMap<String, Option<ast::Expression>>,
+    order: Ghost<Seq<String>>,
     where_clause: &Option<ast::Expression>,
 ) -> (r: Vec<Token>)
     requires
-        printable_stmt(verified_stmt::view_update_arm(*table, set@, *where_clause)),
+        printable_stmt(verified_stmt::view_update_arm(*table, set@, order@, *where_clause)),
     ensures
         verified_production::token_views(r@)
-            == sprint_min_stmt(verified_stmt::view_update_arm(*table, set@, *where_clause)),
+            == sprint_min_stmt(verified_stmt::view_update_arm(*table, set@, order@, *where_clause)),
 {
-    let ghost vs = verified_stmt::view_update_arm(*table, set@, *where_clause);
+    let ghost vs = verified_stmt::view_update_arm(*table, set@, order@, *where_clause);
+    let ghost vset = verified_stmt::view_update_assigns(set@, order@);
     let mut r: Vec<Token> = Vec::new();
     proof {
         broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
 
         verified_stmt::axiom_string_obeys_cmp();
         assert(vstd::std_specs::btree::key_obeys_cmp_spec::<String>());
-        if set@.dom().len() != 1 {
+        // `printable_stmt(vs)` forces `vs` to be a sorted-canonical `Update`, hence
+        // `wf_update(set@, order@)` and the assignment list is sorted / distinct.
+        if !verified_stmt::wf_update(set@, order@) {
             assert(vs == SStmt::Unsupported);
             assert(false);
         }
-        assert(set@.dom().len() == 1);
-    }
-    let ghost k0 = set@.dom().choose();
-    let ghost vset: Seq<(String, Option<SExpr>)> = seq![(k0, verified_stmt::view_opt(set@[k0]))];
-    proof {
+        assert(verified_stmt::wf_update(set@, order@));
         assert(vs == SStmt::Update {
             table: *table,
             set: vset,
             where_clause: verified_stmt::view_opt(*where_clause),
         });
+        assert(vset.len() == order@.len());
+        assert(order@.to_set() == set@.dom());
+        // From `printable_stmt`: distinct, sorted keys, printable values.
+        assert(verified_stmt_prec::assign_keys_distinct(vset));
+        assert(vstd::std_specs::btree::increasing_seq(verified_stmt_prec::assign_keys(vset)));
+        assert(printable_assigns(vset));
+        assert(vset.len() >= 1);
+    }
+    // `assign_keys(vset) == order@` (keys of `view_update_assigns` are `order@`).
+    proof {
+        assert(verified_stmt_prec::assign_keys(vset) =~= order@) by {
+            assert(verified_stmt_prec::assign_keys(vset).len() == vset.len());
+            assert forall|i: int| 0 <= i < vset.len() implies
+                #[trigger] verified_stmt_prec::assign_keys(vset)[i] == order@[i] by {
+                assert(vset[i] == (order@[i], verified_stmt::view_opt(set@[order@[i]])));
+            }
+        }
     }
     push_tok(&mut r, Token::Keyword(Keyword::Update));
     push_tok(&mut r, Token::Ident(table.clone()));
     push_tok(&mut r, Token::Keyword(Keyword::Set));
+    let ghost head = seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)];
+    proof {
+        assert(verified_production::token_views(r@) =~= head);
+    }
     let mut it = set.iter();
     let ghost rem0 = vstd::std_specs::iter::IteratorSpec::remaining(&it);
+    // The iterator walks the map in sorted key order. Its key projection is the
+    // (unique) sorted key sequence, so it coincides with `order@`; and each
+    // remaining pair views to the corresponding `vset` entry.
+    let ghost rem_keys = rem0.map_values(|kv: (&String, &Option<ast::Expression>)| *kv.0);
     proof {
         broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
 
+        verified_stmt::axiom_string_obeys_cmp();
         assert(rem0.len() == set@.dom().len());
-        assert(set@.dom().contains(k0)) by {
-            assert(rem0.len() == 1);
-            assert(set@.contains_key(*rem0[0].0));
+        assert(rem0.no_duplicates());
+        assert(vstd::std_specs::btree::increasing_seq(rem_keys));
+        assert(rem_keys.len() == rem0.len());
+        assert forall|i: int| 0 <= i < rem0.len() implies #[trigger] rem_keys[i] == *rem0[i].0 by {}
+        // rem_keys is distinct (rem0 distinct => key projection distinct, since
+        // the map has no repeated keys).
+        assert(rem_keys.no_duplicates()) by {
+            assert forall|i: int, j: int| 0 <= i < rem_keys.len() && 0 <= j < rem_keys.len()
+                && i != j implies rem_keys[i] != rem_keys[j] by {
+                assert(set@.contains_key(*rem0[i].0) && set@[*rem0[i].0] == *rem0[i].1);
+                assert(set@.contains_key(*rem0[j].0) && set@[*rem0[j].0] == *rem0[j].1);
+                if *rem0[i].0 == *rem0[j].0 {
+                    assert(rem0[i] == (&(*rem0[i].0), &set@[*rem0[i].0]));
+                    assert(rem0[j] == (&(*rem0[j].0), &set@[*rem0[j].0]));
+                    assert(rem0[i] == rem0[j]);
+                }
+            }
         }
-        assert(set@.contains_key(k0));
-        assert(rem0.contains((&k0, &set@[k0])));
-        assert(rem0[0] == (&k0, &set@[k0]));
+        // rem_keys covers exactly set@.dom() == order@.to_set().
+        assert(rem_keys.to_set() =~= set@.dom()) by {
+            assert forall|k: String| rem_keys.to_set().contains(k) implies set@.dom().contains(k) by {
+                let i = choose|i: int| 0 <= i < rem_keys.len() && rem_keys[i] == k;
+                assert(rem_keys[i] == *rem0[i].0);
+                assert(set@.contains_key(*rem0[i].0));
+            }
+            assert forall|k: String| set@.dom().contains(k) implies rem_keys.to_set().contains(k) by {
+                assert(set@.contains_key(k));
+                assert(rem0.contains((&k, &set@[k])));
+                let i = choose|i: int| 0 <= i < rem0.len() && rem0[i] == (&k, &set@[k]);
+                assert(rem_keys[i] == *rem0[i].0);
+                assert(rem_keys[i] == k);
+            }
+        }
+        assert(order@.no_duplicates());
+        assert(order@.to_set() == set@.dom());
+        assert(rem_keys.to_set() == order@.to_set());
+        verified_stmt::lemma_increasing_seq_eq(rem_keys, order@);
+        assert(rem_keys == order@);
+        // Each remaining pair views to the corresponding vset entry.
+        assert forall|i: int| 0 <= i < rem0.len() implies
+            #[trigger] rem0[i] == (&order@[i], &set@[order@[i]]) by {
+            assert(rem_keys[i] == order@[i]);
+            assert(*rem0[i].0 == order@[i]);
+            assert(set@.contains_key(*rem0[i].0) && set@[*rem0[i].0] == *rem0[i].1);
+            assert(*rem0[i].1 == set@[order@[i]]);
+        }
     }
-    let kv = it.next();
-    match kv {
-        Some(pair) => {
-            let (k, v) = pair;
-            proof {
-                assert((k, v) == rem0[0]);
-                assert(*k == k0);
-                assert(*v == set@[k0]);
-            }
-            push_tok(&mut r, Token::Ident(k.clone()));
-            push_tok(&mut r, Token::Equal);
-            match v {
-                Some(e) => {
-                    proof {
-                        assert(verified_stmt::view_opt(set@[k0])
-                            == Some(verified_roundtrip::view_expr(*e)));
-                        assert(printable_opt_se(vset[0].1));
-                        assert(printable_se(verified_roundtrip::view_expr(*e)));
+    proof {
+        broadcast use vstd::std_specs::btree::axiom_spec_btree_map_len;
+        broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
+        verified_stmt::axiom_string_obeys_cmp();
+        assert(set.len() == set@.len());
+        assert(set@.len() == set@.dom().len());
+        assert(set.len() == rem0.len());
+    }
+    let mut i: usize = 0;
+    while i < set.len()
+        invariant
+            0 <= i <= rem0.len(),
+            rem0.len() == vset.len(),
+            vstd::std_specs::iter::IteratorSpec::remaining(&it) == rem0.subrange(i as int, rem0.len() as int),
+            set.len() == rem0.len(),
+            vset.len() == order@.len(),
+            printable_assigns(vset),
+            forall|j: int| 0 <= j < rem0.len() ==> #[trigger] rem0[j] == (&order@[j], &set@[order@[j]]),
+            forall|j: int| 0 <= j < order@.len()
+                ==> #[trigger] vset[j] == (order@[j], verified_stmt::view_opt(set@[order@[j]])),
+            verified_production::token_views(r@)
+                == head + sprint_assign_list(vset.subrange(0, i as int)),
+        decreases set.len() - i,
+    {
+        proof {
+            broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
+            assert(vstd::std_specs::iter::IteratorSpec::remaining(&it).len() == rem0.len() - i);
+            assert(vstd::std_specs::iter::IteratorSpec::remaining(&it).len() > 0);
+            assert(vstd::std_specs::iter::IteratorSpec::remaining(&it)[0] == rem0[i as int]);
+        }
+        let ghost pre = vset.subrange(0, i as int);
+        let kv = it.next();
+        match kv {
+            Some(pair) => {
+                let (k, v) = pair;
+                proof {
+                    assert((k, v) == rem0[i as int]);
+                    assert(*k == order@[i as int]);
+                    assert(*v == set@[order@[i as int]]);
+                    assert(vset[i as int] == (order@[i as int], verified_stmt::view_opt(set@[order@[i as int]])));
+                    assert(printable_opt_se(vset[i as int].1));
+                }
+                if i > 0 {
+                    push_tok(&mut r, Token::Comma);
+                }
+                push_tok(&mut r, Token::Ident(k.clone()));
+                push_tok(&mut r, Token::Equal);
+                match v {
+                    Some(e) => {
+                        proof {
+                            assert(verified_stmt::view_opt(set@[order@[i as int]])
+                                == Some(verified_roundtrip::view_expr(*e)));
+                            assert(printable_se(verified_roundtrip::view_expr(*e)));
+                        }
+                        let ex = verified_minparen::print_min_at(e, 0);
+                        append_toks(&mut r, ex);
+                    },
+                    None => {
+                        push_tok(&mut r, Token::Keyword(Keyword::Default));
+                    },
+                }
+                proof {
+                    // The tokens just appended are exactly `sprint_assign(vset[i])`
+                    // (optionally prefixed by a comma for i > 0).
+                    assert(sprint_assign(vset[i as int])
+                        =~= seq![TokenView::Ident(order@[i as int]), TokenView::Equal]
+                            + (match set@[order@[i as int]] {
+                                Some(ee) => sprint_min(verified_roundtrip::view_expr(ee), 0),
+                                None => seq![kwv(Keyword::Default)],
+                            }));
+                    lemma_sprint_assign_list_snoc(pre, vset[i as int]);
+                    assert(pre.push(vset[i as int]) =~= vset.subrange(0, i + 1 as int));
+                    if i > 0 {
+                        assert(verified_production::token_views(r@)
+                            =~= head + sprint_assign_list(pre) + seq![TokenView::Comma]
+                                + sprint_assign(vset[i as int]));
+                        assert(pre.len() > 0);
+                    } else {
+                        assert(verified_production::token_views(r@)
+                            =~= head + sprint_assign(vset[i as int]));
+                        assert(pre.len() == 0);
                     }
-                    let ex = verified_minparen::print_min_at(e, 0);
-                    append_toks(&mut r, ex);
-                },
-                None => {
-                    push_tok(&mut r, Token::Keyword(Keyword::Default));
-                },
-            }
-            proof {
-                assert(verified_production::token_views(r@)
-                    =~= seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)]
-                        + sprint_assign(vset[0]));
-            }
-        },
-        None => {
-            proof {
-                assert(rem0.len() == 1);
-                assert(false);
-            }
-        },
+                    assert(verified_production::token_views(r@)
+                        =~= head + sprint_assign_list(vset.subrange(0, i + 1 as int)));
+                }
+            },
+            None => {
+                proof {
+                    assert(vstd::std_specs::iter::IteratorSpec::remaining(&it).len() > 0);
+                    assert(false);
+                }
+            },
+        }
+        i = i + 1;
+    }
+    proof {
+        assert(i == rem0.len());
+        assert(vset.subrange(0, i as int) =~= vset);
+        assert(verified_production::token_views(r@) =~= head + sprint_assign_list(vset));
     }
     match where_clause {
         Some(e) => {
@@ -3018,12 +3317,10 @@ fn print_min_update_stmt(
     }
     proof {
         assert(verified_production::token_views(r@)
-            =~= seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)]
-                + sprint_assign(vset[0])
+            =~= head + sprint_assign_list(vset)
                 + sprint_kw_expr(Keyword::Where, verified_stmt::view_opt(*where_clause)));
         assert(sprint_min_stmt(vs)
-            == seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)]
-                + sprint_assign(vset[0])
+            == head + sprint_assign_list(vset)
                 + sprint_kw_expr(Keyword::Where, verified_stmt::view_opt(*where_clause)));
     }
     r
@@ -3340,11 +3637,11 @@ pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
             }
             r
         },
-        ast::Statement::Update { table, set, where_clause } => {
+        ast::Statement::Update { table, set, order, where_clause } => {
             proof {
-                assert(vs == verified_stmt::view_update_arm(*table, set@, *where_clause));
+                assert(vs == verified_stmt::view_update_arm(*table, set@, order@, *where_clause));
             }
-            print_min_update_stmt(table, set, where_clause)
+            print_min_update_stmt(table, set, order.0, where_clause)
         },
         ast::Statement::Select {
             select, from, where_clause, group_by, having, order_by, offset, limit,

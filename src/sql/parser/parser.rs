@@ -401,7 +401,12 @@ impl<S: PeekStream> StreamingParser<S> {
                 break;
             }
         }
-        Ok(ast::Statement::Update { table, set, where_clause: self.parse_where_clause()? })
+        Ok(ast::Statement::Update {
+            table,
+            set,
+            order: ast::AssignOrder::placeholder(),
+            where_clause: self.parse_where_clause()?,
+        })
     }
 
     /// Parses a SELECT statement.

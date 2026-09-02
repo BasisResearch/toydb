@@ -22,6 +22,14 @@ use super::verified_roundtrip::{sparse, sparse_args, view_args, view_expr};
 use super::{Keyword, ast, verified_integer};
 #[allow(unused_imports)]
 use crate::sql::types::DataType;
+#[allow(unused_imports)]
+use core::cmp::Ordering;
+// `std_specs` is gated behind `verus_keep_ghost`; these trait imports are only
+// needed for the `cmp_spec`/`eq_spec` proof helpers below, so gate them too or a
+// plain `cargo build`/`cargo test` fails to resolve them.
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use vstd::std_specs::cmp::{OrdSpec, PartialEqSpec, PartialOrdSpec};
 
 verus! {
 
@@ -188,23 +196,46 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
         // ordering: the sole (key, value) is recovered with `dom().choose()`.
         // Multi-assignment maps map to `Unsupported` until the executable,
         // sorted-`iter()` bridge lands.
-        ast::Statement::Update { table, set, where_clause } =>
-            view_update_arm(table, set@, where_clause),
+        ast::Statement::Update { table, set, order, where_clause } =>
+            view_update_arm(table, set@, order@, where_clause),
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
     }
 }
 
+/// Well-formedness of an UPDATE's ghost `order` against its `set` map: the
+/// order lists each assigned column exactly once (`no_dups`) and lists all of
+/// them and only them (`order.to_set() == set.dom()`). Together with the value
+/// map this is a bijection `Seq<(String, Option<SExpr>)> <-> Map<...>` on the
+/// UPDATE assignment set (see `lemma_update_bijection`).
+pub open spec fn wf_update(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
+) -> bool {
+    &&& order.no_duplicates()
+    &&& order.to_set() == set.dom()
+}
+
+/// Build the mirror assignment sequence from the ghost `order`: read the keys in
+/// `order` and pair each with its value from `set`. Total (no `dom().choose()`,
+/// no `len == 1` special case) when `wf_update(set, order)` holds.
+pub open spec fn view_update_assigns(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
+) -> Seq<(String, Option<SExpr>)> {
+    order.map_values(|k: String| (k, view_opt(set[k])))
+}
+
 pub open spec fn view_update_arm(
     table: String,
     set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
     where_clause: Option<ast::Expression>,
 ) -> SStmt {
-    if set.dom().len() == 1 {
-        let k = set.dom().choose();
+    if wf_update(set, order) {
         SStmt::Update {
             table,
-            set: seq![(k, view_opt(set[k]))],
+            set: view_update_assigns(set, order),
             where_clause: view_opt(where_clause),
         }
     } else {
@@ -1104,6 +1135,283 @@ pub proof fn axiom_string_obeys_cmp()
 {
 }
 
+/// Trusted: `String`'s `PartialEq` is by-value, so `eq_spec` coincides with `==`
+/// (`obeys_concrete_eq`). Needed to turn `cmp_spec(x, y) is Equal` into `x == y`
+/// when proving the key order is a *total ordering* (antisymmetry).
+#[verifier::external_body]
+pub proof fn axiom_string_concrete_eq()
+    ensures vstd::laws_eq::obeys_concrete_eq::<String>(),
+{
+}
+
+/// Non-strict key order on `String`, derived from the `Ord` model: `a <= b` iff
+/// `a.cmp_spec(&b)` is `Less` or `Equal`. This is the total order the sorted
+/// canonical UPDATE-assignment form is sorted by; it matches vstd's BTreeMap
+/// `increasing_seq` (which uses the *strict* `is Less`) on distinct keys.
+pub open spec fn str_leq(a: String, b: String) -> bool {
+    a.cmp_spec(&b) is Less
+        || a.cmp_spec(&b) is Equal
+}
+
+/// `str_leq` is a total ordering (reflexive, antisymmetric, transitive,
+/// strongly-connected) — the precondition of `Seq::sort_by` / `lemma_sorted_unique`.
+pub proof fn lemma_str_leq_total_ordering()
+    ensures vstd::relations::total_ordering(|a: String, b: String| str_leq(a, b)),
+{
+    axiom_string_obeys_cmp();
+    axiom_string_concrete_eq();
+    let leq = |a: String, b: String| str_leq(a, b);
+    reveal(vstd::laws_cmp::obeys_cmp_ord);
+    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+    reveal(vstd::laws_eq::obeys_concrete_eq);
+    // partial_cmp_spec(x, y) == Some(cmp_spec(x, y)) for all x, y.
+    assert forall|x: String, y: String|
+        x.partial_cmp_spec(&y) == Some(x.cmp_spec(&y)) by {}
+    // reflexive: cmp_spec(x, x) is Equal (via eq_spec reflexivity).
+    assert(vstd::relations::reflexive(leq)) by {
+        assert forall|x: String| #[trigger] leq(x, x) by {
+            assert(x.eq_spec(&x));
+            assert(x.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Equal));
+        }
+    }
+    // strongly_connected: for all x, y, leq(x, y) || leq(y, x).
+    assert(vstd::relations::strongly_connected(leq)) by {
+        assert forall|x: String, y: String| #[trigger] leq(x, y) || #[trigger] leq(y, x) by {
+            match x.cmp_spec(&y) {
+                core::cmp::Ordering::Less => {},
+                core::cmp::Ordering::Equal => {},
+                core::cmp::Ordering::Greater => {
+                    assert(x.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Greater));
+                    assert(y.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Less));
+                    assert(y.cmp_spec(&x) is Less);
+                },
+            }
+        }
+    }
+    // antisymmetric: leq(x, y) && leq(y, x) ==> x == y (both non-Greater forces Equal).
+    assert(vstd::relations::antisymmetric(leq)) by {
+        assert forall|x: String, y: String| #[trigger] leq(x, y) && #[trigger] leq(y, x)
+            implies x == y by {
+            // Neither can be Less (Less on one side forces Greater on the other,
+            // contradicting the other leq), so both are Equal.
+            if x.cmp_spec(&y) is Less {
+                assert(x.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Less));
+                assert(y.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Greater));
+                assert(y.cmp_spec(&x) is Greater);
+                assert(false);
+            }
+            assert(x.cmp_spec(&y) is Equal);
+            assert(x.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Equal));
+            assert(x.eq_spec(&y));
+            assert(x == y);
+        }
+    }
+    // transitive: leq(x, y) && leq(y, z) ==> leq(x, z).
+    assert(vstd::relations::transitive(leq)) by {
+        assert forall|x: String, y: String, z: String| #[trigger] leq(x, y) && #[trigger] leq(y, z)
+            implies leq(x, z) by {
+            // Reduce to partial_cmp_spec facts. leq(a, b) <==> !(b < a).
+            if x.cmp_spec(&z) is Greater {
+                assert(x.partial_cmp_spec(&z) == Some(core::cmp::Ordering::Greater));
+                assert(z.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Less));
+                // z < x with x <= y and y <= z contradicts transitivity of <.
+                if x.cmp_spec(&y) is Equal {
+                    assert(x.eq_spec(&y));
+                    // x == y, so z < x means z < y, but y <= z.
+                    assert(x == y);
+                    if y.cmp_spec(&z) is Equal {
+                        assert(y.eq_spec(&z));
+                        assert(y == z);
+                        assert(false);
+                    } else {
+                        assert(y.partial_cmp_spec(&z) == Some(core::cmp::Ordering::Less));
+                        assert(z.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Less));
+                        // y < z and z < x=y ==> y < y, contradiction with reflexive Equal.
+                        assert(z.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Less));
+                        assert(y.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Less));
+                        assert(y.eq_spec(&y));
+                        assert(false);
+                    }
+                } else {
+                    assert(x.partial_cmp_spec(&y) == Some(core::cmp::Ordering::Less));
+                    if y.cmp_spec(&z) is Equal {
+                        assert(y.eq_spec(&z));
+                        assert(y == z);
+                        // x < y=z and z < x ==> x < x.
+                        assert(z.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Less));
+                        assert(x.partial_cmp_spec(&x) == Some(core::cmp::Ordering::Less));
+                        assert(x.eq_spec(&x));
+                        assert(false);
+                    } else {
+                        assert(y.partial_cmp_spec(&z) == Some(core::cmp::Ordering::Less));
+                        // x < y and y < z ==> x < z, contradicting z < x.
+                        assert(x.partial_cmp_spec(&z) == Some(core::cmp::Ordering::Less));
+                        assert(false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sort a key list into ascending `str_leq` order. Used to canonicalise an
+/// UPDATE's assignment order so it matches the sorted `BTreeMap::iter()` walk of
+/// the executable printer, independent of parse order.
+pub open spec fn sorted_keys(keys: Seq<String>) -> Seq<String> {
+    keys.sort_by(|a: String, b: String| str_leq(a, b))
+}
+
+/// A key sequence that is already sorted (distinct + `increasing_seq`) is a fixed
+/// point of `sorted_keys`: sorting it is the identity. This is the "sort is
+/// identity on already-sorted keys" idempotence used by the UPDATE roundtrip.
+pub proof fn lemma_sorted_keys_idempotent(keys: Seq<String>)
+    requires
+        keys.no_duplicates(),
+        vstd::std_specs::btree::increasing_seq(keys),
+    ensures
+        sorted_keys(keys) == keys,
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+    lemma_str_leq_total_ordering();
+    let leq = |a: String, b: String| str_leq(a, b);
+    // `keys` is already `sorted_by(leq)`: increasing_seq gives strict Less on i<j.
+    assert(vstd::relations::sorted_by(keys, leq)) by {
+        assert forall|i: int, j: int| 0 <= i < j < keys.len()
+            implies #[trigger] leq(keys[i], keys[j]) by {
+            assert(keys[i].cmp_spec(&keys[j]) is Less);
+        }
+    }
+    // `sorted_keys(keys)` is sorted and a permutation of `keys` (same multiset).
+    keys.lemma_sort_by_ensures(leq);
+    assert(vstd::relations::sorted_by(keys.sort_by(leq), leq));
+    assert(keys.to_multiset() =~= keys.sort_by(leq).to_multiset());
+    // Two sorted sequences with the same multiset are equal.
+    vstd::seq_lib::lemma_sorted_unique(keys, keys.sort_by(leq), leq);
+}
+
+/// Sorting a distinct key sequence yields a permutation that is still distinct,
+/// covers the same set of keys, has the same length, and is `increasing_seq`
+/// (strictly ascending, since distinct). These are the facts needed to prove
+/// `wf_update(set, sorted_keys(order))` and to feed `printable_stmt`.
+pub proof fn lemma_sorted_keys_props(keys: Seq<String>)
+    requires
+        keys.no_duplicates(),
+    ensures
+        sorted_keys(keys).len() == keys.len(),
+        sorted_keys(keys).to_multiset() == keys.to_multiset(),
+        sorted_keys(keys).to_set() == keys.to_set(),
+        sorted_keys(keys).no_duplicates(),
+        vstd::std_specs::btree::increasing_seq(sorted_keys(keys)),
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+    broadcast use vstd::seq_lib::group_to_multiset_ensures;
+    lemma_str_leq_total_ordering();
+    let leq = |a: String, b: String| str_leq(a, b);
+    let s = sorted_keys(keys);
+    keys.lemma_sort_by_ensures(leq);
+    // Same multiset (permutation) => same length and same element set.
+    assert(s.to_multiset() =~= keys.to_multiset());
+    s.to_multiset_ensures();
+    keys.to_multiset_ensures();
+    assert(s.len() == s.to_multiset().len());
+    assert(keys.len() == keys.to_multiset().len());
+    assert(s.len() == keys.len());
+    assert(s.to_set() =~= keys.to_set()) by {
+        assert forall|k: String| s.to_set().contains(k) <==> keys.to_set().contains(k) by {
+            if s.to_set().contains(k) {
+                assert(s.contains(k));
+                assert(s.to_multiset().count(k) > 0);
+                assert(keys.to_multiset().count(k) > 0);
+                assert(keys.contains(k));
+            }
+            if keys.to_set().contains(k) {
+                assert(keys.contains(k));
+                assert(keys.to_multiset().count(k) > 0);
+                assert(s.to_multiset().count(k) > 0);
+                assert(s.contains(k));
+            }
+        }
+    }
+    // Distinctness is preserved through the shared multiset.
+    keys.lemma_multiset_has_no_duplicates();
+    assert(s.no_duplicates()) by {
+        s.lemma_multiset_has_no_duplicates_conv();
+    }
+    // sorted_by + distinct => strict Less on i<j => increasing_seq.
+    assert(vstd::relations::sorted_by(s, leq));
+    assert(vstd::std_specs::btree::increasing_seq(s)) by {
+        assert forall|i: int, j: int| 0 <= i < j < s.len()
+            implies #[trigger] s[i].cmp_spec(&s[j]) is Less by {
+            assert(leq(s[i], s[j]));
+            assert(s[i] != s[j]) by {
+                s.lemma_multiset_has_no_duplicates();
+            }
+            // leq && distinct => strict Less (Equal would force eq_spec, hence ==).
+            if s[i].cmp_spec(&s[j]) is Equal {
+                axiom_string_concrete_eq();
+                reveal(vstd::laws_cmp::obeys_cmp_ord);
+                reveal(vstd::laws_eq::obeys_concrete_eq);
+                assert(s[i].partial_cmp_spec(&s[j]) == Some(Ordering::Equal));
+                reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+                assert(s[i].eq_spec(&s[j]));
+                assert(s[i] == s[j]);
+                assert(false);
+            }
+        }
+    }
+}
+
+/// Two strictly-ascending (`increasing_seq`), distinct key sequences over the
+/// same element set are equal. Used to identify the parser's sorted `order@` with
+/// the sorted key projection of the executable printer's `BTreeMap::iter()` walk.
+pub proof fn lemma_increasing_seq_eq(a: Seq<String>, b: Seq<String>)
+    requires
+        a.no_duplicates(),
+        b.no_duplicates(),
+        vstd::std_specs::btree::increasing_seq(a),
+        vstd::std_specs::btree::increasing_seq(b),
+        a.to_set() == b.to_set(),
+    ensures
+        a == b,
+{
+    axiom_string_obeys_cmp();
+    broadcast use vstd::std_specs::btree::axiom_increasing_seq_meaning;
+    broadcast use vstd::seq_lib::group_to_multiset_ensures;
+    lemma_str_leq_total_ordering();
+    let leq = |a1: String, b1: String| str_leq(a1, b1);
+    // Both are `sorted_by(leq)` (strict Less implies leq).
+    assert(vstd::relations::sorted_by(a, leq)) by {
+        assert forall|i: int, j: int| 0 <= i < j < a.len() implies #[trigger] leq(a[i], a[j]) by {
+            assert(a[i].cmp_spec(&a[j]) is Less);
+        }
+    }
+    assert(vstd::relations::sorted_by(b, leq)) by {
+        assert forall|i: int, j: int| 0 <= i < j < b.len() implies #[trigger] leq(b[i], b[j]) by {
+            assert(b[i].cmp_spec(&b[j]) is Less);
+        }
+    }
+    // Same set + distinct => same multiset.
+    a.lemma_multiset_has_no_duplicates();
+    b.lemma_multiset_has_no_duplicates();
+    assert(a.to_multiset() =~= b.to_multiset()) by {
+        assert forall|x: String| a.to_multiset().count(x) == b.to_multiset().count(x) by {
+            a.to_multiset_ensures();
+            b.to_multiset_ensures();
+            if a.to_set().contains(x) {
+                assert(a.contains(x));
+                assert(b.contains(x));
+            } else {
+                assert(!a.contains(x));
+                assert(!b.to_set().contains(x));
+                assert(!b.contains(x));
+            }
+        }
+    }
+    vstd::seq_lib::lemma_sorted_unique(a, b, leq);
+}
+
 pub open spec fn view_opt(v: Option<ast::Expression>) -> Option<SExpr> {
     match v {
         Some(e) => Some(view_expr(e)),
@@ -1173,6 +1481,84 @@ pub proof fn lemma_assign_dom_len(
     }
 }
 
+/// The keys of the parser's ghost `done` sequence.
+pub open spec fn done_keys(items: Seq<(String, Option<ast::Expression>)>) -> Seq<String> {
+    items.map_values(|kv: (String, Option<ast::Expression>)| kv.0)
+}
+
+/// Bijection lemma: under the parser's assignment invariants (distinct keys +
+/// key set == map domain), the ghost `order = done_keys(items)` is well-formed
+/// (`wf_update`) and reading the map back through `order` reproduces exactly the
+/// ordered assignment sequence `view_assign_pairs(items)`.
+///
+/// This is the Seq <-> Map bijection on the UPDATE assignment set:
+///   * soundness    — `order.no_duplicates()` and every listed key is a real
+///                    assignment (`order.to_set() subset set.dom()`);
+///   * completeness — every assignment is listed (`set.dom() subset
+///                    order.to_set()`);
+/// together giving `order.to_set() == set.dom()` and, with the value map,
+/// `view_update_assigns(set, order) == view_assign_pairs(items)`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(60000)]
+pub proof fn lemma_update_bijection(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+)
+    requires
+        set.dom().finite(),
+        forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0,
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] set.dom().contains(items[i].0)
+            && set[items[i].0] == items[i].1,
+        forall|k: String| set.dom().contains(k)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
+    ensures
+        wf_update(set, done_keys(items)),
+        view_update_assigns(set, done_keys(items)) == view_assign_pairs(items),
+{
+    let order = done_keys(items);
+    assert(order.len() == items.len());
+    assert forall|i: int| 0 <= i < order.len() implies #[trigger] order[i] == items[i].0 by {}
+    // soundness: no_duplicates.
+    assert(order.no_duplicates()) by {
+        assert forall|i: int, j: int| 0 <= i < order.len() && 0 <= j < order.len()
+            && i != j implies order[i] != order[j] by {
+            if i < j {
+                assert(items[i].0 != items[j].0);
+            } else {
+                assert(items[j].0 != items[i].0);
+            }
+        }
+    }
+    // order.to_set() == set.dom(), both directions.
+    assert(order.to_set() =~= set.dom()) by {
+        assert forall|k: String| order.to_set().contains(k) implies set.dom().contains(k) by {
+            let i = choose|i: int| 0 <= i < order.len() && order[i] == k;
+            assert(order[i] == items[i].0);
+            assert(set.dom().contains(items[i].0));
+        }
+        assert forall|k: String| set.dom().contains(k) implies order.to_set().contains(k) by {
+            let i = choose|i: int| 0 <= i < items.len() && items[i].0 == k;
+            assert(order[i] == k);
+        }
+    }
+    // value agreement: view_update_assigns(set, order) == view_assign_pairs(items).
+    view_assign_pairs_index(items);
+    assert(view_update_assigns(set, order) =~= view_assign_pairs(items)) by {
+        assert(view_update_assigns(set, order).len() == items.len());
+        assert(view_assign_pairs(items).len() == items.len());
+        assert forall|i: int| 0 <= i < items.len() implies
+            #[trigger] view_update_assigns(set, order)[i] == view_assign_pairs(items)[i] by {
+            assert(view_update_assigns(set, order)[i] == (order[i], view_opt(set[order[i]])));
+            assert(order[i] == items[i].0);
+            assert(set.dom().contains(items[i].0) && set[items[i].0] == items[i].1);
+            assert(view_assign_pairs(items)[i] == (items[i].0, view_opt(items[i].1)));
+        }
+    }
+}
+
+/// Boundary lemma used by the verified parser: with `order = done_keys(items)`,
+/// the total `view_update_arm` equals the mirror `Update` built from the ordered
+/// assignment list. No `len == 1` special case — this now covers multi-assign.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(60000)]
 pub proof fn lemma_update_view_boundary(
@@ -1189,44 +1575,22 @@ pub proof fn lemma_update_view_boundary(
         forall|k: String| set.dom().contains(k)
             ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
     ensures
-        items.len() == 1 ==> view_update_arm(table, set, where_clause)
+        view_update_arm(table, set, done_keys(items), where_clause)
             == (SStmt::Update {
                 table,
-                set: seq![(items[0].0, view_opt(items[0].1))],
+                set: view_assign_pairs(items),
                 where_clause: view_opt(where_clause),
             }),
-        items.len() != 1 ==> view_update_arm(table, set, where_clause) == SStmt::Unsupported,
 {
-    lemma_assign_dom_len(set, items);
-    if items.len() == 1 {
-        assert(set.dom().len() == 1);
-        let k = set.dom().choose();
-        assert(set.dom().contains(k)) by {
-            assert(set.dom().len() == 1);
-            assert(!set.dom().is_empty());
-        }
-        assert(set.dom().contains(items[0].0));
-        assert(k == items[0].0) by {
-            if k != items[0].0 {
-                assert(set.dom().contains(k) && set.dom().contains(items[0].0));
-                assert(set.dom().remove(items[0].0).contains(k));
-                assert(set.dom().remove(items[0].0).len() >= 1);
-                assert(set.dom().len() >= 2);
-            }
-        }
-        assert(set[k] == items[0].1);
-        assert(view_update_arm(table, set, where_clause)
-            == SStmt::Update {
-                table,
-                set: seq![(k, view_opt(set[k]))],
-                where_clause: view_opt(where_clause),
-            });
-        assert(seq![(k, view_opt(set[k]))] =~= seq![(items[0].0, view_opt(items[0].1))]);
-    } else {
-        assert(set.dom().len() == items.len());
-        assert(set.dom().len() != 1);
-        assert(view_update_arm(table, set, where_clause) == SStmt::Unsupported);
-    }
+    lemma_update_bijection(set, items);
+    let order = done_keys(items);
+    assert(wf_update(set, order));
+    assert(view_update_arm(table, set, order, where_clause)
+        == SStmt::Update {
+            table,
+            set: view_update_assigns(set, order),
+            where_clause: view_opt(where_clause),
+        });
 }
 
 } // verus!

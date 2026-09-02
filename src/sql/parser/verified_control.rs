@@ -3285,25 +3285,28 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             },
         }
         let ghost we = verified_roundtrip::view_expr(where_clause->0);
+        let order = Ghost(verified_stmt::sorted_keys(verified_stmt::done_keys(done)));
         proof {
             if sized {
-                verified_stmt::lemma_update_view_boundary(table, set@, done, where_clause);
+                verified_stmt_prec::lemma_update_canon_boundary(table, set@, done, where_clause);
                 verified_stmt::view_assign_pairs_index(done);
+                assert(order@ == verified_stmt::sorted_keys(verified_stmt::done_keys(done)));
                 assert(verified_stmt::view_opt(where_clause) == Some(we));
                 assert(verified_stmt_prec::sparse_control_update(input)
                     == (Some(verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we))),
                         verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
-                assert(verified_stmt::view_update_arm(table, set@, where_clause)
-                    == verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we))) by {
-                    if done.len() == 1 {
-                        assert(items_v[0] == (done[0].0, verified_stmt::view_opt(done[0].1)));
-                    }
-                }
+                assert(verified_stmt::view_update_arm(table, set@, order@, where_clause)
+                    == verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we)));
             }
         }
-        return (Some(ast::Statement::Update { table, set, where_clause }), cur, None);
+        return (
+            Some(ast::Statement::Update { table, set, order: ast::AssignOrder(order), where_clause }),
+            cur,
+            None,
+        );
     }
 
+    let order = Ghost(verified_stmt::sorted_keys(verified_stmt::done_keys(done)));
     proof {
         if sized {
             if cur < toks.len() {
@@ -3315,21 +3318,22 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 toks@.subrange(cur as int, toks@.len() as int)));
             assert(!(al_rest.len() >= 1
                 && al_rest[0] == verified_production::TokenView::Keyword(Keyword::Where)));
-            verified_stmt::lemma_update_view_boundary(table, set@, done, where_clause);
+            verified_stmt_prec::lemma_update_canon_boundary(table, set@, done, where_clause);
             verified_stmt::view_assign_pairs_index(done);
+            assert(order@ == verified_stmt::sorted_keys(verified_stmt::done_keys(done)));
             assert(where_clause is None);
             assert(verified_stmt::view_opt(where_clause) == None::<SExpr>);
             assert(verified_stmt_prec::sparse_control_update(input)
                 == (Some(verified_stmt_prec::assign_list_to_sstmt(table, items_v, None)), al_rest));
-            assert(verified_stmt::view_update_arm(table, set@, where_clause)
-                == verified_stmt_prec::assign_list_to_sstmt(table, items_v, None)) by {
-                if done.len() == 1 {
-                    assert(items_v[0] == (done[0].0, verified_stmt::view_opt(done[0].1)));
-                }
-            }
+            assert(verified_stmt::view_update_arm(table, set@, order@, where_clause)
+                == verified_stmt_prec::assign_list_to_sstmt(table, items_v, None));
         }
     }
-    (Some(ast::Statement::Update { table, set, where_clause }), cur, None)
+    (
+        Some(ast::Statement::Update { table, set, order: ast::AssignOrder(order), where_clause }),
+        cur,
+        None,
+    )
 }
 
 #[verifier::spinoff_prover]
