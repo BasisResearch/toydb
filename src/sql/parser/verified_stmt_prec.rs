@@ -2102,4 +2102,382 @@ pub proof fn lemma_from_list_last(cur: Seq<TokenView>, item: SFrom, r: Seq<Token
 {
 }
 
+// ===========================================================================
+// UPDATE  (spec twin of `verified_control::parse_update_at`)
+//
+// `input` is the token-view suffix just past the leading `UPDATE` keyword.
+// Grammar:
+//   `<ident> SET <assign> (, <assign>)* [WHERE <expr>]`
+// where an `<assign>` is `<ident> = (DEFAULT | <expr>)`. The exec parser stores
+// the assignments in a `BTreeMap<String, Option<Expression>>` and *rejects* the
+// statement (returns `None`) as soon as a column name repeats. `view_stmt` only
+// bridges a single-assignment `Update` (the sole `(key, value)` recovered via
+// `dom().choose()`) and collapses every multi-assignment `Update` to
+// `SStmt::Unsupported`.
+//
+// The mirror stays at the *ordered assignment list* level: `sparse_control_assign
+// _list` parses the comma-separated list into a parse-ordered
+// `Seq<(String, Option<SExpr>)>` (no dedup — a duplicate is still a well-formed
+// *parse*), and `sparse_control_update` performs the exec's duplicate-column
+// rejection and the `view_stmt` boundary map (singleton `Update` vs `Unsupported`)
+// itself. This is deliberately a *dedicated* twin (per the phase-2 review): it
+// does not touch `view_stmt`'s `Unsupported` multi-assignment case or the
+// roundtrip printer.
+// ===========================================================================
+
+/// Parse one assignment `<ident> = (DEFAULT | <expr>)`. Mirrors the exec's
+/// value branch, which checks `DEFAULT` *first* (yielding `None` value) and only
+/// otherwise runs `sparse_prec`. Yields the `(name, value-view)` and the suffix
+/// just past the value, or `None` on a missing ident / `=` / malformed value.
+pub open spec fn sparse_control_assign(input: Seq<TokenView>)
+    -> (Option<(String, Option<SExpr>)>, Seq<TokenView>) {
+    if input.len() < 2 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(name) => {
+                if input[1] != TokenView::Equal {
+                    (None, input)
+                } else {
+                    let rest = input.drop_first().drop_first();
+                    if rest.len() >= 1 && rest[0] == TokenView::Keyword(Keyword::Default) {
+                        (Some((name, None)), rest.drop_first())
+                    } else {
+                        match sparse_prec(rest, 0, expr_fuel(rest)) {
+                            (Some(e), r) => (Some((name, Some(e))), r),
+                            (None, _) => (None, input),
+                        }
+                    }
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
+/// `sparse_control_assign` never grows its input.
+pub proof fn lemma_control_assign_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_assign(input).1.len() <= input.len(),
+{
+    if input.len() >= 2 {
+        match input[0] {
+            TokenView::Ident(name) => {
+                if input[1] == TokenView::Equal {
+                    let rest = input.drop_first().drop_first();
+                    if rest.len() >= 1 && rest[0] == TokenView::Keyword(Keyword::Default) {
+                    } else {
+                        verified_precedence::lemma_prec_slen(rest, 0, expr_fuel(rest));
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// One-or-more comma-separated `<assign>`s. Recurses on the input length: a
+/// successful assignment never grows the input (`lemma_control_assign_slen`) and
+/// the comma step drops one more token. Mirrors the exec's assignment loop; there
+/// is *no* duplicate-column rejection here (that is at the `sparse_control_update`
+/// boundary), matching `view_stmt`, which folds every multi-assignment case
+/// (well-formed or not) into a single spec result.
+pub open spec fn sparse_control_assign_list(input: Seq<TokenView>)
+    -> (Option<Seq<(String, Option<SExpr>)>>, Seq<TokenView>)
+    decreases input.len(),
+    when true
+    via sparse_control_assign_list_decreases
+{
+    match sparse_control_assign(input) {
+        (Some(a), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_assign_list(r.drop_first()) {
+                    (Some(more), r2) => (Some(seq![a] + more), r2),
+                    (None, _) => (None, input),
+                }
+            } else {
+                (Some(seq![a]), r)
+            }
+        },
+        (None, _) => (None, input),
+    }
+}
+
+/// Termination witness for `sparse_control_assign_list`.
+#[via_fn]
+proof fn sparse_control_assign_list_decreases(input: Seq<TokenView>) {
+    lemma_control_assign_slen(input);
+}
+
+/// `sparse_control_assign_list` never grows its input.
+pub proof fn lemma_control_assign_list_slen(input: Seq<TokenView>)
+    ensures
+        sparse_control_assign_list(input).1.len() <= input.len(),
+    decreases input.len(),
+{
+    lemma_control_assign_slen(input);
+    match sparse_control_assign(input) {
+        (Some(a), r) => {
+            if r.len() >= 1 && r[0] == TokenView::Comma {
+                match sparse_control_assign_list(r.drop_first()) {
+                    (Some(more), r2) => {
+                        lemma_control_assign_list_slen(r.drop_first());
+                    },
+                    (None, _) => {},
+                }
+            }
+        },
+        (None, _) => {},
+    }
+}
+
+/// Prepend already-consumed `done` assignments onto a tail assign-list parse.
+pub open spec fn assign_list_prepend(
+    done: Seq<(String, Option<SExpr>)>,
+    whole: Seq<TokenView>,
+    tail: (Option<Seq<(String, Option<SExpr>)>>, Seq<TokenView>),
+) -> (Option<Seq<(String, Option<SExpr>)>>, Seq<TokenView>) {
+    match tail.0 {
+        Some(m) => (Some(done + m), tail.1),
+        None => (None, whole),
+    }
+}
+
+/// One-level unfold of `sparse_control_assign_list(cur)` when a comma follows the
+/// head assignment `a`.
+pub proof fn lemma_assign_list_step(cur: Seq<TokenView>, a: (String, Option<SExpr>), r: Seq<TokenView>)
+    requires
+        sparse_control_assign(cur) == (Some(a), r),
+        r.len() >= 1,
+        r[0] == TokenView::Comma,
+    ensures
+        sparse_control_assign_list(cur)
+            == assign_list_prepend(seq![a], cur, sparse_control_assign_list(r.drop_first())),
+{
+    match sparse_control_assign_list(r.drop_first()) {
+        (Some(more), r2) => {
+            assert(sparse_control_assign_list(cur) == (Some(seq![a] + more), r2));
+        },
+        (None, _) => {
+            assert(sparse_control_assign_list(cur)
+                == (None::<Seq<(String, Option<SExpr>)>>, cur));
+        },
+    }
+}
+
+/// Re-establishes the loop-resumption invariant after consuming one more
+/// assignment.
+pub proof fn lemma_assign_list_resume_step(
+    ls: Seq<TokenView>,
+    cur: Seq<TokenView>,
+    cur1: Seq<TokenView>,
+    done: Seq<(String, Option<SExpr>)>,
+    a: (String, Option<SExpr>),
+    whole: (Option<Seq<(String, Option<SExpr>)>>, Seq<TokenView>),
+)
+    requires
+        whole == assign_list_prepend(done, ls, sparse_control_assign_list(cur)),
+        sparse_control_assign_list(cur)
+            == assign_list_prepend(seq![a], cur, sparse_control_assign_list(cur1)),
+    ensures
+        whole == assign_list_prepend(done + seq![a], ls, sparse_control_assign_list(cur1)),
+{
+    match sparse_control_assign_list(cur1).0 {
+        Some(more) => {
+            assert(done + (seq![a] + more) == (done + seq![a]) + more);
+        },
+        None => {},
+    }
+}
+
+/// Terminal step: no comma after the head assignment, so the list is the single
+/// assignment.
+pub proof fn lemma_assign_list_last(cur: Seq<TokenView>, a: (String, Option<SExpr>), r: Seq<TokenView>)
+    requires
+        sparse_control_assign(cur) == (Some(a), r),
+        !(r.len() >= 1 && r[0] == TokenView::Comma),
+    ensures
+        sparse_control_assign_list(cur) == (Some(seq![a]), r),
+{
+}
+
+/// Keys of a parse-ordered assignment list.
+pub open spec fn assign_keys(items: Seq<(String, Option<SExpr>)>) -> Seq<String> {
+    items.map_values(|kv: (String, Option<SExpr>)| kv.0)
+}
+
+/// The parse-ordered assignment list has all-distinct keys (the exec's
+/// duplicate-column rejection succeeded).
+pub open spec fn assign_keys_distinct(items: Seq<(String, Option<SExpr>)>) -> bool {
+    forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0
+}
+
+/// The `SStmt` a well-formed, duplicate-free assignment list denotes, at the
+/// `view_stmt` boundary: a lone assignment becomes `SStmt::Update`, and any other
+/// arity collapses to `SStmt::Unsupported` (mirroring `view_stmt`'s
+/// `set@.dom().len() == 1` split).
+pub open spec fn assign_list_to_sstmt(
+    table: String,
+    items: Seq<(String, Option<SExpr>)>,
+    where_clause: Option<SExpr>,
+) -> SStmt {
+    if items.len() == 1 {
+        SStmt::Update { table, set: seq![(items[0].0, items[0].1)], where_clause }
+    } else {
+        SStmt::Unsupported
+    }
+}
+
+/// The head of a successful `sparse_control_assign_list` is the head assignment.
+pub proof fn lemma_assign_list_head(cur: Seq<TokenView>, a: (String, Option<SExpr>), r: Seq<TokenView>)
+    requires
+        sparse_control_assign(cur) == (Some(a), r),
+    ensures
+        sparse_control_assign_list(cur).0 is Some ==> {
+            let lst = sparse_control_assign_list(cur).0.unwrap();
+            lst.len() >= 1 && lst[0] == a
+        },
+{
+    if r.len() >= 1 && r[0] == TokenView::Comma {
+        match sparse_control_assign_list(r.drop_first()) {
+            (Some(more), r2) => {
+                assert(sparse_control_assign_list(cur).0.unwrap() == seq![a] + more);
+                assert((seq![a] + more)[0] == a);
+            },
+            (None, _) => {},
+        }
+    } else {
+        assert(sparse_control_assign_list(cur) == (Some(seq![a]), r));
+    }
+}
+
+/// If the exec detected a duplicate column, the whole UPDATE twin rejects:
+/// either the assignment list rejects, or it succeeds with a list that repeats
+/// the head key (already present in `done`), which the twin's distinctness check
+/// catches at the boundary. `input` is positioned at `<ident> SET ...`.
+pub proof fn lemma_update_reject_on_duplicate(
+    input: Seq<TokenView>,
+    table: String,
+    cur: Seq<TokenView>,
+    a: (String, Option<SExpr>),
+    r_after: Seq<TokenView>,
+    done: Seq<(String, Option<SExpr>)>,
+    di: int,
+)
+    requires
+        input.len() >= 1,
+        input[0] == TokenView::Ident(table),
+        input.drop_first().len() >= 1,
+        input.drop_first()[0] == TokenView::Keyword(Keyword::Set),
+        sparse_control_assign_list(input.drop_first().drop_first())
+            == assign_list_prepend(done, input.drop_first().drop_first(),
+                sparse_control_assign_list(cur)),
+        sparse_control_assign(cur) == (Some(a), r_after),
+        0 <= di < done.len(),
+        done[di].0 == a.0,
+    ensures
+        sparse_control_update(input).0 is None,
+{
+    let r1 = input.drop_first().drop_first();
+    let al_whole = sparse_control_assign_list(r1);
+    match sparse_control_assign_list(cur).0 {
+        Some(lst) => {
+            lemma_assign_list_head(cur, a, r_after);
+            assert(lst.len() >= 1 && lst[0] == a);
+            // `al_whole` Some list == done ++ lst. Key at `di` and at `done.len()`
+            // both equal `a.0` -> not distinct.
+            assert(al_whole == (Some(done + lst), sparse_control_assign_list(cur).1));
+            let full = done + lst;
+            assert(full[di].0 == done[di].0);
+            assert(full[done.len() as int] == lst[0]);
+            assert(full[done.len() as int].0 == a.0);
+            assert(di < done.len());
+            assert(!assign_keys_distinct(full)) by {
+                assert(full[di].0 == full[done.len() as int].0);
+                assert(0 <= di < (done.len() as int) < full.len());
+            }
+        },
+        None => {
+            assert(al_whole.0 is None);
+        },
+    }
+}
+
+/// If the assignment list rejects at the SET position, the whole UPDATE twin
+/// rejects. `input` is positioned at `<ident> SET ...`.
+pub proof fn lemma_update_reject_on_list_none(input: Seq<TokenView>, table: String)
+    requires
+        input.len() >= 1,
+        input[0] == TokenView::Ident(table),
+        input.drop_first().len() >= 1,
+        input.drop_first()[0] == TokenView::Keyword(Keyword::Set),
+        sparse_control_assign_list(input.drop_first().drop_first()).0 is None,
+    ensures
+        sparse_control_update(input).0 is None,
+{
+}
+
+/// If the WHERE expression rejects, the whole UPDATE twin rejects. `input` is
+/// positioned at `<ident> SET ...`; the assignment list is `(Some(items), r2)`
+/// with distinct keys and `r2` starting with `WHERE`.
+pub proof fn lemma_update_reject_on_where_none(
+    input: Seq<TokenView>,
+    table: String,
+    items: Seq<(String, Option<SExpr>)>,
+    r2: Seq<TokenView>,
+)
+    requires
+        input.len() >= 1,
+        input[0] == TokenView::Ident(table),
+        input.drop_first().len() >= 1,
+        input.drop_first()[0] == TokenView::Keyword(Keyword::Set),
+        sparse_control_assign_list(input.drop_first().drop_first()) == (Some(items), r2),
+        assign_keys_distinct(items),
+        r2.len() >= 1,
+        r2[0] == TokenView::Keyword(Keyword::Where),
+        sparse_prec(r2.drop_first(), 0, expr_fuel(r2.drop_first())).0 is None,
+    ensures
+        sparse_control_update(input).0 is None,
+{
+}
+
+/// Spec twin of `parse_update_at`. `input` is the suffix just past `UPDATE`.
+/// Rejects a duplicate column (like the exec) and maps the ordered assignment
+/// list onto an `SStmt` through the `view_stmt` boundary.
+pub open spec fn sparse_control_update(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    // Table name.
+    if input.len() < 1 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Ident(table) => {
+                let r0 = input.drop_first();
+                // SET
+                if r0.len() < 1 || r0[0] != TokenView::Keyword(Keyword::Set) {
+                    (None, input)
+                } else {
+                    let r1 = r0.drop_first();
+                    match sparse_control_assign_list(r1) {
+                        (Some(items), r2) => {
+                            if !assign_keys_distinct(items) {
+                                (None, input)
+                            } else if r2.len() >= 1 && r2[0] == TokenView::Keyword(Keyword::Where) {
+                                match sparse_prec(r2.drop_first(), 0, expr_fuel(r2.drop_first())) {
+                                    (Some(e), r3) =>
+                                        (Some(assign_list_to_sstmt(table, items, Some(e))), r3),
+                                    (None, _) => (None, input),
+                                }
+                            } else {
+                                (Some(assign_list_to_sstmt(table, items, None)), r2)
+                            }
+                        },
+                        (None, _) => (None, input),
+                    }
+                }
+            },
+            _ => (None, input),
+        }
+    }
+}
+
 } // verus!
