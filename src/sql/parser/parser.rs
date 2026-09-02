@@ -1,15 +1,18 @@
+#[cfg(test)]
 use std::ops::Add;
 
+#[cfg(test)]
+use super::stream::PeekStream;
 #[cfg(test)]
 use super::stream::SliceTokenStream;
 #[cfg(test)]
 use super::stream::TokenStream;
-use super::stream::{BufferedTokenStream, PeekStream};
-use super::{
-    Keyword, Token, ast, float_trust, verified_control, verified_integer, verified_precedence,
-};
+#[cfg(test)]
+use super::{Keyword, float_trust, verified_integer};
+use super::{Token, ast, verified_control};
 use crate::errinput;
 use crate::error::Result;
+#[cfg(test)]
 use crate::sql::types::DataType;
 
 /// The SQL parser takes tokens from the lexer and parses the SQL syntax into an
@@ -23,21 +26,73 @@ use crate::sql::types::DataType;
 pub struct Parser;
 
 /// The parser implementation, generic over its streaming token source.
+///
+/// This is the legacy handcrafted recursive-descent parser, retained only as a
+/// `cfg(test)` differential oracle against the verified parser. Production code
+/// never constructs it (see `Parser::parse`), so it is compiled out of
+/// non-test builds — if any production path referenced it, the build would fail.
+#[cfg(test)]
 struct StreamingParser<S> {
     stream: S,
 }
 
+/// Robustness bound on parenthesis nesting depth accepted by `Parser::parse`.
+///
+/// The verified control parser is recursive-descent, so pathologically deep
+/// parenthesization (observed to overflow the stack and abort the process at a
+/// depth of ~937) would crash the server. This bound is a cheap O(n) pre-check
+/// that rejects such input with a clean error instead of recursing. 256 is far
+/// above any legitimate query and far below the overflow point, so it changes
+/// behaviour ONLY for pathologically nested input (depth > 256), which no real
+/// query, goldenscript, differential case, or corpus input reaches.
+const MAX_NESTING_DEPTH: usize = 256;
+
 impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
+    ///
+    /// Production parsing goes directly through the verified parser
+    /// (`verified_control::parse_control_at`); it never touches the legacy
+    /// recursive-descent `StreamingParser`, which is a `cfg(test)`-only
+    /// differential oracle.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
-        let statement = parser.parse_statement()?;
-        parser.skip(Token::Semicolon);
-        if let Some(token) = parser.stream.next()? {
-            return errinput!("unexpected token {token}");
+        let tokens: Vec<Token> = super::Lexer::new(statement).collect::<Result<_>>()?;
+
+        // Robustness guard: reject pathologically deep parenthesis nesting up
+        // front, so the recursive verified parser cannot overflow the stack and
+        // abort the process. This is an O(n) scan over the token stream.
+        let mut depth: usize = 0;
+        for token in &tokens {
+            match token {
+                Token::OpenParen => {
+                    depth += 1;
+                    if depth > MAX_NESTING_DEPTH {
+                        return errinput!("expression nesting too deep");
+                    }
+                }
+                Token::CloseParen => depth = depth.saturating_sub(1),
+                _ => {}
+            }
         }
-        Ok(statement)
+
+        let (opt, consumed, perr) = verified_control::parse_control_at(&tokens, 0);
+        match opt {
+            Some(statement) => {
+                // Skip an optional trailing semicolon, then reject any leftover
+                // tokens with the same error the legacy parser produced.
+                let mut pos = consumed;
+                if tokens.get(pos) == Some(&Token::Semicolon) {
+                    pos += 1;
+                }
+                if let Some(token) = tokens.get(pos) {
+                    return errinput!("unexpected token {token}");
+                }
+                Ok(statement)
+            }
+            None => Err(perr
+                .expect("the verified parser always reports an error on rejection")
+                .render()),
+        }
     }
 
     #[cfg(test)]
@@ -99,6 +154,7 @@ impl Parser {
     }
 }
 
+#[cfg(test)]
 impl<S: PeekStream> StreamingParser<S> {
     /// Creates a parser over a streaming token source.
     fn new(stream: S) -> Self {
@@ -165,21 +221,6 @@ impl<S: PeekStream> StreamingParser<S> {
 
     /// Parses a SQL statement.
     fn parse_statement(&mut self) -> Result<ast::Statement> {
-        if let Some((tokens, pos)) = self.stream.buffer() {
-            let (opt, consumed, perr) = verified_control::parse_control_at(tokens, pos);
-            match opt {
-                Some(statement) => {
-                    self.stream.set_pos(consumed);
-                    return Ok(statement);
-                }
-                None => {
-                    return Err(perr
-                        .expect("the verified parser always reports an error on rejection")
-                        .render());
-                }
-            }
-        }
-
         let Some(token) = self.peek()? else {
             return errinput!("unexpected end of input");
         };
@@ -683,16 +724,6 @@ impl<S: PeekStream> StreamingParser<S> {
     ///   op = parse_infix_operator(prec=0) = None (end of expression)
     ///   return lhs = ((2 ^ (3 ^ 2)) - (4 * 3))
     fn parse_expression(&mut self) -> Result<ast::Expression> {
-        let verified = if let Some((tokens, pos)) = self.stream.buffer() {
-            let fuel = 2usize.saturating_mul(tokens.len().saturating_sub(pos)).saturating_add(3);
-            Some(verified_precedence::parse_expression_at(tokens, pos, 0, fuel))
-        } else {
-            None
-        };
-        if let Some((Some(expression), consumed, _err)) = verified {
-            self.stream.set_pos(consumed);
-            return Ok(expression);
-        }
         self.parse_expression_at(0)
     }
 
@@ -878,14 +909,17 @@ impl<S: PeekStream> StreamingParser<S> {
 }
 
 /// Operator precedence.
+#[cfg(test)]
 type Precedence = u8;
 
 /// Operator associativity.
+#[cfg(test)]
 enum Associativity {
     Left,
     Right,
 }
 
+#[cfg(test)]
 impl Add<Associativity> for Precedence {
     type Output = Self;
 
@@ -900,12 +934,14 @@ impl Add<Associativity> for Precedence {
 }
 
 /// Prefix operators.
+#[cfg(test)]
 enum PrefixOperator {
     Minus, // -a
     Not,   // NOT a
     Plus,  // +a
 }
 
+#[cfg(test)]
 impl PrefixOperator {
     /// The operator precedence.
     fn precedence(&self) -> Precedence {
@@ -933,6 +969,7 @@ impl PrefixOperator {
 }
 
 /// Infix operators.
+#[cfg(test)]
 enum InfixOperator {
     Add,                // a + b
     And,                // a AND b
@@ -951,6 +988,7 @@ enum InfixOperator {
     Subtract,           // a - b
 }
 
+#[cfg(test)]
 impl InfixOperator {
     /// The operator precedence.
     ///
@@ -1004,12 +1042,14 @@ impl InfixOperator {
 }
 
 /// Postfix operators.
+#[cfg(test)]
 enum PostfixOperator {
     Factorial,           // a!
     Is(ast::Literal),    // a IS NULL | NAN
     IsNot(ast::Literal), // a IS NOT NULL | NAN
 }
 
+#[cfg(test)]
 impl PostfixOperator {
     // The operator precedence.
     fn precedence(&self) -> Precedence {
@@ -1027,5 +1067,35 @@ impl PostfixOperator {
             Self::Is(v) => ast::Operator::Is(lhs, v).into(),
             Self::IsNot(v) => ast::Operator::Not(ast::Operator::Is(lhs, v).into()).into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parser;
+
+    /// Pathologically deep parenthesis nesting is rejected with a clean error
+    /// instead of overflowing the stack and aborting the process.
+    #[test]
+    fn deep_nesting_is_rejected_not_crashed() {
+        let depth = 300;
+        let mut sql = String::from("SELECT ");
+        sql.push_str(&"(".repeat(depth));
+        sql.push('1');
+        sql.push_str(&")".repeat(depth));
+
+        let result = Parser::parse(&sql);
+        assert!(result.is_err(), "deeply nested input should be rejected, got {result:?}");
+        assert!(
+            result.unwrap_err().to_string().contains("nesting too deep"),
+            "should report a nesting-depth error",
+        );
+    }
+
+    /// A normal query with modest parenthesis nesting still parses.
+    #[test]
+    fn modest_nesting_still_parses() {
+        Parser::parse("SELECT ((1 + 2) * (3 - 4))").expect("modest nesting should parse");
+        Parser::parse("SELECT 1 WHERE (((1 = 1)))").expect("modest nesting should parse");
     }
 }

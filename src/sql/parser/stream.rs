@@ -1,55 +1,21 @@
 //! Streaming token lookahead for the SQL parser.
 
+#[cfg(test)]
 use super::{Lexer, Token};
+#[cfg(test)]
 use crate::error::Result;
 
 /// A token source with one-token lookahead.
+///
+/// Only the legacy `cfg(test)` differential-oracle parser consumes tokens
+/// through this trait; production parsing operates on a `Vec<Token>` directly.
+#[cfg(test)]
 pub(crate) trait PeekStream {
     /// Returns the next token without consuming it.
     fn peek(&mut self) -> Result<Option<&Token>>;
 
     /// Returns and consumes the next token.
     fn next(&mut self) -> Result<Option<Token>>;
-
-    fn buffer(&self) -> Option<(&Vec<Token>, usize)> {
-        None
-    }
-
-    fn set_pos(&mut self, _pos: usize) {}
-}
-
-pub(crate) struct BufferedTokenStream {
-    tokens: Vec<Token>,
-    pos: usize,
-}
-
-impl BufferedTokenStream {
-    pub(crate) fn new(input: &str) -> Result<Self> {
-        let tokens: Vec<Token> = Lexer::new(input).collect::<Result<_>>()?;
-        Ok(Self { tokens, pos: 0 })
-    }
-}
-
-impl PeekStream for BufferedTokenStream {
-    fn peek(&mut self) -> Result<Option<&Token>> {
-        Ok(self.tokens.get(self.pos))
-    }
-
-    fn next(&mut self) -> Result<Option<Token>> {
-        let token = self.tokens.get(self.pos).cloned();
-        if token.is_some() {
-            self.pos += 1;
-        }
-        Ok(token)
-    }
-
-    fn buffer(&self) -> Option<(&Vec<Token>, usize)> {
-        Some((&self.tokens, self.pos))
-    }
-
-    fn set_pos(&mut self, pos: usize) {
-        self.pos = pos;
-    }
 }
 
 /// A streaming lexer with a single cached token.
