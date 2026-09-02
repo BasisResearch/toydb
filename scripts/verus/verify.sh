@@ -30,7 +30,6 @@ VERIFY_MODULES=(
   sql::parser::parse_error
   sql::parser::printer
   sql::parser::unicode_trust
-  sql::parser::verified
   sql::parser::verified_control
   sql::parser::verified_expression
   sql::parser::verified_lexer
