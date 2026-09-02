@@ -1,51 +1,18 @@
-//! Minimal-parenthesisation *statement* printer and its roundtrip
-//! (Phase 6 of the parser cutover, tasks 3-4).
-//!
-//! Phase 3 proved the minimal-parenthesisation roundtrip for expressions
-//! (`verified_minparen::min_roundtrip` / `min_roundtrip_live`); this module
-//! lifts it to whole statements. `sprint_min_stmt` prints a mirror statement
-//! (`verified_stmt::SStmt`) as a keyword skeleton whose expression positions
-//! are `verified_minparen::sprint_min(e, 0)` — bare precedence syntax, no
-//! redundant parentheses — and whose clause lists are per-clause spec printers
-//! (select items, FROM join trees, GROUP BY / ORDER BY lists, INSERT rows,
-//! CREATE TABLE columns, the UPDATE assignment). The exec twin
-//! `print_min_stmt` produces a real `Vec<Token>` whose token view refines it.
-//!
-//! The headline theorems:
-//!
-//! - `stmt_min_roundtrip` (spec): for every `printable_stmt` mirror statement,
-//!   `sparse_control(sprint_min_stmt(s)) == (Some(s), empty)` — the statement
-//!   dispatch twin recovers the statement exactly and consumes every token.
-//! - `stmt_min_roundtrip_live` (exec): the production `parse_control_at`
-//!   recovers a printable `ast::Statement` from `print_min_stmt(s)` up to
-//!   `view_stmt`, consuming every token — lifted through phase 6 task 2's
-//!   refinement of the dispatch.
-//!
-//! Printable domain (`printable_stmt`): every embedded expression is
-//! `printable_se`; grammar-mandated one-or-more lists are non-empty (the
-//! select list, INSERT rows and row expressions, an INSERT column list when
-//! present, CREATE TABLE columns); a `SELECT` alias is never on `*`; a join's
-//! right side is a base table and its predicate presence matches the join
-//! type (CROSS has none, the others require one); an UPDATE has exactly one
-//! assignment (`view_stmt` collapses multi-assignment maps to `Unsupported`);
-//! `EXPLAIN` wraps a non-`EXPLAIN` printable statement.
 
-// Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use vstd::prelude::*;
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_expression::{BinaryTag, UnaryTag};
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_production::TokenView;
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_roundtrip::SExpr;
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_stmt::{SColumn, SFrom, SJoinStep, SStmt};
-// Ghost (spec/proof) imports, stripped from non-Verus builds.
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_minparen::{inert, lemma_min, neutral_head, sprint_min, sprint_min_len};
@@ -76,11 +43,7 @@ use std::collections::BTreeMap;
 
 verus! {
 
-// ===========================================================================
-// Printable domain.
-// ===========================================================================
 
-/// An optional expression position is printable when the expression (if any) is.
 pub open spec fn printable_opt_se(o: Option<SExpr>) -> bool {
     match o {
         Some(e) => printable_se(e),
@@ -88,7 +51,6 @@ pub open spec fn printable_opt_se(o: Option<SExpr>) -> bool {
     }
 }
 
-/// Structural all-printable over a plain expression list (GROUP BY, a VALUES row).
 pub open spec fn printable_exprs(items: Seq<SExpr>) -> bool
     decreases items.len(),
 {
@@ -99,8 +61,6 @@ pub open spec fn printable_exprs(items: Seq<SExpr>) -> bool
     }
 }
 
-/// Select-list items: printable expressions, and no alias on `*` (the parser
-/// rejects `SELECT * AS x`).
 pub open spec fn printable_select_items(items: Seq<(SExpr, Option<String>)>) -> bool
     decreases items.len(),
 {
@@ -113,7 +73,6 @@ pub open spec fn printable_select_items(items: Seq<(SExpr, Option<String>)>) -> 
     }
 }
 
-/// ORDER BY items: printable expressions (any direction prints).
 pub open spec fn printable_order_items(items: Seq<(SExpr, ast::Direction)>) -> bool
     decreases items.len(),
 {
@@ -124,7 +83,6 @@ pub open spec fn printable_order_items(items: Seq<(SExpr, ast::Direction)>) -> b
     }
 }
 
-/// INSERT rows: each row is a non-empty printable expression list.
 pub open spec fn printable_rows(rows: Seq<Seq<SExpr>>) -> bool
     decreases rows.len(),
 {
@@ -135,7 +93,6 @@ pub open spec fn printable_rows(rows: Seq<Seq<SExpr>>) -> bool
     }
 }
 
-/// A CREATE TABLE column: only the DEFAULT expression constrains printability.
 pub open spec fn printable_column(c: SColumn) -> bool {
     printable_opt_se(c.default)
 }
@@ -150,8 +107,6 @@ pub open spec fn printable_columns(cols: Seq<SColumn>) -> bool
     }
 }
 
-/// One join step: the right side is a base table, and the predicate presence
-/// matches the join type (CROSS has none; the others require one).
 pub open spec fn printable_step(st: SJoinStep) -> bool {
     (st.right is Table)
     && (if is_cross(st.join_type) {
@@ -171,7 +126,6 @@ pub open spec fn printable_steps(steps: Seq<SJoinStep>) -> bool
     }
 }
 
-/// A FROM item: a left-deep join tree whose right children are base tables.
 pub open spec fn printable_sfrom(f: SFrom) -> bool
     decreases f,
 {
@@ -194,7 +148,6 @@ pub open spec fn printable_froms(fs: Seq<SFrom>) -> bool
     }
 }
 
-/// The domain of the min-parens statement printer.
 pub open spec fn printable_stmt(s: SStmt) -> bool
     decreases s,
 {
@@ -230,16 +183,11 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
     }
 }
 
-// ===========================================================================
-// The spec printer.
-// ===========================================================================
 
-/// Shorthand: a keyword token view.
 pub open spec fn kwv(k: Keyword) -> TokenView {
     TokenView::Keyword(k)
 }
 
-/// `[AS <ident>]` — the printer always spells an alias with `AS`.
 pub open spec fn sprint_alias(alias: Option<String>) -> Seq<TokenView> {
     match alias {
         Some(a) => seq![kwv(Keyword::As), TokenView::Ident(a)],
@@ -247,7 +195,6 @@ pub open spec fn sprint_alias(alias: Option<String>) -> Seq<TokenView> {
     }
 }
 
-/// Comma-separated `<expr> [AS <ident>]` select items.
 pub open spec fn sprint_select_items(items: Seq<(SExpr, Option<String>)>) -> Seq<TokenView>
     decreases items.len(),
 {
@@ -261,7 +208,6 @@ pub open spec fn sprint_select_items(items: Seq<(SExpr, Option<String>)>) -> Seq
     }
 }
 
-/// Comma-separated bare expressions (GROUP BY body, a VALUES row body).
 pub open spec fn sprint_exprs(items: Seq<SExpr>) -> Seq<TokenView>
     decreases items.len(),
 {
@@ -274,7 +220,6 @@ pub open spec fn sprint_exprs(items: Seq<SExpr>) -> Seq<TokenView>
     }
 }
 
-/// The direction keyword — always printed, so the parse recovers it exactly.
 pub open spec fn dir_tok(d: ast::Direction) -> TokenView {
     match d {
         ast::Direction::Ascending => kwv(Keyword::Asc),
@@ -282,7 +227,6 @@ pub open spec fn dir_tok(d: ast::Direction) -> TokenView {
     }
 }
 
-/// Comma-separated `<expr> ASC|DESC` order items.
 pub open spec fn sprint_order_items(items: Seq<(SExpr, ast::Direction)>) -> Seq<TokenView>
     decreases items.len(),
 {
@@ -296,7 +240,6 @@ pub open spec fn sprint_order_items(items: Seq<(SExpr, ast::Direction)>) -> Seq<
     }
 }
 
-/// Optional `KW <expr>` clause (WHERE / HAVING / LIMIT / OFFSET).
 pub open spec fn sprint_kw_expr(k: Keyword, o: Option<SExpr>) -> Seq<TokenView> {
     match o {
         Some(e) => seq![kwv(k)] + sprint_min(e, 0),
@@ -304,7 +247,6 @@ pub open spec fn sprint_kw_expr(k: Keyword, o: Option<SExpr>) -> Seq<TokenView> 
     }
 }
 
-/// Optional `GROUP BY <exprs>` clause (nothing when the list is empty).
 pub open spec fn sprint_group_by(items: Seq<SExpr>) -> Seq<TokenView> {
     if items.len() == 0 {
         Seq::empty()
@@ -313,7 +255,6 @@ pub open spec fn sprint_group_by(items: Seq<SExpr>) -> Seq<TokenView> {
     }
 }
 
-/// Optional `ORDER BY <items>` clause (nothing when the list is empty).
 pub open spec fn sprint_order_by(items: Seq<(SExpr, ast::Direction)>) -> Seq<TokenView> {
     if items.len() == 0 {
         Seq::empty()
@@ -322,8 +263,6 @@ pub open spec fn sprint_order_by(items: Seq<(SExpr, ast::Direction)>) -> Seq<Tok
     }
 }
 
-/// A base table `<ident> [AS <ident>]`. (Empty for a non-table, outside the
-/// printable domain.)
 pub open spec fn sprint_table(f: SFrom) -> Seq<TokenView> {
     match f {
         SFrom::Table { name, alias } => seq![TokenView::Ident(name)] + sprint_alias(alias),
@@ -331,8 +270,6 @@ pub open spec fn sprint_table(f: SFrom) -> Seq<TokenView> {
     }
 }
 
-/// The keyword sequence introducing a join: `JOIN`, `CROSS JOIN`, `LEFT JOIN`,
-/// `RIGHT JOIN` (no `INNER` / `OUTER` spellings — the parse is identical).
 pub open spec fn join_kw_toks(jt: ast::JoinType) -> Seq<TokenView> {
     match jt {
         ast::JoinType::Inner => seq![kwv(Keyword::Join)],
@@ -342,7 +279,6 @@ pub open spec fn join_kw_toks(jt: ast::JoinType) -> Seq<TokenView> {
     }
 }
 
-/// One join step: the join keywords, the right table, and `ON <expr>` unless CROSS.
 pub open spec fn sprint_join_step(st: SJoinStep) -> Seq<TokenView> {
     join_kw_toks(st.join_type) + sprint_table(st.right)
         + (match st.predicate {
@@ -361,8 +297,6 @@ pub open spec fn sprint_join_steps(steps: Seq<SJoinStep>) -> Seq<TokenView>
     }
 }
 
-/// One FROM item: the leftmost base table followed by its join steps (the
-/// printer inverts the parser's left-deep fold via `from_head` / `from_steps`).
 pub open spec fn sprint_from_item(f: SFrom) -> Seq<TokenView> {
     sprint_table(from_head(f)) + sprint_join_steps(from_steps(f))
 }
@@ -379,7 +313,6 @@ pub open spec fn sprint_from_items(fs: Seq<SFrom>) -> Seq<TokenView>
     }
 }
 
-/// Optional `FROM <items>` clause (nothing when the list is empty).
 pub open spec fn sprint_from_clause(fs: Seq<SFrom>) -> Seq<TokenView> {
     if fs.len() == 0 {
         Seq::empty()
@@ -388,8 +321,6 @@ pub open spec fn sprint_from_clause(fs: Seq<SFrom>) -> Seq<TokenView> {
     }
 }
 
-/// The canonical datatype keyword (the parser also accepts aliases; the printer
-/// emits the canonical spelling, which maps back to the same `DataType`).
 pub open spec fn datatype_tok(dt: DataType) -> TokenView {
     match dt {
         DataType::Boolean => kwv(Keyword::Boolean),
@@ -399,8 +330,6 @@ pub open spec fn datatype_tok(dt: DataType) -> TokenView {
     }
 }
 
-/// A column's constraints in canonical order, DEFAULT last (so the DEFAULT
-/// expression is always followed by `,` / `)`, never by a constraint keyword).
 pub open spec fn sprint_constraints(c: SColumn) -> Seq<TokenView> {
     (if c.primary_key {
         seq![kwv(Keyword::Primary), kwv(Keyword::Key)]
@@ -424,7 +353,6 @@ pub open spec fn sprint_constraints(c: SColumn) -> Seq<TokenView> {
     })
 }
 
-/// `<name> <datatype> <constraint>*`.
 pub open spec fn sprint_column(c: SColumn) -> Seq<TokenView> {
     seq![TokenView::Ident(c.name), datatype_tok(c.datatype)] + sprint_constraints(c)
 }
@@ -441,7 +369,6 @@ pub open spec fn sprint_columns(cols: Seq<SColumn>) -> Seq<TokenView>
     }
 }
 
-/// Comma-separated bare identifiers (the INSERT column list body).
 pub open spec fn sprint_idents(names: Seq<String>) -> Seq<TokenView>
     decreases names.len(),
 {
@@ -454,7 +381,6 @@ pub open spec fn sprint_idents(names: Seq<String>) -> Seq<TokenView>
     }
 }
 
-/// One `( <exprs> )` VALUES row.
 pub open spec fn sprint_row(row: Seq<SExpr>) -> Seq<TokenView> {
     seq![TokenView::OpenParen] + sprint_exprs(row) + seq![TokenView::CloseParen]
 }
@@ -471,7 +397,6 @@ pub open spec fn sprint_rows(rows: Seq<Seq<SExpr>>) -> Seq<TokenView>
     }
 }
 
-/// One UPDATE assignment `<ident> = (DEFAULT | <expr>)`.
 pub open spec fn sprint_assign(a: (String, Option<SExpr>)) -> Seq<TokenView> {
     seq![TokenView::Ident(a.0), TokenView::Equal]
         + (match a.1 {
@@ -480,7 +405,6 @@ pub open spec fn sprint_assign(a: (String, Option<SExpr>)) -> Seq<TokenView> {
         })
 }
 
-/// The BEGIN clause tail (everything after the `BEGIN` keyword).
 pub open spec fn sprint_begin_body(read_only: bool, as_of: Option<u64>) -> Seq<TokenView> {
     (if read_only { seq![kwv(Keyword::Read), kwv(Keyword::Only)] } else { Seq::empty() })
     + (match as_of {
@@ -492,7 +416,6 @@ pub open spec fn sprint_begin_body(read_only: bool, as_of: Option<u64>) -> Seq<T
     })
 }
 
-/// The SELECT clause tail (everything after the `SELECT` keyword).
 pub open spec fn sprint_select_body(
     select: Seq<(SExpr, Option<String>)>,
     from: Seq<SFrom>,
@@ -513,9 +436,6 @@ pub open spec fn sprint_select_body(
     + sprint_kw_expr(Keyword::Offset, offset)
 }
 
-/// The min-parens statement printer: a keyword skeleton whose expression
-/// positions are `sprint_min(e, 0)` and whose clause lists are the per-clause
-/// printers above.
 pub open spec fn sprint_min_stmt(s: SStmt) -> Seq<TokenView>
     decreases s,
 {
@@ -563,14 +483,7 @@ pub open spec fn sprint_min_stmt(s: SStmt) -> Seq<TokenView>
     }
 }
 
-// ===========================================================================
-// Head-token facts.
-// ===========================================================================
 
-/// A printed expression never *starts* with a keyword other than the literal /
-/// operator keywords (`NULL`, `TRUE`, `FALSE`, `INFINITY`, `NAN`, `NOT`); in
-/// particular it never starts with `DEFAULT`, which the UPDATE value grammar
-/// checks before trying an expression.
 pub proof fn sprint_min_head_not_default(e: SExpr, ctx: u8)
     requires
         printable_se(e),
@@ -590,7 +503,6 @@ pub proof fn sprint_min_head_not_default(e: SExpr, ctx: u8)
     }
 }
 
-/// Body form of `sprint_min_head_not_default`.
 pub proof fn sprint_body_head_not_default(e: SExpr)
     requires
         printable_se(e),
@@ -651,19 +563,11 @@ pub proof fn sprint_body_head_not_default(e: SExpr)
     }
 }
 
-// ===========================================================================
-// Clause roundtrip lemmas. Each parses its printed clause followed by an
-// arbitrary continuation `tail` whose head satisfies the clause's stop
-// condition, recovering the clause exactly and leaving `tail`.
-// ===========================================================================
 
-/// A continuation that can follow a printed expression at context 0 AND stops
-/// a comma-separated list: empty, or a non-operator head that is not a comma.
 pub open spec fn expr_list_tail(tail: Seq<TokenView>) -> bool {
     tail.len() == 0 || (neutral_head(tail[0]) && tail[0] != TokenView::Comma)
 }
 
-/// An `expr_list_tail` is inert at level 0.
 pub proof fn expr_list_tail_inert(tail: Seq<TokenView>)
     requires
         expr_list_tail(tail),
@@ -672,7 +576,6 @@ pub proof fn expr_list_tail_inert(tail: Seq<TokenView>)
 {
 }
 
-/// GROUP BY / row body: a printed one-or-more expression list parses back.
 pub proof fn lemma_exprs_rt(items: Seq<SExpr>, tail: Seq<TokenView>)
     requires
         printable_exprs(items),
@@ -713,8 +616,6 @@ pub proof fn lemma_exprs_rt(items: Seq<SExpr>, tail: Seq<TokenView>)
     }
 }
 
-/// Select list: a printed one-or-more `<expr> [AS <ident>]` list parses back.
-/// The tail must not look like a (bare-identifier) alias or a comma.
 pub proof fn lemma_select_items_rt(items: Seq<(SExpr, Option<String>)>, tail: Seq<TokenView>)
     requires
         printable_select_items(items),
@@ -742,7 +643,6 @@ pub proof fn lemma_select_items_rt(items: Seq<(SExpr, Option<String>)>, tail: Se
                 }
                 lemma_min(e, 0, atail, expr_fuel(input));
                 assert(sparse_prec(input, 0, expr_fuel(input)) == (Some(e), atail));
-                // Alias resolution: `AS <ident>` consumed, alias recovered.
                 assert(atail.drop_first() =~= seq![TokenView::Ident(a)] + tail);
                 assert((seq![TokenView::Ident(a)] + tail).drop_first() =~= tail);
                 assert(verified_stmt_prec::sparse_control_select_alias(e, atail)
@@ -809,7 +709,6 @@ pub proof fn lemma_select_items_rt(items: Seq<(SExpr, Option<String>)>, tail: Se
     }
 }
 
-/// ORDER BY list: a printed one-or-more `<expr> ASC|DESC` list parses back.
 pub proof fn lemma_order_items_rt(items: Seq<(SExpr, ast::Direction)>, tail: Seq<TokenView>)
     requires
         printable_order_items(items),
@@ -839,7 +738,6 @@ pub proof fn lemma_order_items_rt(items: Seq<(SExpr, ast::Direction)>, tail: Seq
         lemma_min(e, 0, dtail, expr_fuel(input));
         assert(sparse_prec(input, 0, expr_fuel(input)) == (Some(e), dtail));
         assert(dtail.drop_first() =~= tail);
-        // Direction resolution and no trailing comma.
         match d {
             ast::Direction::Ascending => {
                 assert(dtail[0] == kwv(Keyword::Asc));
@@ -881,7 +779,6 @@ pub proof fn lemma_order_items_rt(items: Seq<(SExpr, ast::Direction)>, tail: Seq
     }
 }
 
-/// INSERT column-name list: a printed one-or-more bare-identifier list parses back.
 pub proof fn lemma_idents_rt(names: Seq<String>, tail: Seq<TokenView>)
     requires
         names.len() >= 1,
@@ -913,7 +810,6 @@ pub proof fn lemma_idents_rt(names: Seq<String>, tail: Seq<TokenView>)
     }
 }
 
-/// One VALUES row `( <exprs> )` parses back, leaving the continuation untouched.
 pub proof fn lemma_row_rt(row: Seq<SExpr>, tail: Seq<TokenView>)
     requires
         printable_exprs(row),
@@ -937,7 +833,6 @@ pub proof fn lemma_row_rt(row: Seq<SExpr>, tail: Seq<TokenView>)
     assert(close_tail.drop_first() =~= tail);
 }
 
-/// The VALUES body: a printed one-or-more row list parses back.
 pub proof fn lemma_rows_rt(rows: Seq<Seq<SExpr>>, tail: Seq<TokenView>)
     requires
         printable_rows(rows),
@@ -970,15 +865,11 @@ pub proof fn lemma_rows_rt(rows: Seq<Seq<SExpr>>, tail: Seq<TokenView>)
     }
 }
 
-// ---- CREATE TABLE columns --------------------------------------------------
 
-/// A continuation that ends a column definition: empty, `,`, or `)` (the
-/// constraint loop stops at the first non-keyword token).
 pub open spec fn col_tail(tail: Seq<TokenView>) -> bool {
     tail.len() == 0 || tail[0] == TokenView::Comma || tail[0] == TokenView::CloseParen
 }
 
-/// One-step unfold: `PRIMARY KEY` folds into the accumulator.
 proof fn lemma_colc_pk(t1: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     ensures
         verified_stmt_prec::sparse_control_col_constraints(
@@ -993,7 +884,6 @@ proof fn lemma_colc_pk(t1: Seq<TokenView>, name: String, dt: DataType, acc: veri
     assert(input.drop_first().drop_first() =~= t1);
 }
 
-/// One-step unfold: `NULL` folds into the accumulator.
 proof fn lemma_colc_null(t1: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     requires
         acc.nullable is None,
@@ -1008,7 +898,6 @@ proof fn lemma_colc_null(t1: Seq<TokenView>, name: String, dt: DataType, acc: ve
     assert(input.drop_first() =~= t1);
 }
 
-/// One-step unfold: `NOT NULL` folds into the accumulator.
 proof fn lemma_colc_notnull(t1: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     requires
         acc.nullable is None,
@@ -1025,7 +914,6 @@ proof fn lemma_colc_notnull(t1: Seq<TokenView>, name: String, dt: DataType, acc:
     assert(input.drop_first().drop_first() =~= t1);
 }
 
-/// One-step unfold: `UNIQUE` folds into the accumulator.
 proof fn lemma_colc_unique(t1: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     ensures
         verified_stmt_prec::sparse_control_col_constraints(
@@ -1038,7 +926,6 @@ proof fn lemma_colc_unique(t1: Seq<TokenView>, name: String, dt: DataType, acc: 
     assert(input.drop_first() =~= t1);
 }
 
-/// One-step unfold: `INDEX` folds into the accumulator.
 proof fn lemma_colc_index(t1: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     ensures
         verified_stmt_prec::sparse_control_col_constraints(
@@ -1051,7 +938,6 @@ proof fn lemma_colc_index(t1: Seq<TokenView>, name: String, dt: DataType, acc: v
     assert(input.drop_first() =~= t1);
 }
 
-/// One-step unfold: `REFERENCES <ident>` folds into the accumulator.
 proof fn lemma_colc_refs(
     rname: String,
     t1: Seq<TokenView>,
@@ -1072,8 +958,6 @@ proof fn lemma_colc_refs(
     assert(input.drop_first().drop_first() =~= t1);
 }
 
-/// One-step unfold: `DEFAULT <expr>` parses the expression (min-parens) and
-/// folds it into the accumulator.
 proof fn lemma_colc_default(
     e: SExpr,
     tail: Seq<TokenView>,
@@ -1099,8 +983,6 @@ proof fn lemma_colc_default(
     assert(sparse_prec(e_in, 0, expr_fuel(e_in)) == (Some(e), tail));
 }
 
-/// The constraint loop stops at a non-keyword tail, yielding the accumulated
-/// column.
 proof fn lemma_colc_stop(tail: Seq<TokenView>, name: String, dt: DataType, acc: verified_stmt_prec::ColAcc)
     requires
         col_tail(tail),
@@ -1110,10 +992,6 @@ proof fn lemma_colc_stop(tail: Seq<TokenView>, name: String, dt: DataType, acc: 
 {
 }
 
-/// The printed constraint chain parses from the empty accumulator back to the
-/// column, stopping at the tail. The printer's canonical order (PRIMARY KEY,
-/// NULL/NOT NULL, UNIQUE, INDEX, REFERENCES, DEFAULT) is one of the arbitrary
-/// orders the any-order constraint loop accepts.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(200000)]
 pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
@@ -1165,7 +1043,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
     let acc5 = verified_stmt_prec::ColAcc { references: c.references, ..acc4 };
     let acc6 = verified_stmt_prec::ColAcc { default: c.default, ..acc5 };
 
-    // PRIMARY KEY.
     if c.primary_key {
         assert(t0 =~= seq![kwv(Keyword::Primary), kwv(Keyword::Key)] + t1);
         lemma_colc_pk(t1, name, dt, acc0);
@@ -1177,7 +1054,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         assert(acc1 == acc0);
     }
 
-    // NULL / NOT NULL.
     match c.nullable {
         Some(b) => {
             assert(acc1.nullable is None);
@@ -1199,7 +1075,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         },
     }
 
-    // UNIQUE.
     if c.unique {
         assert(t2 =~= seq![kwv(Keyword::Unique)] + t3);
         lemma_colc_unique(t3, name, dt, acc2);
@@ -1211,7 +1086,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         assert(acc3 == acc2);
     }
 
-    // INDEX.
     if c.index {
         assert(t3 =~= seq![kwv(Keyword::Index)] + t4);
         lemma_colc_index(t4, name, dt, acc3);
@@ -1223,7 +1097,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         assert(acc4 == acc3);
     }
 
-    // REFERENCES <ident>.
     match c.references {
         Some(rname) => {
             assert(t4 =~= seq![kwv(Keyword::References), TokenView::Ident(rname)] + t5);
@@ -1238,7 +1111,6 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         },
     }
 
-    // DEFAULT <expr>.
     match c.default {
         Some(e) => {
             assert(t5 =~= seq![kwv(Keyword::Default)] + (sprint_min(e, 0) + tail));
@@ -1258,12 +1130,10 @@ pub proof fn lemma_constraints_rt(c: SColumn, tail: Seq<TokenView>)
         },
     }
 
-    // Stop at the tail (empty or a non-keyword `,` / `)`).
     lemma_colc_stop(tail, name, dt, acc6);
     assert(verified_stmt_prec::col_from_acc(name, dt, acc6) == c);
 }
 
-/// One printed column `<name> <datatype> <constraint>*` parses back.
 pub proof fn lemma_column_rt(c: SColumn, tail: Seq<TokenView>)
     requires
         printable_column(c),
@@ -1294,7 +1164,6 @@ pub proof fn lemma_column_rt(c: SColumn, tail: Seq<TokenView>)
         r1, c.name, c.datatype, verified_stmt_prec::col_acc_empty()) == (Some(c), tail));
 }
 
-/// The printed one-or-more column list parses back.
 pub proof fn lemma_columns_rt(cols: Seq<SColumn>, tail: Seq<TokenView>)
     requires
         printable_columns(cols),
@@ -1328,9 +1197,7 @@ pub proof fn lemma_columns_rt(cols: Seq<SColumn>, tail: Seq<TokenView>)
     }
 }
 
-// ---- FROM join trees --------------------------------------------------------
 
-/// The leftmost leaf of any `SFrom` tree is a base table.
 pub proof fn lemma_from_head_is_table(f: SFrom)
     ensures
         from_head(f) is Table,
@@ -1344,8 +1211,6 @@ pub proof fn lemma_from_head_is_table(f: SFrom)
     }
 }
 
-/// `fold_joins` peels an appended step: `fold(h, steps ++ [st]) ==
-/// apply_step(fold(h, steps), st)`.
 pub proof fn lemma_fold_append(head: SFrom, steps: Seq<SJoinStep>, st: SJoinStep)
     ensures
         fold_joins(head, steps + seq![st]) == apply_step(fold_joins(head, steps), st),
@@ -1362,8 +1227,6 @@ pub proof fn lemma_fold_append(head: SFrom, steps: Seq<SJoinStep>, st: SJoinStep
     }
 }
 
-/// `from_head` / `from_steps` invert the fold: every tree is its head folded
-/// through its steps.
 pub proof fn lemma_fold_head_steps(f: SFrom)
     ensures
         fold_joins(from_head(f), from_steps(f)) == f,
@@ -1384,7 +1247,6 @@ pub proof fn lemma_fold_head_steps(f: SFrom)
     }
 }
 
-/// `printable_steps` distributes over append.
 pub proof fn lemma_printable_steps_append(a: Seq<SJoinStep>, b: Seq<SJoinStep>)
     requires
         printable_steps(a),
@@ -1402,7 +1264,6 @@ pub proof fn lemma_printable_steps_append(a: Seq<SJoinStep>, b: Seq<SJoinStep>)
     }
 }
 
-/// A printable tree's step decomposition is printable.
 pub proof fn lemma_steps_printable(f: SFrom)
     requires
         printable_sfrom(f),
@@ -1429,13 +1290,10 @@ pub proof fn lemma_steps_printable(f: SFrom)
     }
 }
 
-/// A continuation that can follow a printed base table when its alias may be
-/// absent: never `AS` or a bare identifier (which the alias grammar would eat).
 pub open spec fn table_tail(rest: Seq<TokenView>) -> bool {
     rest.len() == 0 || (rest[0] != kwv(Keyword::As) && !(rest[0] is Ident))
 }
 
-/// A printed base table `<ident> [AS <ident>]` parses back.
 pub proof fn lemma_from_table_rt(f: SFrom, rest: Seq<TokenView>)
     requires
         f is Table,
@@ -1470,14 +1328,10 @@ pub proof fn lemma_from_table_rt(f: SFrom, rest: Seq<TokenView>)
     }
 }
 
-/// A continuation that can follow a printed join step: a non-operator head
-/// that is not `AS` / an identifier (for the right table's absent alias).
 pub open spec fn step_tail(rest: Seq<TokenView>) -> bool {
     rest.len() == 0 || (neutral_head(rest[0]) && rest[0] != kwv(Keyword::As) && !(rest[0] is Ident))
 }
 
-/// The head of a printed join step is a join keyword (and thus a neutral,
-/// non-alias head for the preceding table / step).
 pub proof fn lemma_join_step_head(st: SJoinStep)
     ensures
         sprint_join_step(st).len() > 0,
@@ -1504,7 +1358,6 @@ pub proof fn lemma_join_step_head(st: SJoinStep)
     }
 }
 
-/// One printed join step parses back.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(600000)]
 pub proof fn lemma_join_step_rt(st: SJoinStep, rest: Seq<TokenView>)
@@ -1524,7 +1377,6 @@ pub proof fn lemma_join_step_rt(st: SJoinStep, rest: Seq<TokenView>)
     let tbl_rest = on_part + rest;
     let after_kw = sprint_table(st.right) + tbl_rest;
     assert(input =~= join_kw_toks(jt) + after_kw);
-    // The join keyword sequence resolves to the join type.
     match jt {
         ast::JoinType::Inner => {
             assert(input[0] == kwv(Keyword::Join));
@@ -1559,7 +1411,6 @@ pub proof fn lemma_join_step_rt(st: SJoinStep, rest: Seq<TokenView>)
                 == Some((ast::JoinType::Right, true, after_kw)));
         },
     }
-    // The right table.
     assert(table_tail(tbl_rest)) by {
         match st.predicate {
             Some(e) => {
@@ -1572,7 +1423,6 @@ pub proof fn lemma_join_step_rt(st: SJoinStep, rest: Seq<TokenView>)
     }
     lemma_from_table_rt(st.right, tbl_rest);
     assert(verified_stmt_prec::sparse_control_from_table(after_kw) == (Some(st.right), tbl_rest));
-    // The ON predicate (unless CROSS).
     match st.predicate {
         Some(e) => {
             assert(!is_cross(jt));
@@ -1593,15 +1443,12 @@ pub proof fn lemma_join_step_rt(st: SJoinStep, rest: Seq<TokenView>)
     }
 }
 
-/// A continuation that stops the join fold: not a join keyword, and safe after
-/// a printed table / ON expression.
 pub open spec fn joins_tail(rest: Seq<TokenView>) -> bool {
     rest.len() == 0
         || (neutral_head(rest[0]) && rest[0] != kwv(Keyword::As) && !(rest[0] is Ident)
             && !verified_stmt_prec::is_join_start(rest))
 }
 
-/// The printed join steps replay the left-deep fold.
 pub proof fn lemma_join_steps_rt(acc: SFrom, steps: Seq<SJoinStep>, rest: Seq<TokenView>)
     requires
         printable_steps(steps),
@@ -1641,7 +1488,6 @@ pub proof fn lemma_join_steps_rt(acc: SFrom, steps: Seq<SJoinStep>, rest: Seq<To
     }
 }
 
-/// One printed FROM item (base table + join steps) parses back.
 pub proof fn lemma_from_item_rt(f: SFrom, rest: Seq<TokenView>)
     requires
         printable_sfrom(f),
@@ -1675,12 +1521,10 @@ pub proof fn lemma_from_item_rt(f: SFrom, rest: Seq<TokenView>)
     assert(fold_joins(head, steps) == f);
 }
 
-/// A continuation that stops the FROM item list: `joins_tail` and not a comma.
 pub open spec fn from_list_tail(rest: Seq<TokenView>) -> bool {
     joins_tail(rest) && (rest.len() == 0 || rest[0] != TokenView::Comma)
 }
 
-/// The printed one-or-more FROM item list parses back.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 pub proof fn lemma_from_items_rt(fs: Seq<SFrom>, rest: Seq<TokenView>)
@@ -1720,7 +1564,6 @@ pub proof fn lemma_from_items_rt(fs: Seq<SFrom>, rest: Seq<TokenView>)
     }
 }
 
-/// The optional printed FROM clause parses back.
 pub proof fn lemma_from_clause_rt(fs: Seq<SFrom>, rest: Seq<TokenView>)
     requires
         printable_froms(fs),
@@ -1741,9 +1584,7 @@ pub proof fn lemma_from_clause_rt(fs: Seq<SFrom>, rest: Seq<TokenView>)
     }
 }
 
-// ---- optional keyword-expression clauses and clause wrappers ----------------
 
-/// The optional printed `KW <expr>` clause parses back.
 pub proof fn lemma_kw_expr_rt(k: Keyword, o: Option<SExpr>, rest: Seq<TokenView>)
     requires
         printable_opt_se(o),
@@ -1770,7 +1611,6 @@ pub proof fn lemma_kw_expr_rt(k: Keyword, o: Option<SExpr>, rest: Seq<TokenView>
     }
 }
 
-/// The optional printed GROUP BY clause parses back.
 pub proof fn lemma_group_by_rt(items: Seq<SExpr>, rest: Seq<TokenView>)
     requires
         printable_exprs(items),
@@ -1795,7 +1635,6 @@ pub proof fn lemma_group_by_rt(items: Seq<SExpr>, rest: Seq<TokenView>)
     }
 }
 
-/// The optional printed ORDER BY clause parses back.
 pub proof fn lemma_order_by_rt(items: Seq<(SExpr, ast::Direction)>, rest: Seq<TokenView>)
     requires
         printable_order_items(items),
@@ -1820,7 +1659,6 @@ pub proof fn lemma_order_by_rt(items: Seq<(SExpr, ast::Direction)>, rest: Seq<To
     }
 }
 
-/// One printed UPDATE assignment `<ident> = (DEFAULT | <expr>)` parses back.
 pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
     requires
         printable_opt_se(a.1),
@@ -1861,11 +1699,7 @@ pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
     }
 }
 
-// ===========================================================================
-// Task 4 — per-statement body roundtrips and the headline spec theorem.
-// ===========================================================================
 
-/// The printed BEGIN clause tail parses back.
 pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
     ensures
         verified_stmt_prec::sparse_control_begin(sprint_begin_body(read_only, as_of))
@@ -1879,7 +1713,6 @@ pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
         None => Seq::empty(),
     };
     let input = sprint_begin_body(read_only, as_of);
-    // No TRANSACTION printed: the head (READ / AS / nothing) is not TRANSACTION.
     if read_only {
         assert(input =~= seq![kwv(Keyword::Read), kwv(Keyword::Only)] + asof_part);
         assert(input[0] == kwv(Keyword::Read));
@@ -1897,7 +1730,6 @@ pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
             },
         }
     }
-    // The AS OF SYSTEM TIME chain (when present) recovers the version.
     match as_of {
         Some(v) => {
             assert(asof_part[0] == kwv(Keyword::As));
@@ -1915,7 +1747,6 @@ pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
     }
 }
 
-/// The printed DROP TABLE clause tail parses back.
 pub proof fn lemma_drop_body_rt(name: String, if_exists: bool)
     ensures
         verified_stmt_prec::sparse_control_drop(
@@ -1949,7 +1780,6 @@ pub proof fn lemma_drop_body_rt(name: String, if_exists: bool)
     }
 }
 
-/// The printed DELETE clause tail parses back.
 pub proof fn lemma_delete_body_rt(table: String, where_clause: Option<SExpr>)
     requires
         printable_opt_se(where_clause),
@@ -1982,7 +1812,6 @@ pub proof fn lemma_delete_body_rt(table: String, where_clause: Option<SExpr>)
     }
 }
 
-/// The printed CREATE TABLE clause tail parses back.
 pub proof fn lemma_create_body_rt(name: String, columns: Seq<SColumn>)
     requires
         columns.len() >= 1,
@@ -2009,7 +1838,6 @@ pub proof fn lemma_create_body_rt(name: String, columns: Seq<SColumn>)
     assert(close.drop_first() =~= Seq::<TokenView>::empty());
 }
 
-/// The printed INSERT clause tail parses back.
 pub proof fn lemma_insert_body_rt(
     table: String,
     columns: Option<Seq<String>>,
@@ -2040,7 +1868,6 @@ pub proof fn lemma_insert_body_rt(
     };
     let vtail = seq![kwv(Keyword::Values)] + sprint_rows(values);
     let input = seq![kwv(Keyword::Into), TokenView::Ident(table)] + colpart + vtail;
-    // Link the ensures' left-associated concatenation to `input`.
     assert(seq![kwv(Keyword::Into), TokenView::Ident(table)] + colpart
         + seq![kwv(Keyword::Values)] + sprint_rows(values) =~= input);
     assert(input[0] == kwv(Keyword::Into));
@@ -2048,7 +1875,6 @@ pub proof fn lemma_insert_body_rt(
     assert(r0[0] == TokenView::Ident(table));
     let r1 = r0.drop_first();
     assert(r1 =~= colpart + vtail);
-    // The optional column list.
     match columns {
         Some(cols) => {
             assert(r1 =~= seq![TokenView::OpenParen]
@@ -2071,7 +1897,6 @@ pub proof fn lemma_insert_body_rt(
                 == Some((None::<Seq<String>>, vtail)));
         },
     }
-    // VALUES and the rows.
     assert(vtail[0] == kwv(Keyword::Values));
     assert(vtail.drop_first() =~= sprint_rows(values) + Seq::<TokenView>::empty());
     lemma_rows_rt(values, Seq::<TokenView>::empty());
@@ -2079,8 +1904,6 @@ pub proof fn lemma_insert_body_rt(
         == (Some(values), Seq::<TokenView>::empty()));
 }
 
-/// The printed UPDATE clause tail parses back (single assignment: the printable
-/// domain, matching `view_stmt`'s singleton bridge).
 pub proof fn lemma_update_body_rt(
     table: String,
     set: Seq<(String, Option<SExpr>)>,
@@ -2103,7 +1926,6 @@ pub proof fn lemma_update_body_rt(
     assert(r0[0] == kwv(Keyword::Set));
     let r1 = r0.drop_first();
     assert(r1 =~= sprint_assign(set[0]) + wpart);
-    // The single assignment; the continuation is `WHERE ...` or empty.
     assert(wpart.len() == 0 || (neutral_head(wpart[0]) && wpart[0] != TokenView::Comma)) by {
         match where_clause {
             Some(e) => {
@@ -2125,7 +1947,6 @@ pub proof fn lemma_update_body_rt(
     assert(verified_stmt_prec::sparse_control_assign_list(r1) == (Some(seq![set[0]]), wpart));
     let items = seq![set[0]];
     assert(verified_stmt_prec::assign_keys_distinct(items));
-    // The optional WHERE.
     match where_clause {
         Some(e) => {
             assert(wpart =~= seq![kwv(Keyword::Where)] + sprint_min(e, 0));
@@ -2141,7 +1962,6 @@ pub proof fn lemma_update_body_rt(
             assert(wpart.len() == 0);
         },
     }
-    // The singleton boundary map yields exactly the statement.
     assert(verified_stmt_prec::assign_list_to_sstmt(table, items, where_clause)
         == SStmt::Update { table, set, where_clause }) by {
         assert(items[0] == set[0]);
@@ -2150,7 +1970,6 @@ pub proof fn lemma_update_body_rt(
     }
 }
 
-/// The printed SELECT clause tail parses back through the composed clause twin.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 pub proof fn lemma_select_body_rt(
@@ -2195,7 +2014,6 @@ pub proof fn lemma_select_body_rt(
     assert(sprint_select_body(select, from, where_clause, group_by, having, order_by, limit,
         offset) =~= body);
 
-    // Heads of the successive suffixes: each is empty or a later clause keyword.
     assert(t7.len() == 0 || t7[0] == kwv(Keyword::Offset)) by {
         match offset {
             Some(e) => {
@@ -2267,13 +2085,11 @@ pub proof fn lemma_select_body_rt(
         }
     }
 
-    // The clause keywords are all neutral, non-comma, non-alias, non-join heads.
     assert(neutral_head(kwv(Keyword::From)) && neutral_head(kwv(Keyword::Where))
         && neutral_head(kwv(Keyword::Group)) && neutral_head(kwv(Keyword::Having))
         && neutral_head(kwv(Keyword::Order)) && neutral_head(kwv(Keyword::Limit))
         && neutral_head(kwv(Keyword::Offset)));
 
-    // Chain the clause roundtrips.
     lemma_select_items_rt(select, t1);
     assert(verified_stmt_prec::sparse_control_select_list(body) == (Some(select), t1));
     lemma_from_clause_rt(from, t2);
@@ -2294,8 +2110,6 @@ pub proof fn lemma_select_body_rt(
     assert(verified_stmt_prec::sparse_control_kw_expr(t7, Keyword::Offset) == (Some(offset), t8));
 }
 
-/// A printable non-EXPLAIN statement's print never begins with `EXPLAIN` (the
-/// nested-EXPLAIN guard of the dispatch twin).
 pub proof fn lemma_stmt_head_not_explain(s: SStmt)
     requires
         printable_stmt(s),
@@ -2333,17 +2147,6 @@ pub proof fn lemma_stmt_head_not_explain(s: SStmt)
     }
 }
 
-/// HEADLINE (task 4, spec level): the min-parens print of any printable mirror
-/// statement re-parses through the statement dispatch twin to exactly that
-/// statement, consuming every token:
-///
-///   sparse_control(sprint_min_stmt(s)) == (Some(s), empty)
-///
-/// Because every expression position prints via `sprint_min` (bare precedence
-/// syntax) and every clause list prints without redundant delimiters, this
-/// pins the statement grammar's keyword skeleton, clause sequencing, list
-/// separators, join folding, and the full precedence/associativity table,
-/// end to end.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(200000)]
 pub proof fn stmt_min_roundtrip(s: SStmt)
@@ -2446,12 +2249,7 @@ pub proof fn stmt_min_roundtrip(s: SStmt)
     }
 }
 
-// ===========================================================================
-// Task 3 remainder — the executable statement printer, refining
-// `sprint_min_stmt` at the token-view level.
-// ===========================================================================
 
-/// Push one token, tracking the token view.
 fn push_tok(out: &mut Vec<Token>, t: Token)
     ensures
         verified_production::token_views(final(out)@)
@@ -2470,7 +2268,6 @@ fn push_tok(out: &mut Vec<Token>, t: Token)
     }
 }
 
-/// Append a token vector, tracking the token views.
 fn append_toks(out: &mut Vec<Token>, more: Vec<Token>)
     ensures
         verified_production::token_views(final(out)@)
@@ -2487,7 +2284,6 @@ fn append_toks(out: &mut Vec<Token>, more: Vec<Token>)
     }
 }
 
-/// `view_select_list` length.
 pub proof fn lemma_view_select_list_len(items: Seq<(ast::Expression, Option<String>)>)
     ensures
         verified_stmt::view_select_list(items).len() == items.len(),
@@ -2498,7 +2294,6 @@ pub proof fn lemma_view_select_list_len(items: Seq<(ast::Expression, Option<Stri
     }
 }
 
-/// `view_order_list` length.
 pub proof fn lemma_view_order_list_len(items: Seq<(ast::Expression, ast::Direction)>)
     ensures
         verified_stmt::view_order_list(items).len() == items.len(),
@@ -2509,7 +2304,6 @@ pub proof fn lemma_view_order_list_len(items: Seq<(ast::Expression, ast::Directi
     }
 }
 
-/// `view_rows` length.
 pub proof fn lemma_view_rows_len(rows: Seq<Vec<ast::Expression>>)
     ensures
         verified_stmt::view_rows(rows).len() == rows.len(),
@@ -2520,7 +2314,6 @@ pub proof fn lemma_view_rows_len(rows: Seq<Vec<ast::Expression>>)
     }
 }
 
-/// `view_columns` length.
 pub proof fn lemma_view_columns_len(cols: Seq<ast::Column>)
     ensures
         verified_stmt::view_columns(cols).len() == cols.len(),
@@ -2531,7 +2324,6 @@ pub proof fn lemma_view_columns_len(cols: Seq<ast::Column>)
     }
 }
 
-/// `view_froms` length.
 pub proof fn lemma_view_froms_len(fs: Seq<ast::From>)
     ensures
         verified_stmt::view_froms(fs).len() == fs.len(),
@@ -2542,7 +2334,6 @@ pub proof fn lemma_view_froms_len(fs: Seq<ast::From>)
     }
 }
 
-/// Exec printer for a comma-separated expression list.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn print_exprs_slice(s: &[ast::Expression]) -> (r: Vec<Token>)
@@ -2586,7 +2377,6 @@ fn print_exprs_slice(s: &[ast::Expression]) -> (r: Vec<Token>)
     }
 }
 
-/// Exec printer for the select list.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(150000)]
 fn print_select_items_slice(s: &[(ast::Expression, Option<String>)]) -> (r: Vec<Token>)
@@ -2647,7 +2437,6 @@ fn print_select_items_slice(s: &[(ast::Expression, Option<String>)]) -> (r: Vec<
     }
 }
 
-/// Exec printer for the ORDER BY list.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(150000)]
 fn print_order_items_slice(s: &[(ast::Expression, ast::Direction)]) -> (r: Vec<Token>)
@@ -2703,7 +2492,6 @@ fn print_order_items_slice(s: &[(ast::Expression, ast::Direction)]) -> (r: Vec<T
     }
 }
 
-/// Exec printer for the INSERT column-name list.
 fn print_idents_slice(s: &[String]) -> (r: Vec<Token>)
     requires
         s@.len() >= 1,
@@ -2735,7 +2523,6 @@ fn print_idents_slice(s: &[String]) -> (r: Vec<Token>)
     }
 }
 
-/// Exec printer for the VALUES rows.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(150000)]
 fn print_rows_slice(s: &[Vec<ast::Expression>]) -> (r: Vec<Token>)
@@ -2784,7 +2571,6 @@ fn print_rows_slice(s: &[Vec<ast::Expression>]) -> (r: Vec<Token>)
     }
 }
 
-/// Exec printer for one CREATE TABLE column.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(300000)]
 fn print_column_toks(c: &ast::Column) -> (r: Vec<Token>)
@@ -2890,7 +2676,6 @@ fn print_column_toks(c: &ast::Column) -> (r: Vec<Token>)
     r
 }
 
-/// Exec printer for the CREATE TABLE column list.
 fn print_columns_slice(s: &[ast::Column]) -> (r: Vec<Token>)
     requires
         s@.len() >= 1,
@@ -2930,7 +2715,6 @@ fn print_columns_slice(s: &[ast::Column]) -> (r: Vec<Token>)
     }
 }
 
-/// `sprint_join_steps` distributes over append.
 pub proof fn lemma_sprint_join_steps_append(a: Seq<SJoinStep>, b: Seq<SJoinStep>)
     ensures
         sprint_join_steps(a + b) == sprint_join_steps(a) + sprint_join_steps(b),
@@ -2950,8 +2734,6 @@ pub proof fn lemma_sprint_join_steps_append(a: Seq<SJoinStep>, b: Seq<SJoinStep>
     }
 }
 
-/// The print of a join tree decomposes into the left subtree's print followed
-/// by the topmost step's print.
 pub proof fn lemma_sprint_from_item_join(
     left: SFrom,
     right: SFrom,
@@ -2979,7 +2761,6 @@ pub proof fn lemma_sprint_from_item_join(
             + sprint_join_step(st));
 }
 
-/// Exec printer for one FROM item (a left-deep join tree).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(300000)]
 fn print_from_item_toks(f: &ast::From) -> (r: Vec<Token>)
@@ -3046,7 +2827,6 @@ fn print_from_item_toks(f: &ast::From) -> (r: Vec<Token>)
                 assert(verified_production::token_views(r@)
                     =~= sprint_from_item(vleft) + join_kw_toks(*join_type));
             }
-            // The right side is a base table in the printable domain.
             match &**right {
                 ast::From::Table { name, alias } => {
                     push_tok(&mut r, Token::Ident(name.clone()));
@@ -3096,7 +2876,6 @@ fn print_from_item_toks(f: &ast::From) -> (r: Vec<Token>)
     }
 }
 
-/// Exec printer for the FROM item list.
 fn print_from_items_slice(s: &[ast::From]) -> (r: Vec<Token>)
     requires
         s@.len() >= 1,
@@ -3136,8 +2915,6 @@ fn print_from_items_slice(s: &[ast::From]) -> (r: Vec<Token>)
     }
 }
 
-/// The UPDATE arm of the statement printer, split out so each spinoff query
-/// stays within the solver's reach.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 fn print_min_update_stmt(
@@ -3158,8 +2935,6 @@ fn print_min_update_stmt(
 
         verified_stmt::axiom_string_obeys_cmp();
         assert(vstd::std_specs::btree::key_obeys_cmp_spec::<String>());
-        // In the printable domain the assignment map is a singleton (otherwise
-        // `view_update_arm` yields `Unsupported`, which is not printable).
         if set@.dom().len() != 1 {
             assert(vs == SStmt::Unsupported);
             assert(false);
@@ -3184,7 +2959,6 @@ fn print_min_update_stmt(
         broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
 
         assert(rem0.len() == set@.dom().len());
-        // The sole pair in `remaining` is `(k0, set@[k0])`.
         assert(set@.dom().contains(k0)) by {
             assert(rem0.len() == 1);
             assert(set@.contains_key(*rem0[0].0));
@@ -3256,8 +3030,6 @@ fn print_min_update_stmt(
     r
 }
 
-/// The SELECT arm of the statement printer, split out so each spinoff query
-/// stays within the solver's reach.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(600000)]
 fn print_min_select_stmt(
@@ -3410,9 +3182,6 @@ fn print_min_select_stmt(
     r
 }
 
-/// The executable min-parens statement printer: a real `Vec<Token>` whose
-/// token view is `sprint_min_stmt(view_stmt(*s))` — the spec printer applied
-/// to the statement's mirror.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
@@ -3614,22 +3383,7 @@ pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
     }
 }
 
-// ===========================================================================
-// Task 4 remainder — the live statement roundtrip over the executable printer.
-// ===========================================================================
 
-/// HEADLINE (task 4, live): the production statement parser recovers a
-/// printable statement from its executable min-parens print, up to
-/// `view_stmt`, consuming every token:
-///
-///   parse_control_at(print_min_stmt(s), 0)
-///       == (Some(s'), print_min_stmt(s).len(), _)  with view_stmt(s') == view_stmt(s).
-///
-/// This lifts `stmt_min_roundtrip` (a `sparse_control` fact) through phase 6
-/// task 2's refinement of the dispatch to the live code path: the whole
-/// statement grammar — keyword skeleton, clause sequencing, list separators,
-/// join folding, and the precedence/associativity table in every expression
-/// position — provably inverts the min-parens printer.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 pub fn stmt_min_roundtrip_live(s: &ast::Statement) -> (r: (
@@ -3669,4 +3423,4 @@ pub fn stmt_min_roundtrip_live(s: &ast::Statement) -> (r: (
     (opt, pos, err)
 }
 
-} // verus!
+}

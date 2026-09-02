@@ -31,40 +31,6 @@ impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        // The input is lexed up front into a buffered token vector, and the
-        // Verus-verified concrete parser (`verified_control::parse_control_at`)
-        // runs at the cursor over every statement kind, clause, and expression;
-        // it also produces the rejection error. There is no recursive-descent
-        // fallback in production — the legacy `StreamingParser` methods are
-        // compiled only under `#[cfg(test)]`, as the differential oracle, and
-        // fire solely for the streaming/slice test token sources.
-        //
-        // What Verus actually proves about that parser (do not overstate it):
-        //   * no panic, no arithmetic overflow, and termination — everywhere,
-        //     across the whole statement + expression grammar;
-        //   * a *functional* specification (refinement to the `sparse_prec`
-        //     precedence-climbing model) at the expression level, and — as of
-        //     phase 2 (2026-08-31, including UPDATE) and phase 6 (2026-09-02)
-        //     — on EVERY statement parser: each clause parser
-        //     (`parse_delete_at`, `parse_drop_at`, `parse_begin_at`,
-        //     `parse_update_at`, `parse_order_by_at`, `parse_group_by_at`, the
-        //     `CREATE TABLE` pair, the `SELECT` list, `parse_insert_at`, the
-        //     `FROM` join tree), the composed `parse_select_at`, and the
-        //     top-level dispatch `parse_control_at` / `parse_explain_at`
-        //     refine the `sparse_control*` twins in `verified_stmt_prec` up to
-        //     `view_stmt` (a dispatch swap now fails verification);
-        //   * print/parse round-trips: the fully-parenthesised printer
-        //     (`verified_roundtrip`), the minimal-parenthesisation expression
-        //     printer (`verified_minparen::min_roundtrip_live`), and — phase 6
-        //     — the minimal-parenthesisation *statement* printer
-        //     (`verified_minparen_stmt::stmt_min_roundtrip_live`):
-        //     `parse_control_at(print_min_stmt(s))` recovers `s` up to
-        //     `view_stmt`, consuming every token, for every printable
-        //     statement;
-        //   * outside the printable domain (e.g. multi-assignment UPDATEs at
-        //     the `view_stmt` boundary), the intended AST is pinned by the
-        //     goldenscript suite and the (test-only) differential harness
-        //     against the legacy oracle.
         let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
@@ -74,8 +40,6 @@ impl Parser {
         Ok(statement)
     }
 
-    /// The legacy statement parser (streaming, fully recursive-descent
-    /// expressions), retained as the differential oracle for the cutover.
     #[cfg(test)]
     pub(crate) fn parse_legacy(statement: &str) -> Result<ast::Statement> {
         let mut parser = StreamingParser::new(TokenStream::new(statement));
@@ -89,12 +53,6 @@ impl Parser {
 
     /// Parse the input string into a SQL expression AST. The entire string must
     /// be parsed as a single expression. Only used in tests.
-    ///
-    /// Fully cut over to the Verus-verified precedence parser
-    /// ([`verified_precedence::parse_expression_full`], proven to invert the
-    /// canonical printer): it produces both the AST and, on rejection, the
-    /// structured `ParseError` rendered to the production error string. No legacy
-    /// fallback.
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
         let tokens: Vec<Token> = super::Lexer::new(expr).collect::<Result<_>>()?;
@@ -107,8 +65,6 @@ impl Parser {
         }
     }
 
-    /// The legacy recursive-descent expression parser, retained as the oracle for
-    /// the differential harness that gates the [`Parser::parse_expr`] cutover.
     #[cfg(test)]
     pub(crate) fn parse_expr_legacy(expr: &str) -> Result<ast::Expression> {
         let mut parser = StreamingParser::new(TokenStream::new(expr));
@@ -209,9 +165,6 @@ impl<S: PeekStream> StreamingParser<S> {
 
     /// Parses a SQL statement.
     fn parse_statement(&mut self) -> Result<ast::Statement> {
-        // Production cutover: over a buffered stream, the Verus-verified concrete
-        // statement parser handles every kind and produces the rejection error
-        // itself (rendered from its structured `ParseError`). No legacy fallback.
         if let Some((tokens, pos)) = self.stream.buffer() {
             let (opt, consumed, perr) = verified_control::parse_control_at(tokens, pos);
             match opt {
@@ -227,7 +180,6 @@ impl<S: PeekStream> StreamingParser<S> {
             }
         }
 
-        // Streaming/slice source (test oracle only): legacy recursive-descent.
         let Some(token) = self.peek()? else {
             return errinput!("unexpected end of input");
         };
@@ -726,11 +678,6 @@ impl<S: PeekStream> StreamingParser<S> {
     ///   op = parse_infix_operator(prec=0) = None (end of expression)
     ///   return lhs = ((2 ^ (3 ^ 2)) - (4 * 3))
     fn parse_expression(&mut self) -> Result<ast::Expression> {
-        // Cutover: over a buffered stream, parse the expression at the cursor with
-        // the Verus-verified position-based precedence parser and advance the
-        // cursor by what it consumed. `parse_expression_at` stops at the first
-        // token that cannot extend the expression (a clause keyword, `)`, `,`, …),
-        // matching the legacy streaming parser (the differential harness gates it).
         let verified = if let Some((tokens, pos)) = self.stream.buffer() {
             let fuel = 2usize.saturating_mul(tokens.len().saturating_sub(pos)).saturating_add(3);
             Some(verified_precedence::parse_expression_at(tokens, pos, 0, fuel))
@@ -741,9 +688,6 @@ impl<S: PeekStream> StreamingParser<S> {
             self.stream.set_pos(consumed);
             return Ok(expression);
         }
-        // Streaming source, or the verified parser found no expression at the
-        // cursor (it rejects exactly where legacy does): use the legacy path,
-        // which also produces the specific rejection error.
         self.parse_expression_at(0)
     }
 

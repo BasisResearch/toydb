@@ -11,29 +11,19 @@ pub(crate) trait PeekStream {
     /// Returns and consumes the next token.
     fn next(&mut self) -> Result<Option<Token>>;
 
-    /// For a fully-buffered source, the whole token vector and the current
-    /// position — enabling the position-based Verus-verified expression parser to
-    /// run at the cursor. Streaming sources (which can't provide a stable
-    /// `&Vec<Token>`) return `None`, and the parser uses its legacy streaming path.
     fn buffer(&self) -> Option<(&Vec<Token>, usize)> {
         None
     }
 
-    /// Repositions a buffered source's cursor (paired with [`buffer`]). No-op for
-    /// streaming sources.
     fn set_pos(&mut self, _pos: usize) {}
 }
 
-/// A fully-buffered token source: the input is lexed up front into a vector, and
-/// the cursor is an index. This backs the production parser's cutover to the
-/// verified expression parser, which needs random access to the token vector.
 pub(crate) struct BufferedTokenStream {
     tokens: Vec<Token>,
     pos: usize,
 }
 
 impl BufferedTokenStream {
-    /// Lexes `input` fully into a buffered stream.
     pub(crate) fn new(input: &str) -> Result<Self> {
         let tokens: Vec<Token> = Lexer::new(input).collect::<Result<_>>()?;
         Ok(Self { tokens, pos: 0 })
@@ -63,10 +53,6 @@ impl PeekStream for BufferedTokenStream {
 }
 
 /// A streaming lexer with a single cached token.
-///
-/// Retained as the legacy parser's token source (the differential oracle) after
-/// the production parser cut over to the buffered [`BufferedTokenStream`], which
-/// the position-based verified expression parser requires.
 ///
 /// # Invariants
 ///

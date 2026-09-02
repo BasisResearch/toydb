@@ -21,20 +21,10 @@
 //! and extensional, the mirror roundtrip closes with real `==` on `SExpr`.
 //!
 //! The bridge to production values is `view_expr: ast::Expression -> SExpr`.
-//! The live consumers are `verified_precedence` (whose production parser
-//! `parse_expression_full` refines `sparse_prec`, itself stated over this
-//! mirror) and the statement layer (`verified_stmt` / `verified_stmt_prec` /
-//! `verified_control`), which reuse `SExpr`, `view_expr`, `sparse` and the
-//! roundtrip lemmas. The executable twin that used to sit on this scaffold
-//! (`parse_expr_exec` / `print_expr_exec` for the fully-parenthesised grammar,
-//! plus their wrap/roundtrip helpers) was never called by production and was
-//! deleted in phase 4; `print_lit_exec`
-//! stays, serving `verified_minparen`'s min-parens printer.
 //!
 //! Trust surface is unchanged: the only axioms are the `float_trust` boundary
 //! reused through `literal_views` / `parse_literal_views`.
 
-// Ghost bindings are erased by the non-Verus build; the module is verification
 // scaffolding.
 #![allow(dead_code, unused_variables)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the

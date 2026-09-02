@@ -1,27 +1,6 @@
-//! Spec-level mirror of the statement grammar, serving the live parser's proofs.
 //!
-//! `SStmt` is a `Seq`-based mirror of `ast::Statement` whose expression children
-//! are the expression mirror `SExpr` (through the existing `view_expr` bridge)
-//! and whose containers (`Vec`s, join trees, the `BTreeMap` set) become `Seq`s.
-//! The bridge to production values is `view_stmt: ast::Statement -> SStmt`; the
-//! mirror parser `sparse_stmt` (and its per-clause `sparse_*` helpers) is the
-//! functional spec that the live statement parser's twins in
-//! `verified_stmt_prec` are stated against and that `verified_control`'s
-//! refinement proofs consume.
 //!
-//! The executable twins that used to live here (`parse_stmt_exec` /
-//! `print_stmt_exec` and the mirror printer / roundtrip layer serving them)
-//! parsed only the fully-parenthesised grammar and were never called by
-//! production; phase 4 deleted them — git
-//! remembers.
 //!
-//! Trust surface: one axiom, `axiom_string_obeys_cmp` (String's `Ord` is
-//! lawful), used by the UPDATE `BTreeMap` reasoning in `verified_control`;
-//! everything else reduces to the `float_trust` boundary reached transitively
-//! through the expression layer.
-//!
-//! Statement kinds that are not mirrored map to `SStmt::Unsupported`, which the
-//! live-parser refinement proofs treat as outside the specified domain.
 
 // Proof/verification scaffolding, not idiomatic library code: exempt from the
 // crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.
@@ -32,8 +11,6 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)]
 use super::verified_production::TokenView;
-// The `SExpr` mirror enum: needed under a plain `cargo build` (the mirror
-// types are real Rust enums/structs).
 #[allow(unused_imports)]
 use super::verified_roundtrip::SExpr;
 // Ghost (spec/proof) helpers: stripped under a plain `cargo build`, so gate the
@@ -48,12 +25,9 @@ use crate::sql::types::DataType;
 
 verus! {
 
-// ---- Seq-based mirror of the statement grammar -------------------------------
 
 /// Mirror of `ast::Statement`. Expression children are `SExpr` (via `view_expr`)
 /// and containers become `Seq`s. `Unsupported` is the placeholder for statement
-/// kinds that are not mirrored; the refinement proofs treat it as outside the
-/// specified domain.
 pub enum SStmt {
     Begin { read_only: bool, as_of: Option<u64> },
     Commit,
@@ -221,12 +195,6 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
     }
 }
 
-/// `view_stmt`'s `Update` arm, factored out over the `BTreeMap`'s spec view
-/// `set: Map` so it can be reasoned about at the `Map` level (the exec parser
-/// holds a `BTreeMap` whose view is a `Map`, and lemmas over the assignment list
-/// need to talk about `set@` without materialising a `BTreeMap`). Behaviour is
-/// unchanged: a single-entry map is a one-assignment `Update`, anything else is
-/// `Unsupported`.
 pub open spec fn view_update_arm(
     table: String,
     set: vstd::map::Map<String, Option<ast::Expression>>,
@@ -244,7 +212,6 @@ pub open spec fn view_update_arm(
     }
 }
 
-// ---- column mirror parser ---------------------------------------------------
 
 pub open spec fn parse_datatype_kw(t: TokenView) -> Option<DataType> {
     match t {
@@ -257,9 +224,6 @@ pub open spec fn parse_datatype_kw(t: TokenView) -> Option<DataType> {
 }
 
 /// Consume an optional single-keyword flag. Returns whether it was present and
-/// the remaining tokens. Opaque so refinement proofs compose cheap per-clause
-/// facts (via `reveal`) instead of inlining the whole optional chain into one
-/// solver query.
 #[verifier::opaque]
 pub open spec fn opt_flag(input: Seq<TokenView>, kw: Keyword) -> (bool, Seq<TokenView>) {
     if input.len() >= 1 && input[0] == TokenView::Keyword(kw) {
@@ -382,7 +346,6 @@ pub open spec fn is_sexplain(s: SStmt) -> bool {
     }
 }
 
-// ---- statement mirror parser ------------------------------------------------
 
 /// `BEGIN` forms. `input[0]` is known to be `BEGIN`.
 pub open spec fn sparse_begin(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
@@ -493,9 +456,6 @@ pub open spec fn sparse_create(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
-/// Parse the `[WHERE e] [GROUP BY exprs] [HAVING e]` tail. Opaque so
-/// `sparse_select` and the proofs over it stay small (else the one-shot
-/// symbolic evaluation of the whole nested match blows up the solver).
 #[verifier::opaque]
 pub open spec fn sparse_where_group(r2: Seq<TokenView>, fuel: nat)
     -> (Option<(Option<SExpr>, Seq<SExpr>, Option<SExpr>)>, Seq<TokenView>) {
@@ -787,13 +747,8 @@ pub open spec fn sparse_insert(input: Seq<TokenView>, fuel: nat) -> (Option<SStm
     }
 }
 
-// ---- FROM join tree ---------------------------------------------------------
 //
 // A `From` item is a left-deep join tree whose right child is always a table.
-// The token stream lists the leftmost table and then a forward list of join
-// steps; the parser folds them left-deep, so no left-recursion is needed.
-// `fold_joins`/`from_head`/`from_steps` decompose the tree into (head table,
-// step list) and reassemble it.
 
 pub struct SJoinStep {
     pub join_type: ast::JoinType,
@@ -971,7 +926,6 @@ pub open spec fn sparse_from(input: Seq<TokenView>, fuel: nat) -> (Option<SFrom>
     }
 }
 
-// ---- clause list mirror parsers ----------------------------------------------
 
 #[verifier::opaque]
 pub open spec fn sparse_from_list(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<SFrom>>, Seq<TokenView>)
@@ -998,7 +952,6 @@ pub open spec fn sparse_from_list(input: Seq<TokenView>, fuel: nat) -> (Option<S
 
 /// Parse `k = expr` or `k = DEFAULT`. The expr is tried first; `DEFAULT` is a
 /// keyword that never starts an expression, so `sparse` fails on it and the
-/// `DEFAULT` fallback fires.
 #[verifier::opaque]
 pub open spec fn sparse_assign(input: Seq<TokenView>, fuel: nat) -> (Option<(String, Option<SExpr>)>, Seq<TokenView>) {
     if input.len() >= 2 && input[1] == TokenView::Equal {
@@ -1145,12 +1098,6 @@ pub open spec fn sparse_select_list(input: Seq<TokenView>, fuel: nat) -> (Option
     }
 }
 
-/// `String`'s `Ord` obeys the full total-order cmp laws (antisymmetry,
-/// transitivity, `Equal <==> ==`): the "String Ord is lawful" trust boundary,
-/// audited rather than proven (`String` comparison is external Rust). Used by
-/// the UPDATE `BTreeMap` reasoning in `verified_control::parse_update_at`. It
-/// is the only axiom the statement layer introduces, analogous to the
-/// `float_trust` assumptions.
 #[verifier::external_body]
 pub proof fn axiom_string_obeys_cmp()
     ensures vstd::laws_cmp::obeys_cmp::<String>(),
@@ -1164,7 +1111,6 @@ pub open spec fn view_opt(v: Option<ast::Expression>) -> Option<SExpr> {
     }
 }
 
-/// View the *value* of each exec-level assignment pair.
 pub open spec fn view_assign_pairs(items: Seq<(String, Option<ast::Expression>)>)
     -> Seq<(String, Option<SExpr>)> {
     items.map_values(|kv: (String, Option<ast::Expression>)| (kv.0, view_opt(kv.1)))
@@ -1178,10 +1124,6 @@ pub proof fn view_assign_pairs_index(items: Seq<(String, Option<ast::Expression>
 {
 }
 
-/// A `BTreeMap` view `m` whose domain is exactly the (distinct) key set of a
-/// parse-ordered assignment list `items`, and which maps each key to that list's
-/// value, has domain size `items.len()`. The distinct-key seq has a
-/// same-size element-key set, and the map's domain equals it.
 pub proof fn lemma_assign_dom_len(
     m: vstd::map::Map<String, Option<ast::Expression>>,
     items: Seq<(String, Option<ast::Expression>)>,
@@ -1231,14 +1173,6 @@ pub proof fn lemma_assign_dom_len(
     }
 }
 
-/// The UPDATE boundary bridge, at the pure `view_stmt` level (the twin's
-/// `assign_list_to_sstmt` boundary map is spelled out in the caller so this stays
-/// free of a `verified_stmt_prec` back-dependency). Given the exec loop invariant
-/// relating `set@` to a parse-ordered, distinct-key assignment list `items`:
-///
-///   - a lone assignment: `view_stmt(Update{set})` is
-///     `SStmt::Update { set: seq![(items[0].0, view_opt(items[0].1))] }`;
-///   - any other arity: `view_stmt(Update{set})` is `SStmt::Unsupported`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(60000)]
 pub proof fn lemma_update_view_boundary(
@@ -1265,7 +1199,6 @@ pub proof fn lemma_update_view_boundary(
 {
     lemma_assign_dom_len(set, items);
     if items.len() == 1 {
-        // Single assignment: `view_update_arm` recovers the sole key via `dom().choose()`.
         assert(set.dom().len() == 1);
         let k = set.dom().choose();
         assert(set.dom().contains(k)) by {
@@ -1275,7 +1208,6 @@ pub proof fn lemma_update_view_boundary(
         assert(set.dom().contains(items[0].0));
         assert(k == items[0].0) by {
             if k != items[0].0 {
-                // Two distinct domain members contradict `len() == 1`.
                 assert(set.dom().contains(k) && set.dom().contains(items[0].0));
                 assert(set.dom().remove(items[0].0).contains(k));
                 assert(set.dom().remove(items[0].0).len() >= 1);

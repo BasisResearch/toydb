@@ -1,21 +1,5 @@
-//! Verified lexer bricks: byte-level spec scanners and their roundtrip proofs.
 //!
 //! The grammar layer (`verified_stmt` etc.) operates on a clean `Token` stream.
-//! This module carries the spec layer for a from-scratch verified lexer over
-//! raw bytes — per-class `lscan_*` scanners over `Seq<u8>` with an explicit
-//! cursor, canonical byte prints, locality lemmas, and spec-level roundtrip
-//! theorems (`lemma_lex_all_seq_roundtrip`, `lemma_lex_mtok_seq_roundtrip`) —
-//! grown one brick (L0, L1, ...) at a time.
-//!
-//! Production lexing is the hand-written `super::Lexer`, which routes through
-//! exactly two verified exec scanners: `scan_symbol_bytes` here and
-//! `scan_number_bytes` in `lexer.rs`. The rest of the executable lexer twin
-//! (`lex_all_exec`, `lscan_token_exec`, `lex_mtok_exec`, ... and their
-//! roundtrip lemmas) was dead code — production never called it — and was
-//! deleted in phase 4; git remembers. A
-//! future lexer cutover milestone would restate the exec layer against the
-//! spec scanners kept here (string-level roundtrip still needs identifiers /
-//! keywords / strings verified, which today they are not).
 
 #![allow(dead_code)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the
@@ -539,11 +523,7 @@ pub proof fn lemma_lex_token_end_progress(input: Seq<u8>, pos: int)
     }
 }
 
-// -- L6: spec token-list scanner ----------------------------------------------
 //
-// `lex_all_ends` is the spec-level whole-input scanner: the strictly-increasing
-// sequence of token end positions, fuel-bounded (like the parser's `sparse`, to
-// sidestep proving termination through the L5 progress lemma inside a spec fn).
 
 /// Spec whole-input token-list scanner: the sequence of token end positions from
 /// `pos`, stopping at end-of-input or an unrecognized (deferred-class) byte.
@@ -629,11 +609,7 @@ pub proof fn lemma_lex_all_ends_fuel_stable(input: Seq<u8>, pos: int, fuel: nat)
     }
 }
 
-// -- L8: position-sequence view -----------------------------------------------
 
-/// Int view of a `usize` position sequence, for relating an exec `Vec<usize>`
-/// to the spec `Seq<int>` end-position list (used by the phase-4-deleted exec
-/// token-list loop; kept for a future lexer cutover).
 pub open spec fn ends_int(v: Seq<usize>) -> Seq<int> {
     v.map_values(|x: usize| x as int)
 }
@@ -2116,12 +2092,7 @@ pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     }
 }
 
-// -- L17: locality lemmas for the token scanners --------------------------------
 //
-// Position/subrange bridges relating each `lscan_*` spec scanner at an offset
-// to the same scanner on the suffix of the input. These carried the exec lexer
-// twin's refinement (deleted in phase 4) and remain the bridge a future exec
-// lexer cutover would need.
 
 /// `skip_ws` is suffix-local.
 pub proof fn lemma_skip_ws_local(input: Seq<u8>, pos: int)

@@ -1,60 +1,29 @@
-//! Verified precedence-climbing expression parser (Phase 2 of the parser
-//! cutover, see `verus-parser-cutover-prompt.md`).
-//!
-//! Unlike `verified_roundtrip`'s mirror parser `sparse` — which is the exact
-//! inverse of the canonical printer and accepts only fully-parenthesised forms
-//! — this parser is a 1:1 port of the production precedence-climbing parser in
-//! `parser.rs`. It accepts the full concrete grammar (`a + b * c`, prefix/infix/
-//! postfix operators with precedence and associativity, function calls,
-//! qualified columns, parenthesised groups) and builds production
-//! `ast::Expression` values directly over `super::Token`.
-//!
-//! # What Verus proves here (milestone 1)
-//!
-//! No panic, no arithmetic overflow, and termination. Every `Vec` index is
-//! bounds-guarded, every `pos + k` / `prec + assoc` is range-bounded, and
-//! recursion terminates on a `fuel` measure. On top of that, the parser is
-//! proven to refine the spec model `sparse_prec` (see `parse_expression_full`'s
-//! `ensures`), and the spec-level roundtrip `lemma_prec` proves `sparse_prec`
-//! inverts the canonical printer `sprint` — together: `parse(print(e))`'s
-//! mirror view equals `e`'s. This is the sole production
-//! expression parser; on rejection it returns a structured
-//! [`super::parse_error::ParseError`] (see `parse_expression_full`), rendered to
-//! the production error string at the boundary.
-//!
-//! The `fuel == 0` and out-of-bounds branches return a parse failure. Because the
-//! caller supplies enough fuel, the `fuel == 0` guard is never taken on
-//! well-formed input.
 
-// Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use vstd::prelude::*;
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::parse_error::ParseError;
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_expression::{BinaryTag, UnaryTag};
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_production::TokenView;
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::verified_roundtrip::{
     IsLit, SExpr, binary_tag_exec, build_binary, build_unary, parse_literal_exec, prefix_op_exec,
 };
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::{
     Keyword, Token, ast, float_trust, verified_expression, verified_integer, verified_production,
 };
 
 verus! {
 
-// ---- precedence table (mirrors parser.rs) ----------------------------------
 
-// ---- spec twins of the precedence tables (for the roundtrip proof) ---------
 
-/// Spec twin of `binary_prec`; the exec fn is proven to refine it.
 pub open spec fn binary_prec_s(tag: BinaryTag) -> u8 {
     match tag {
         BinaryTag::Or => 1,
@@ -75,7 +44,6 @@ pub open spec fn binary_prec_s(tag: BinaryTag) -> u8 {
     }
 }
 
-/// Spec twin of `binary_assoc`.
 pub open spec fn binary_assoc_s(tag: BinaryTag) -> u8 {
     match tag {
         BinaryTag::Exponentiate => 0,
@@ -83,7 +51,6 @@ pub open spec fn binary_assoc_s(tag: BinaryTag) -> u8 {
     }
 }
 
-/// Spec twin of `prefix_prec`.
 pub open spec fn prefix_prec_s(tag: UnaryTag) -> u8 {
     match tag {
         UnaryTag::Not => 3,
@@ -92,7 +59,6 @@ pub open spec fn prefix_prec_s(tag: UnaryTag) -> u8 {
     }
 }
 
-/// Infix operator precedence. 1 is lowest. Mirrors `InfixOperator::precedence`.
 pub fn binary_prec(tag: BinaryTag) -> (r: u8)
     ensures 1 <= r <= 8, r == binary_prec_s(tag),
 {
@@ -110,9 +76,6 @@ pub fn binary_prec(tag: BinaryTag) -> (r: u8)
     }
 }
 
-/// Infix associativity increment: left-associative operators bind tighter to
-/// their left operand (+1), `^` is right-associative (+0). Mirrors
-/// `InfixOperator::associativity` folded through `Add<Associativity>`.
 pub fn binary_assoc(tag: BinaryTag) -> (r: u8)
     ensures r <= 1, r == binary_assoc_s(tag),
 {
@@ -122,7 +85,6 @@ pub fn binary_assoc(tag: BinaryTag) -> (r: u8)
     }
 }
 
-/// Prefix operator precedence. Mirrors `PrefixOperator::precedence`.
 pub fn prefix_prec(tag: UnaryTag) -> (r: u8)
     ensures 3 <= r <= 10, r == prefix_prec_s(tag),
 {
@@ -132,19 +94,12 @@ pub fn prefix_prec(tag: UnaryTag) -> (r: u8)
     }
 }
 
-// ---- postfix classification ------------------------------------------------
 
-/// A detected postfix operator: `!`, or `IS [NOT] NULL|NAN`.
 pub enum PostfixOp {
     Factorial,
-    /// `negated` is the `NOT`, `nan` selects `NAN` over `NULL`.
     Is { negated: bool, nan: bool },
 }
 
-/// `token_views` commutes with a `k`-step shift of the subrange start: dropping
-/// the first `k` views of the suffix at `pos` equals the suffix at `pos + k`.
-/// The multi-step generalisation of `token_views_suffix` (which is `k == 1`);
-/// used to reach `input[k]` and the post-`k` tail without chaining drops by hand.
 pub proof fn token_views_shift(s: Seq<Token>, pos: int, k: int)
     requires
         0 <= pos,
@@ -176,11 +131,6 @@ pub proof fn token_views_shift(s: Seq<Token>, pos: int, k: int)
     }
 }
 
-/// Detects a postfix operator at `pos` whose precedence is at least `min_prec`,
-/// returning it and the position past its tokens. `IS`/`IS NOT` is precedence 4,
-/// `!` is precedence 9. Mirrors the legacy `parse_postfix_operator_at`; a
-/// malformed `IS ... <other>` yields no postfix (leaving the tokens for the
-/// caller to reject as a trailing-token error).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(40000)]
 pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Option<PostfixOp>, usize))
@@ -209,7 +159,6 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
     proof {
         super::verified_roundtrip::token_views_suffix(toks@, pos as int);
     }
-    // input[0] == token_view(toks@[pos]); input.drop_first() == views from pos+1.
     match &toks[pos] {
         Token::Keyword(Keyword::Is) => {
             if 4 < min_prec {
@@ -236,7 +185,6 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
                 }
                 false
             };
-            // Ghost: the spec's relative postfix index, matching exec `p - pos`.
             let ghost sp: int = if negated { 2 } else { 1 };
             if p < toks.len() {
                 proof {
@@ -246,7 +194,6 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
                     if pos + 1 < toks.len() {
                         super::verified_roundtrip::token_views_suffix(toks@, pos as int + 1);
                     }
-                    // input[sp] == token_view(toks[p]); tail input[sp+1..] == views(p+1).
                     token_views_shift(toks@, pos as int, sp);
                     token_views_shift(toks@, pos as int, sp + 1);
                 }
@@ -308,9 +255,6 @@ pub fn parse_postfix_at(toks: &Vec<Token>, pos: usize, min_prec: u8) -> (r: (Opt
     }
 }
 
-/// The mirror expression a detected postfix operator produces over an operand
-/// view. Mirrors `build_postfix` at the `SExpr` level; used by the postfix-loop
-/// refinement to connect the exec's `build_postfix` to `sparse_postfix_loop`.
 pub open spec fn postfix_view(op: PostfixOp, lhs: SExpr) -> SExpr {
     match op {
         PostfixOp::Factorial => SExpr::Factorial(Box::new(lhs)),
@@ -326,10 +270,6 @@ pub open spec fn postfix_view(op: PostfixOp, lhs: SExpr) -> SExpr {
     }
 }
 
-/// The `sparse_postfix_loop` state after `parse_postfix_at` reports result `r`
-/// from position `pos`: if it detected an op, one loop step (apply `postfix_view`,
-/// advance to `r.1`); if not (`r.1 == pos`), the loop halts here. This is the
-/// exact right-hand side of `parse_postfix_at`'s step ensures.
 pub open spec fn postfix_after(
     r: (Option<PostfixOp>, usize),
     lhs: SExpr,
@@ -343,8 +283,6 @@ pub open spec fn postfix_after(
     }
 }
 
-/// Builds the `ast::Expression` for a detected postfix operator applied to `lhs`.
-/// Mirrors `PostfixOperator::into_expression`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(30000)]
 pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> (r: ast::Expression)
@@ -374,11 +312,7 @@ pub fn build_postfix(op: PostfixOp, lhs: ast::Expression) -> (r: ast::Expression
     }
 }
 
-// ---- the parser ------------------------------------------------------------
 
-/// Whether every byte of `n` is an ASCII digit — mirrors the legacy
-/// `n.iter().all(u8::is_ascii_digit)` guard that decides integer vs. float
-/// literals, used only to pick the matching rejection message.
 fn all_ascii_digits(n: &Vec<u8>) -> bool {
     let mut i = 0;
     while i < n.len()
@@ -394,9 +328,6 @@ fn all_ascii_digits(n: &Vec<u8>) -> bool {
     true
 }
 
-/// Parses an expression atom, proven to refine `sparse_atom` at the `view_expr`
-/// / `token_views` level. The `fuel >= 2*len + 2` precondition keeps every
-/// sub-parse well-fuelled so fuel-stability applies.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(600000)]
 pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
@@ -444,8 +375,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
         Token::Number(n) => {
             match parse_literal_exec(&toks[pos]) {
                 Some(l) => (Some(ast::Expression::Literal(l)), pos + 1, None),
-                // Integer overflow vs. malformed float: mirror the two legacy
-                // errinput! sites for a `Number` token.
                 None => if all_ascii_digits(n) {
                     (None, pos, Some(ParseError::NumberTooLarge))
                 } else {
@@ -456,7 +385,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
         Token::String(_) => {
             match parse_literal_exec(&toks[pos]) {
                 Some(l) => (Some(ast::Expression::Literal(l)), pos + 1, None),
-                // Unreachable (a string literal always parses); defensive.
                 None => (None, pos, Some(ParseError::ExpectedAtom(toks[pos].clone()))),
             }
         },
@@ -496,8 +424,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
             if pos + 1 < toks.len() && matches!(toks[pos + 1], Token::OpenParen) {
                 let fname = name.clone();
                 proof {
-                    // input[0] == token_view(toks[pos]) == TokenView::Ident(fname),
-                    // so sparse_atom's Function name matches parse_function_call's.
                     assert(input[0] == verified_production::token_view(toks@[pos as int]));
                     assert(input[0] == TokenView::Ident(fname));
                 }
@@ -527,14 +453,12 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
                                 None,
                             )
                         },
-                        // `table . <non-ident>`: legacy `next_ident()` errors.
                         _ => (None, pos, Some(ParseError::ExpectedIdent(toks[pos + 2].clone()))),
                     }
                 } else {
                     proof {
                         super::verified_roundtrip::token_views_len(toks@.subrange(pos as int + 2, toks@.len() as int));
                     }
-                    // `table .` at end of input: legacy `next_ident()` hits EOF.
                     (None, pos, Some(ParseError::UnexpectedEof))
                 }
             } else {
@@ -555,7 +479,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
                             proof {
                                 super::verified_roundtrip::token_views_suffix(toks@, ipos as int);
                             }
-                            // Missing closing paren: legacy `expect(CloseParen)`.
                             (
                                 None,
                                 pos,
@@ -569,7 +492,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
                         }
                     }
                 },
-                // Inner expression failed: propagate its error.
                 None => (None, pos, ierr),
             }
         },
@@ -577,9 +499,6 @@ pub fn parse_atom(toks: &Vec<Token>, pos: usize, fuel: usize) -> (r: (
     }
 }
 
-/// Reads a function-call argument list starting at `pos` (just past `name (`),
-/// stopping at the closing `)`. Structural recursion refining `sparse_fn_args`
-/// (empty list, or delegate to the non-empty reader).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
@@ -607,7 +526,6 @@ pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
         proof {
             super::verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
         }
-        // Legacy reads the first arg via `parse_expression()`, hitting EOF.
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
     proof {
@@ -622,8 +540,6 @@ pub fn parse_fn_args_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
     }
 }
 
-/// Reads a non-empty argument list (`arg (, arg)*`) ending at `)`. Structural
-/// recursion refining `sparse_fn_args_nonempty`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
@@ -660,7 +576,6 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
                 proof {
                     super::verified_roundtrip::token_views_len(toks@.subrange(npos as int, toks@.len() as int));
                 }
-                // After an arg, legacy expects `)` or `,`, hitting EOF.
                 (None, pos, Some(ParseError::UnexpectedEof))
             } else {
                 proof {
@@ -689,7 +604,6 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
                         None => (None, pos, merr),
                     }
                 } else {
-                    // Neither `)` nor `,`: legacy `expect(Comma)` fails.
                     (None, pos, Some(ParseError::ExpectedToken(Token::Comma, toks[npos].clone())))
                 }
             }
@@ -698,8 +612,6 @@ pub fn parse_fn_args_ne_exec(toks: &Vec<Token>, pos: usize, fuel: usize)
     }
 }
 
-/// Parses a function call's argument list and closing `)`, building the
-/// `Function` expression. Refines `sparse_atom`'s function-call handling.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(50000)]
 pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: usize)
@@ -737,7 +649,6 @@ pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: us
                     proof {
                         super::verified_roundtrip::token_views_suffix(toks@, apos as int);
                     }
-                    // Unreachable: the arg reader stops at `)`. Defensive.
                     (
                         None,
                         pos,
@@ -755,9 +666,6 @@ pub fn parse_function_call(toks: &Vec<Token>, name: String, pos: usize, fuel: us
     }
 }
 
-/// Parses an expression at the given minimum precedence. Mirrors
-/// `parse_expression_at`: prefix operator or atom for the left-hand side, a
-/// postfix pass, an infix precedence-climbing loop, then a second postfix pass.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(400000)]
 pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: usize)
@@ -793,12 +701,8 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     proof {
         super::verified_roundtrip::token_views_suffix(toks@, pos as int);
     }
-    // Ghost: the spec's lhs-phase result (lhs_opt_s, after_lhs_s).
     let ghost lhs_opt_s = prec_lhs_phase(input, min_prec, fuel as nat).0;
     let ghost after_lhs_s = prec_lhs_phase(input, min_prec, fuel as nat).1;
-    // Left-hand side: prefix operator (if its precedence clears min_prec) or atom.
-    // `popt == prefix_operator(input[0])`, so the exec branch decision matches the
-    // ghost's; each arm establishes the correspondence before the join.
     let popt = prefix_op_exec(&toks[pos]);
     let (lhs_opt, lhs_pos, lhs_err) = if popt.is_some() && prefix_prec(popt.unwrap()) >= min_prec {
         let tag = popt.unwrap();
@@ -833,12 +737,10 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
         None => return (None, pos, lhs_err),
     };
     let mut cur = lhs_pos;
-    // Ghost anchors for the loop resumption invariants.
     let ghost lhs0_view = super::verified_roundtrip::view_expr(lhs);
     let ghost after_lhs_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost (lhs1_s, cur1_s) = sparse_postfix_loop(lhs0_view, after_lhs_v, min_prec);
 
-    // Postfix pass 1.
     loop
         invariant
             pos < cur <= toks.len(),
@@ -876,7 +778,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     let ghost target_infix = sparse_infix_loop(lhs1_s, cur1_s, min_prec, fuel as nat);
     let ghost mut gfuel: nat = fuel as nat;
 
-    // Infix precedence-climbing loop.
     loop
         invariant
             pos < cur <= toks.len(),
@@ -939,9 +840,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
                         let ghost cv = verified_production::token_views(
                             toks@.subrange(cur as int, toks@.len() as int));
                         proof {
-                            // Capture the loop invariant BEFORE revealing sparse_prec
-                            // (its body holds sparse_infix_loop; revealing it would
-                            // unfold that and break this opacity).
                             assert(sparse_infix_loop(super::verified_roundtrip::view_expr(lhs), cv, min_prec, gfuel)
                                 == target_infix);
                             super::verified_roundtrip::token_views_suffix(toks@, cur as int);
@@ -974,7 +872,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
                             assert(input.len() > 0);
                             lemma_prec_none(input, min_prec, fuel as nat, lhs0_view, after_lhs_v);
                         }
-                        // Infix right-hand side failed: propagate its error.
                         return (None, pos, rerr);
                     },
                 }
@@ -992,7 +889,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     let ghost after2_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost (lhs3_v, cur3_v) = sparse_postfix_loop(lhs2_view, after2_v, min_prec);
 
-    // Postfix pass 2.
     loop
         invariant
             pos < cur <= toks.len(),
@@ -1027,7 +923,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
             },
         }
     }
-    // Compose: sparse_prec = pf2(infix(pf1(lhs0, after_lhs))) matches the exec.
     proof {
         reveal_with_fuel(sparse_prec, 1);
         assert(lhs_opt_s == Some(lhs0_view));
@@ -1044,12 +939,6 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     (Some(lhs), cur, None)
 }
 
-/// Production entry for a complete expression, returning the parsed value or the
-/// structured `ParseError` on rejection: parse with fuel `2*len + 3`, require
-/// the whole vector consumed. The `ensures` refines the spec model
-/// `sparse_prec`, which `lemma_prec` proves inverts the canonical printer.
-/// Leftover tokens after a complete parse become the trailing-token
-/// `unexpected token` error, matching `Parser::parse_expr_legacy`.
 pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
     Option<ast::Expression>,
     Option<ParseError>,
@@ -1064,7 +953,6 @@ pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
         }),
 {
     if toks.len() > (usize::MAX - 3) / 2 {
-        // Unreachable in practice (no such vector exists); reject defensively.
         return (None, Some(ParseError::UnexpectedEof));
     }
     let fuel = 2 * toks.len() + 3;
@@ -1087,9 +975,6 @@ pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
     }
 }
 
-/// Spec model of `parse_expression_at`: prefix-or-atom for the left-hand side,
-/// a postfix pass, the infix precedence-climbing loop, then a second postfix
-/// pass. `min_prec` is the minimum operator precedence this call will consume.
 pub open spec fn sparse_prec(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     -> (Option<SExpr>, Seq<TokenView>)
     decreases fuel, 3nat,
@@ -1097,8 +982,6 @@ pub open spec fn sparse_prec(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     if fuel == 0 || input.len() == 0 {
         (None, input)
     } else {
-        // Left-hand side: a prefix operator whose precedence clears min_prec, or
-        // an atom.
         let (lhs_opt, after_lhs) = match verified_expression::prefix_operator(input[0]) {
             Some(tag) => if prefix_prec_s(tag) >= min_prec {
                 match sparse_prec(input.drop_first(), prefix_prec_s(tag), (fuel - 1) as nat) {
@@ -1126,8 +1009,6 @@ pub open spec fn sparse_prec(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     }
 }
 
-/// Spec model of `parse_atom`: literal, `*`, column, function call, or
-/// parenthesised group.
 pub open spec fn sparse_atom(input: Seq<TokenView>, fuel: nat)
     -> (Option<SExpr>, Seq<TokenView>)
     decreases fuel, 3nat,
@@ -1162,9 +1043,6 @@ pub open spec fn sparse_atom(input: Seq<TokenView>, fuel: nat)
                         _ => (None, input),
                     }
                 } else if input.len() >= 2 && input[1] == TokenView::Period {
-                    // A `.` commits to a qualified column (matching the exec); a
-                    // missing column name after it is a parse failure, not a bare
-                    // column with a dangling `.`.
                     if input.len() >= 3 {
                         match input[2] {
                             TokenView::Ident(column) =>
@@ -1192,10 +1070,6 @@ pub open spec fn sparse_atom(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// Spec model of the infix precedence-climbing loop. `None` signals a hard
-/// failure (a matched operator whose right-hand side failed to parse); the
-/// caller then discards all progress and returns the original input, mirroring
-/// the exec loop's `return (None, pos)`.
 pub open spec fn sparse_infix_loop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     -> (Option<SExpr>, Seq<TokenView>)
     decreases fuel, 2nat,
@@ -1223,9 +1097,6 @@ pub open spec fn sparse_infix_loop(lhs: SExpr, input: Seq<TokenView>, min_prec: 
     }
 }
 
-/// Spec model of a postfix pass: applies `!` (precedence 9) and `IS [NOT]
-/// NULL|NAN` (precedence 4) repeatedly while their precedence clears `min_prec`.
-/// A malformed `IS ...` stops the pass, leaving its tokens for the caller.
 pub open spec fn sparse_postfix_loop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     -> (SExpr, Seq<TokenView>)
     decreases input.len(),
@@ -1267,10 +1138,6 @@ pub open spec fn sparse_postfix_loop(lhs: SExpr, input: Seq<TokenView>, min_prec
     }
 }
 
-/// Spec model of the function-call argument list, positioned just past `name (`.
-/// The empty list (`f()`) is accepted only here; a non-empty list requires at
-/// least one argument via `sparse_fn_args_nonempty`. Returns the suffix at the
-/// closing `)` (the caller consumes it).
 pub open spec fn sparse_fn_args(input: Seq<TokenView>, fuel: nat)
     -> (Option<Seq<SExpr>>, Seq<TokenView>)
     decreases fuel, 2nat,
@@ -1284,9 +1151,6 @@ pub open spec fn sparse_fn_args(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// Parses `arg (, arg)*` ending at the closing `)`. Unlike `sparse_fn_args` this
-/// never accepts an empty argument in leading position, so a trailing comma
-/// (`f(a,)`) fails exactly as the exec loop does.
 pub open spec fn sparse_fn_args_nonempty(input: Seq<TokenView>, fuel: nat)
     -> (Option<Seq<SExpr>>, Seq<TokenView>)
     decreases fuel, 1nat,
@@ -1314,13 +1178,7 @@ pub open spec fn sparse_fn_args_nonempty(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-// ---- suffix-monotonicity: parser output is no longer than its input --------
-//
-// Needed to decrease the exec infix loop against the spec (the loop consumes a
-// strictly shorter suffix each iteration). Proven for the whole family; this is
-// the shared prerequisite of both remaining Brick-2 strategies.
 
-/// The postfix loop never grows its input.
 pub proof fn lemma_postfix_slen(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     ensures
         sparse_postfix_loop(lhs, input, min_prec).1.len() <= input.len(),
@@ -1355,7 +1213,6 @@ pub proof fn lemma_postfix_slen(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     }
 }
 
-/// The infix loop never grows its input.
 pub proof fn lemma_infix_slen(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     ensures
         sparse_infix_loop(lhs, input, min_prec, fuel).1.len() <= input.len(),
@@ -1386,7 +1243,6 @@ pub proof fn lemma_infix_slen(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f
     }
 }
 
-/// The function-argument-list parser never grows its input.
 pub proof fn lemma_fnargs_slen(input: Seq<TokenView>, fuel: nat)
     ensures
         sparse_fn_args(input, fuel).1.len() <= input.len(),
@@ -1400,7 +1256,6 @@ pub proof fn lemma_fnargs_slen(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// The non-empty argument-list parser never grows its input.
 pub proof fn lemma_fnargs_ne_slen(input: Seq<TokenView>, fuel: nat)
     ensures
         sparse_fn_args_nonempty(input, fuel).1.len() <= input.len(),
@@ -1429,7 +1284,6 @@ pub proof fn lemma_fnargs_ne_slen(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// The atom parser never grows its input.
 pub proof fn lemma_atom_slen(input: Seq<TokenView>, fuel: nat)
     ensures
         sparse_atom(input, fuel).1.len() <= input.len(),
@@ -1454,7 +1308,6 @@ pub proof fn lemma_atom_slen(input: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// The full expression parser never grows its input.
 pub proof fn lemma_prec_slen(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     ensures
         sparse_prec(input, min_prec, fuel).1.len() <= input.len(),
@@ -1501,17 +1354,7 @@ pub proof fn lemma_prec_slen(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     }
 }
 
-// ---- fuel-stability: enough fuel fixes the result --------------------------
-//
-// The exec infix loop feeds `fuel-1` to EVERY rhs parse, but `sparse_infix_loop`
-// decrements fuel per step; these lemmas bridge that gap. `sparse_X(input, f) ==
-// sparse_X(input, g)` once both fuels clear a print-length-independent bound
-// (`2*len + c`, the worst case being a deep run of unmatched `(` that spends two
-// fuel per token). Measure: `(input.len(), phase)` with atom < prec < nonempty <
-// fn_args and infix below all (its recursions strictly shrink the input via
-// suffix-monotonicity); every same-input edge drops phase.
 
-/// Atom-parser fuel-stability.
 pub proof fn lemma_atom_fuel(input: Seq<TokenView>, f: nat, g: nat)
     requires
         f >= 2 * input.len() + 2,
@@ -1539,7 +1382,6 @@ pub proof fn lemma_atom_fuel(input: Seq<TokenView>, f: nat, g: nat)
     }
 }
 
-/// Infix-loop fuel-stability.
 pub proof fn lemma_infix_fuel(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f: nat, g: nat)
     requires
         f >= 2 * input.len() + 3,
@@ -1575,7 +1417,6 @@ pub proof fn lemma_infix_fuel(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f
     }
 }
 
-/// Argument-list fuel-stability.
 pub proof fn lemma_fnargs_fuel(input: Seq<TokenView>, f: nat, g: nat)
     requires
         f >= 2 * input.len() + 4,
@@ -1592,7 +1433,6 @@ pub proof fn lemma_fnargs_fuel(input: Seq<TokenView>, f: nat, g: nat)
     }
 }
 
-/// Non-empty argument-list fuel-stability.
 pub proof fn lemma_fnargs_ne_fuel(input: Seq<TokenView>, f: nat, g: nat)
     requires
         f >= 2 * input.len() + 4,
@@ -1620,7 +1460,6 @@ pub proof fn lemma_fnargs_ne_fuel(input: Seq<TokenView>, f: nat, g: nat)
     }
 }
 
-/// Expression-parser fuel-stability.
 pub proof fn lemma_prec_fuel(input: Seq<TokenView>, min_prec: u8, f: nat, g: nat)
     requires
         f >= 2 * input.len() + 3,
@@ -1667,29 +1506,11 @@ pub proof fn lemma_prec_fuel(input: Seq<TokenView>, min_prec: u8, f: nat, g: nat
     }
 }
 
-// ===========================================================================
-// Phase 2.2 — spec-level roundtrip: sparse_prec(sprint(e) ++ tail) == (e, tail)
-// ===========================================================================
-//
-// The mathematical heart of the roundtrip, proven purely at the spec level
-// (exec-independent). The key structural fact: in the canonical fully-
-// parenthesised print, every operand is immediately followed by a token that
-// stops the postfix/infix loops — `)`, `,`, `!`, `IS`, or a single binary
-// operator — so the precedence-climbing loops each do at most one productive
-// step and never diverge on precedence. Operands parsed via `sparse_prec`
-// (prefix rhs, infix rhs, top level) always see a *prec-boundary* tail (`)` /
-// `,` / empty); operands parsed via `sparse_atom` (lhs phase) may see a `!`,
-// `IS`, or binary-operator tail, which the enclosing loop then consumes.
 
-/// A tail that stops every continuation loop: the postfix loop (`!` / `IS`),
-/// the infix loop (any binary operator), and keeps a bare atom self-delimiting.
-/// `)` and `,` are the only tokens that can follow a complete `sparse_prec`
-/// sub-parse in the canonical form.
 pub open spec fn prec_boundary(tail: Seq<TokenView>) -> bool {
     tail.len() == 0 || tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma
 }
 
-/// The infix loop halts immediately when there is no binary operator to consume.
 pub proof fn infix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     requires
         input.len() == 0 || verified_expression::binary_from_token(input[0]) is None,
@@ -1699,7 +1520,6 @@ pub proof fn infix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: n
     reveal_with_fuel(sparse_infix_loop, 1);
 }
 
-/// The postfix loop halts immediately when the head is neither `!` nor `IS`.
 pub proof fn postfix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     requires
         input.len() == 0
@@ -1710,10 +1530,6 @@ pub proof fn postfix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
     reveal_with_fuel(sparse_postfix_loop, 1);
 }
 
-/// One productive step of the infix loop: given the right operand already parsed
-/// by `sparse_prec`, the loop consumes the operator and recurses on the built
-/// `Binary` with one less fuel. The exec infix loop uses this with the result of
-/// its recursive `parse_expression_at` call.
 pub proof fn lemma_infix_step(
     lhs: SExpr,
     tag: BinaryTag,
@@ -1744,9 +1560,6 @@ pub proof fn lemma_infix_step(
     reveal_with_fuel(sparse_infix_loop, 1);
 }
 
-/// The infix loop halts: the head is either absent, not a binary operator, or a
-/// binary operator whose precedence is below `min_prec`. Covers every way the
-/// exec infix loop's `_ => break` fires.
 pub proof fn lemma_infix_stop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     requires
         input.len() == 0 || match verified_expression::binary_from_token(input[0]) {
@@ -1759,8 +1572,6 @@ pub proof fn lemma_infix_stop(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, f
     reveal_with_fuel(sparse_infix_loop, 1);
 }
 
-/// One infix step whose right-hand side fails to parse: the loop yields the hard
-/// failure `(None, input)`.
 pub proof fn lemma_infix_step_none(
     lhs: SExpr,
     tag: BinaryTag,
@@ -1784,8 +1595,6 @@ pub proof fn lemma_infix_step_none(
     reveal_with_fuel(sparse_infix_loop, 1);
 }
 
-/// The lhs phase of `sparse_prec` (prefix operator or atom), extracted so both
-/// the exec refinement and `lemma_prec_none` can name it.
 pub open spec fn prec_lhs_phase(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     -> (Option<SExpr>, Seq<TokenView>) {
     match verified_expression::prefix_operator(input[0]) {
@@ -1801,8 +1610,6 @@ pub open spec fn prec_lhs_phase(input: Seq<TokenView>, min_prec: u8, fuel: nat)
     }
 }
 
-/// `sparse_prec` yields a hard failure when the lhs phase produced `Some(lhs0)`
-/// (with tail `after_lhs`) but the infix loop over the postfix-1 result fails.
 pub proof fn lemma_prec_none(
     input: Seq<TokenView>,
     min_prec: u8,
@@ -1827,8 +1634,6 @@ pub proof fn lemma_prec_none(
     reveal_with_fuel(sparse_prec, 1);
 }
 
-/// A prec-boundary head is neither a binary operator nor a postfix operator, so
-/// both continuation loops halt on it.
 pub proof fn prec_boundary_halts(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     requires
         prec_boundary(input),
@@ -1849,11 +1654,6 @@ pub proof fn prec_boundary_halts(lhs: SExpr, input: Seq<TokenView>, min_prec: u8
     }
 }
 
-/// Roundtrip for the atom parser: parsing the canonical print of any printable
-/// mirror expression (followed by an atom-safe `boundary` tail) via `sparse_atom`
-/// recovers the expression and leaves the tail unconsumed. This is the primary
-/// induction; `sparse_atom` dispatches every compound form into the interior
-/// `sparse_prec` on its parenthesised body.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(20000)]
 pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
@@ -1915,10 +1715,8 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
             unary_tok_prefix(tag);
             let close_tail = seq![TokenView::CloseParen] + tail;
             let body = seq![unary_tok(tag)] + sprint(*inner) + close_tail;
-            // sparse_atom sees `(` and recurses sparse_prec on the body.
             assert(tokens[0] == TokenView::OpenParen);
             assert(tokens.drop_first() =~= body);
-            // sparse_prec(body, 0, fuel-1): prefix op then inner then `)`.
             lemma_prec(*inner, prefix_prec_s(tag), close_tail, (fuel - 2) as nat);
             assert(body[0] == unary_tok(tag));
             assert(body.drop_first() =~= sprint(*inner) + close_tail);
@@ -1937,7 +1735,6 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
             let body = sprint(*inner) + seq![TokenView::Exclamation] + close_tail;
             assert(tokens[0] == TokenView::OpenParen);
             assert(tokens.drop_first() =~= body);
-            // lhs phase parses inner; postfix loop consumes `!`.
             lemma_atom(*inner, seq![TokenView::Exclamation] + close_tail, (fuel - 2) as nat);
             assert(body =~= sprint(*inner) + (seq![TokenView::Exclamation] + close_tail));
             let after_inner = seq![TokenView::Exclamation] + close_tail;
@@ -1976,7 +1773,6 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
             let body = sprint(*left) + right_part;
             assert(tokens[0] == TokenView::OpenParen);
             assert(tokens.drop_first() =~= body);
-            // lhs phase parses left; infix loop consumes op then right.
             lemma_atom(*left, right_part, (fuel - 2) as nat);
             assert(right_part[0] == binary_tok(tag));
             assert(right_part.drop_first() =~= sprint(*right) + close_tail);
@@ -2004,11 +1800,6 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// Roundtrip for the full expression parser: for a prec-boundary tail (`)` / `,`
-/// / empty), `sparse_prec` at any `min_prec` recovers the expression. The lhs
-/// phase routes to `sparse_atom` (an operand never begins with a prefix
-/// operator, by `sprint_head`), then both continuation loops halt on the
-/// boundary.
 pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
@@ -2024,13 +1815,10 @@ pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     sprint_head(e);
     let tokens = sprint(e) + tail;
     assert(tokens[0] == sprint(e)[0]);
-    // prefix_operator(tokens[0]) is None (sprint_head), so lhs = sparse_atom.
     lemma_atom(e, tail, (fuel - 1) as nat);
     prec_boundary_halts(e, tail, min_prec, fuel);
 }
 
-/// Comma-list roundtrip: parsing the print of a printable argument sequence,
-/// closed by a `)`-led tail, recovers the sequence. Empty list allowed here.
 pub proof fn lemma_fn_args(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::all_printable_se(args),
@@ -2055,8 +1843,6 @@ pub proof fn lemma_fn_args(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
     }
 }
 
-/// Non-empty argument list: at least one argument (parsed via `sparse_prec` at
-/// precedence 0), each followed by `,` or the closing `)`.
 pub proof fn lemma_fn_args_nonempty(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::all_printable_se(args),
@@ -2088,9 +1874,7 @@ pub proof fn lemma_fn_args_nonempty(args: Seq<SExpr>, tail: Seq<TokenView>, fuel
     }
 }
 
-// ---- small step helpers ----------------------------------------------------
 
-/// One productive step of the postfix loop for `!`.
 pub proof fn postfix_step_factorial(inner: SExpr, close_tail: Seq<TokenView>)
     requires
         close_tail.len() > 0,
@@ -2106,7 +1890,6 @@ pub proof fn postfix_step_factorial(inner: SExpr, close_tail: Seq<TokenView>)
     postfix_halt(SExpr::Factorial(Box::new(inner)), close_tail, 0);
 }
 
-/// One productive step of the postfix loop for `IS NULL` / `IS NAN`.
 pub proof fn postfix_step_is(inner: SExpr, lit: IsLit, close_tail: Seq<TokenView>)
     requires
         close_tail.len() > 0,
@@ -2138,8 +1921,6 @@ pub proof fn postfix_step_is(inner: SExpr, lit: IsLit, close_tail: Seq<TokenView
     postfix_halt(SExpr::Is(Box::new(inner), lit), close_tail, 0);
 }
 
-/// One productive step of the infix loop: consume `op`, parse the right operand
-/// via `sparse_prec`, then halt at `)`.
 pub proof fn infix_step_binary(
     tag: BinaryTag,
     left: SExpr,
@@ -2178,4 +1959,4 @@ pub proof fn infix_step_binary(
     );
 }
 
-} // verus!
+}

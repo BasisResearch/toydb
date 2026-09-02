@@ -1,66 +1,15 @@
-//! Verified concrete parser for the **complete** toyDB statement grammar. Every
-//! kind the legacy `parse_statement` dispatches is covered: `BEGIN` / `COMMIT` /
-//! `ROLLBACK` (control), `CREATE TABLE` / `DROP TABLE` (DDL, with full column
-//! definitions), the row-carrying DML `DELETE` / `INSERT` / `UPDATE` / `SELECT`
-//! (whose predicates, values, and clause expressions are parsed by the verified
-//! expression parser), and `EXPLAIN <statement>` (recursing through the entry
-//! point, rejecting nested EXPLAIN). `SELECT` covers the full clause set: select
-//! list with aliases, the `FROM` join tree (INNER/LEFT/RIGHT/CROSS, left-deep
-//! folded), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (with direction), `LIMIT`,
-//! and `OFFSET`. See `verus-parser-roundtrip-plan.md`. Each entry is a 1:1 port
-//! of the corresponding `parser.rs` routine, producing the production
-//! `ast::Statement` over `super::Token` and returning the position past the
-//! consumed tokens (so the caller can check for a trailing semicolon / end of
-//! input, exactly like the legacy path); on any malformed form it returns
-//! `(None, pos)` and the retained legacy parser re-parses to own the error text.
-//!
-//! Verus proves no panic, no arithmetic overflow, and termination: every `Vec`
-//! index is bounds-guarded, every `cur + 1` is bounded by the token count, and
-//! every clause loop `decreases toks.len() - cur` on a strictly-advancing
-//! cursor.
-//!
-//! Functional specification (phase 2, in progress): a subset of the clause
-//! parsers additionally carry a *full refinement* against the spec twins in
-//! `verified_stmt_prec`, whose expression positions are `sparse_prec` (unlike
-//! `verified_stmt::sparse_stmt`, which uses the fully-parenthesised grammar).
-//! `parse_delete_at`, `parse_drop_at`, `parse_begin_at`, `parse_order_by_at`,
-//! `parse_group_by_at`, the `CREATE TABLE` pair `parse_create_at` /
-//! `parse_create_column_at`, the `SELECT` list `parse_select_list_at`,
-//! `parse_insert_at`, and the `FROM` join tree `parse_from_clause_at` /
-//! `parse_from_table_at` are proven to produce exactly the AST their spec twin
-//! (`sparse_control_delete` / `_drop` / `_begin` / `_order_by` / `_group_by` /
-//! `_create` / `_column` / `_select_list` / `_insert` / `_from` / `_from_table`)
-//! computes, up to `verified_stmt::view_stmt` / `view_order_list` /
-//! `view_select_list` / `view_rows` / `view_column` / `view_froms` /
-//! `verified_roundtrip::view_args`, with the leftover-token stream pinned — so
-//! e.g. mis-defaulting an `ORDER BY` direction, dropping `IF EXISTS`, dropping a
-//! column's `PRIMARY KEY` / `NOT NULL` flag, swapping a `SELECT` alias, dropping
-//! an `INSERT` row, confusing a join type, or dropping a join's `ON` predicate
-//! now breaks verification, not just the goldenscript suite. The `FROM` twin
-//! reuses the printer's left-deep decomposition (`fold_joins` / `apply_step` /
-//! `SJoinStep`): the exec inner join loop folds each parsed join onto its
-//! accumulator exactly as `apply_step`, and the twin's
-//! `sparse_control_from_joins` recursion mirrors that fold. The remaining
-//! dispatch (`parse_control_at`) and clause parsers (UPDATE assignments,
-//! EXPLAIN) still carry only the
-//! no-panic/terminate/error-on-reject contract; their accepted ASTs and
-//! rejection errors are pinned by the goldenscript suite. Embedded
-//! expressions are parsed by `verified_precedence`, which additionally carries a
-//! print/parse roundtrip proof. On rejection each parser returns a structured
-//! [`super::parse_error::ParseError`], rendered to the production error string.
 
-// Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use vstd::prelude::*;
 
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::parse_error::ParseError;
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
-#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+#[allow(unused_imports)]
 use super::{verified_production, verified_roundtrip, verified_stmt, verified_stmt_prec};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
@@ -73,14 +22,6 @@ use std::collections::BTreeMap;
 
 verus! {
 
-/// Parses a statement at `pos`, dispatching on the leading keyword, and returns
-/// it with the position past its tokens — or `(None, pos)` if the token at `pos`
-/// does not begin a statement, or the statement is malformed (so the caller
-/// falls back to the legacy parser, which owns the specific error). This is the
-/// module's entry point; it now covers every statement kind the legacy
-/// `parse_statement` dispatches. The `decreases` measure pairs with
-/// `parse_explain_at` for their mutual recursion (`EXPLAIN <statement>`): the
-/// second component orders the two functions at an equal token position.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(200000)]
 pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -89,8 +30,6 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
-        // Full refinement against the top-level dispatch twin `sparse_control`,
-        // up to `view_stmt`, on all realistically-sized inputs.
         toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_stmt_prec::sparse_control(input);
@@ -131,13 +70,6 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
     }
 }
 
-/// Parses an `EXPLAIN <statement>` statement, having consumed `EXPLAIN`. The
-/// inner statement is parsed by `parse_control_at`; a nested `EXPLAIN` is
-/// rejected here (like the legacy parser, which errors) by yielding
-/// `(None, pos)`. Mirrors `parse_explain`. The `decreases` second component
-/// (`1int` vs `parse_control_at`'s `0int`) breaks the equal-position mutual
-/// recursion: `parse_explain_at(pos)` calls `parse_control_at(pos)` at the same
-/// `pos`, and `1int > 0int` makes that call strictly smaller.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -146,7 +78,6 @@ fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
-        // Full refinement against `sparse_control_explain`, up to `view_stmt`.
         toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_stmt_prec::sparse_control_explain(input);
@@ -169,7 +100,6 @@ fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement
             reveal(verified_production::token_view);
         }
     }
-    // Nested EXPLAIN is disallowed; defer to legacy for the specific error.
     if pos < toks.len() && matches!(toks[pos], Token::Keyword(Keyword::Explain)) {
         proof {
             if sized {
@@ -207,9 +137,6 @@ fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement
     }
 }
 
-/// Parses a required expression clause at `pos` (the caller has already consumed
-/// the leading keyword), wrapping the verified expression parser with the
-/// guarded fuel computation. `(None, pos)` on a parse failure or overflow.
 fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expression>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
@@ -217,8 +144,6 @@ fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expre
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
         r.0 is None ==> r.2 is Some,
-        // On a realistically-sized input, refines `sparse_prec` at the fuel the
-        // caller (statement parser) always hands the expression parser.
         toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_precedence::sparse_prec(input, 0, verified_stmt_prec::expr_fuel(input));
@@ -240,12 +165,6 @@ fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expre
     verified_precedence::parse_expression_at(toks, pos, 0, fuel)
 }
 
-/// Parses a `SELECT` statement's clauses, having consumed the leading `SELECT`
-/// keyword: the select list, then optional `FROM` / `WHERE` / `GROUP BY` /
-/// `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`. Mirrors `parse_select`; a
-/// malformed clause yields `(None, pos)` so the caller falls back to legacy.
-/// Refines `sparse_control_select` (the composition of the per-clause spec
-/// twins) up to `view_stmt`, on all realistically-sized inputs.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(600000)]
 fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -268,7 +187,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 {
     let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
-    // Select list (the `SELECT` keyword is already consumed).
     let (sopt, c1, serr) = parse_select_list_at(toks, pos);
     let select = match sopt {
         Some(s) => s,
@@ -283,7 +201,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         },
     };
     let mut cur = c1;
-    // `r1` — the suffix past the select list, pinned by the list refinement.
     let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         if sized {
@@ -292,7 +209,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // FROM
     let (fopt, c2, ferr) = parse_from_clause_at(toks, cur);
     let from = match fopt {
         Some(f) => f,
@@ -315,7 +231,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // WHERE
     let mut where_clause: Option<ast::Expression> = None;
     proof {
         verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -371,7 +286,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // GROUP BY
     let (gopt, cg, gerr) = parse_group_by_at(toks, cur);
     let group_by = match gopt {
         Some(g) => g,
@@ -394,7 +308,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // HAVING
     let mut having: Option<ast::Expression> = None;
     proof {
         verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -450,7 +363,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // ORDER BY
     let (oopt, co, oerr) = parse_order_by_at(toks, cur);
     let order_by = match oopt {
         Some(o) => o,
@@ -473,7 +385,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // LIMIT
     let mut limit: Option<ast::Expression> = None;
     proof {
         verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -529,7 +440,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // OFFSET
     let mut offset: Option<ast::Expression> = None;
     proof {
         verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -623,9 +533,6 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     (Some(statement), cur, None)
 }
 
-/// Parses the `SELECT` list (one or more `<expr> [[AS] <alias>]`, comma
-/// separated), having consumed the `SELECT` keyword. `*` (the `All`
-/// expression) cannot be aliased. Mirrors `parse_select_clause`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(80000)]
 fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
@@ -650,8 +557,6 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             }
         }),
 {
-    // `list_start` — the suffix at `pos`, where the select list begins. Since
-    // there is no leading clause keyword, the whole clause parse IS the list.
     let ghost list_start = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     let ghost whole = verified_stmt_prec::sparse_control_select_list(list_start);
     let mut select: Vec<(ast::Expression, Option<String>)> = Vec::new();
@@ -663,9 +568,6 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             list_start == verified_production::token_views(
                 toks@.subrange(pos as int, toks@.len() as int)),
             whole == verified_stmt_prec::sparse_control_select_list(list_start),
-            // Resumption: the whole list equals what's been consumed (`select`)
-            // prepended onto the parse continuing at `cur`. Only meaningful on a
-            // realistically-sized input (where the expression parser refines).
             toks.len() <= (usize::MAX - 3) / 2 ==>
                 whole == verified_stmt_prec::select_list_prepend(
                     verified_stmt::view_select_list(select@),
@@ -679,7 +581,6 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
             list_start == verified_production::token_views(
                 toks@.subrange(pos as int, toks@.len() as int)),
             whole == verified_stmt_prec::sparse_control_select_list(list_start),
-            // At break the accumulated list is final.
             toks.len() <= (usize::MAX - 3) / 2 ==>
                 whole == (Some(verified_stmt::view_select_list(select@)),
                     verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
@@ -717,13 +618,12 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
         }
         cur = c;
 
-        // Optional alias: `AS <ident>` or a bare `<ident>`.
         let is_as = cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As));
         let is_ident = cur < toks.len() && matches!(toks[cur], Token::Ident(_));
         let mut alias: Option<String> = None;
         if is_as || is_ident {
             if matches!(expr, ast::Expression::All) {
-                return (None, pos, Some(ParseError::CantAliasStar)); // can't alias *
+                return (None, pos, Some(ParseError::CantAliasStar));
             }
             if is_as {
                 cur = cur + 1;
@@ -744,14 +644,9 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
                 _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
             }
         }
-        // `r1` — the suffix after the (optional) alias was consumed. Pin it to
-        // the spec twin's `sparse_control_select_alias` result.
         let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         proof {
             if sized {
-                // `r_after_expr[0] == token_view(toks[c])` (when c < len) drives the
-                // exec `is_as`/`is_ident` guards, so the spec alias resolution agrees
-                // with the exec choice and lands on `r1`.
                 reveal(verified_production::token_view);
                 assert(verified_stmt_prec::sparse_control_select_alias(
                     verified_roundtrip::view_expr(expr), r_after_expr)
@@ -827,9 +722,6 @@ fn parse_select_list_at(toks: &Vec<Token>, pos: usize) -> (r: (
     (Some(select), cur, None)
 }
 
-/// Parses an optional `FROM` clause: a comma-separated list of join trees.
-/// Returns `(Some(vec![]), pos)` when no `FROM` keyword is present. Mirrors
-/// `parse_from_clause` (including the left-deep join folding).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(900000)]
 fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::From>>, usize, Option<ParseError>))
@@ -865,7 +757,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
         }
         return (Some(empty), pos, None);
     }
-    // Head is `FROM`; the comma-separated from-item list begins at `pos + 1`.
     let ghost list_start = verified_production::token_views(toks@.subrange((pos + 1) as int, toks@.len() as int));
     let ghost whole = verified_stmt_prec::sparse_control_from_list(list_start);
     proof {
@@ -912,7 +803,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
         let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         let ghost done_v = verified_stmt::view_froms(from@);
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
-        // Base table for this from-item.
         let (topt, tc, terr) = parse_from_table_at(toks, cur);
         let mut from_item = match topt {
             Some(t) => t,
@@ -930,8 +820,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 return (None, pos, terr);
             },
         };
-        // `view_from(from_item)` is the base of the fold; `cur_v` bridges to the
-        // spec twin's `sparse_control_from_item`, which folds joins onto it.
         let ghost base_v = verified_stmt::view_from(from_item);
         proof {
             if sized {
@@ -940,9 +828,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                         toks@.subrange(tc as int, toks@.len() as int))));
             }
         }
-        // Record the outer resumption in terms of `cur_v` (= views at
-        // `outer_start`) *before* mutating `cur`, so it survives into the inner
-        // loop invariant (which references the fixed `outer_start`).
         proof {
             if sized {
                 assert(whole == verified_stmt_prec::from_list_prepend(
@@ -955,17 +840,13 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 toks@.subrange(outer_start as int, toks@.len() as int)));
         }
 
-        // Snapshot the post-base-table position: the join loop only advances
-        // `cur`, so the outer from-list loop's `decreases` sees strict progress.
         let ghost item_start = cur;
-        // Fold any joins into a left-deep tree.
         loop
             invariant_except_break
                 pos < cur,
                 outer_start < item_start <= cur,
                 cur <= toks.len(),
                 sized == (toks.len() <= (usize::MAX - 3) / 2),
-                // Stable outer facts needed by the reject helpers.
                 input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
                 input.len() >= 1,
                 input[0] == verified_production::TokenView::Keyword(Keyword::From),
@@ -1063,8 +944,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 Token::Keyword(Keyword::Left) => {
                     proof { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); }
                     let mut c = cur + 1;
-                    // `r2_start` tracks where the spec's `r2` begins (past an
-                    // optional `OUTER`), so `views(c..) == r2` throughout.
                     proof { if c < toks.len() { verified_roundtrip::token_views_suffix(toks@, c as int); reveal(verified_production::token_view); } else { verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int)); } }
                     if c < toks.len() && matches!(toks[c], Token::Keyword(Keyword::Outer)) {
                         c = c + 1;
@@ -1111,7 +990,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     proof { jt_v = ast::JoinType::Right; needs_on_v = true; }
                 },
                 _ => {
-                    // no join-start keyword: this from-item is complete
                     proof {
                         if sized {
                             assert(!verified_stmt_prec::is_join_start(jcur_v));
@@ -1121,7 +999,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                     break;
                 },
             }
-            // The join keyword-sequence parsed: `join_head(jcur_v) == Some((jt_v, needs_on_v, views(jc..)))`.
             let ghost after_kw_v = verified_production::token_views(toks@.subrange(jc as int, toks@.len() as int));
             proof {
                 if sized {
@@ -1131,7 +1008,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 }
             }
 
-            // Right table of the join.
             proof { verified_roundtrip::token_views_len(toks@.subrange(jc as int, toks@.len() as int)); }
             let (ropt, rc, rerr) = parse_from_table_at(toks, jc);
             let right = match ropt {
@@ -1158,7 +1034,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
             }
             let mut cur2 = rc;
 
-            // ON <predicate>, except for CROSS joins.
             let mut predicate: Option<ast::Expression> = None;
             let ghost pred_v: Option<verified_roundtrip::SExpr>;
             let ghost after_pred_v: Seq<verified_production::TokenView>;
@@ -1235,18 +1110,15 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
             cur = cur2;
             proof {
                 if sized {
-                    // `view_from(Join{..}) == apply_step(view_from(old), step_v)`.
                     reveal_with_fuel(verified_stmt::view_from, 2);
                     assert(verified_stmt::view_from(from_item)
                         == verified_stmt::apply_step(verified_stmt::view_from(old_from_item), step_v));
-                    // The step twin at `jcur_v` yields `(step_v, after_pred_v)`.
                     assert(verified_stmt_prec::sparse_control_from_step(jcur_v)
                         == Some((step_v, after_pred_v)));
                     assert(after_pred_v == verified_production::token_views(
                         toks@.subrange(cur as int, toks@.len() as int)));
                     verified_stmt_prec::lemma_from_joins_step(
                         verified_stmt::view_from(old_from_item), jcur_v, step_v, after_pred_v);
-                    // Combine with the loop invariant (resumption).
                     assert(verified_stmt_prec::sparse_control_from_joins(
                         verified_stmt::view_from(old_from_item), jcur_v)
                         == verified_stmt_prec::sparse_control_from_joins(
@@ -1255,8 +1127,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
                 }
             }
         }
-        // Inner loop done: `from_item` is the folded tree; establish the outer
-        // from-list resumption after pushing it.
         let ghost item_v = verified_stmt::view_from(from_item);
         proof {
             if sized {
@@ -1321,13 +1191,6 @@ fn parse_from_clause_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::F
     (Some(from), cur, None)
 }
 
-/// Reject helper for the inner join loop: when the current join step is
-/// malformed (`sparse_control_from_joins` at `cur` rejects), the whole
-/// `from`-list parse (`whole`) rejects too. Chains: the rejecting fold at `cur`
-/// (via the inner loop-resumption invariant) makes the fold from the base table
-/// reject; that makes `sparse_control_from_item(cur_v)` reject; via the outer
-/// loop-resumption invariant `whole` then rejects. Isolated so the deeply-nested
-/// loop exits stay legible.
 proof fn from_joins_reject_here(
     toks: &Vec<Token>,
     from_item: ast::From,
@@ -1343,30 +1206,24 @@ proof fn from_joins_reject_here(
     requires
         cur_start <= item_start <= cur <= toks.len(),
         toks.len() <= (usize::MAX - 3) / 2,
-        // Head-`FROM` facts linking `input` to `list_start` and `whole`.
         input.len() >= 1,
         input[0] == verified_production::TokenView::Keyword(Keyword::From),
         list_start == input.drop_first(),
         whole == verified_stmt_prec::sparse_control_from_list(list_start),
-        // `item_start` is where the base table's suffix begins (post-base-table).
         verified_stmt_prec::sparse_control_from_table(
             verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int)))
             == (Some(base_v), verified_production::token_views(
                 toks@.subrange(item_start as int, toks@.len() as int))),
-        // Inner resumption: the fold from the base equals the fold at `cur`.
         verified_stmt_prec::sparse_control_from_joins(
             base_v,
             verified_production::token_views(toks@.subrange(item_start as int, toks@.len() as int)))
         == verified_stmt_prec::sparse_control_from_joins(
             verified_stmt::view_from(from_item),
             verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
-        // A join-start keyword is present at `cur` but the step is malformed, so
-        // the fold at `cur` rejects.
         verified_stmt_prec::is_join_start(
             verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         verified_stmt_prec::sparse_control_from_step(
             verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))) is None,
-        // Outer resumption: `whole` is `done_v` prepended onto the parse at `cur_start`.
         whole == verified_stmt_prec::from_list_prepend(
             done_v, list_start,
             verified_stmt_prec::sparse_control_from_list(
@@ -1376,28 +1233,15 @@ proof fn from_joins_reject_here(
         verified_stmt_prec::sparse_control_from(input).0 is None,
 {
     let cur_v = verified_production::token_views(toks@.subrange(cur_start as int, toks@.len() as int));
-    // The malformed join step makes the fold at `cur` reject...
     verified_stmt_prec::lemma_from_joins_reject(
         verified_stmt::view_from(from_item),
         verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
-    // ...hence the fold from the base rejects (inner resumption), so the
-    // from-item rejects.
     assert(verified_stmt_prec::sparse_control_from_item(cur_v).0 is None);
-    // A rejecting from-item makes the from-list at `cur_v` reject.
     assert(verified_stmt_prec::sparse_control_from_list(cur_v).0 is None);
-    // And `from_list_prepend` routes the None through `whole`.
-    // `sparse_control_from(input)` unfolds (head is `FROM`) to the list at
-    // `input.drop_first() == list_start`, which is `whole`.
     assert(verified_stmt_prec::sparse_control_from(input)
         == verified_stmt_prec::sparse_control_from_list(list_start));
 }
 
-/// Reject helper for a malformed *join keyword* (a join-start keyword — `CROSS` /
-/// `INNER` / `LEFT` / `RIGHT` — not followed by `JOIN`). Such a head makes
-/// `sparse_control_join_head` (hence the step) `None` while `is_join_start`
-/// holds, so the fold rejects; the rest of the chain to `whole` is
-/// `from_joins_reject_here`. Distinct from that helper only in that the caller
-/// need not have parsed the join keyword-sequence to establish the step is None.
 proof fn from_kw_reject_here(
     toks: &Vec<Token>,
     from_item: ast::From,
@@ -1427,8 +1271,6 @@ proof fn from_kw_reject_here(
         == verified_stmt_prec::sparse_control_from_joins(
             verified_stmt::view_from(from_item),
             verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
-        // A join-start keyword is present, but no `JOIN` follows, so
-        // `sparse_control_join_head` (and hence the step) is None.
         verified_stmt_prec::is_join_start(
             verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         verified_stmt_prec::sparse_control_join_head(
@@ -1441,15 +1283,12 @@ proof fn from_kw_reject_here(
         whole.0 is None,
         verified_stmt_prec::sparse_control_from(input).0 is None,
 {
-    // `join_head` None implies the step is None; delegate the rest.
     assert(verified_stmt_prec::sparse_control_from_step(
         verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))) is None);
     from_joins_reject_here(toks, from_item, item_start, cur, base_v, cur_start,
         list_start, done_v, whole, input);
 }
 
-/// Parses a `FROM` table (`<name> [[AS] <alias>]`), strictly advancing on
-/// success (a table always consumes its name). Mirrors `parse_from_table`.
 fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
@@ -1481,14 +1320,12 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
     };
     proof { reveal(verified_production::token_view); }
     let mut cur = pos + 1;
-    // `input.drop_first()` — the suffix past the table name.
     let ghost r_after_name = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         verified_roundtrip::token_views_suffix(toks@, pos as int);
         assert(r_after_name == input.drop_first());
     }
 
-    // Optional alias: `AS <ident>` or a bare `<ident>`.
     let is_as = cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::As));
     let is_ident = cur < toks.len() && matches!(toks[cur], Token::Ident(_));
     proof {
@@ -1531,9 +1368,6 @@ fn parse_from_table_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::From>,
     (Some(ast::From::Table { name, alias }), cur, None)
 }
 
-/// Parses an optional `GROUP BY <expr> [, ...]` clause. Returns
-/// `(Some(vec![]), pos)` when no `GROUP` keyword is present. Mirrors
-/// `parse_group_by_clause`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expression>>, usize, Option<ParseError>))
@@ -1725,10 +1559,6 @@ fn parse_group_by_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<Vec<ast::Expr
     (Some(group_by), cur, None)
 }
 
-/// Head facts for the `parse_order_by_at` input at `pos` when at least two
-/// tokens remain: relates `input[0]`/`input[1]` to the tokens and pins the
-/// list-start suffix. Factored out to keep both the reject and accept exits of
-/// `parse_order_by_at` small.
 proof fn order_by_input_head(toks: &Vec<Token>, pos: usize)
     requires
         pos + 2 <= toks.len(),
@@ -1747,10 +1577,6 @@ proof fn order_by_input_head(toks: &Vec<Token>, pos: usize)
     verified_roundtrip::token_views_suffix(toks@, (pos + 1) as int);
 }
 
-/// Concludes the reject case of `parse_order_by_at`: given the `ORDER BY` head
-/// tokens and `whole` (the list parse from `list_start`) rejecting, the whole
-/// `sparse_control_order_by(input)` rejects. Isolated so the deeply-nested loop
-/// exit stays legible.
 proof fn order_by_conclude_none(
     toks: &Vec<Token>,
     pos: usize,
@@ -1777,8 +1603,6 @@ proof fn order_by_conclude_none(
     assert(list_start == input.drop_first().drop_first());
 }
 
-/// Accept case: `sparse_control_order_by(input)` equals the final accumulated
-/// list result `(Some(items), rest)`.
 proof fn order_by_conclude_some(
     toks: &Vec<Token>,
     pos: usize,
@@ -1810,9 +1634,6 @@ proof fn order_by_conclude_some(
     assert(list_start == input.drop_first().drop_first());
 }
 
-/// Concludes the reject case of `parse_group_by_at`: given the `GROUP BY` head
-/// tokens and `whole` (the list parse from `list_start`) rejecting, the whole
-/// `sparse_control_group_by(input)` rejects. Mirrors `order_by_conclude_none`.
 proof fn group_by_conclude_none(
     toks: &Vec<Token>,
     pos: usize,
@@ -1839,8 +1660,6 @@ proof fn group_by_conclude_none(
     assert(list_start == input.drop_first().drop_first());
 }
 
-/// Accept case: `sparse_control_group_by(input)` equals the final accumulated
-/// list result `(Some(items), rest)`. Mirrors `order_by_conclude_some`.
 proof fn group_by_conclude_some(
     toks: &Vec<Token>,
     pos: usize,
@@ -1872,9 +1691,6 @@ proof fn group_by_conclude_some(
     assert(list_start == input.drop_first().drop_first());
 }
 
-/// Parses an optional `ORDER BY <expr> [ASC|DESC] [, ...]` clause. Returns
-/// `(Some(vec![]), pos)` when no `ORDER` keyword is present. Mirrors
-/// `parse_order_by_clause`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
@@ -1920,12 +1736,10 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         )));
     }
     cur = cur + 1;
-    // Pin the `ORDER` / `BY` head tokens as structural facts (from the guards).
     proof {
         assert(toks@[pos as int] == Token::Keyword(Keyword::Order));
         assert(toks@[(pos + 1) as int] == Token::Keyword(Keyword::By));
     }
-    // `list_start` — the suffix just past `ORDER BY`, where the item list begins.
     let ghost list_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost whole = verified_stmt_prec::sparse_control_order_list(list_start);
     proof {
@@ -1944,11 +1758,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
             list_start == verified_production::token_views(
                 toks@.subrange((pos + 2) as int, toks@.len() as int)),
             whole == verified_stmt_prec::sparse_control_order_list(list_start),
-            // Resumption: the whole list equals what's been consumed (`order_by`)
-            // prepended onto the parse continuing at `cur`. Only meaningful on a
-            // realistically-sized input (where the expression parser refines).
-            // Holds each iteration but NOT at break (post-terminal-item `cur`
-            // would start a fresh parse); the break state is pinned by `ensures`.
             toks.len() <= (usize::MAX - 3) / 2 ==>
                 whole == verified_stmt_prec::order_list_prepend(
                     verified_stmt::view_order_list(order_by@),
@@ -1964,8 +1773,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
             list_start == verified_production::token_views(
                 toks@.subrange((pos + 2) as int, toks@.len() as int)),
             whole == verified_stmt_prec::sparse_control_order_list(list_start),
-            // At break the accumulated list is final: the whole parse is exactly
-            // `(Some(view_order_list(order_by@)), suffix-at-cur)`.
             toks.len() <= (usize::MAX - 3) / 2 ==>
                 whole == (Some(verified_stmt::view_order_list(order_by@)),
                     verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
@@ -1979,9 +1786,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         let expr = match opt {
             Some(e) => e,
             None => {
-                // `sparse_prec(cur_v) is None`, so `sparse_control_order_list(cur_v)`
-                // is `(None, cur_v)`, hence `whole == (None, list_start)`, hence
-                // `sparse_control_order_by(input) is None`.
                 proof {
                     if sized {
                         reveal_with_fuel(verified_stmt_prec::sparse_control_order_list, 1);
@@ -1996,21 +1800,18 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         };
         let ghost r_after_expr = verified_production::token_views(toks@.subrange(c as int, toks@.len() as int));
         proof {
-            // parse_clause_expr_at's (gated) refinement pins the sparse_prec result.
             if sized {
                 assert(verified_precedence::sparse_prec(cur_v, 0, verified_stmt_prec::expr_fuel(cur_v))
                     == (Some(verified_roundtrip::view_expr(expr)), r_after_expr));
             }
             if sized && c < toks.len() {
-                verified_roundtrip::token_views_suffix(toks@, c as int);  // r_after_expr head
+                verified_roundtrip::token_views_suffix(toks@, c as int);
             } else {
                 verified_roundtrip::token_views_len(toks@.subrange(c as int, toks@.len() as int));
             }
         }
         cur = c;
 
-        // Optional direction; defaults to ascending. `dir_consumed` records
-        // whether an ASC/DESC token was eaten, pinning `r1` for the spec lemmas.
         let mut direction = ast::Direction::Ascending;
         let ghost c_head_is_dir: bool = r_after_expr.len() >= 1
             && (r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Asc)
@@ -2033,19 +1834,14 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         }
         let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         proof {
-            // Pin the direction/`r1` relations that the step/last lemmas require.
-            // `r_after_expr[0] == token_view(toks[c])` (when c < len) drives the
-            // exec match, so the ghost direction-guards agree with the exec choice.
             if sized {
                 if c_head_is_dir {
-                    // ASC or DESC was consumed: r1 == r_after_expr.drop_first().
                     assert(r1 == r_after_expr.drop_first());
                     assert(r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Asc)
                         ==> direction == ast::Direction::Ascending);
                     assert(r_after_expr[0] == verified_production::TokenView::Keyword(Keyword::Desc)
                         ==> direction == ast::Direction::Descending);
                 } else {
-                    // No direction token: r1 == r_after_expr, direction default.
                     assert(r1 == r_after_expr);
                     assert(direction == ast::Direction::Ascending);
                 }
@@ -2054,7 +1850,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         let ghost old_order = order_by@;
         order_by.push((expr, direction));
         proof {
-            // order_by view distributes: done_v ++ [(view_expr(expr), direction)].
             verified_stmt_prec::lemma_view_order_list_append(old_order, seq![(expr, direction)]);
             verified_stmt_prec::lemma_view_order_list_single(expr, direction);
             assert(order_by@ == old_order + seq![(expr, direction)]);
@@ -2066,8 +1861,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
             proof {
                 verified_roundtrip::token_views_suffix(toks@, cur as int);
                 if sized {
-                    // Step: `sparse_control_order_list(cur_v)` prepends the item and
-                    // recurses at the post-comma suffix.
                     verified_stmt_prec::lemma_order_list_step(
                         cur_v, verified_roundtrip::view_expr(expr), direction, r_after_expr, r1);
                 }
@@ -2078,19 +1871,15 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
                 assert(r1.drop_first() == verified_production::token_views(
                     toks@.subrange(cur as int, toks@.len() as int)));
                 if sized {
-                    // Precondition #1 (entry invariant) and #2 (step lemma) for resume_step.
                     assert(whole == verified_stmt_prec::order_list_prepend(
                         done_v, list_start, verified_stmt_prec::sparse_control_order_list(cur_v)));
                     assert(verified_stmt_prec::sparse_control_order_list(cur_v)
                         == verified_stmt_prec::order_list_prepend(
                             seq![(verified_roundtrip::view_expr(expr), direction)], cur_v,
                             verified_stmt_prec::sparse_control_order_list(r1.drop_first())));
-                    // Re-establish the resumption invariant after appending one item.
                     verified_stmt_prec::lemma_order_list_resume_step(
                         list_start, cur_v, r1.drop_first(),
                         done_v, verified_roundtrip::view_expr(expr), direction, whole);
-                    // Bridge the lemma's `done_v + [item]` to `view_order_list(order_by@)`
-                    // and `r1.drop_first()` to the new current suffix.
                     assert(verified_stmt::view_order_list(order_by@)
                         == done_v + seq![(verified_roundtrip::view_expr(expr), direction)]);
                     assert(whole == verified_stmt_prec::order_list_prepend(
@@ -2111,14 +1900,12 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
                 if sized {
                     verified_stmt_prec::lemma_order_list_last(
                         cur_v, verified_roundtrip::view_expr(expr), direction, r_after_expr, r1);
-                    // whole == prepend(done_v, ls, (Some([item]), r1)) == (Some(done_v+[item]), r1).
                     assert(verified_stmt_prec::sparse_control_order_list(cur_v)
                         == (Some(seq![(verified_roundtrip::view_expr(expr), direction)]), r1));
                     assert(whole == (Some(done_v
                         + seq![(verified_roundtrip::view_expr(expr), direction)]), r1));
                     assert(verified_stmt::view_order_list(order_by@)
                         == done_v + seq![(verified_roundtrip::view_expr(expr), direction)]);
-                    // These survive the break as path facts (cur is final here).
                     assert(whole == (Some(verified_stmt::view_order_list(order_by@)),
                         verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
                 }
@@ -2127,8 +1914,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
         }
     }
     proof {
-        // `sparse_control_order_by` unfolds to `sparse_control_order_list(list_start)
-        // == whole`, which the break-ensures pinned to the final list result.
         if toks.len() <= (usize::MAX - 3) / 2 {
             order_by_conclude_some(toks, pos, cur, list_start, whole,
                 verified_stmt::view_order_list(order_by@));
@@ -2137,10 +1922,6 @@ fn parse_order_by_at(toks: &Vec<Token>, pos: usize) -> (r: (
     (Some(order_by), cur, None)
 }
 
-/// Parses a `CREATE TABLE <name> (<column>, ...)` statement, having consumed
-/// `CREATE`. Each column definition is parsed by `parse_create_column_at`.
-/// Mirrors `parse_create_table`; a malformed form yields `(None, pos)` so the
-/// caller falls back to the legacy parser.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -2149,7 +1930,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
-        // Full refinement against `sparse_control_create`, up to `view_stmt`.
         toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_stmt_prec::sparse_control_create(input);
@@ -2166,7 +1946,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
     proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
 
-    // TABLE
     if pos >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
@@ -2179,7 +1958,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     }
     let mut cur = pos + 1;
 
-    // Table name.
     if cur >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -2192,7 +1970,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     proof { assert(input[1] == verified_production::TokenView::Ident(name)); }
     cur = cur + 1;
 
-    // Opening paren of the column list.
     if cur >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -2207,7 +1984,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     proof { assert(input[2] == verified_production::TokenView::OpenParen); }
     cur = cur + 1;
 
-    // The column-list start suffix and its whole-parse against the spec twin.
     let ghost list_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost whole = verified_stmt_prec::sparse_control_column_list(list_start);
     proof {
@@ -2216,7 +1992,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         assert(list_start == input.drop_first().drop_first().drop_first());
     }
 
-    // One or more comma-separated column definitions.
     let mut columns: Vec<ast::Column> = Vec::new();
     loop
         invariant_except_break
@@ -2326,7 +2101,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     }
     let ghost after_list = cur;
 
-    // Closing paren.
     proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
     if cur >= toks.len() {
         proof {
@@ -2363,9 +2137,6 @@ fn parse_create_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     (Some(ast::Statement::CreateTable { name, columns }), cur, None)
 }
 
-/// Head facts for a `parse_create_at` input at `pos` when at least three tokens
-/// remain: `input[0..2]` are `TABLE`, the table ident, and `(`, and the
-/// column-list start is `input.drop_first()^3`.
 proof fn create_input_head(toks: &Vec<Token>, pos: usize)
     requires
         pos + 3 <= toks.len(),
@@ -2387,8 +2158,6 @@ proof fn create_input_head(toks: &Vec<Token>, pos: usize)
     verified_roundtrip::token_views_suffix(toks@, (pos + 2) as int);
 }
 
-/// Reject bridge: the column list from `list_start` rejects, so
-/// `sparse_control_create(input)` rejects.
 proof fn create_conclude_none(
     toks: &Vec<Token>,
     pos: usize,
@@ -2415,7 +2184,6 @@ proof fn create_conclude_none(
     assert(list_start == input.drop_first().drop_first().drop_first());
 }
 
-/// Reject bridge for a missing / wrong close paren after the accepted list.
 proof fn create_conclude_reject_close(
     toks: &Vec<Token>,
     pos: usize,
@@ -2456,8 +2224,6 @@ proof fn create_conclude_reject_close(
     }
 }
 
-/// Accept bridge: the whole statement, with the close paren consumed at
-/// `close_at`, equals `sparse_control_create(input) == (Some(CreateTable), rest)`.
 proof fn create_conclude_some(
     toks: &Vec<Token>,
     pos: usize,
@@ -2501,13 +2267,6 @@ proof fn create_conclude_some(
         toks@.subrange(cur as int, toks@.len() as int)));
 }
 
-/// Parses a single `CREATE TABLE` column definition (`<name> <datatype>
-/// <constraint>*`) at `pos`. Constraints are the keyword-led clauses
-/// `PRIMARY KEY`, `[NOT] NULL`, `DEFAULT <expr>`, `UNIQUE`, `INDEX`, and
-/// `REFERENCES <table>`; the clause loop ends at the first non-keyword token.
-/// Returns `(None, pos)` on any malformed / unexpected keyword. Mirrors
-/// `parse_create_table_column`; strictly advances on success (a column always
-/// consumes at least its name and datatype).
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
 fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Column>, usize, Option<ParseError>))
@@ -2517,8 +2276,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         pos <= r.1 <= toks.len(),
         r.0 is Some ==> pos < r.1,
         r.0 is None ==> r.2 is Some,
-        // Full refinement: the produced column and leftover token stream agree
-        // with the spec twin `sparse_control_column`, up to `view_column`.
         toks.len() <= (usize::MAX - 3) / 2 ==> ({
             let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
             let (sopt, srest) = verified_stmt_prec::sparse_control_column(input);
@@ -2535,16 +2292,13 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
     let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
     proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
 
-    // Column name.
     if pos >= toks.len() {
-        // Empty input: `sparse_control_column` rejects.
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
     proof { verified_roundtrip::token_views_suffix(toks@, pos as int); reveal(verified_production::token_view); }
     let name = match &toks[pos] {
         Token::Ident(n) => n.clone(),
         _ => {
-            // `input[0]` is not an ident: `sparse_control_column` rejects.
             proof { assert(!(input[0] is Ident)); }
             return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone())));
         },
@@ -2552,9 +2306,7 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
     proof { assert(input[0] == verified_production::TokenView::Ident(name)); }
     let mut cur = pos + 1;
 
-    // Datatype keyword.
     if cur >= toks.len() {
-        // No token after the name: `input.drop_first().len() < 1`, reject.
         proof {
             verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
             verified_roundtrip::token_views_suffix(toks@, pos as int);
@@ -2579,14 +2331,10 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         | Token::Keyword(Keyword::Text)
         | Token::Keyword(Keyword::Varchar) => DataType::String,
         _ => {
-            // `input[1]` is not a datatype keyword: reject.
             proof { assert(verified_stmt_prec::parse_column_datatype_kw(input[1]) is None); }
             return (None, pos, Some(ParseError::UnexpectedToken(toks[cur].clone())));
         },
     };
-    // The datatype keyword at `pos+1` maps to `datatype` under the spec mirror,
-    // and the name at `pos` is `Ident(name)`; both pin `sparse_control_column`'s
-    // prefix reduction.
     proof {
         reveal(verified_production::token_view);
         assert(verified_stmt_prec::parse_column_datatype_kw(
@@ -2594,10 +2342,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
     }
     cur = cur + 1;
 
-    // Ghost: the constraint-loop start suffix, and the whole constraint parse
-    // from it against the spec twin. `input[0]` is the name ident, `input[1]`
-    // the datatype keyword, so the spec's `sparse_control_column` reduces to
-    // `sparse_control_col_constraints(cstart, name, datatype, empty)`.
     let ghost cstart = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost cwhole = verified_stmt_prec::sparse_control_col_constraints(
         cstart, name, datatype, verified_stmt_prec::col_acc_empty());
@@ -2612,7 +2356,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         assert(verified_stmt_prec::parse_column_datatype_kw(input[1]) == Some(datatype));
     }
 
-    // Column constraints; `cur` is now strictly past `pos` (name + datatype).
     let mut primary_key = false;
     let mut nullable: Option<bool> = None;
     let mut default: Option<ast::Expression> = None;
@@ -2632,8 +2375,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
                 cstart, name, datatype, verified_stmt_prec::col_acc_empty()),
             input[0] == verified_production::TokenView::Ident(name),
             verified_stmt_prec::parse_column_datatype_kw(input[1]) == Some(datatype),
-            // The constraint parse from `cstart` equals continuing from the
-            // current suffix with the accumulator reflecting the exec locals.
             sized ==> cwhole == verified_stmt_prec::sparse_control_col_constraints(
                 verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)),
                 name, datatype,
@@ -2652,8 +2393,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
                 toks@.subrange((pos + 2) as int, toks@.len() as int)),
             input[0] == verified_production::TokenView::Ident(name),
             verified_stmt_prec::parse_column_datatype_kw(input[1]) == Some(datatype),
-            // On exit, the whole constraint parse accepts, producing the final
-            // column (view) and the current suffix as leftover.
             sized ==> cwhole == (
                 Some(verified_stmt::view_column(ast::Column {
                     name, datatype, primary_key, nullable, default, unique, index, references,
@@ -2672,8 +2411,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         };
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         if cur >= toks.len() {
-            // EOF ends the column: `sparse_control_col_constraints(empty, ..)`
-            // accepts with `col_from_acc`, which is `view_column` of the column.
             proof {
                 if sized {
                     assert(cur_v.len() == 0);
@@ -2688,7 +2425,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
             break;
         }
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); reveal(verified_production::token_view); }
-        // Constraints are keyword-led; a non-keyword token ends the column.
         let keyword = match &toks[cur] {
             Token::Keyword(k) => *k,
             _ => {
@@ -2837,8 +2573,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
         } else if matches!(keyword, Keyword::Default) {
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
-                // Only reachable when the token count exceeds the spec's size
-                // bound, i.e. `!sized`, so the refinement is vacuous here.
                 proof { assert(!sized); }
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
@@ -2947,8 +2681,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
                 },
             }
         } else {
-            // Unexpected keyword for a column definition: not one of the
-            // recognised constraint keywords, so the spec rejects too.
             proof {
                 if sized {
                     assert(keyword != Keyword::Primary && keyword != Keyword::Null
@@ -2981,10 +2713,6 @@ fn parse_create_column_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Col
     (Some(column), cur, None)
 }
 
-/// Reject bridge for `parse_create_column_at`: given the constraint parse from
-/// `cur_v` (the current suffix) rejects, and the loop invariant relating it to
-/// the whole parse `cwhole` from `cstart`, conclude `sparse_control_column`
-/// rejects on the column's input. Isolated so the nested loop stays legible.
 proof fn col_constraints_reject(
     toks: &Vec<Token>,
     pos: usize,
@@ -3018,9 +2746,6 @@ proof fn col_constraints_reject(
     assert(cwhole.0 is None);
 }
 
-/// Accept bridge for `parse_create_column_at`: the loop-exit invariant (the
-/// whole constraint parse produces `view_column(column)` and the current suffix)
-/// lifts to `sparse_control_column(input) == (Some(view_column(column)), rest)`.
 proof fn col_constraints_accept(
     toks: &Vec<Token>,
     pos: usize,
@@ -3059,10 +2784,6 @@ proof fn col_constraints_accept(
     assert(cstart == input.drop_first().drop_first());
 }
 
-/// Head facts for a `parse_create_column_at` input at `pos` when at least two
-/// tokens remain: `input[0]` is the name ident, `input[1]` the datatype keyword,
-/// and the constraint-loop start is `input.drop_first().drop_first()`. Pins the
-/// prefix so `sparse_control_column` reduces to the constraint parse.
 proof fn col_input_head(toks: &Vec<Token>, pos: usize)
     requires
         pos + 2 <= toks.len(),
@@ -3081,12 +2802,6 @@ proof fn col_input_head(toks: &Vec<Token>, pos: usize)
     verified_roundtrip::token_views_suffix(toks@, (pos + 1) as int);
 }
 
-/// Parses an `UPDATE <table> SET <col> = <expr|DEFAULT> [, ...] [WHERE <expr>]`
-/// statement, having consumed `UPDATE`. Assignment values and the optional
-/// `WHERE` predicate are parsed by the verified expression parser; `DEFAULT`
-/// maps to `None`. A duplicate column, like any malformed form, yields
-/// `(None, pos)` so the caller falls back to the legacy parser (which also
-/// carries the specific error text). Mirrors `parse_update`.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(900000)]
 fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -3109,7 +2824,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 {
     let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
-    // Table name.
     if pos >= toks.len() {
         proof {
             verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
@@ -3136,7 +2850,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         },
     };
     let mut cur = pos + 1;
-    // r0 — suffix just past `<ident>`.
     let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         verified_roundtrip::token_views_suffix(toks@, pos as int);
@@ -3144,7 +2857,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         assert(input[0] == verified_production::TokenView::Ident(table));
     }
 
-    // SET
     if cur >= toks.len() {
         proof {
             verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -3168,7 +2880,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         )));
     }
     cur = cur + 1;
-    // r1 — the assign-list start (suffix just past `<ident> SET`).
     let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost al_whole = verified_stmt_prec::sparse_control_assign_list(r1);
     proof {
@@ -3177,9 +2888,7 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         assert(r0[0] == verified_production::TokenView::Keyword(Keyword::Set));
     }
 
-    // One or more comma-separated `<col> = <value>` assignments.
     let mut set: BTreeMap<String, Option<ast::Expression>> = BTreeMap::new();
-    // `done` — the parse-ordered exec assignment pairs accumulated so far.
     let ghost mut done: Seq<(String, Option<ast::Expression>)> = Seq::empty();
     proof {
         verified_stmt::axiom_string_obeys_cmp();
@@ -3199,13 +2908,11 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             r1 == r0.drop_first(),
             al_whole == verified_stmt_prec::sparse_control_assign_list(r1),
             set@.dom().finite(),
-            // `done` <-> `set@` correspondence and distinctness.
             forall|i: int, j: int| 0 <= i < j < done.len() ==> done[i].0 != done[j].0,
             forall|i: int| 0 <= i < done.len() ==> #[trigger] set@.dom().contains(done[i].0)
                 && set@[done[i].0] == done[i].1,
             forall|k: String| set@.dom().contains(k)
                 ==> exists|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == k,
-            // Resumption invariant for the twin (sized inputs only).
             sized ==> al_whole == verified_stmt_prec::assign_list_prepend(
                 verified_stmt::view_assign_pairs(done),
                 r1,
@@ -3228,14 +2935,12 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             forall|k: String| set@.dom().contains(k)
                 ==> exists|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == k,
             done.len() >= 1,
-            // At break, the assign list is final and equals the view'd `done`.
             sized ==> al_whole == (Some(verified_stmt::view_assign_pairs(done)),
                 verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
         let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         let ghost done_v = verified_stmt::view_assign_pairs(done);
-        // Column name.
         if cur >= toks.len() {
             proof {
                 verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -3280,7 +2985,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         cur = cur + 1;
         proof { verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int); }
 
-        // `=`
         if cur >= toks.len() {
             proof {
                 verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
@@ -3314,7 +3018,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             )));
         }
         cur = cur + 1;
-        // `rest` — suffix just past `<col> =` (the value position).
         let ghost rest_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         proof {
             verified_roundtrip::token_views_suffix(toks@, (cur - 2) as int);
@@ -3327,9 +3030,7 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             }
         }
 
-        // Value: the `DEFAULT` keyword maps to `None`; otherwise an expression.
         let value: Option<ast::Expression>;
-        // `r_after_val` — suffix just past the value.
         let ghost r_after_val: Seq<verified_production::TokenView>;
         if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Default)) {
             proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
@@ -3397,7 +3098,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 },
             }
         }
-        // The assignment `(column, value)` was parsed; the suffix is now `r_after_val`.
         let ghost a: (String, Option<SExpr>) = (column, verified_stmt::view_opt(value));
         proof {
             if sized {
@@ -3405,19 +3105,16 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             }
         }
 
-        // Reject a column set twice (legacy owns the error text).
         proof { verified_stmt::axiom_string_obeys_cmp(); }
         if set.contains_key(&column) {
             proof {
                 verified_stmt::axiom_string_obeys_cmp();
                 broadcast use vstd::std_specs::btree::group_btree_axioms;
-                // `column` is a duplicate: it already appears among `done`'s keys.
                 assert(set@.contains_key(column));
                 if sized {
                     let di = choose|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == column;
                     assert(done[di].0 == column);
                     verified_stmt::view_assign_pairs_index(done);
-                    // `done_v[di].0 == column == a.0`.
                     assert(done_v[di].0 == done[di].0);
                     assert(a.0 == column);
                     verified_stmt_prec::lemma_update_reject_on_duplicate(
@@ -3439,7 +3136,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             verified_stmt::axiom_string_obeys_cmp();
             broadcast use vstd::std_specs::btree::group_btree_axioms;
             assert(set@ == old_set.insert(column, value));
-            // Re-establish `done` <-> `set@`.
             assert(forall|i: int, j: int| 0 <= i < j < done.len() ==> done[i].0 != done[j].0) by {
                 assert forall|i: int, j: int| 0 <= i < j < done.len() implies done[i].0 != done[j].0 by {
                     if j < old_done.len() {
@@ -3524,13 +3220,11 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // At this point `done` (>= 1) holds the parsed assignments with distinct keys.
     let ghost items_v = verified_stmt::view_assign_pairs(done);
     let ghost al_rest = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         if sized {
             assert(al_whole == (Some(items_v), al_rest));
-            // Distinct keys: the twin's boundary duplicate check passes.
             verified_stmt::view_assign_pairs_index(done);
             assert(verified_stmt_prec::assign_keys_distinct(items_v)) by {
                 assert forall|i: int, j: int| 0 <= i < j < items_v.len()
@@ -3542,7 +3236,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // Optional WHERE <expr>.
     let mut where_clause: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
@@ -3597,7 +3290,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             if sized {
                 verified_stmt::lemma_update_view_boundary(table, set@, done, where_clause);
                 verified_stmt::view_assign_pairs_index(done);
-                // The twin unfolds to `assign_list_to_sstmt(table, items_v, Some(we))`.
                 assert(verified_stmt::view_opt(where_clause) == Some(we));
                 assert(verified_stmt_prec::sparse_control_update(input)
                     == (Some(verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we))),
@@ -3641,10 +3333,6 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     (Some(ast::Statement::Update { table, set, where_clause }), cur, None)
 }
 
-/// Parses an `INSERT INTO <table> [(<col>, ...)] VALUES (<expr>, ...), ...`
-/// statement, having consumed `INSERT`. The row values are parsed by the
-/// verified expression parser. Mirrors `parse_insert`; a malformed form yields
-/// `(None, pos)` so the caller falls back to the legacy parser.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(200000)]
 fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -3667,7 +3355,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
 {
     let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
-    // INTO
     if pos >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -3680,14 +3367,12 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         )));
     }
     let mut cur = pos + 1;
-    // r0 — suffix just past `INTO`.
     let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         verified_roundtrip::token_views_suffix(toks@, pos as int);
         assert(r0 == input.drop_first());
     }
 
-    // Table name.
     if cur >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -3698,7 +3383,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
     };
     cur = cur + 1;
-    // r1 — suffix just past `INTO <ident>`.
     let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     proof {
         verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
@@ -3706,12 +3390,10 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         assert(r0[0] == verified_production::TokenView::Ident(table));
     }
 
-    // Optional parenthesised column list.
     let mut columns: Option<Vec<String>> = None;
     if cur < toks.len() && matches!(toks[cur], Token::OpenParen) {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
-        // list_start for the ident list.
         let ghost cl_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         let ghost cl_whole = verified_stmt_prec::sparse_control_ident_list(cl_start);
         proof {
@@ -3816,14 +3498,11 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 break;
             }
         }
-        // rc — spec suffix after the ident list (matches cl_whole.1).
         let ghost rc = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         if cur >= toks.len() {
             proof {
                 verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
                 assert(rc.len() == 0);
-                // Ident list succeeded (`cl_whole.0 is Some`) but no `)` follows, so
-                // the spec column helper rejects, so the whole INSERT rejects.
                 assert(cl_whole == (Some(cols@), rc));
                 assert(verified_stmt_prec::sparse_control_opt_columns(r1).is_none());
                 insert_conclude_none_cols(input, r0, r1, cl_start, table);
@@ -3848,9 +3527,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         columns = Some(cols);
         proof {
             verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
-            // The spec column helper agrees: it opened at `(`, the ident list
-            // (`cl_whole`) matched `cols@`, `rc` began with `)`, and the suffix at
-            // `cur` is just past that `)`.
             assert(cl_start == r1.drop_first());
             assert(verified_stmt_prec::sparse_control_ident_list(r1.drop_first()) == cl_whole);
             assert(rc == cl_whole.1);
@@ -3867,8 +3543,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             } else {
                 verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
             }
-            // No `(` opened: the spec helper returns `Some((None, r1))` and the
-            // suffix at `cur` is exactly `r1` (cur unchanged in this branch).
             assert(verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)) == r1);
             assert(!(r1.len() >= 1 && r1[0] == verified_production::TokenView::OpenParen));
             assert(verified_stmt_prec::sparse_control_opt_columns(r1)
@@ -3876,19 +3550,15 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                     verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))));
         }
     }
-    // r2 — spec suffix at the (mandatory) `VALUES` keyword, matching the spec's
-    // `r2` regardless of whether a column list was present.
     let ghost r2 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost cols_view: Option<Seq<String>> = match columns {
         Some(ref v) => Some(v@),
         None => None,
     };
-    // Merge the two column-branch outcomes into the single spec-helper equation.
     proof {
         assert(verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)));
     }
 
-    // VALUES
     if cur >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -3901,16 +3571,11 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         )));
     }
     cur = cur + 1;
-    // vals_start — suffix just past `VALUES`, where the row list begins.
     let ghost vals_start = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
     let ghost vals_whole = verified_stmt_prec::sparse_control_values(vals_start);
     proof {
         verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
         assert(vals_start == r2.drop_first());
-        // Entry resumption: with no rows consumed, `view_rows([]) == []` and the
-        // suffix at `cur` is `vals_start`, so `values_prepend([], vals_start, vals_whole)
-        // == vals_whole` (whether `vals_whole` accepts or rejects, since on reject
-        // `sparse_control_values` returns its input `vals_start`).
         reveal_with_fuel(verified_stmt::view_rows, 1);
         assert(verified_stmt::view_rows(Seq::<Vec<ast::Expression>>::empty())
             == Seq::<Seq<verified_roundtrip::SExpr>>::empty());
@@ -3920,15 +3585,12 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }
     }
 
-    // One or more comma-separated parenthesised rows of expressions.
     let mut values: Vec<Vec<ast::Expression>> = Vec::new();
     loop
         invariant_except_break
             pos < cur,
             cur <= toks.len(),
             sized == (toks.len() <= (usize::MAX - 3) / 2),
-            // Structural head facts, constant across the loop, needed to conclude
-            // `sparse_control_insert` on any exit.
             input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
             input.len() >= 1,
             input[0] == verified_production::TokenView::Keyword(Keyword::Into),
@@ -4001,16 +3663,10 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             )));
         }
         proof { assert(cur_v[0] == verified_production::TokenView::OpenParen); }
-        // `cur_v_outer` — the values-loop suffix at this row's opening `(`, kept
-        // across the inner loop (which shadows `cur_v`) for the reject/accept
-        // bridge lemmas. `done_v_outer` — `view_rows` of the rows consumed so far.
         let ghost cur_v_outer = cur_v;
         let ghost done_v_outer = done_v;
         cur = cur + 1;
-        // Snapshot the post-`(` position: the inner loop only advances `cur`, so
-        // the outer loop's `decreases` sees strict progress across a row.
         let ghost row_start = cur;
-        // rstart_v — suffix just past `(`, where the row's expression list begins.
         let ghost rstart_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         let ghost row_whole = verified_stmt_prec::sparse_control_group_list(rstart_v);
         proof {
@@ -4029,8 +3685,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 rstart_v == verified_production::token_views(
                     toks@.subrange(row_start as int, toks@.len() as int)),
                 row_whole == verified_stmt_prec::sparse_control_group_list(rstart_v),
-                // Structural head facts (constant), so a row-level reject can invoke
-                // `insert_conclude_none`.
                 input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
                 input.len() >= 1,
                 input[0] == verified_production::TokenView::Keyword(Keyword::Into),
@@ -4042,8 +3696,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 r2.len() >= 1,
                 r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
                 vals_start == r2.drop_first(),
-                // Carry the outer values-loop resumption (constant across this inner
-                // loop) so a row-level reject can conclude the whole values reject.
                 vals_whole == verified_stmt_prec::sparse_control_values(vals_start),
                 sized ==>
                     vals_whole == verified_stmt_prec::values_prepend(
@@ -4093,8 +3745,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             let ghost rdone_v = verified_roundtrip::view_args(row@);
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
-                // Only reachable when `!sized`, so the refinement postcondition is
-                // vacuous; nothing to prove about `vals_whole`.
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
@@ -4108,8 +3758,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                         assert(verified_precedence::sparse_prec(rcur_v, 0, fuel as nat).0 is None);
                         assert(verified_stmt_prec::sparse_control_group_list(rcur_v).0 is None);
                         if sized {
-                            // The row's expr list rejects, so `row_whole` rejects, so
-                            // the enclosing row rejects, so the values list rejects.
                             assert(row_whole.0 is None);
                             insert_row_whole_reject(rstart_v, cur_v_outer, row_whole);
                             reveal_with_fuel(verified_stmt_prec::sparse_control_values, 1);
@@ -4179,7 +3827,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 break;
             }
         }
-        // At the end of the inner loop, `row_whole == (Some(view_args(row@)), suffix-at-cur)`.
         let ghost r_after_row_exprs = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         if cur >= toks.len() {
             proof {
@@ -4218,7 +3865,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         cur = cur + 1;
         let ghost old_values = values@;
         values.push(row);
-        // r_after_row — spec suffix just past the row's closing paren.
         let ghost r_after_row = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
         let ghost row_view = verified_roundtrip::view_args(row@);
         proof {
@@ -4230,7 +3876,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             assert(verified_stmt::view_rows(values@)
                 == done_v + seq![row_view]);
             if sized {
-                // `sparse_control_row(cur_v_outer) == (Some(view_args(row@)), r_after_row)`.
                 insert_row_accept(rstart_v, cur_v_outer, row_view, r_after_row_exprs, r_after_row);
             }
         }
@@ -4276,10 +3921,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         if sized {
             insert_conclude(toks, pos, cur, input, r0, r1, r2, vals_start, vals_whole,
                 table, cols_view, verified_stmt::view_rows(values@));
-            // Bridge `view_stmt(Insert{..})` to `SStmt::Insert{table, cols_view, rows}`:
-            // `view_stmt`'s Insert arm maps `columns` through the same `Option`-map
-            // and `values` through `view_rows`, matching `cols_view` / the produced
-            // rows exactly.
             assert(cols_view == match columns {
                 Some(ref v) => Some(v@),
                 None => None::<Seq<String>>,
@@ -4295,9 +3936,6 @@ fn parse_insert_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     (Some(ast::Statement::Insert { table, columns, values }), cur, None)
 }
 
-/// A row parse fails because its inner expression list itself rejects: given
-/// `sparse_control_group_list(rstart_v)` rejects, `sparse_control_row(cur_v)`
-/// rejects. `cur_v` opens with `(` and `rstart_v == cur_v.drop_first()`.
 proof fn insert_row_whole_reject(
     rstart_v: Seq<verified_production::TokenView>,
     cur_v: Seq<verified_production::TokenView>,
@@ -4314,10 +3952,6 @@ proof fn insert_row_whole_reject(
 {
 }
 
-/// A row parse fails: given the inner expression list result at `rstart_v`
-/// (`(Some(exprs), r)` where the head is not a close paren, or EOF), the row
-/// parse `sparse_control_row(cur_v)` rejects. `cur_v` opens with `(` and
-/// `rstart_v == cur_v.drop_first()`.
 proof fn insert_row_reject(
     rstart_v: Seq<verified_production::TokenView>,
     cur_v: Seq<verified_production::TokenView>,
@@ -4335,9 +3969,6 @@ proof fn insert_row_reject(
 {
 }
 
-/// A row parse succeeds: given the inner expression list result at `rstart_v`
-/// (`(Some(exprs), r)` with a leading close paren), the row parse
-/// `sparse_control_row(cur_v)` yields `(Some(exprs), r.drop_first())`.
 proof fn insert_row_accept(
     rstart_v: Seq<verified_production::TokenView>,
     cur_v: Seq<verified_production::TokenView>,
@@ -4358,10 +3989,6 @@ proof fn insert_row_accept(
 {
 }
 
-/// Concludes `parse_insert_at`: from the head tokens (`INTO <ident>`), the
-/// optional column list result, the `VALUES` keyword, and the final values-loop
-/// result (`vals_whole == (Some(rows), suffix-at-cur)`), the whole
-/// `sparse_control_insert(input)` equals the produced INSERT statement's view.
 proof fn insert_conclude(
     toks: &Vec<Token>,
     pos: usize,
@@ -4385,7 +4012,6 @@ proof fn insert_conclude(
         r0.len() >= 1,
         r0[0] == verified_production::TokenView::Ident(table),
         r1 == r0.drop_first(),
-        // The spec column helper's outcome (see `sparse_control_opt_columns`).
         verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)),
         r2.len() >= 1,
         r2[0] == verified_production::TokenView::Keyword(Keyword::Values),
@@ -4400,9 +4026,6 @@ proof fn insert_conclude(
 {
 }
 
-/// Reject-case conclusion for a malformed column list: given the head tokens
-/// (`INTO <ident>`) and the spec column helper rejecting
-/// (`sparse_control_opt_columns(r1) is None`), the whole INSERT rejects.
 proof fn insert_conclude_none_cols(
     input: Seq<verified_production::TokenView>,
     r0: Seq<verified_production::TokenView>,
@@ -4423,9 +4046,6 @@ proof fn insert_conclude_none_cols(
 {
 }
 
-/// Reject-case conclusion: given the structural head facts and the values list
-/// rejecting (`vals_whole.0 is None`), the whole `sparse_control_insert(input)`
-/// rejects.
 proof fn insert_conclude_none(
     input: Seq<verified_production::TokenView>,
     r0: Seq<verified_production::TokenView>,
@@ -4452,19 +4072,12 @@ proof fn insert_conclude_none(
     ensures
         verified_stmt_prec::sparse_control_insert(input).0 is None,
 {
-    // Unfold `sparse_control_insert`: INTO ✓, Ident branch ✓, opt-columns Some,
-    // then the VALUES match lands on the `(None, _)` arm because `vals_whole`
-    // (the values parse) rejects.
     assert(verified_stmt_prec::sparse_control_opt_columns(r1) == Some((cols_view, r2)));
     assert(verified_stmt_prec::sparse_control_values(r2.drop_first()) == vals_whole);
     assert(verified_stmt_prec::sparse_control_insert(input)
         == (None::<verified_stmt::SStmt>, input));
 }
 
-/// Parses a `DELETE FROM <table> [WHERE <expr>]` statement, having consumed
-/// `DELETE`. The optional `WHERE` predicate is parsed by the Verus-verified
-/// expression parser. Mirrors `parse_delete`; a malformed form yields
-/// `(None, pos)` so the caller falls back to the legacy parser.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(40000)]
 fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -4486,7 +4099,6 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         }),
 {
     let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
-    // FROM
     if pos >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -4500,7 +4112,6 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     }
     let mut cur = pos + 1;
 
-    // Table name (an identifier).
     if cur >= toks.len() {
         proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
         return (None, pos, Some(ParseError::UnexpectedEof));
@@ -4512,7 +4123,6 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     };
     cur = cur + 1;
 
-    // Position just past `FROM <ident>` — matches the spec twin's `r`.
     let ghost r_spec = input.drop_first().drop_first();
     proof {
         verified_roundtrip::token_views_suffix(toks@, pos as int);
@@ -4520,12 +4130,10 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         assert(r_spec == verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)));
     }
 
-    // Optional WHERE <expr>, parsed by the verified expression parser.
     let mut where_clause: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
-        // Fuel the verified parser needs (`2*(len-pos)+3`); guard the arithmetic.
         let n = toks.len() - cur;
         if n > (usize::MAX - 3) / 2 {
             return (None, pos, Some(ParseError::UnexpectedEof));
@@ -4551,9 +4159,6 @@ fn parse_delete_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     (Some(ast::Statement::Delete { table, where_clause }), cur, None)
 }
 
-/// Parses a `DROP TABLE [IF EXISTS] <name>` statement, having consumed `DROP`
-/// (so `pos` points just past it). Mirrors `parse_drop_table`; a malformed form
-/// yields `(None, pos)` so the caller falls back to the legacy parser.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(40000)]
 fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -4588,7 +4193,6 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
     }
     let mut cur = pos + 1;
 
-    // Optional IF EXISTS.
     let mut if_exists = false;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::If)) {
         proof { verified_roundtrip::token_views_suffix(toks@, pos as int); verified_roundtrip::token_views_suffix(toks@, cur as int); }
@@ -4612,7 +4216,6 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
         }
     }
 
-    // Table name (an identifier).
     if cur >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
@@ -4627,11 +4230,6 @@ fn parse_drop_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, 
     }
 }
 
-/// Parses a `BEGIN` statement's optional clauses, having consumed the `BEGIN`
-/// keyword (so `pos` points just past it): an optional `TRANSACTION`, an optional
-/// `READ ONLY` / `READ WRITE`, and an optional `AS OF SYSTEM TIME <number>`.
-/// Mirrors `parse_begin`; a malformed clause yields `(None, begin_pos)` so the
-/// caller falls back to the legacy parser for the specific error.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(80000)]
 fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
@@ -4654,22 +4252,17 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
 {
     let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
     proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
-    // `pos` is just past BEGIN; on any malformed clause we return this position so
-    // the caller's cursor is unchanged and legacy re-parses from BEGIN.
     let begin_pos = pos;
     let mut cur = pos;
 
-    // Optional TRANSACTION.
     if cur < toks.len() {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Transaction)) {
         cur = cur + 1;
     }
-    // Ghost: `r0` = spec suffix just past the optional TRANSACTION.
     let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
 
-    // Optional READ ONLY / READ WRITE.
     let mut read_only = false;
     if cur < toks.len() {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
@@ -4691,10 +4284,8 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
             _ => return (None, begin_pos, Some(ParseError::UnexpectedToken(toks[cur].clone()))),
         }
     }
-    // Ghost: `r2` = spec suffix just past the optional READ clause.
     let ghost r2 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
 
-    // Optional AS OF SYSTEM TIME <number>.
     let mut as_of: Option<u64> = None;
     if cur < toks.len() {
         proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
@@ -4753,4 +4344,4 @@ fn parse_begin_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>,
     (Some(ast::Statement::Begin { read_only, as_of }), cur, None)
 }
 
-} // verus!
+}

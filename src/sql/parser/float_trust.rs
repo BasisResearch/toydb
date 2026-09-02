@@ -92,12 +92,6 @@ pub fn canonical_nan() -> (r: f64)
     f64::NAN
 }
 
-/// Constructs positive infinity, the value the production parser builds for the
-/// `INFINITY` keyword. Non-finite, so outside the finite-roundtrip domain; the
-/// precedence parser only needs to construct it. The `spec_infinity()` ensures
-/// pins its ghost value so the spec-level precedence parser can model the
-/// `INFINITY` atom (which is outside the canonical printable domain, but the
-/// exec parser still accepts it and the refinement must account for it).
 #[verifier::external_body]
 pub fn infinity() -> (r: f64)
     ensures r == spec_infinity(),

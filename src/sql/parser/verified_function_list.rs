@@ -20,15 +20,7 @@
 //!    mirror AST (`SExpr`) at the level of a structural view (`view_expr`).
 //!
 //! Types here are a minimal `Atom` / `Function` grammar standing in for the
-//! production AST. The pattern this module pioneered (exec parser over real
-//! `Vec`s verified against a `Seq` mirror) was reused for the whole grammar in
-//! `verified_roundtrip` / `verified_precedence`; the exec demo layer here
-//! (`parse_exec` / `parse_args_exec` / `roundtrip_demo`), which nothing ever
-//! called, was deleted in phase 4 — the spec
-//! mirror and its roundtrip lemmas remain as the template's record.
 
-// Ghost items are erased by the non-Verus build; the module is verification
-// scaffolding.
 #![allow(dead_code, unused_variables)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the
 // crate's `warn(clippy::all)` so proof-shaped constructs don't trip `-D warnings`.

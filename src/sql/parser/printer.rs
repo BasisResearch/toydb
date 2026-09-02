@@ -75,12 +75,6 @@ pub fn print_expr(expression: &ast::Expression) -> Option<Vec<Token>> {
             tokens.push(Token::CloseParen);
             Some(tokens)
         }
-        // `print_operator` produces byte-identical tokens to the verified
-        // `print_core_expr` and also handles `Function` subtrees (which the
-        // function-free core rejects). Calling it directly avoids retrying
-        // `print_core_expr` over the whole subtree at every operator level — an
-        // O(n²) walk on operator trees containing a function — and drops the
-        // dual-dispatch. `print_core_expr` stays for the verified statement path.
         ast::Expression::Operator(operator) => print_operator(operator),
     }
 }
@@ -1006,16 +1000,6 @@ mod tests {
         Expression::Column(None, name.into())
     }
 
-    /// Serialises canonical tokens to SQL source text, quoting and escaping so
-    /// the lexer reproduces each token exactly.
-    ///
-    /// `Token`'s `Display` is lossy for `Ident` and `String` — it writes the raw
-    /// payload with no quoting, so re-lexing a keyword-named, mixed-case, empty,
-    /// or quote-containing identifier (or a `'`-containing string) would diverge.
-    /// Always double-quoting identifiers and single-quoting strings sidesteps all
-    /// of that, so `print -> render -> lex -> parse` is a faithful roundtrip
-    /// rather than the token-level `print -> parse_tokens` shortcut. Tokens are
-    /// space-separated, which never merges adjacent tokens and is valid anywhere.
     fn render_tokens(tokens: &[Token]) -> String {
         tokens
             .iter()
@@ -1284,10 +1268,6 @@ mod tests {
             prop_assert_eq!(Parser::parse_statement_tokens(&tokens), Ok(statement));
         }
 
-        // Source-level counterparts to the two token-level roundtrips above:
-        // render the tokens to SQL text and re-lex, so the lexer's case folding,
-        // keyword recognition, and quote handling are exercised — the divergences
-        // a token-only roundtrip cannot see.
         #[test]
         fn parser_inverts_the_printer_through_sql_source(expression in expressions()) {
             let tokens = print_expr(&expression)
@@ -1333,9 +1313,6 @@ mod tests {
 
     #[test]
     fn source_roundtrip_handles_tricky_identifiers_and_strings() {
-        // The exact cases the token-level roundtrip waves through but a real
-        // re-lex would catch: keyword-named, mixed-case, empty, and qualified
-        // keyword identifiers, plus quote-containing and empty strings.
         for expression in [
             column("select"),
             column("MixedCase"),
@@ -1720,16 +1697,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Phase 3 minimal-parenthesisation printer: associativity acceptance.
-    //
-    // The fully-parenthesised printer emits `( ... )` around every operator,
-    // so it can never exhibit `1 - 2 - 3` or `2 ^ 3 ^ 2` unbracketed. The
-    // min-parens printer (`verified_minparen::print_min_expr`) drops the
-    // parens its associativity-aware contexts prove redundant, and the live
-    // parser recovers the original nesting. These tests pin the observable
-    // behaviour the `min_roundtrip` / `min_roundtrip_live` theorems assert.
-    // ---------------------------------------------------------------------
 
     fn int(value: i64) -> Expression {
         Expression::Literal(Literal::Integer(value))
@@ -1738,18 +1705,15 @@ mod tests {
     #[test]
     fn min_parens_left_assoc_subtract_unbracketed_reparses_left_nested() {
         use crate::sql::parser::verified_minparen::print_min_expr;
-        // `1 - 2 - 3` is left-associative: (1 - 2) - 3.
         let expr = Expression::Operator(Operator::Subtract(
             boxed(Expression::Operator(Operator::Subtract(boxed(int(1)), boxed(int(2))))),
             boxed(int(3)),
         ));
         let tokens = print_min_expr(&expr);
-        // No parentheses: left-associativity makes them all redundant.
         assert!(
             !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
             "1 - 2 - 3 should print with no parentheses, got {tokens:?}"
         );
-        // Re-parsing the bracket-free token stream recovers the left nesting.
         let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
         assert_eq!(parsed, expr);
     }
@@ -1757,18 +1721,15 @@ mod tests {
     #[test]
     fn min_parens_right_assoc_exponent_unbracketed_reparses_right_nested() {
         use crate::sql::parser::verified_minparen::print_min_expr;
-        // `2 ^ 3 ^ 2` is right-associative: 2 ^ (3 ^ 2).
         let expr = Expression::Operator(Operator::Exponentiate(
             boxed(int(2)),
             boxed(Expression::Operator(Operator::Exponentiate(boxed(int(3)), boxed(int(2))))),
         ));
         let tokens = print_min_expr(&expr);
-        // No parentheses: right-associativity makes them all redundant.
         assert!(
             !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
             "2 ^ 3 ^ 2 should print with no parentheses, got {tokens:?}"
         );
-        // Re-parsing the bracket-free token stream recovers the right nesting.
         let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
         assert_eq!(parsed, expr);
     }
