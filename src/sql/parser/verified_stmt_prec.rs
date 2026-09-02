@@ -1881,14 +1881,277 @@ pub open spec fn assign_keys_distinct(items: Seq<(String, Option<SExpr>)>) -> bo
     forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0
 }
 
+/// The value assigned to key `k` in an assignment list: the value of the first
+/// pair whose key is `k` (`None` if absent). On distinct-key lists this is the
+/// unique value; the SExpr-level mirror of reading `set[k]`.
+pub open spec fn assign_val(items: Seq<(String, Option<SExpr>)>, k: String) -> Option<SExpr>
+    decreases items.len(),
+{
+    if items.len() == 0 {
+        None
+    } else if items[0].0 == k {
+        items[0].1
+    } else {
+        assign_val(items.drop_first(), k)
+    }
+}
+
+/// Canonicalise an assignment list into sorted-key order: sort the *keys* by the
+/// total `String` order and reattach each key's value by lookup. This is the
+/// SExpr-level twin of `verified_stmt::view_update_assigns(map, sorted_keys(dom))`
+/// — it makes the parsed statement's assignment order match the sorted
+/// `BTreeMap::iter()` walk of the executable min-parens printer, independent of
+/// parse order. The value list stays parse-independent because pairs are not a
+/// total order (`SExpr` has no `Ord` model): only the keys are sorted.
+pub open spec fn assign_canon(items: Seq<(String, Option<SExpr>)>)
+    -> Seq<(String, Option<SExpr>)> {
+    verified_stmt::sorted_keys(assign_keys(items))
+        .map_values(|k: String| (k, assign_val(items, k)))
+}
+
 pub open spec fn assign_list_to_sstmt(
     table: String,
     items: Seq<(String, Option<SExpr>)>,
     where_clause: Option<SExpr>,
 ) -> SStmt {
-    // Total: the ordered assignment list maps directly to the mirror `Update`.
-    // Multi-assignment is supported; the ordering is exactly the parse order.
-    SStmt::Update { table, set: items, where_clause }
+    // Total: the ordered assignment list maps to the mirror `Update` in the
+    // sorted-key canonical form (see `assign_canon`). Multi-assignment is
+    // supported; the order is the sorted key order, not the parse order, so it
+    // agrees with the executable printer's sorted `BTreeMap::iter()` walk.
+    SStmt::Update { table, set: assign_canon(items), where_clause }
+}
+
+/// On a distinct-key list, `assign_val` recovers the value of the pair at index
+/// `i` from its key: looking up `items[i].0` yields `items[i].1`.
+pub proof fn lemma_assign_val_index(items: Seq<(String, Option<SExpr>)>, i: int)
+    requires
+        assign_keys_distinct(items),
+        0 <= i < items.len(),
+    ensures
+        assign_val(items, items[i].0) == items[i].1,
+    decreases items.len(),
+{
+    if items[0].0 == items[i].0 {
+        // Distinct keys force `i == 0`.
+        if i != 0 {
+            assert(items[0].0 != items[i].0);
+        }
+        assert(i == 0);
+    } else {
+        assert(i != 0);
+        let tail = items.drop_first();
+        assert(tail[i - 1] == items[i]);
+        assert(assign_keys_distinct(tail)) by {
+            assert forall|a: int, b: int| 0 <= a < b < tail.len() implies tail[a].0 != tail[b].0 by {
+                assert(tail[a] == items[a + 1]);
+                assert(tail[b] == items[b + 1]);
+            }
+        }
+        lemma_assign_val_index(tail, i - 1);
+        assert(assign_val(items, items[i].0) == assign_val(tail, tail[i - 1].0));
+    }
+}
+
+/// `assign_canon` is the identity on a list whose keys are already distinct and
+/// sorted (`increasing_seq`): sorting the keys is a no-op (idempotence) and
+/// reattaching each key's value by lookup rebuilds the original pairs. This is
+/// the "sort is identity on already-sorted keys" fact the UPDATE roundtrip needs.
+pub proof fn lemma_assign_canon_sorted(items: Seq<(String, Option<SExpr>)>)
+    requires
+        assign_keys_distinct(items),
+        vstd::std_specs::btree::increasing_seq(assign_keys(items)),
+    ensures
+        assign_canon(items) == items,
+{
+    let keys = assign_keys(items);
+    assert(keys.len() == items.len());
+    assert forall|i: int| 0 <= i < keys.len() implies #[trigger] keys[i] == items[i].0 by {}
+    // Keys are distinct as a sequence (from `assign_keys_distinct`).
+    assert(keys.no_duplicates()) by {
+        assert forall|i: int, j: int| 0 <= i < keys.len() && 0 <= j < keys.len() && i != j
+            implies keys[i] != keys[j] by {
+            if i < j {
+                assert(items[i].0 != items[j].0);
+            } else {
+                assert(items[j].0 != items[i].0);
+            }
+        }
+    }
+    // Sorting an already-sorted distinct key list is the identity.
+    verified_stmt::lemma_sorted_keys_idempotent(keys);
+    assert(verified_stmt::sorted_keys(keys) == keys);
+    let canon = assign_canon(items);
+    assert(canon == keys.map_values(|k: String| (k, assign_val(items, k))));
+    assert(canon.len() == items.len());
+    assert(canon =~= items) by {
+        assert forall|i: int| 0 <= i < items.len() implies #[trigger] canon[i] == items[i] by {
+            assert(canon[i] == (keys[i], assign_val(items, keys[i])));
+            assert(keys[i] == items[i].0);
+            lemma_assign_val_index(items, i);
+            assert(assign_val(items, items[i].0) == items[i].1);
+        }
+    }
+}
+
+/// The SExpr-level keys of `view_assign_pairs(items)` are exactly `done_keys(items)`
+/// (mapping to `SExpr` preserves keys).
+pub proof fn lemma_assign_keys_view(items: Seq<(String, Option<ast::Expression>)>)
+    ensures
+        assign_keys(verified_stmt::view_assign_pairs(items)) == verified_stmt::done_keys(items),
+{
+    let vp = verified_stmt::view_assign_pairs(items);
+    verified_stmt::view_assign_pairs_index(items);
+    assert(assign_keys(vp) =~= verified_stmt::done_keys(items)) by {
+        assert(assign_keys(vp).len() == items.len());
+        assert(verified_stmt::done_keys(items).len() == items.len());
+        assert forall|i: int| 0 <= i < items.len() implies
+            #[trigger] assign_keys(vp)[i] == verified_stmt::done_keys(items)[i] by {
+            assert(assign_keys(vp)[i] == vp[i].0);
+            assert(vp[i].0 == items[i].0);
+            assert(verified_stmt::done_keys(items)[i] == items[i].0);
+        }
+    }
+}
+
+/// Value agreement across the map/list boundary: for any key `k` in the parser's
+/// assignment set, looking `k` up in `view_assign_pairs(items)` (the SExpr list)
+/// yields `view_opt(set[k])` (the SExpr value read back through the map). Holds
+/// because `items` has distinct keys and `set[items[i].0] == items[i].1`.
+pub proof fn lemma_assign_val_view(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+    k: String,
+)
+    requires
+        assign_keys_distinct(verified_stmt::view_assign_pairs(items)),
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] set.dom().contains(items[i].0)
+            && set[items[i].0] == items[i].1,
+        set.dom().contains(k),
+        forall|kk: String| set.dom().contains(kk)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == kk,
+    ensures
+        assign_val(verified_stmt::view_assign_pairs(items), k)
+            == verified_stmt::view_opt(set[k]),
+{
+    let vp = verified_stmt::view_assign_pairs(items);
+    verified_stmt::view_assign_pairs_index(items);
+    let i = choose|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k;
+    assert(vp[i].0 == items[i].0);
+    assert(vp[i].0 == k);
+    assert(vp[i].1 == verified_stmt::view_opt(items[i].1));
+    lemma_assign_val_index(vp, i);
+    assert(assign_val(vp, vp[i].0) == vp[i].1);
+    assert(set[items[i].0] == items[i].1);
+    assert(set[k] == items[i].1);
+}
+
+/// Canonical boundary lemma: with the ghost order set to the *sorted* key order,
+/// `view_update_arm` equals the sorted-canonical `assign_list_to_sstmt` twin. This
+/// is the refinement identity the verified parser discharges at the UPDATE return
+/// sites, replacing the parse-order `lemma_update_view_boundary`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(100000)]
+pub proof fn lemma_update_canon_boundary(
+    table: String,
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+    where_clause: Option<ast::Expression>,
+)
+    requires
+        set.dom().finite(),
+        forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0,
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] set.dom().contains(items[i].0)
+            && set[items[i].0] == items[i].1,
+        forall|k: String| set.dom().contains(k)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
+    ensures
+        verified_stmt::view_update_arm(
+            table, set,
+            verified_stmt::sorted_keys(verified_stmt::done_keys(items)),
+            where_clause,
+        ) == assign_list_to_sstmt(
+            table, verified_stmt::view_assign_pairs(items), verified_stmt::view_opt(where_clause),
+        ),
+{
+    let vp = verified_stmt::view_assign_pairs(items);
+    let dkeys = verified_stmt::done_keys(items);
+    let order = verified_stmt::sorted_keys(dkeys);
+    // done_keys(items) is distinct (from the distinct-key invariant).
+    assert(dkeys.no_duplicates()) by {
+        assert(dkeys.len() == items.len());
+        assert forall|i: int, j: int| 0 <= i < dkeys.len() && 0 <= j < dkeys.len() && i != j
+            implies dkeys[i] != dkeys[j] by {
+            assert(dkeys[i] == items[i].0);
+            assert(dkeys[j] == items[j].0);
+            if i < j {
+                assert(items[i].0 != items[j].0);
+            } else {
+                assert(items[j].0 != items[i].0);
+            }
+        }
+    }
+    // assign_keys(vp) == done_keys(items), so assign_keys_distinct(vp) holds.
+    lemma_assign_keys_view(items);
+    assert(assign_keys(vp) == dkeys);
+    assert(assign_keys_distinct(vp)) by {
+        verified_stmt::view_assign_pairs_index(items);
+        assert forall|i: int, j: int| 0 <= i < j < vp.len() implies vp[i].0 != vp[j].0 by {
+            assert(vp[i].0 == items[i].0);
+            assert(vp[j].0 == items[j].0);
+        }
+    }
+    // Properties of the sorted order: distinct, same set, len preserved.
+    verified_stmt::lemma_sorted_keys_props(dkeys);
+    assert(order.to_set() == dkeys.to_set());
+    assert(order.no_duplicates());
+    assert(order.len() == dkeys.len());
+    // wf_update(set, order): to_set == dom, no_duplicates.
+    verified_stmt::axiom_string_obeys_cmp();
+    assert(dkeys.to_set() =~= set.dom()) by {
+        assert forall|k: String| dkeys.to_set().contains(k) implies set.dom().contains(k) by {
+            let i = choose|i: int| 0 <= i < dkeys.len() && dkeys[i] == k;
+            assert(dkeys[i] == items[i].0);
+        }
+        assert forall|k: String| set.dom().contains(k) implies dkeys.to_set().contains(k) by {
+            let i = choose|i: int| 0 <= i < items.len() && items[i].0 == k;
+            assert(dkeys[i] == items[i].0);
+        }
+    }
+    assert(verified_stmt::wf_update(set, order)) by {
+        assert(order.to_set() == set.dom());
+        assert(order.no_duplicates());
+    }
+    // LHS set = view_update_assigns(set, order); RHS set = assign_canon(vp).
+    let lhs_set = verified_stmt::view_update_assigns(set, order);
+    let rhs_set = assign_canon(vp);
+    // assign_canon(vp) uses sorted_keys(assign_keys(vp)) == sorted_keys(dkeys) == order.
+    assert(rhs_set == order.map_values(|k: String| (k, assign_val(vp, k))));
+    assert(lhs_set == order.map_values(|k: String| (k, verified_stmt::view_opt(set[k]))));
+    assert(lhs_set =~= rhs_set) by {
+        assert(lhs_set.len() == order.len());
+        assert(rhs_set.len() == order.len());
+        assert forall|i: int| 0 <= i < order.len() implies #[trigger] lhs_set[i] == rhs_set[i] by {
+            assert(lhs_set[i] == (order[i], verified_stmt::view_opt(set[order[i]])));
+            assert(rhs_set[i] == (order[i], assign_val(vp, order[i])));
+            // order[i] is in dkeys.to_set() == set.dom().
+            assert(order.to_set().contains(order[i]));
+            assert(set.dom().contains(order[i]));
+            lemma_assign_val_view(set, items, order[i]);
+            assert(assign_val(vp, order[i]) == verified_stmt::view_opt(set[order[i]]));
+        }
+    }
+    assert(verified_stmt::view_update_arm(table, set, order, where_clause)
+        == SStmt::Update {
+            table,
+            set: lhs_set,
+            where_clause: verified_stmt::view_opt(where_clause),
+        });
+    assert(assign_list_to_sstmt(table, vp, verified_stmt::view_opt(where_clause))
+        == SStmt::Update {
+            table,
+            set: rhs_set,
+            where_clause: verified_stmt::view_opt(where_clause),
+        });
 }
 
 pub proof fn lemma_assign_list_head(cur: Seq<TokenView>, a: (String, Option<SExpr>), r: Seq<TokenView>)
