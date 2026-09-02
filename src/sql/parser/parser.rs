@@ -1,3 +1,17 @@
+//! Production parser entry point.
+//!
+//! `Parser::parse` lexes the input, then calls the Verus-verified
+//! `verified_control::parse_control_at` directly on the token vector. The legacy
+//! handcrafted recursive-descent parser in this file is `#[cfg(test)]`-only and
+//! serves purely as a differential oracle against the verified core; it is not
+//! compiled into the shipped binary. `Parser::parse` also applies a cheap
+//! `MAX_NESTING_DEPTH` pre-check to reject pathologically deep parenthesization
+//! before it can overflow the stack.
+//!
+//! Limit: this module is unverified glue — it is NOT in `VERIFY_MODULES`. The
+//! verified guarantees live in the modules it calls; the lexing and dispatch
+//! here are plain Rust.
+
 #[cfg(test)]
 use std::ops::Add;
 

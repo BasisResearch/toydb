@@ -1,3 +1,19 @@
+//! Minimal-parenthesization round-trip theorem for expressions.
+//!
+//! `min_roundtrip` proves the parser inverts the min-parens printer: parsing
+//! `sprint_min(e, 0)` recovers `e` exactly.
+//!
+//! CRITICAL HEDGE: the printer's precedence tables (`bin_prec` / `bin_assoc` /
+//! `pre_prec`) are *proved equal* to the parser's tables (`tables_agree`). So
+//! the theorem shows "the parser inverts the printer", NOT "the parser
+//! implements SQL's precedence" — a consistent permutation of ALL precedence
+//! tables (a "consistent-triple-swap") would still verify this round-trip.
+//! Conformance to real SQL precedence rests instead on the `cfg(test)`
+//! differential oracle and the goldenscripts, not on this theorem.
+//!
+//! Also: the print half (`sprint_min` / `print_min_*`) is a spec/proof
+//! construct and is not part of the shipped binary.
+
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 

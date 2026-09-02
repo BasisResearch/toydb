@@ -1,3 +1,14 @@
+//! Verified statement dispatch — the production parser's verified core.
+//!
+//! Each statement parser here carries a bidirectional functional refinement
+//! against its `sparse_control_*` spec twin (in `verified_stmt_prec`): on accept
+//! the produced AST matches the twin's result and the residual token position
+//! agrees; on reject the twin also rejects.
+//!
+//! Limit: the spec twins are same-author mirrors of the exec algorithm. The
+//! refinement catches porting slips between exec and spec, but a shared
+//! misconception baked into both would still verify.
+
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
