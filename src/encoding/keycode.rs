@@ -174,7 +174,7 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
 // A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
 // `serialize_bool` / `deserialize_bool`). The verified exec codec pair that
 // once accompanied this spec (`encode_bool_key` / `decode_bool_key`) had no
-// caller anywhere and was deleted in phase 4 (`plans/phase-4-delete-twins.md`).
+// caller anywhere and was deleted in phase 4.
 
 /// The single-byte key for a bool: 1 for true, 0 for false.
 pub open spec fn bool_key(b: bool) -> u8 {

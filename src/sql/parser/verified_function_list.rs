@@ -24,7 +24,7 @@
 //! `Vec`s verified against a `Seq` mirror) was reused for the whole grammar in
 //! `verified_roundtrip` / `verified_precedence`; the exec demo layer here
 //! (`parse_exec` / `parse_args_exec` / `roundtrip_demo`), which nothing ever
-//! called, was deleted in phase 4 (`plans/phase-4-delete-twins.md`) — the spec
+//! called, was deleted in phase 4 — the spec
 //! mirror and its roundtrip lemmas remain as the template's record.
 
 // Ghost items are erased by the non-Verus build; the module is verification

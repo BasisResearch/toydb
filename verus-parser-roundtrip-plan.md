@@ -67,7 +67,7 @@ suite). New strategy and progress:
   (below) closed the dispatch, the composed SELECT, and EXPLAIN.
 
 - **Phase 6 (statement-level composition + min-parens statement roundtrip) —
-  COMPLETE (2026-09-02, `plans/phase-6-statement-roundtrip.md`, branch
+  COMPLETE (2026-09-02, branch
   `kg/parser-fix-phase-6-stmt-roundtrip`).** Every statement parser now carries
   a full functional spec: `sparse_control_select` composes the per-clause twins
   (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET — the
@@ -94,7 +94,7 @@ suite). New strategy and progress:
   be non-empty.
 
 - **Delete-twins cleanup — COMPLETE (2026-09-02,
-  `plans/phase-4-delete-twins.md`, branch `kg/parser-fix-phase-4-cleanup`).**
+  branch `kg/parser-fix-phase-4-cleanup`).**
   The dead verified twins are deleted; **the round trip is carried by the live
   parser path, not by the exec twins named in the historical sections below.**
   Gone: `verified.rs` (the Phase-0 proving ground, whole module);

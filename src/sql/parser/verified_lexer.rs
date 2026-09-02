@@ -12,7 +12,7 @@
 //! `scan_number_bytes` in `lexer.rs`. The rest of the executable lexer twin
 //! (`lex_all_exec`, `lscan_token_exec`, `lex_mtok_exec`, ... and their
 //! roundtrip lemmas) was dead code — production never called it — and was
-//! deleted in phase 4 (`plans/phase-4-delete-twins.md`); git remembers. A
+//! deleted in phase 4; git remembers. A
 //! future lexer cutover milestone would restate the exec layer against the
 //! spec scanners kept here (string-level roundtrip still needs identifiers /
 //! keywords / strings verified, which today they are not).

@@ -28,7 +28,7 @@
 //! roundtrip lemmas. The executable twin that used to sit on this scaffold
 //! (`parse_expr_exec` / `print_expr_exec` for the fully-parenthesised grammar,
 //! plus their wrap/roundtrip helpers) was never called by production and was
-//! deleted in phase 4 (`plans/phase-4-delete-twins.md`); `print_lit_exec`
+//! deleted in phase 4; `print_lit_exec`
 //! stays, serving `verified_minparen`'s min-parens printer.
 //!
 //! Trust surface is unchanged: the only axioms are the `float_trust` boundary

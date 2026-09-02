@@ -10,8 +10,7 @@ A review found this repo's largest verified artefacts were dead code: production
 called ``verified_control::parse_control_at`` (then a weak no-panic contract),
 while the round-trip-proven parsers in ``verified_stmt.rs`` (``parse_stmt_exec``
 / ``parse_stmt_full_exec``), ``lex_all_exec`` in ``verified_lexer.rs``, and
-``verified.rs`` were never called. (Phase 4, ``plans/phase-4-delete-twins.md``,
-deleted those twins in 2026-09; this gate keeps new ones from accumulating.) A
+``verified.rs`` were never called. (Phase 4 deleted those twins in 2026-09; this gate keeps new ones from accumulating.) A
 verified function that nothing executes is a proof about dead code. This tool
 makes that visible, with two independent lenses.
 

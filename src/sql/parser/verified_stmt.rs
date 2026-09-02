@@ -12,7 +12,7 @@
 //! The executable twins that used to live here (`parse_stmt_exec` /
 //! `print_stmt_exec` and the mirror printer / roundtrip layer serving them)
 //! parsed only the fully-parenthesised grammar and were never called by
-//! production; phase 4 (`plans/phase-4-delete-twins.md`) deleted them — git
+//! production; phase 4 deleted them — git
 //! remembers.
 //!
 //! Trust surface: one axiom, `axiom_string_obeys_cmp` (String's `Ord` is
