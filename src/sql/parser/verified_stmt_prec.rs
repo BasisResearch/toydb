@@ -2441,6 +2441,70 @@ pub proof fn lemma_update_reject_on_where_none(
 {
 }
 
+// ===========================================================================
+// SELECT (composed)  (spec twin of `verified_control::parse_select_at`)
+//
+// `input` is the token-view suffix just past the leading `SELECT` keyword.
+// The composition sequences the per-clause twins exactly as the exec parser
+// does: select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
+// Any clause rejection rejects the whole SELECT with the original `input`
+// (the exec returns the SELECT's own `pos` on any inner reject).
+// ===========================================================================
+
+/// Optional `KW <expr>` clause (`WHERE` / `HAVING` / `LIMIT` / `OFFSET`): when
+/// the head is `kw`, the expression is required (`sparse_prec` at the fuel the
+/// exec passes); otherwise nothing is consumed. The outer `Option` is the parse
+/// result, the inner the clause's presence. Mirrors the exec's
+/// `if cur < len && toks[cur] == kw { parse_clause_expr_at(..) }` blocks.
+pub open spec fn sparse_control_kw_expr(input: Seq<TokenView>, kw: Keyword)
+    -> (Option<Option<SExpr>>, Seq<TokenView>) {
+    if input.len() >= 1 && input[0] == TokenView::Keyword(kw) {
+        let e_in = input.drop_first();
+        match sparse_prec(e_in, 0, expr_fuel(e_in)) {
+            (Some(e), r) => (Some(Some(e)), r),
+            (None, _) => (None, input),
+        }
+    } else {
+        (Some(None), input)
+    }
+}
+
+/// Spec twin of `parse_select_at`: the full clause composition. `input` is the
+/// suffix just past `SELECT`.
+pub open spec fn sparse_control_select(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>) {
+    match sparse_control_select_list(input) {
+        (None, _) => (None, input),
+        (Some(select), r1) => match sparse_control_from(r1) {
+            (None, _) => (None, input),
+            (Some(from), r2) => match sparse_control_kw_expr(r2, Keyword::Where) {
+                (None, _) => (None, input),
+                (Some(where_clause), r3) => match sparse_control_group_by(r3) {
+                    (None, _) => (None, input),
+                    (Some(group_by), r4) => match sparse_control_kw_expr(r4, Keyword::Having) {
+                        (None, _) => (None, input),
+                        (Some(having), r5) => match sparse_control_order_by(r5) {
+                            (None, _) => (None, input),
+                            (Some(order_by), r6) => match sparse_control_kw_expr(r6, Keyword::Limit) {
+                                (None, _) => (None, input),
+                                (Some(limit), r7) => match sparse_control_kw_expr(r7, Keyword::Offset) {
+                                    (None, _) => (None, input),
+                                    (Some(offset), r8) => (
+                                        Some(SStmt::Select {
+                                            select, from, where_clause, group_by, having,
+                                            order_by, limit, offset,
+                                        }),
+                                        r8,
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+}
+
 /// Spec twin of `parse_update_at`. `input` is the suffix just past `UPDATE`.
 /// Rejects a duplicate column (like the exec) and maps the ordered assignment
 /// list onto an `SStmt` through the `view_stmt` boundary.
@@ -2476,6 +2540,80 @@ pub open spec fn sparse_control_update(input: Seq<TokenView>) -> (Option<SStmt>,
                 }
             },
             _ => (None, input),
+        }
+    }
+}
+
+// ===========================================================================
+// Top-level dispatch  (spec twin of `verified_control::parse_control_at`) and
+// EXPLAIN  (spec twin of `verified_control::parse_explain_at`).
+//
+// `sparse_control`'s `input` is the token-view suffix at the statement's first
+// token; it dispatches on the leading keyword exactly as the exec parser does,
+// handing each sub-twin the suffix just past that keyword. COMMIT / ROLLBACK
+// are inline. `sparse_control_explain`'s `input` is the suffix just past
+// `EXPLAIN`; a nested `EXPLAIN` rejects, otherwise the inner statement recurses
+// through `sparse_control` at the *same* suffix — the mutual recursion is
+// ordered lexicographically like the exec side's `decreases (len - pos, 0/1)`:
+// the dispatch drops the `EXPLAIN` keyword before calling the explain twin, and
+// the explain twin re-enters the dispatch at an equal length but a smaller
+// second component.
+// ===========================================================================
+
+/// Spec twin of `parse_control_at`: keyword dispatch over the statement head.
+pub open spec fn sparse_control(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>)
+    decreases input.len(), 0int,
+{
+    if input.len() == 0 {
+        (None, input)
+    } else {
+        match input[0] {
+            TokenView::Keyword(Keyword::Commit) => (Some(SStmt::Commit), input.drop_first()),
+            TokenView::Keyword(Keyword::Rollback) => (Some(SStmt::Rollback), input.drop_first()),
+            TokenView::Keyword(Keyword::Begin) =>
+                control_norm(input, sparse_control_begin(input.drop_first())),
+            TokenView::Keyword(Keyword::Drop) =>
+                control_norm(input, sparse_control_drop(input.drop_first())),
+            TokenView::Keyword(Keyword::Delete) =>
+                control_norm(input, sparse_control_delete(input.drop_first())),
+            TokenView::Keyword(Keyword::Insert) =>
+                control_norm(input, sparse_control_insert(input.drop_first())),
+            TokenView::Keyword(Keyword::Update) =>
+                control_norm(input, sparse_control_update(input.drop_first())),
+            TokenView::Keyword(Keyword::Create) =>
+                control_norm(input, sparse_control_create(input.drop_first())),
+            TokenView::Keyword(Keyword::Select) =>
+                control_norm(input, sparse_control_select(input.drop_first())),
+            TokenView::Keyword(Keyword::Explain) =>
+                control_norm(input, sparse_control_explain(input.drop_first())),
+            _ => (None, input),
+        }
+    }
+}
+
+/// Normalise a sub-twin's result to the module convention: rejection returns
+/// the *dispatch's* input (the exec analogue returns a position the contract
+/// does not pin on `None`, so only the `Some` payload/suffix must line up).
+pub open spec fn control_norm(whole: Seq<TokenView>, sub: (Option<SStmt>, Seq<TokenView>))
+    -> (Option<SStmt>, Seq<TokenView>) {
+    match sub.0 {
+        Some(s) => (Some(s), sub.1),
+        None => (None, whole),
+    }
+}
+
+/// Spec twin of `parse_explain_at`. `input` is the suffix just past `EXPLAIN`.
+/// A nested `EXPLAIN` rejects (mirroring the exec's explicit check); otherwise
+/// the inner statement is the full dispatch at the same suffix.
+pub open spec fn sparse_control_explain(input: Seq<TokenView>) -> (Option<SStmt>, Seq<TokenView>)
+    decreases input.len(), 1int,
+{
+    if input.len() >= 1 && input[0] == TokenView::Keyword(Keyword::Explain) {
+        (None, input)
+    } else {
+        match sparse_control(input) {
+            (Some(inner), r) => (Some(SStmt::Explain(Box::new(inner))), r),
+            (None, _) => (None, input),
         }
     }
 }
