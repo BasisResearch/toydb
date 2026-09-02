@@ -10,6 +10,13 @@ FALSE ← Not(Equal(Constant(Integer(1)), Constant(Integer(1))))
 TRUE ← Not(Equal(Constant(Integer(1)), Constant(Integer(3))))
 NULL ← Not(Equal(Constant(Integer(1)), Constant(Null)))
 
+# <> is an alternative spelling of !=; both parse to the same tree.
+[expr]> 1 <> 2
+[expr]> 1 != 2
+---
+TRUE ← Not(Equal(Constant(Integer(1)), Constant(Integer(2))))
+TRUE ← Not(Equal(Constant(Integer(1)), Constant(Integer(2))))
+
 [expr]> 3.0 != 3
 [expr]> 0.0 != -0.0
 ---
