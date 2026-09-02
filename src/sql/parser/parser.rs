@@ -2,14 +2,14 @@
 use std::ops::Add;
 
 #[cfg(test)]
+use super::stream::PeekStream;
+#[cfg(test)]
 use super::stream::SliceTokenStream;
 #[cfg(test)]
 use super::stream::TokenStream;
 #[cfg(test)]
-use super::stream::PeekStream;
-use super::{Token, ast, verified_control};
-#[cfg(test)]
 use super::{Keyword, float_trust, verified_integer};
+use super::{Token, ast, verified_control};
 use crate::errinput;
 use crate::error::Result;
 #[cfg(test)]
@@ -36,6 +36,17 @@ struct StreamingParser<S> {
     stream: S,
 }
 
+/// Robustness bound on parenthesis nesting depth accepted by `Parser::parse`.
+///
+/// The verified control parser is recursive-descent, so pathologically deep
+/// parenthesization (observed to overflow the stack and abort the process at a
+/// depth of ~937) would crash the server. This bound is a cheap O(n) pre-check
+/// that rejects such input with a clean error instead of recursing. 256 is far
+/// above any legitimate query and far below the overflow point, so it changes
+/// behaviour ONLY for pathologically nested input (depth > 256), which no real
+/// query, goldenscript, differential case, or corpus input reaches.
+const MAX_NESTING_DEPTH: usize = 256;
+
 impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
@@ -46,6 +57,23 @@ impl Parser {
     /// differential oracle.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
         let tokens: Vec<Token> = super::Lexer::new(statement).collect::<Result<_>>()?;
+
+        // Robustness guard: reject pathologically deep parenthesis nesting up
+        // front, so the recursive verified parser cannot overflow the stack and
+        // abort the process. This is an O(n) scan over the token stream.
+        let mut depth: usize = 0;
+        for token in &tokens {
+            match token {
+                Token::OpenParen => {
+                    depth += 1;
+                    if depth > MAX_NESTING_DEPTH {
+                        return errinput!("expression nesting too deep");
+                    }
+                }
+                Token::CloseParen => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
 
         let (opt, consumed, perr) = verified_control::parse_control_at(&tokens, 0);
         match opt {
@@ -1039,5 +1067,35 @@ impl PostfixOperator {
             Self::Is(v) => ast::Operator::Is(lhs, v).into(),
             Self::IsNot(v) => ast::Operator::Not(ast::Operator::Is(lhs, v).into()).into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parser;
+
+    /// Pathologically deep parenthesis nesting is rejected with a clean error
+    /// instead of overflowing the stack and aborting the process.
+    #[test]
+    fn deep_nesting_is_rejected_not_crashed() {
+        let depth = 300;
+        let mut sql = String::from("SELECT ");
+        sql.push_str(&"(".repeat(depth));
+        sql.push('1');
+        sql.push_str(&")".repeat(depth));
+
+        let result = Parser::parse(&sql);
+        assert!(result.is_err(), "deeply nested input should be rejected, got {result:?}");
+        assert!(
+            result.unwrap_err().to_string().contains("nesting too deep"),
+            "should report a nesting-depth error",
+        );
+    }
+
+    /// A normal query with modest parenthesis nesting still parses.
+    #[test]
+    fn modest_nesting_still_parses() {
+        Parser::parse("SELECT ((1 + 2) * (3 - 4))").expect("modest nesting should parse");
+        Parser::parse("SELECT 1 WHERE (((1 = 1)))").expect("modest nesting should parse");
     }
 }
