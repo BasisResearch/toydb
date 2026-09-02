@@ -31,7 +31,9 @@ suite). New strategy and progress:
 - **Phase 2.2 (hard goal, user-promoted) — COMPLETE (2026-08-28).** roundtrip-(a)
   for the precedence parser — `parse(print(e))==e` — is proven end to end, 48
   verified / 0 errors, axiom-free beyond the pre-existing float trust. The headline
-  `print_parse_roundtrip` (commit `ebbf272`) proves
+  `print_parse_roundtrip` (commit `ebbf272`; the exec wrapper was deleted in the
+  2026-09-02 delete-twins cleanup — the theorem content lives in
+  `parse_expression_full`'s refinement `ensures` + `lemma_prec`) proves
   `view_expr(parse_expression(print_expr_exec(e))) == view_expr(e)` for any printable
   `e`: the verified precedence-climbing parser provably inverts the canonical printer.
   Path: spec model (Brick 1) + spec-level roundtrip `lemma_prec` (Brick 3) + full
@@ -61,6 +63,30 @@ suite). New strategy and progress:
   assignments, EXPLAIN) still have no functional spec; their
   concrete behaviour is pinned only by the goldenscripts and the restored
   differential oracle.
+
+- **Delete-twins cleanup — COMPLETE (2026-09-02,
+  `plans/phase-4-delete-twins.md`, branch `kg/parser-fix-phase-4-cleanup`).**
+  The dead verified twins are deleted; **the round trip is carried by the live
+  parser path, not by the exec twins named in the historical sections below.**
+  Gone: `verified.rs` (the Phase-0 proving ground, whole module);
+  `verified_stmt`'s executable layer (`parse_stmt_exec` / `parse_stmt_full_exec`
+  / `print_stmt_exec` / `print_parse_roundtrip_stmt*`, the mirror printer
+  `sprint_stmt` and its roundtrip lemmas, and the `axiom_string_key_obeys_cmp`
+  trust entry that served only them — `verified_stmt` keeps the spec mirror
+  `SStmt` / `view_stmt` / `sparse_stmt` that the live refinement proofs
+  consume); `verified_lexer`'s exec twin (`lex_all_exec` / `lex_mtok_exec` and
+  the per-class exec scanners; the spec scanners, locality lemmas, spec-level
+  roundtrip theorems and the production-called `scan_symbol_bytes` stay);
+  `verified_roundtrip`'s fully-parenthesised exec layer (`parse_expr_exec` /
+  `print_expr_exec` / wraps; `print_lit_exec` stays for `verified_minparen`);
+  `verified_function_list`'s exec demo; `verified_precedence`'s single-shot
+  `parse_expression` demo entry and exec-carried `print_parse_roundtrip`
+  wrapper; `encoding::keycode`'s caller-less bool codec pair. Current carriers
+  of the guarantees: `parse_expression_full` (refines `sparse_prec`, which
+  `lemma_prec` proves inverts `sprint`), the `verified_control` /
+  `verified_stmt_prec` statement refinements, and `verified_minparen`'s
+  min-parens roundtrip (`min_roundtrip` / `min_roundtrip_live`). References to
+  the deleted items in the sections below are historical record; git remembers.
 
 - **Phase 4 (error production + legacy retirement) — COMPLETE (2026-08-29).** The
   verified parser now produces its own rejection errors and the legacy
@@ -322,8 +348,8 @@ verified parser to the full production grammar:
    keyword prefixes threaded through `sprint_from`/`sparse_from`).
 3. **Multi-assignment Update** — the sorted-`iter()` bridge over `Map` equality
    (the general case `extract_one_entry` was built for the singleton).
-4. **Byte-cursor lexer** — `verified.rs::next_token` as it stands is a **Phase 0
-   toy** (its own 25-variant `Token`; single-digit integers via `b-48`,
+4. **Byte-cursor lexer** — `verified.rs::next_token` (module deleted in the
+   2026-09-02 delete-twins cleanup) was a **Phase 0 toy** (its own 25-variant `Token`; single-digit integers via `b-48`,
    single-byte keywords `t`/`f`/`n`), so it cannot tokenize real SQL. Item 4 is
    therefore "build a production-capable verified byte-cursor lexer" (multi-char
    numbers, identifiers, quoted strings, the full `Keyword` set) plus the
