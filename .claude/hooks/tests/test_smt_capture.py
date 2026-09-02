@@ -81,7 +81,9 @@ class SmtCaptureLibTest(unittest.TestCase):
         os.environ.pop("VERUS_INGEST_DRY_RUN", None)
 
     def _producer_dir(self, files):
-        d = tempfile.mkdtemp(prefix="prod-", dir=self.tmp)
+        pend = os.path.join(self.tmp, "pending")
+        os.makedirs(pend, exist_ok=True)
+        d = tempfile.mkdtemp(prefix="prod-", dir=pend)
         for name, content in files.items():
             with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
                 fh.write(content)
@@ -171,10 +173,16 @@ class SmtCaptureLibTest(unittest.TestCase):
         self.assertEqual({x["kind"] for x in body["files"]}, {"smt2", "smt_transcript"})
 
     def test_upload_batches_large_captures(self):
+        content = os.urandom(400).hex()
+        # A cap that admits one encoded artifact but not two, so the two
+        # files split across POSTs. Derived from the real encoding, not a
+        # magic number: a cap below a single artifact means "cannot be sent
+        # at all", which is a different behaviour (see the skip test below).
+        one = len(base64.b64encode(gzip.compress(content.encode(), 6)))
         old = smt.BATCH_GZ_BYTES
-        smt.BATCH_GZ_BYTES = 64  # force one file per batch
+        smt.BATCH_GZ_BYTES = one + 10
         try:
-            dest = self._collected(tuid="tu_batch", content=os.urandom(400).hex())
+            dest = self._collected(tuid="tu_batch", content=content)
             ok = smt.upload(dest, url=self.url, token=TOKEN)
         finally:
             smt.BATCH_GZ_BYTES = old
@@ -183,6 +191,39 @@ class SmtCaptureLibTest(unittest.TestCase):
         for p in _Capture.posts:
             self.assertEqual(p["body"]["tool_use_id"], "tu_batch")
             self.assertEqual(len(p["body"]["files"]), 1)
+
+    def test_artifact_over_the_cap_is_skipped_not_retried_forever(self):
+        """A single artifact too big for the ingest body would 413 in every
+        batch, so the capture would never be marked uploaded and every later
+        catch-up would re-read and re-compress it. Skip it, ship the rest."""
+        prod = self._producer_dir(
+            {"huge.smt2": os.urandom(2000).hex(), "small.air": "ok"})
+        dest = smt.collect(prod, "sess-up", "tu_skip", {"source": "agent"},
+                           root=self.tmp)
+        one = len(base64.b64encode(gzip.compress(b"ok", 6)))
+        old = smt.BATCH_GZ_BYTES
+        smt.BATCH_GZ_BYTES = one + 10
+        try:
+            ok = smt.upload(dest, url=self.url, token=TOKEN)
+        finally:
+            smt.BATCH_GZ_BYTES = old
+        self.assertTrue(ok, "the rest of the capture still uploads")
+        self.assertTrue(os.path.exists(os.path.join(dest, ".uploaded")))
+        sent = [f["filename"] for p in _Capture.posts for f in p["body"]["files"]]
+        self.assertEqual(sent, ["small.air"])
+
+    def test_upload_with_no_usable_artifacts_stays_pending(self):
+        prod = self._producer_dir({"huge.smt2": os.urandom(2000).hex()})
+        dest = smt.collect(prod, "sess-up", "tu_none", {"source": "agent"},
+                           root=self.tmp)
+        old = smt.BATCH_GZ_BYTES
+        smt.BATCH_GZ_BYTES = 8
+        try:
+            ok = smt.upload(dest, url=self.url, token=TOKEN)
+        finally:
+            smt.BATCH_GZ_BYTES = old
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(os.path.join(dest, ".uploaded")))
 
     def test_rejected_files_leave_capture_pending(self):
         dest = self._collected(tuid="tu_rej")
@@ -248,7 +289,11 @@ class SmtHookTest(unittest.TestCase):
         )
 
     def _producer(self, files):
-        d = tempfile.mkdtemp(prefix="prod-", dir=self.tmp)
+        """A per-run scratch dir where a real producer writes it: under the
+        capture root's `pending/`. Anywhere else is refused by the hook."""
+        pend = os.path.join(self.tmp, "pending")
+        os.makedirs(pend, exist_ok=True)
+        d = tempfile.mkdtemp(prefix="prod-", dir=pend)
         for name, content in files.items():
             with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
                 fh.write(content)
@@ -356,8 +401,53 @@ class SmtHookTest(unittest.TestCase):
         })
         self.assertEqual(r.returncode, 0)
         self.assertEqual(
-            [d for d in os.listdir(self.tmp) if not d.startswith("prod-")], []
+            [d for d in os.listdir(self.tmp)
+             if not d.startswith("prod-") and d != "pending"], []
         )
+
+    def test_dir_outside_a_producer_root_is_refused(self):
+        """The path comes from tool OUTPUT. collect() empties and deletes it,
+        so a directory that is not a per-run scratch dir must be untouched."""
+        victim = os.path.join(self.tmp, "important")
+        os.makedirs(victim)
+        with open(os.path.join(victim, "keep.txt"), "w") as fh:
+            fh.write("do not delete")
+        r = self._run_hook({
+            "session_id": "s9", "tool_use_id": "t9",
+            "tool_name": "mcp__verus__check",
+            "tool_response": {"smt_log_dir": victim},
+        })
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(os.path.isfile(os.path.join(victim, "keep.txt")),
+                        "hook must not consume a directory outside pending/")
+        self.assertIn("ignoring smt_log_dir", r.stderr)
+
+    def test_producer_root_itself_is_refused(self):
+        """The root holds every pending run; consuming it as one would move
+        and delete all of them."""
+        prod = self._producer({"a.smt2": "x"})
+        root = os.path.dirname(prod)
+        r = self._run_hook({
+            "session_id": "s10", "tool_use_id": "t10",
+            "tool_name": "mcp__verus__check",
+            "tool_response": {"smt_log_dir": root},
+        })
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(os.path.isdir(prod), "sibling runs must survive")
+
+    def test_bash_output_cannot_name_a_dir_via_the_json_field(self):
+        """A Bash command echoing a saved MCP response (cat/jq/grep) must not
+        make the hook consume the directory it mentions; only verify.sh's own
+        stderr marker counts on the Bash side."""
+        prod = self._producer({"a.smt2": "x"})
+        r = self._run_hook({
+            "session_id": "s11", "tool_use_id": "t11", "tool_name": "Bash",
+            "tool_input": {"command": "cat saved-response.json"},
+            "tool_response": {"stdout": '{"smt_log_dir": "%s"}' % prod},
+        })
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(os.path.isdir(prod), "producer dir must be untouched")
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "s11")))
 
     def test_empty_producer_dir_skipped(self):
         prod = self._producer({})

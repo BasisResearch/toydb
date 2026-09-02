@@ -36,9 +36,11 @@ BLOCK_MESSAGE = (
     "failed, so this session is blocked (fail-closed gate).\n"
     "Reason: %s\n\n"
     "The default (.mcp.json) launches one server per session over stdio via "
-    ".claude/bin/verus-mcp, which self-installs a pinned verus-tools-mcp build "
-    "and points it at this checkout. Run it once by hand to see what it says:\n"
-    "    .claude/bin/verus-mcp --check\n\n"
+    ".claude/bin/verus-mcp, which points it at this checkout. Diagnose it with:\n"
+    "    .claude/bin/verus-mcp --check\n"
+    "If it says the server is not installed, provision it once (this takes a\n"
+    "few minutes and is deliberately NOT done inside the gate probe):\n"
+    "    .claude/bin/verus-mcp --install\n\n"
     "To hack on the server instead, make .mcp.dev.json active "
     "(`ln -sf .mcp.dev.json .mcp.json`) and run the hot-reload HTTP server:\n"
     "    cd ../verus-tools-mcp && ./scripts/dev-http.sh --workspace \"$PWD\"\n"
@@ -67,17 +69,27 @@ WARN_MESSAGE = (
 )
 
 
-def _emit_block(reason):
+def _block(message):
+    """Emit a SessionStart block both ways.
+
+    The caller exits 2, which surfaces STDERR; the stdout JSON is honoured on
+    exit 0. Writing only one of them means whichever path the harness takes,
+    the user may see a blank hook failure with no reason and no remedy."""
+    sys.stderr.write(message + "\n")
     payload = {
         "decision": "block",
-        "reason": BLOCK_MESSAGE % reason,
+        "reason": message,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": BLOCK_MESSAGE % reason,
+            "additionalContext": message,
         },
     }
     sys.stdout.write(json.dumps(payload))
     sys.stdout.write("\n")
+
+
+def _emit_block(reason):
+    _block(BLOCK_MESSAGE % reason)
 
 
 def _workspace_drift(workspace):
@@ -155,19 +167,7 @@ def main():
     # `toolchain_ok` is absent on older server builds -> treated as healthy.
     if result.version.get("toolchain_ok") is False:
         detail = result.version.get("toolchain_error") or "no detail reported"
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "decision": "block",
-                    "reason": TOOLCHAIN_MESSAGE % detail,
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": TOOLCHAIN_MESSAGE % detail,
-                    },
-                }
-            )
-            + "\n"
-        )
+        _block(TOOLCHAIN_MESSAGE % detail)
         return 2
 
     # Healthy. Warn (but allow) on a dev / non-release build.

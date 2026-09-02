@@ -24,6 +24,13 @@
 # Usage:
 #   .claude/bin/verus-mcp [stdio]   launch the server (what .mcp.json does)
 #   .claude/bin/verus-mcp --check   print what it resolved and exit 0/1
+#   .claude/bin/verus-mcp --install install the pinned server, then exit
+#
+# VERUS_MCP_NO_INSTALL=1 turns a missing server binary into a fast, explicit
+# failure instead of a multi-minute `cargo install`. The SessionStart gate
+# probe sets it: the probe has a 20 s budget, so an install underneath it
+# would always time out and block the session with a misleading "probe timed
+# out" rather than "the server is not installed yet".
 #
 # All output except the exec'd server's own stdio protocol goes to stderr so it
 # never corrupts the MCP stdio stream.
@@ -61,16 +68,26 @@ verus_source_bin_dir() { # <checkout root> -> prints bin dir if it looks right
   [ -x "$dir/verus" ] && printf '%s' "$dir"
 }
 
+# Either supported shape: a source checkout (binaries under
+# source/target-verus/release) or an unpacked release zip (binaries directly
+# in the directory).
+verus_bin_dir() { # <root> -> prints the binary dir, or fails
+  local root="$1"
+  verus_source_bin_dir "$root" && return 0
+  [ -x "$root/verus" ] && printf '%s' "$root"
+}
+
 resolve_toolchain() {
   local candidate dir
 
   # a) Explicit configuration wins.
   if [ -n "${VERUS_PROJECT_ROOT:-}" ]; then
-    if dir="$(verus_source_bin_dir "$VERUS_PROJECT_ROOT")"; then
+    if dir="$(verus_bin_dir "$VERUS_PROJECT_ROOT")"; then
       TOOLCHAIN_DIR="$dir"; TOOLCHAIN_SRC="VERUS_PROJECT_ROOT"
       return 0
     fi
-    log "warning: VERUS_PROJECT_ROOT=$VERUS_PROJECT_ROOT has no source/target-verus/release/verus"
+    log "warning: VERUS_PROJECT_ROOT=$VERUS_PROJECT_ROOT holds no verus binary"
+    log "         (looked for \$root/source/target-verus/release/verus and \$root/verus)"
   fi
 
   # b) A Verus source checkout sitting next to this clone, or named by
@@ -137,6 +154,43 @@ find_server() {
   return 1
 }
 
+# Install the pinned build into the per-ref cache. Minutes on a cold cache.
+install_pinned() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "ERROR: cargo not found on PATH; cannot install verus-tools-mcp."
+    log "Install the Rust toolchain (rustup) or put verus-tools-mcp on PATH, then retry."
+    exit 127
+  fi
+  log "installing verus-tools-mcp @ $VERUS_MCP_REF into $CACHE_DIR (one-time) ..."
+  mkdir -p "$CACHE_DIR"
+  # A tag and a branch/sha are passed to cargo differently: --tag vs --rev. We
+  # do not know which the pin is, so try --tag first (works for release tags)
+  # and fall back to --rev (branches and commit shas like `main`/`1b40a7d`).
+  if cargo install --git "$VERUS_MCP_REPO" --tag "$VERUS_MCP_REF" \
+        --root "$CACHE_DIR" verus-tools-mcp >&2 2>/dev/null; then
+    :
+  else
+    log "--tag $VERUS_MCP_REF failed or is not a tag; retrying as --rev ..."
+    cargo install --git "$VERUS_MCP_REPO" --rev "$VERUS_MCP_REF" \
+        --root "$CACHE_DIR" verus-tools-mcp >&2
+  fi
+  if [ ! -x "$CACHED_BIN" ]; then
+    log "ERROR: install completed but $CACHED_BIN is missing or not executable."
+    exit 1
+  fi
+  log "installed: $CACHED_BIN"
+}
+
+# --- --install: one-time provisioning --------------------------------------
+if [ "${1:-}" = "--install" ]; then
+  if server_bin="$(find_server)"; then
+    log "already installed: $server_bin"
+    exit 0
+  fi
+  install_pinned
+  exit 0
+fi
+
 # --- --check: diagnose and exit -------------------------------------------
 if [ "${1:-}" = "--check" ]; then
   echo "[verus-mcp] repo (VERUS_MCP_WORKSPACE): $VERUS_MCP_WORKSPACE" >&2
@@ -176,31 +230,14 @@ if server_bin="$(find_server)"; then
   exec "$server_bin" "${ARGS[@]}"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-  log "ERROR: cargo not found on PATH; cannot install verus-tools-mcp."
-  log "Install the Rust toolchain (rustup) or put verus-tools-mcp on PATH, then retry."
+# Not installed. A probe must not sit through a multi-minute build.
+if [ "${VERUS_MCP_NO_INSTALL:-0}" = "1" ]; then
+  log "ERROR: verus-tools-mcp is not installed, and installing was declined"
+  log "       (VERUS_MCP_NO_INSTALL=1). Install it once with:"
+  log "           .claude/bin/verus-mcp --install"
   exit 127
 fi
 
-log "installing verus-tools-mcp @ $VERUS_MCP_REF into $CACHE_DIR (one-time) ..."
-mkdir -p "$CACHE_DIR"
-
-# A tag and a branch/sha are passed to cargo differently: --tag vs --rev. We do
-# not know which the pin is, so try --tag first (works for release tags) and
-# fall back to --rev (works for branches and commit shas like `main`/`1b40a7d`).
-if cargo install --git "$VERUS_MCP_REPO" --tag "$VERUS_MCP_REF" \
-      --root "$CACHE_DIR" verus-tools-mcp >&2 2>/dev/null; then
-  :
-else
-  log "--tag $VERUS_MCP_REF failed or is not a tag; retrying as --rev ..."
-  cargo install --git "$VERUS_MCP_REPO" --rev "$VERUS_MCP_REF" \
-      --root "$CACHE_DIR" verus-tools-mcp >&2
-fi
-
-if [ ! -x "$CACHED_BIN" ]; then
-  log "ERROR: install completed but $CACHED_BIN is missing or not executable."
-  exit 1
-fi
-
-log "installed; launching pinned build"
+install_pinned
+log "launching pinned build"
 exec "$CACHED_BIN" "${ARGS[@]}"

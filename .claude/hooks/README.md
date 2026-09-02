@@ -81,7 +81,14 @@ Two committed Claude Code MCP configs, for two audiences:
 
   ```sh
   .claude/bin/verus-mcp --check     # prints workspace, toolchain, binary; exits 1 if incomplete
+  .claude/bin/verus-mcp --install   # one-time provisioning of the pinned build
   ```
+
+  Provisioning is **never** done inside the gate probe: the probe has a 20 s
+  budget and a `cargo install` takes minutes, so it would always time out and
+  block the session with a misleading "probe timed out". The probe sets
+  `VERUS_MCP_NO_INSTALL=1`, which turns a missing binary into an immediate,
+  explicit error naming `--install`.
 
 - **`.mcp.dev.json` (hacking on the server) — shared hot-reload HTTP.** Points
   Claude Code at `http://127.0.0.1:8765/mcp`, served by `cargo watch` from the
@@ -175,6 +182,26 @@ activated per clone by `git config core.hooksPath .githooks`, which
 hooks (Claude `SessionStart` gate, opencode gate, Codex Stop). It never
 overrides a hooksPath the user set to something else.
 
+## SMT capture safety (smt_capture.py)
+
+The PostToolUse hook learns where a Verus run wrote its `--log-all` artifacts
+from **tool output**, then moves every file out of that directory and deletes
+it. Tool output is not trustworthy — it is whatever a command printed — so two
+rules constrain it:
+
+1. An `smt_log_dir` **field** is honoured only from a `mcp__verus__*` result.
+   On the Bash side only verify.sh's own `verus-smt-log-dir:` stderr marker
+   counts, so a command that merely echoes a saved response (`cat`, `jq`,
+   `grep`) cannot name a directory for consumption.
+2. The path must be a *strict subdirectory* of a producer root
+   (`VERUS_SMT_LOG_ROOT`, else `<capture root>/pending`). The root itself is
+   refused: it holds every pending run.
+
+Uploads are streamed batch by batch rather than assembled in memory (a full
+capture is hundreds of megabytes and the hook subprocess has a 30 s/120 s
+budget), and an artifact too large for the ingest body is skipped with a log
+line instead of 413-ing forever and pinning the capture as never-uploaded.
+
 ## Verus through MCP only (verus_cli_guard.py)
 
 Agents must run Verus through the MCP server (`check` / `profile` /
@@ -185,8 +212,14 @@ freshness check, can silently replay a stale result (`check` deletes the
 crate's `.fingerprint` entries before every run). The guard reuses
 `branch_guard.py`'s tokenizer and scans each simple-command segment after
 unwrapping `time`, `timeout`, `env`, `nice`, `nohup`, `exec`, `command`,
-leading `VAR=val` assignments, `bash -c "..."`, `bash <script>`, and `$(...)`
-/ backtick substitutions. Blocked: `verus`, `rust_verify`, `cargo-verus`,
+`sudo`/`doas`, `setsid`, `ionice`/`taskset`, leading `VAR=val` assignments,
+`bash -c "..."` **including bundled short flags** (`bash -lc`, `sh -xc`,
+`zsh -ic`), `env -C` / `env -S "..."`, `bash <script>`, and `$(...)` /
+backtick substitutions. The shared tokenizer also strips shell reserved words
+(`for … do … done`, `if … then … fi`, `{ …; }`, `!`), without which the
+program name reads as `do` or `then` and a loop over modules — the natural
+way to use this — would slip past. `bash -n <script>` (parse only, no
+execution) is deliberately allowed. Blocked: `verus`, `rust_verify`, `cargo-verus`,
 `cargo [+toolchain] verus ...`, and `scripts/verus/verify.sh` (any path).
 Allowed: `--help` / `-h` / `--version` / `-V`, `command -v verus`, `which`,
 and anything that merely mentions verus (grep, cat, echo, heredoc bodies).

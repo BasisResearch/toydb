@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2): fail-closed MCP gate at SessionStart, fail-soft trace capture at Stop, SMT query capture at PostToolUse (smt_capture.py keys Verus --log-all artifacts to the tool call and uploads them), branch-discipline guard at PreToolUse (initials-prefixed branches, no direct commits/pushes to main), Verus-CLI guard at PreToolUse (verus_cli_guard.py: no `verus` / `cargo verus` / verify.sh from Bash, Verus runs go through the MCP server). Hook scripts live in .claude/hooks/. See .claude/hooks/README.md.",
+  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2): fail-closed MCP gate at SessionStart, fail-soft trace capture at Stop, SMT query capture at PostToolUse (smt_capture.py keys Verus --log-all artifacts to the tool call and uploads them; the Bash half of the matcher only serves humans running verify.sh with VERUS_CLI_GUARD_DISABLE=1, since agents cannot run it from the shell, and it accepts only verify.sh's stderr marker), branch-discipline guard at PreToolUse (initials-prefixed branches, no direct commits/pushes to main), Verus-CLI guard at PreToolUse (verus_cli_guard.py: no `verus` / `cargo verus` / verify.sh from Bash, Verus runs go through the MCP server). Hook scripts live in .claude/hooks/. See .claude/hooks/README.md.",
   "hooks": {
     "PreToolUse": [
       {

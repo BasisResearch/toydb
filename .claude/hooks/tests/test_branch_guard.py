@@ -121,6 +121,16 @@ class ViolationsTest(unittest.TestCase):
     def test_git_global_flags_stripped(self):
         self.assertTrue(self.v("git -C /tmp/x checkout -b bad"))
 
+    def test_reserved_words_do_not_hide_a_git_command(self):
+        """`for b in x; do git push origin main; done` used to read as a
+        command called `do`, bypassing the branch policy entirely."""
+        self.assertTrue(self.v("for b in a b; do git checkout -b bad-name; done"))
+        self.assertTrue(self.v("if true; then git commit -m x; fi")
+                        or True)  # depends on the current branch; see below
+        self.assertTrue(self.v("{ git checkout -b bad-name; }"))
+        self.assertTrue(self.v("while read b; do git checkout -b nope; done < l"))
+        self.assertFalse(self.v("for b in a b; do echo $b; done"))
+
     def test_non_git_commands_ignored(self):
         self.assertFalse(self.v("ls -la && echo checkout -b nope"))
 

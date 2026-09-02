@@ -30,6 +30,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import urllib.error
@@ -294,6 +295,19 @@ def _rpc_line(obj):
     return (json.dumps(obj) + "\n").encode("utf-8")
 
 
+def _kill_group(proc):
+    """Kill the probe's whole process group. `proc` may be a shell launcher
+    that spawned the real server; killing only the direct child orphans the
+    rest."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def probe_version_stdio():
     """Launch the server over stdio, initialize, call `version`. Fail-closed."""
     cmd = _server_command()
@@ -306,15 +320,25 @@ def probe_version_stdio():
         )
 
     try:
+        env = dict(os.environ)
+        # The probe has a PROBE_TIMEOUT_S budget; provisioning the server takes
+        # minutes. Without this the launcher would start a `cargo install`
+        # underneath us, the probe would time out, and the session would be
+        # blocked with "probe timed out" instead of "not installed yet".
+        env.setdefault("VERUS_MCP_NO_INSTALL", "1")
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
             # Claude Code launches the server with the project as its cwd; the
             # server resolves its workspace from there, so the probe must too.
             cwd=repo_root(),
+            env=env,
+            # Own process group, so a timeout can take down the launcher AND
+            # anything it started, not just the shell wrapper.
+            start_new_session=True,
         )
     except Exception as exc:
         return ProbeResult(False, transport="stdio",
@@ -336,9 +360,9 @@ def probe_version_stdio():
     payload = _rpc_line(init) + _rpc_line(initialized) + _rpc_line(call)
 
     try:
-        out, _ = proc.communicate(input=payload, timeout=PROBE_TIMEOUT_S)
+        out, err = proc.communicate(input=payload, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_group(proc)
         try:
             proc.communicate(timeout=2)
         except Exception:
@@ -354,6 +378,17 @@ def probe_version_stdio():
                            error="probe I/O error: %s" % exc)
 
     version = _extract_version_stdio(out)
+    if version is None:
+        detail = (err or b"").decode("utf-8", "replace").strip()
+        if detail:
+            # The launcher explains itself on stderr ("not installed", "no
+            # Verus toolchain found"). Without this the user only ever sees
+            # the generic "no valid `version` tool result from server".
+            return ProbeResult(
+                False, transport="stdio",
+                error="server did not answer `version`: %s"
+                      % detail.splitlines()[-1][:300],
+            )
     return _finalize(version, "stdio")
 
 

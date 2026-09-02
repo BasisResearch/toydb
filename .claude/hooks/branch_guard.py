@@ -46,6 +46,14 @@ import sys
 
 BRANCH_RE = re.compile(r"^[a-z]{2,3}/[A-Za-z0-9._/-]+$")
 OPERATORS = {"&&", "||", ";", "|", "&"}
+# Shell reserved words and grouping tokens that may lead a simple command.
+# Without stripping them, `for b in x; do <cmd>; done` looks like a command
+# called `do` and slips past every check in this module.
+RESERVED = {
+    "if", "then", "elif", "else", "fi",
+    "for", "while", "until", "do", "done", "select",
+    "case", "esac", "in", "function", "{", "}", "!", "(", ")",
+}
 PROTECTED = ("main", "master")
 # This clone is a fork; `gh pr create` must target this repo explicitly or gh
 # defaults the base to the upstream and the PR fails.
@@ -101,6 +109,15 @@ def _is_redirect(tok):
     return bool(tok) and all(c in "<>&" for c in tok) and (">" in tok or "<" in tok)
 
 
+def _strip_reserved(seg):
+    """Drop leading shell reserved words / grouping tokens so seg[0] is the
+    program actually being run."""
+    i = 0
+    while i < len(seg) and seg[i] in RESERVED:
+        i += 1
+    return seg[i:]
+
+
 def _segments(command):
     """Split a (possibly multi-line) command into simple-command segments:
     per line, then on shell operators. Backslash continuations are joined
@@ -121,13 +138,17 @@ def _segments(command):
                 continue
             if tok in OPERATORS or all(c in "|&;()" for c in tok):
                 if cur:
-                    yield cur
+                    stripped = _strip_reserved(cur)
+                    if stripped:
+                        yield stripped
                 cur = []
             else:
                 cur.append(tok)
             i += 1
         if cur:
-            yield cur
+            stripped = _strip_reserved(cur)
+            if stripped:
+                yield stripped
 
 
 def _strip_git_globals(args):

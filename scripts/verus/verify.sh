@@ -71,8 +71,16 @@ echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}" >&
 # Override the parent dir with VERUS_SMT_LOG_ROOT (CI does).
 smt_log_args=()
 if [[ "${VERUS_SMT_LOG_DISABLE:-0}" != "1" ]]; then
-  smt_root="${VERUS_SMT_LOG_ROOT:-$HOME/.verus-trace/smt/pending}"
+  # ${HOME:-...}: `set -u` aborts the whole script on an unset HOME, which
+  # some CI and container environments have.
+  smt_root="${VERUS_SMT_LOG_ROOT:-${HOME:-/tmp}/.verus-trace/smt/pending}"
   if mkdir -p "$smt_root" 2>/dev/null       && smt_dir="$(mktemp -d "$smt_root/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX" 2>/dev/null)"; then
+    # Each run leaves ~500 MB here. The Claude PostToolUse hook collects and
+    # prunes what it captured, but nothing else does: Codex/opencode users,
+    # humans running this directly, and CI would accumulate that per
+    # invocation forever. Drop scratch dirs older than a week, best effort.
+    find "$smt_root" -maxdepth 1 -mindepth 1 -type d -mtime +7 \
+        -exec rm -rf {} + 2>/dev/null || true
     smt_log_args=(--log-all --log-dir "$smt_dir")
     echo "verus-smt-log-dir: $smt_dir" >&2
   else

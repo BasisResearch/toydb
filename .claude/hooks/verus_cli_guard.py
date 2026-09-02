@@ -52,12 +52,26 @@ import branch_guard  # noqa: E402  (shared tokenizer + repo-root helper)
 VERUS_PROGRAMS = {"verus", "rust_verify", "cargo-verus"}
 # Shells whose first positional (or `-c` string) is the real command.
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-# Wrappers that take no argument of their own.
-BARE_WRAPPERS = {"time", "nohup", "exec", "nice", "stdbuf", "caffeinate"}
+# Wrappers that run another command; their own flags are skipped.
+BARE_WRAPPERS = {
+    "time", "nohup", "exec", "nice", "stdbuf", "caffeinate",
+    "setsid", "ionice", "taskset", "sudo", "doas", "proxychains",
+}
+# Wrapper flags that consume the following token, per wrapper.
+WRAPPER_FLAG_ARGS = {
+    "sudo": {"-u", "--user", "-g", "--group", "-C", "--close-from", "-p", "--prompt"},
+    "doas": {"-u", "-C"},
+    "ionice": {"-c", "-n", "-p", "-P"},
+    "taskset": {"-p", "-c", "--cpu-list"},
+    "stdbuf": {"-i", "-o", "-e"},
+}
 # Flags an invocation may carry that make it informational, not a run.
 INFO_FLAGS = {"--help", "-h", "--version", "-V"}
 # Pattern for a leading VAR=value assignment word.
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A numeric / hex / CPU-list operand (taskset mask, nice priority): digits and
+# separators only, so it can never be the name of the program being run.
+MASK_RE = re.compile(r"^(0[xX])?[0-9]+([,-][0-9]+)*$")
 # Command substitutions: their body is a command, not data.
 SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 
@@ -75,12 +89,26 @@ def _unwrap(seg):
             seg = seg[1:]
         elif prog == "env":
             seg = seg[1:]
-            while seg and (
-                ASSIGN_RE.match(seg[0]) or seg[0] in ("-i", "--ignore-environment")
-            ):
+            # Skip assignments and options. An UNKNOWN option must be skipped
+            # too, not end the walk: otherwise `env -C /x verus a.rs` reads as
+            # a command called `-C` and passes.
+            while seg and (ASSIGN_RE.match(seg[0]) or seg[0].startswith("-")):
+                if seg[0] == "--":
+                    seg = seg[1:]
+                    break
+                flag = seg[0]
+                if ASSIGN_RE.match(flag):
+                    seg = seg[1:]
+                    continue
+                # `-S "cmd args"` / `--split-string=...` carry a command.
+                if flag in ("-S", "--split-string"):
+                    return seg[1] if len(seg) > 1 else []
+                if flag.startswith("--split-string="):
+                    return flag.split("=", 1)[1]
+                if flag in ("-u", "--unset", "-C", "--chdir"):
+                    seg = seg[2:]
+                    continue
                 seg = seg[1:]
-            if seg and seg[0] in ("-u", "--unset"):
-                seg = seg[2:]
         elif prog == "timeout":
             seg = seg[1:]
             while seg and seg[0].startswith("-"):
@@ -98,14 +126,41 @@ def _unwrap(seg):
             while seg and seg[0].startswith("-"):
                 seg = seg[1:]
         elif prog in BARE_WRAPPERS:
+            takes_arg = WRAPPER_FLAG_ARGS.get(prog, set())
             seg = seg[1:]
             while seg and seg[0].startswith("-"):
+                if seg[0] == "--":
+                    seg = seg[1:]
+                    break
+                flag = seg[0]
+                seg = seg[2:] if flag in takes_arg else seg[1:]
+            # `taskset <mask> cmd` / `nice <prio> cmd`: a bare numeric or
+            # CPU-mask operand is never a program name.
+            if seg and MASK_RE.match(seg[0]):
                 seg = seg[1:]
         elif prog in SHELLS:
             rest = seg[1:]
             while rest and rest[0].startswith("-"):
-                if rest[0] == "-c":
-                    return rest[1] if len(rest) > 1 else []
+                flag = rest[0]
+                if flag == "--":
+                    rest = rest[1:]
+                    break
+                # `-o pipefail` / `+o posix` consume the next word.
+                if flag in ("-o", "+o"):
+                    rest = rest[2:]
+                    continue
+                if not flag.startswith("--"):
+                    cluster = flag[1:]
+                    # `-n` is noexec: `bash -n script.sh` only parses it, so
+                    # nothing runs and there is nothing to block.
+                    if "n" in cluster:
+                        return []
+                    # `-c` is often bundled with other short flags — `bash -lc`,
+                    # `sh -xc`, `zsh -ic` are all common. Whenever the cluster
+                    # contains `c`, the next word is the command string and
+                    # must be scanned recursively.
+                    if "c" in cluster:
+                        return rest[1] if len(rest) > 1 else []
                 rest = rest[1:]
             seg = rest  # `bash scripts/verus/verify.sh ...`
         else:

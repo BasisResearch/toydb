@@ -90,6 +90,43 @@ def capture_root():
     return os.path.expanduser("~/.verus-trace/smt")
 
 
+def producer_roots():
+    """Directories a Verus run may legitimately have written a `--log-all`
+    scratch dir into: `VERUS_SMT_LOG_ROOT` when set (CI sets it), and the
+    default `<capture_root>/pending` that verify.sh and the MCP server use."""
+    roots = []
+    env = os.environ.get("VERUS_SMT_LOG_ROOT")
+    if env and env.strip():
+        roots.append(os.path.expanduser(env.strip()))
+    roots.append(os.path.join(capture_root(), "pending"))
+    return roots
+
+
+def is_producer_dir(path, roots=None):
+    """Whether `path` is a per-run scratch dir we may consume.
+
+    THE PATH COMES FROM TOOL OUTPUT, which is not trustworthy: it is whatever
+    a command printed. `collect()` moves every file out of the directory and
+    then deletes it, so a bare "is it a directory?" check turns any tool that
+    happens to echo an `smt_log_dir` value — printing a saved MCP response,
+    say — into a directory remover. Only accept a *strict subdirectory* of a
+    known producer root; the root itself holds every pending run and must
+    never be consumed as one."""
+    try:
+        if not path:
+            return False
+        target = os.path.realpath(os.path.expanduser(str(path)))
+        if not os.path.isdir(target):
+            return False
+        for root in roots if roots is not None else producer_roots():
+            resolved = os.path.realpath(os.path.expanduser(root))
+            if target != resolved and target.startswith(resolved + os.sep):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def kind_of(filename):
     for suffix, kind in _KIND_SUFFIXES:
         if filename.endswith(suffix):
@@ -227,69 +264,88 @@ def upload(dest, url=None, token=None):
     # only matters when files span batches).
     names.sort(key=lambda n: (kind_of(n) not in ("smt_transcript", "smt2"), n))
 
-    batches = []
-    cur, cur_bytes = [], 0
-    for name in names:
+    dry_run = _env.is_dry_run()
+    if not token and not dry_run:
+        _log("no VERUS_INGEST_TOKEN set; capture stays pending (fail soft)")
+        return False
+
+    def encode(name):
+        """One artifact as a payload entry, or None to skip it."""
         try:
             with open(os.path.join(dest, name), "rb") as fh:
                 raw = fh.read()
         except OSError as exc:
             _log("unreadable artifact %s: %s" % (name, exc))
-            continue
+            return None
         blob = gzip.compress(raw, 6)
-        entry = {
+        if len(blob) > BATCH_GZ_BYTES:
+            # Alone in its own batch it would still exceed the ingest body
+            # cap, so the POST would 413 forever and the capture would never
+            # be marked uploaded — it would be re-read and re-compressed by
+            # every later catch-up. Skip it and ship the rest.
+            _log("artifact %s too large for the ingest cap (%d MB gzipped); skipped"
+                 % (name, len(blob) // (1024 * 1024)))
+            return None
+        return {
             "filename": name,
             "kind": kind_of(name),
             "encoding": "gzip",
             "sha256": hashlib.sha256(raw).hexdigest(),
             "data_b64": base64.b64encode(blob).decode("ascii"),
         }
-        if cur and cur_bytes + len(blob) > BATCH_GZ_BYTES:
-            batches.append(cur)
-            cur, cur_bytes = [], 0
-        cur.append(entry)
-        cur_bytes += len(blob)
-    if cur:
-        batches.append(cur)
 
-    if _env.is_dry_run():
-        sys.stdout.write(json.dumps({
-            "smt_capture_dry_run": True,
-            "dest": dest,
-            "url": url,
-            "batches": [
-                [{k: v for k, v in e.items() if k != "data_b64"} for e in b]
-                for b in batches
-            ],
-        }, indent=2))
-        sys.stdout.write("\n")
-        return True
-
-    if not token:
-        _log("no VERUS_INGEST_TOKEN set; capture stays pending (fail soft)")
-        return False
-
+    # Send batch by batch instead of building them all first: a full
+    # --log-all capture is hundreds of megabytes, and holding every gzipped,
+    # base64'd artifact in memory at once (plus a json.dumps copy per body)
+    # can exhaust the 30s/120s hook subprocess.
     ok = True
-    for i, batch in enumerate(batches):
+    sent = 0
+    cur, cur_bytes = [], 0
+
+    def flush(batch):
+        if not batch:
+            return True
+        if dry_run:
+            _log("DRY RUN batch %d: %d file(s) -> %s"
+                 % (sent + 1, len(batch),
+                    ", ".join(e["filename"] for e in batch[:5])))
+            return True
         payload = dict(base)
         payload["files"] = batch
         try:
             res = _post_batch(payload, url, token)
             rejected = res.get("rejected") or []
             if rejected:
-                ok = False
-                _log("batch %d/%d: server rejected %d file(s): %s"
-                     % (i + 1, len(batches), len(rejected), rejected[:3]))
-            else:
-                _log("batch %d/%d: stored %d file(s), %d queries indexed"
-                     % (i + 1, len(batches), res.get("stored", 0),
-                        res.get("indexed_queries", 0)))
+                _log("batch %d: server rejected %d file(s): %s"
+                     % (sent + 1, len(rejected), rejected[:3]))
+                return False
+            _log("batch %d: stored %d file(s), %d queries indexed"
+                 % (sent + 1, res.get("stored", 0), res.get("indexed_queries", 0)))
+            return True
         except urllib.error.HTTPError as exc:
-            ok = False
-            _log("batch %d/%d HTTP %s: %s" % (i + 1, len(batches), exc.code, exc.reason))
+            _log("batch %d HTTP %s: %s" % (sent + 1, exc.code, exc.reason))
+            return False
         except Exception as exc:
-            ok = False
-            _log("batch %d/%d failed: %s" % (i + 1, len(batches), exc))
+            _log("batch %d failed: %s" % (sent + 1, exc))
+            return False
+
+    for name in names:
+        entry = encode(name)
+        if entry is None:
+            continue
+        size = len(entry["data_b64"])
+        if cur and cur_bytes + size > BATCH_GZ_BYTES:
+            ok = flush(cur) and ok
+            sent += 1
+            cur, cur_bytes = [], 0
+        cur.append(entry)
+        cur_bytes += size
+    if cur:
+        ok = flush(cur) and ok
+        sent += 1
+    if sent == 0:
+        _log("no uploadable artifacts in %s" % dest)
+        return False
     if ok:
         try:
             with open(os.path.join(dest, _UPLOADED_NAME), "w", encoding="utf-8") as fh:

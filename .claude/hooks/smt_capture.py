@@ -189,21 +189,32 @@ def handle_post_tool_use(hook_input):
     _strings(tool_response, texts)
     docs = _parsed_docs(tool_response, texts)
     log_dir = None
-    for doc in docs:
-        log_dir = _find_key(doc, "smt_log_dir")
-        if log_dir:
-            break
+    # An `smt_log_dir` FIELD is only meaningful from a Verus MCP tool result.
+    # Accepting it from any Bash output would make `cat` of a saved response
+    # (or any command echoing that key) name a directory for consumption.
+    if str(tool_name).startswith("mcp__verus__"):
+        for doc in docs:
+            log_dir = _find_key(doc, "smt_log_dir")
+            if log_dir:
+                break
+        if not log_dir:
+            m = _SMT_DIR_JSON_RE.search("\n".join(texts))
+            if m:
+                log_dir = m.group(1)
     if not log_dir:
-        m = _SMT_DIR_JSON_RE.search("\n".join(texts))
-        if m:
-            log_dir = m.group(1)
-    if not log_dir:
+        # verify.sh's own stderr protocol, the only Bash-side producer.
         log_dir = _smt.find_log_dir("\n".join(texts))
     if not log_dir:
         return
-    log_dir = os.path.expanduser(str(log_dir))
-    if not os.path.isdir(log_dir):
+    # collect() empties and deletes this directory, so refuse anything that is
+    # not a per-run scratch dir under a known producer root.
+    if not _smt.is_producer_dir(log_dir):
+        sys.stderr.write(
+            "[verus-smt] ignoring smt_log_dir %r: not a per-run scratch dir under %s\n"
+            % (str(log_dir)[:200], ", ".join(_smt.producer_roots()))
+        )
         return
+    log_dir = os.path.expanduser(str(log_dir))
 
     session_id = hook_input.get("session_id") or "unknown-session"
     tool_use_id = hook_input.get("tool_use_id") or ("unmatched-" + _env.iso_now())

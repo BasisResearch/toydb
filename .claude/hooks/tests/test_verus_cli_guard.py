@@ -57,6 +57,53 @@ class BlockedTest(unittest.TestCase):
         self.assertTrue(self.v('bash -c "cargo verus focus --lib"'))
         self.assertTrue(self.v("sh -c 'scripts/verus/verify.sh'"))
 
+    def test_shell_c_bundled_with_other_short_flags(self):
+        """`bash -lc "..."` is a common agent idiom; matching only a bare
+        `-c` token let every bundled form through."""
+        self.assertTrue(self.v('bash -lc "cargo verus focus --lib"'))
+        self.assertTrue(self.v('sh -xc "verus src/lib.rs"'))
+        self.assertTrue(self.v('zsh -ic "cargo verus focus"'))
+        self.assertTrue(self.v('bash -o pipefail -c "verus x.rs"'))
+        # A bundled cluster without `c` is not a command string.
+        self.assertFalse(self.v('bash -l scripts/build.sh'))
+
+    def test_noexec_syntax_check_is_not_a_run(self):
+        """`bash -n <script>` parses and exits; nothing executes."""
+        self.assertFalse(self.v("bash -n scripts/verus/verify.sh"))
+        self.assertFalse(self.v("sh -n scripts/verus/verify.sh"))
+        self.assertTrue(self.v("bash scripts/verus/verify.sh"))
+
+    def test_shell_reserved_words_do_not_hide_the_command(self):
+        """Without stripping reserved words the program reads as `do` / `then`
+        / `{`, and a loop over modules — the natural way to use this — runs
+        Verus unnoticed."""
+        self.assertTrue(self.v(
+            "for m in a b; do cargo verus focus --lib -- --verify-module $m; done"))
+        self.assertTrue(self.v("while read m; do verus $m; done < list"))
+        self.assertTrue(self.v("if [ -f x ]; then scripts/verus/verify.sh; fi"))
+        self.assertTrue(self.v("{ cargo verus focus; }"))
+        self.assertTrue(self.v("! cargo verus focus"))
+        # Ordinary loops stay allowed.
+        self.assertFalse(self.v("for f in a b; do cargo test $f; done"))
+        self.assertFalse(self.v("if true; then cargo build; fi"))
+
+    def test_privilege_and_scheduling_wrappers(self):
+        self.assertTrue(self.v("sudo verus x.rs"))
+        self.assertTrue(self.v("sudo -u bob cargo verus focus"))
+        self.assertTrue(self.v("setsid cargo verus focus"))
+        self.assertTrue(self.v("ionice -c 3 verus a.rs"))
+        self.assertTrue(self.v("taskset -c 0-3 cargo verus focus"))
+        self.assertTrue(self.v("taskset 0x3 verus a.rs"))
+
+    def test_env_options_are_skipped_not_treated_as_the_program(self):
+        """An unknown `env` option used to end the walk, so `-C` became the
+        program name and the real command was never inspected."""
+        self.assertTrue(self.v("env -C /tmp verus a.rs"))
+        self.assertTrue(self.v("env --chdir=/repo cargo verus focus"))
+        self.assertTrue(self.v('env -S "verus a.rs"'))
+        self.assertTrue(self.v('env --split-string="cargo verus focus"'))
+        self.assertFalse(self.v("env -C /tmp cargo test"))
+
     def test_compound_and_pipes(self):
         self.assertTrue(self.v("touch src/raft/log.rs && cargo verus focus --lib -- --verify-module raft::log 2>&1 | tail -5"))
         self.assertTrue(self.v("cargo test\ncargo verus focus"))
