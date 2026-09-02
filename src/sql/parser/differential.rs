@@ -347,6 +347,7 @@ const CONCRETE_SYNTAX_CORPUS: &[&str] = &[
     "BEGIN AS OF SYSTEM TIME 42",
     "DROP TABLE IF EXISTS t",
     "UPDATE t SET a = 1, b = DEFAULT",
+    "UPDATE t SET a = 1, b = 2 WHERE c = 3",
     "INSERT INTO t VALUES (1, 2), (3, 4)",
     "DELETE FROM t WHERE a > 1",
     "SELECT a FROM t GROUP BY a HAVING count(a) > 1 ORDER BY a DESC LIMIT 10 OFFSET 5",

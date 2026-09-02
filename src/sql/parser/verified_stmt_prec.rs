@@ -1886,11 +1886,9 @@ pub open spec fn assign_list_to_sstmt(
     items: Seq<(String, Option<SExpr>)>,
     where_clause: Option<SExpr>,
 ) -> SStmt {
-    if items.len() == 1 {
-        SStmt::Update { table, set: seq![(items[0].0, items[0].1)], where_clause }
-    } else {
-        SStmt::Unsupported
-    }
+    // Total: the ordered assignment list maps directly to the mirror `Update`.
+    // Multi-assignment is supported; the ordering is exactly the parse order.
+    SStmt::Update { table, set: items, where_clause }
 }
 
 pub proof fn lemma_assign_list_head(cur: Seq<TokenView>, a: (String, Option<SExpr>), r: Seq<TokenView>)

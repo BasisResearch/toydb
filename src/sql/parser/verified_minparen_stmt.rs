@@ -165,7 +165,15 @@ pub open spec fn printable_stmt(s: SStmt) -> bool
             && values.len() >= 1 && printable_rows(values)
         },
         SStmt::Update { table, set, where_clause } => {
-            set.len() == 1 && printable_opt_se(set[0].1) && printable_opt_se(where_clause)
+            // Spec-level (SStmt) printer/roundtrip support multi-assignment (see
+            // `sprint_assign_list` / `lemma_update_body_rt`). The gate is kept at
+            // `set.len() == 1` only because the *executable* `print_min_update_stmt`
+            // still emits a single assignment; lifting it to a verified
+            // `set.iter()` loop (with vstd's sorted `increasing_seq` iterator
+            // spec) plus the parser recording the sorted key order is the
+            // remaining step. See session report.
+            set.len() == 1 && verified_stmt_prec::assign_keys_distinct(set)
+                && printable_assigns(set) && printable_opt_se(where_clause)
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
             select.len() >= 1 && printable_select_items(select)
@@ -404,6 +412,24 @@ pub open spec fn sprint_assign(a: (String, Option<SExpr>)) -> Seq<TokenView> {
         })
 }
 
+/// Print an assignment list as comma-separated `col = val` in list order.
+pub open spec fn sprint_assign_list(items: Seq<(String, Option<SExpr>)>) -> Seq<TokenView>
+    decreases items.len(),
+{
+    if items.len() == 0 {
+        Seq::empty()
+    } else if items.len() == 1 {
+        sprint_assign(items[0])
+    } else {
+        sprint_assign(items[0]) + seq![TokenView::Comma] + sprint_assign_list(items.drop_first())
+    }
+}
+
+/// Every assigned value is printable.
+pub open spec fn printable_assigns(items: Seq<(String, Option<SExpr>)>) -> bool {
+    forall|i: int| 0 <= i < items.len() ==> #[trigger] printable_opt_se(items[i].1)
+}
+
 pub open spec fn sprint_begin_body(read_only: bool, as_of: Option<u64>) -> Seq<TokenView> {
     (if read_only { seq![kwv(Keyword::Read), kwv(Keyword::Only)] } else { Seq::empty() })
     + (match as_of {
@@ -470,7 +496,7 @@ pub open spec fn sprint_min_stmt(s: SStmt) -> Seq<TokenView>
         },
         SStmt::Update { table, set, where_clause } => {
             seq![kwv(Keyword::Update), TokenView::Ident(table), kwv(Keyword::Set)]
-                + (if set.len() >= 1 { sprint_assign(set[0]) } else { Seq::empty() })
+                + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause)
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
@@ -1699,6 +1725,108 @@ pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
 }
 
 
+/// As `lemma_assign_rt`, but only requires the trailing tokens to be `inert`
+/// for the value-expression parser (so `rest` may begin with a comma). Used to
+/// step through a multi-assignment list, where each assignment is followed by a
+/// comma before the next.
+pub proof fn lemma_assign_rt_inert(a: (String, Option<SExpr>), rest: Seq<TokenView>)
+    requires
+        printable_opt_se(a.1),
+        inert(rest, 0),
+    ensures
+        verified_stmt_prec::sparse_control_assign(sprint_assign(a) + rest) == (Some(a), rest),
+{
+    let input = sprint_assign(a) + rest;
+    match a.1 {
+        Some(e) => {
+            assert(input =~= seq![TokenView::Ident(a.0), TokenView::Equal]
+                + (sprint_min(e, 0) + rest));
+            assert(input.len() >= 2);
+            assert(input[0] == TokenView::Ident(a.0));
+            assert(input[1] == TokenView::Equal);
+            let e_in = input.drop_first().drop_first();
+            assert(e_in =~= sprint_min(e, 0) + rest);
+            sprint_min_head_not_default(e, 0);
+            assert(e_in[0] == sprint_min(e, 0)[0]);
+            assert(!(e_in.len() >= 1 && e_in[0] == kwv(Keyword::Default)));
+            lemma_min(e, 0, rest, expr_fuel(e_in));
+            assert(sparse_prec(e_in, 0, expr_fuel(e_in)) == (Some(e), rest));
+            assert((a.0, Some(e)) == a);
+        },
+        None => {
+            assert(input =~= seq![TokenView::Ident(a.0), TokenView::Equal]
+                + (seq![kwv(Keyword::Default)] + rest));
+            assert(input.len() >= 2);
+            assert(input[0] == TokenView::Ident(a.0));
+            assert(input[1] == TokenView::Equal);
+            let e_in = input.drop_first().drop_first();
+            assert(e_in =~= seq![kwv(Keyword::Default)] + rest);
+            assert(e_in[0] == kwv(Keyword::Default));
+            assert(e_in.drop_first() =~= rest);
+            assert((a.0, None::<SExpr>) == a);
+        },
+    }
+}
+
+/// Round-trip for a whole (multi-)assignment list: printing `items` and parsing
+/// it back with `sparse_control_assign_list` reproduces exactly `items`, leaving
+/// `rest` untouched. `rest` must be inert for the value parser and not itself
+/// start a further assignment continuation (`rest[0] != Comma`).
+pub proof fn lemma_assign_list_rt(items: Seq<(String, Option<SExpr>)>, rest: Seq<TokenView>)
+    requires
+        items.len() >= 1,
+        printable_assigns(items),
+        inert(rest, 0),
+        rest.len() == 0 || rest[0] != TokenView::Comma,
+    ensures
+        verified_stmt_prec::sparse_control_assign_list(sprint_assign_list(items) + rest)
+            == (Some(items), rest),
+    decreases items.len(),
+{
+    let a = items[0];
+    assert(printable_opt_se(a.1)) by {
+        assert(printable_opt_se(items[0].1));
+    }
+    if items.len() == 1 {
+        let input = sprint_assign_list(items) + rest;
+        assert(input =~= sprint_assign(a) + rest);
+        lemma_assign_rt_inert(a, rest);
+        assert(verified_stmt_prec::sparse_control_assign(input) == (Some(a), rest));
+        assert(!(rest.len() >= 1 && rest[0] == TokenView::Comma));
+        assert(verified_stmt_prec::sparse_control_assign_list(input) == (Some(seq![a]), rest));
+        assert(seq![a] =~= items);
+    } else {
+        let tail = items.drop_first();
+        let comma_rest = seq![TokenView::Comma] + (sprint_assign_list(tail) + rest);
+        let input = sprint_assign_list(items) + rest;
+        assert(input =~= sprint_assign(a) + comma_rest) by {
+            assert(sprint_assign_list(items)
+                =~= sprint_assign(a) + seq![TokenView::Comma] + sprint_assign_list(tail));
+        }
+        // The head of comma_rest is a comma, which is inert for the value parser.
+        assert(inert(comma_rest, 0)) by {
+            assert(comma_rest[0] == TokenView::Comma);
+        }
+        lemma_assign_rt_inert(a, comma_rest);
+        assert(verified_stmt_prec::sparse_control_assign(input) == (Some(a), comma_rest));
+        // Continue: comma_rest starts with a comma, so recurse on `tail`.
+        assert(comma_rest[0] == TokenView::Comma);
+        assert(comma_rest.drop_first() =~= sprint_assign_list(tail) + rest);
+        assert(printable_assigns(tail)) by {
+            assert forall|i: int| 0 <= i < tail.len() implies #[trigger] printable_opt_se(tail[i].1) by {
+                assert(tail[i] == items[i + 1]);
+                assert(printable_opt_se(items[i + 1].1));
+            }
+        }
+        lemma_assign_list_rt(tail, rest);
+        assert(verified_stmt_prec::sparse_control_assign_list(sprint_assign_list(tail) + rest)
+            == (Some(tail), rest));
+        assert(verified_stmt_prec::sparse_control_assign_list(input)
+            == (Some(seq![a] + tail), rest));
+        assert(seq![a] + tail =~= items);
+    }
+}
+
 pub proof fn lemma_begin_body_rt(read_only: bool, as_of: Option<u64>)
     ensures
         verified_stmt_prec::sparse_control_begin(sprint_begin_body(read_only, as_of))
@@ -1903,29 +2031,45 @@ pub proof fn lemma_insert_body_rt(
         == (Some(values), Seq::<TokenView>::empty()));
 }
 
+#[verifier::spinoff_prover]
+#[verifier::rlimit(200000)]
 pub proof fn lemma_update_body_rt(
     table: String,
     set: Seq<(String, Option<SExpr>)>,
     where_clause: Option<SExpr>,
 )
     requires
-        set.len() == 1,
-        printable_opt_se(set[0].1),
+        set.len() >= 1,
+        verified_stmt_prec::assign_keys_distinct(set),
+        printable_assigns(set),
         printable_opt_se(where_clause),
     ensures
         verified_stmt_prec::sparse_control_update(
-            seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0])
+            seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause),
         ) == (Some(SStmt::Update { table, set, where_clause }), Seq::<TokenView>::empty()),
 {
     let wpart = sprint_kw_expr(Keyword::Where, where_clause);
-    let input = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0]) + wpart;
+    let input = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set) + wpart;
     assert(input[0] == TokenView::Ident(table));
     let r0 = input.drop_first();
     assert(r0[0] == kwv(Keyword::Set));
     let r1 = r0.drop_first();
-    assert(r1 =~= sprint_assign(set[0]) + wpart);
-    assert(wpart.len() == 0 || (neutral_head(wpart[0]) && wpart[0] != TokenView::Comma)) by {
+    assert(r1 =~= sprint_assign_list(set) + wpart);
+    // `wpart` is inert for the value parser and does not start a comma
+    // continuation.
+    assert(inert(wpart, 0)) by {
+        match where_clause {
+            Some(e) => {
+                assert(wpart[0] == kwv(Keyword::Where));
+                assert(neutral_head(wpart[0]));
+            },
+            None => {
+                assert(wpart.len() == 0);
+            },
+        }
+    }
+    assert(wpart.len() == 0 || wpart[0] != TokenView::Comma) by {
         match where_clause {
             Some(e) => {
                 assert(wpart[0] == kwv(Keyword::Where));
@@ -1933,19 +2077,8 @@ pub proof fn lemma_update_body_rt(
             None => {},
         }
     }
-    lemma_assign_rt(set[0], wpart);
-    assert(verified_stmt_prec::sparse_control_assign(r1) == (Some(set[0]), wpart));
-    assert(!(wpart.len() >= 1 && wpart[0] == TokenView::Comma)) by {
-        match where_clause {
-            Some(e) => {
-                assert(wpart[0] == kwv(Keyword::Where));
-            },
-            None => {},
-        }
-    }
-    assert(verified_stmt_prec::sparse_control_assign_list(r1) == (Some(seq![set[0]]), wpart));
-    let items = seq![set[0]];
-    assert(verified_stmt_prec::assign_keys_distinct(items));
+    lemma_assign_list_rt(set, wpart);
+    assert(verified_stmt_prec::sparse_control_assign_list(r1) == (Some(set), wpart));
     match where_clause {
         Some(e) => {
             assert(wpart =~= seq![kwv(Keyword::Where)] + sprint_min(e, 0));
@@ -1961,12 +2094,8 @@ pub proof fn lemma_update_body_rt(
             assert(wpart.len() == 0);
         },
     }
-    assert(verified_stmt_prec::assign_list_to_sstmt(table, items, where_clause)
-        == SStmt::Update { table, set, where_clause }) by {
-        assert(items[0] == set[0]);
-        assert((items[0].0, items[0].1) == set[0]);
-        assert(seq![(items[0].0, items[0].1)] =~= set);
-    }
+    assert(verified_stmt_prec::assign_list_to_sstmt(table, set, where_clause)
+        == SStmt::Update { table, set, where_clause });
 }
 
 #[verifier::spinoff_prover]
@@ -2217,11 +2346,14 @@ pub proof fn stmt_min_roundtrip(s: SStmt)
             lemma_insert_body_rt(table, columns, values);
         },
         SStmt::Update { table, set, where_clause } => {
-            let body = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign(set[0])
+            let body = seq![TokenView::Ident(table), kwv(Keyword::Set)] + sprint_assign_list(set)
                 + sprint_kw_expr(Keyword::Where, where_clause);
             assert(toks =~= seq![kwv(Keyword::Update)] + body);
             assert(toks[0] == kwv(Keyword::Update));
             assert(toks.drop_first() =~= body);
+            assert(set.len() >= 1);
+            assert(verified_stmt_prec::assign_keys_distinct(set));
+            assert(printable_assigns(set));
             lemma_update_body_rt(table, set, where_clause);
         },
         SStmt::Select { select, from, where_clause, group_by, having, order_by, limit, offset } => {
@@ -2928,22 +3060,45 @@ fn print_min_update_stmt(
         verified_production::token_views(r@)
             == sprint_min_stmt(verified_stmt::view_update_arm(*table, set@, order@, *where_clause)),
 {
-    let ghost vs = verified_stmt::view_update_arm(*table, set@, *where_clause);
+    let ghost vs = verified_stmt::view_update_arm(*table, set@, order@, *where_clause);
     let mut r: Vec<Token> = Vec::new();
     proof {
         broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
 
         verified_stmt::axiom_string_obeys_cmp();
         assert(vstd::std_specs::btree::key_obeys_cmp_spec::<String>());
-        if set@.dom().len() != 1 {
+        // `printable_stmt(vs)` forces `vs` to be `Update` with a single
+        // assignment, hence `wf_update(set@, order@)` holds and
+        // `order@.len() == set@.dom().len() == 1`.
+        if !verified_stmt::wf_update(set@, order@) {
             assert(vs == SStmt::Unsupported);
             assert(false);
         }
-        assert(set@.dom().len() == 1);
+        assert(verified_stmt::wf_update(set@, order@));
+        assert(vs == SStmt::Update {
+            table: *table,
+            set: verified_stmt::view_update_assigns(set@, order@),
+            where_clause: verified_stmt::view_opt(*where_clause),
+        });
+        assert(verified_stmt::view_update_assigns(set@, order@).len() == order@.len());
+        assert(order@.len() == 1);
+        assert(order@.to_set() == set@.dom());
+        assert(set@.dom().contains(order@[0])) by {
+            assert(order@.to_set().contains(order@[0]));
+        }
+        assert(set@.dom().len() == 1) by {
+            assert(order@.to_set().len() == 1) by {
+                assert(order@.no_duplicates());
+                order@.unique_seq_to_set();
+            }
+        }
     }
-    let ghost k0 = set@.dom().choose();
+    let ghost k0 = order@[0];
     let ghost vset: Seq<(String, Option<SExpr>)> = seq![(k0, verified_stmt::view_opt(set@[k0]))];
     proof {
+        assert(verified_stmt::view_update_assigns(set@, order@)[0]
+            == (order@[0], verified_stmt::view_opt(set@[order@[0]])));
+        assert(verified_stmt::view_update_assigns(set@, order@) =~= vset);
         assert(vs == SStmt::Update {
             table: *table,
             set: vset,
@@ -2959,11 +3114,21 @@ fn print_min_update_stmt(
         broadcast use vstd::std_specs::btree::axiom_key_obeys_cmp_spec_meaning;
 
         assert(rem0.len() == set@.dom().len());
-        assert(set@.dom().contains(k0)) by {
-            assert(rem0.len() == 1);
-            assert(set@.contains_key(*rem0[0].0));
-        }
+        assert(rem0.len() == 1);
+        assert(set@.dom().contains(k0));
         assert(set@.contains_key(k0));
+        // The single iterated key is the single domain element, i.e. `k0`.
+        assert(set@.contains_key(*rem0[0].0));
+        assert(*rem0[0].0 == k0) by {
+            assert(set@.dom().contains(*rem0[0].0));
+            assert(set@.dom().contains(k0));
+            if *rem0[0].0 != k0 {
+                assert(set@.dom().remove(k0).contains(*rem0[0].0));
+                assert(set@.dom().remove(k0).len() >= 1);
+                assert(set@.dom().len() >= 2);
+            }
+        }
+        assert(set@[*rem0[0].0] == set@[k0]);
         assert(rem0.contains((&k0, &set@[k0])));
         assert(rem0[0] == (&k0, &set@[k0]));
     }
@@ -3022,9 +3187,12 @@ fn print_min_update_stmt(
             =~= seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)]
                 + sprint_assign(vset[0])
                 + sprint_kw_expr(Keyword::Where, verified_stmt::view_opt(*where_clause)));
+        assert(sprint_assign_list(vset) == sprint_assign(vset[0])) by {
+            assert(vset.len() == 1);
+        }
         assert(sprint_min_stmt(vs)
             == seq![kwv(Keyword::Update), TokenView::Ident(*table), kwv(Keyword::Set)]
-                + sprint_assign(vset[0])
+                + sprint_assign_list(vset)
                 + sprint_kw_expr(Keyword::Where, verified_stmt::view_opt(*where_clause)));
     }
     r

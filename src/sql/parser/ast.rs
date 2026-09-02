@@ -5,6 +5,8 @@ use vstd::prelude::*;
 
 use crate::sql::types::DataType;
 
+verus! {
+
 /// Ghost record of an UPDATE's assignment order, wrapping `Ghost<Seq<String>>`.
 ///
 /// A bare `Ghost<Seq<String>>` field cannot live inside a `#[derive(Debug, Eq,
@@ -20,36 +22,11 @@ impl AssignOrder {
     /// Construct a placeholder ghost order at a non-proof (external Rust) site.
     /// The erased runtime value is meaningless; verified construction sites
     /// supply the real parsed order instead.
+    #[verifier::external_body]
     pub const fn placeholder() -> Self {
         AssignOrder(Ghost::assume_new())
     }
 }
-
-impl Clone for AssignOrder {
-    fn clone(&self) -> Self {
-        AssignOrder(self.0)
-    }
-}
-
-impl Copy for AssignOrder {}
-
-impl std::fmt::Debug for AssignOrder {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
-    }
-}
-
-impl PartialEq for AssignOrder {
-    fn eq(&self, _other: &Self) -> bool {
-        // Ghost ordering carries no runtime meaning: all orders compare equal so
-        // that structural `Statement` equality ignores this field.
-        true
-    }
-}
-
-impl Eq for AssignOrder {}
-
-verus! {
 
 impl View for AssignOrder {
     type V = Seq<String>;
@@ -218,6 +195,34 @@ pub enum Direction {
 }
 
 } // verus!
+
+// Trait impls for the ghost `AssignOrder` field. Kept outside `verus!` and
+// hand-written (not derived) so `Statement`'s `#[derive(Debug, Eq, PartialEq)]`
+// resolves under a plain `cargo build`, where `verus!` is a no-op passthrough
+// and the derives would otherwise see the trait-less `Ghost` field. All
+// instances are equal and `Debug`-invisible: the order is pure ghost state with
+// no runtime meaning.
+impl Clone for AssignOrder {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for AssignOrder {}
+
+impl std::fmt::Debug for AssignOrder {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl PartialEq for AssignOrder {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AssignOrder {}
 
 impl Clone for Column {
     fn clone(&self) -> Self {

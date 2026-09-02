@@ -34,9 +34,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
 
             Delete { table, where_clause } => self.build_delete(table, where_clause),
             Insert { table, columns, values } => self.build_insert(table, columns, values),
-            Update { table, set, where_clause, .. } => {
-                self.build_update(table, set, where_clause)
-            }
+            Update { table, set, where_clause, .. } => self.build_update(table, set, where_clause),
             Select { select, from, where_clause, group_by, having, order_by, offset, limit } => {
                 self.build_select(
                     select,

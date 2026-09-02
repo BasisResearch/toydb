@@ -1196,6 +1196,84 @@ pub proof fn lemma_assign_dom_len(
     }
 }
 
+/// The keys of the parser's ghost `done` sequence.
+pub open spec fn done_keys(items: Seq<(String, Option<ast::Expression>)>) -> Seq<String> {
+    items.map_values(|kv: (String, Option<ast::Expression>)| kv.0)
+}
+
+/// Bijection lemma: under the parser's assignment invariants (distinct keys +
+/// key set == map domain), the ghost `order = done_keys(items)` is well-formed
+/// (`wf_update`) and reading the map back through `order` reproduces exactly the
+/// ordered assignment sequence `view_assign_pairs(items)`.
+///
+/// This is the Seq <-> Map bijection on the UPDATE assignment set:
+///   * soundness    — `order.no_duplicates()` and every listed key is a real
+///                    assignment (`order.to_set() subset set.dom()`);
+///   * completeness — every assignment is listed (`set.dom() subset
+///                    order.to_set()`);
+/// together giving `order.to_set() == set.dom()` and, with the value map,
+/// `view_update_assigns(set, order) == view_assign_pairs(items)`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(60000)]
+pub proof fn lemma_update_bijection(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+)
+    requires
+        set.dom().finite(),
+        forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0,
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] set.dom().contains(items[i].0)
+            && set[items[i].0] == items[i].1,
+        forall|k: String| set.dom().contains(k)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
+    ensures
+        wf_update(set, done_keys(items)),
+        view_update_assigns(set, done_keys(items)) == view_assign_pairs(items),
+{
+    let order = done_keys(items);
+    assert(order.len() == items.len());
+    assert forall|i: int| 0 <= i < order.len() implies #[trigger] order[i] == items[i].0 by {}
+    // soundness: no_duplicates.
+    assert(order.no_duplicates()) by {
+        assert forall|i: int, j: int| 0 <= i < order.len() && 0 <= j < order.len()
+            && i != j implies order[i] != order[j] by {
+            if i < j {
+                assert(items[i].0 != items[j].0);
+            } else {
+                assert(items[j].0 != items[i].0);
+            }
+        }
+    }
+    // order.to_set() == set.dom(), both directions.
+    assert(order.to_set() =~= set.dom()) by {
+        assert forall|k: String| order.to_set().contains(k) implies set.dom().contains(k) by {
+            let i = choose|i: int| 0 <= i < order.len() && order[i] == k;
+            assert(order[i] == items[i].0);
+            assert(set.dom().contains(items[i].0));
+        }
+        assert forall|k: String| set.dom().contains(k) implies order.to_set().contains(k) by {
+            let i = choose|i: int| 0 <= i < items.len() && items[i].0 == k;
+            assert(order[i] == k);
+        }
+    }
+    // value agreement: view_update_assigns(set, order) == view_assign_pairs(items).
+    view_assign_pairs_index(items);
+    assert(view_update_assigns(set, order) =~= view_assign_pairs(items)) by {
+        assert(view_update_assigns(set, order).len() == items.len());
+        assert(view_assign_pairs(items).len() == items.len());
+        assert forall|i: int| 0 <= i < items.len() implies
+            #[trigger] view_update_assigns(set, order)[i] == view_assign_pairs(items)[i] by {
+            assert(view_update_assigns(set, order)[i] == (order[i], view_opt(set[order[i]])));
+            assert(order[i] == items[i].0);
+            assert(set.dom().contains(items[i].0) && set[items[i].0] == items[i].1);
+            assert(view_assign_pairs(items)[i] == (items[i].0, view_opt(items[i].1)));
+        }
+    }
+}
+
+/// Boundary lemma used by the verified parser: with `order = done_keys(items)`,
+/// the total `view_update_arm` equals the mirror `Update` built from the ordered
+/// assignment list. No `len == 1` special case — this now covers multi-assign.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(60000)]
 pub proof fn lemma_update_view_boundary(
@@ -1212,44 +1290,22 @@ pub proof fn lemma_update_view_boundary(
         forall|k: String| set.dom().contains(k)
             ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
     ensures
-        items.len() == 1 ==> view_update_arm(table, set, where_clause)
+        view_update_arm(table, set, done_keys(items), where_clause)
             == (SStmt::Update {
                 table,
-                set: seq![(items[0].0, view_opt(items[0].1))],
+                set: view_assign_pairs(items),
                 where_clause: view_opt(where_clause),
             }),
-        items.len() != 1 ==> view_update_arm(table, set, where_clause) == SStmt::Unsupported,
 {
-    lemma_assign_dom_len(set, items);
-    if items.len() == 1 {
-        assert(set.dom().len() == 1);
-        let k = set.dom().choose();
-        assert(set.dom().contains(k)) by {
-            assert(set.dom().len() == 1);
-            assert(!set.dom().is_empty());
-        }
-        assert(set.dom().contains(items[0].0));
-        assert(k == items[0].0) by {
-            if k != items[0].0 {
-                assert(set.dom().contains(k) && set.dom().contains(items[0].0));
-                assert(set.dom().remove(items[0].0).contains(k));
-                assert(set.dom().remove(items[0].0).len() >= 1);
-                assert(set.dom().len() >= 2);
-            }
-        }
-        assert(set[k] == items[0].1);
-        assert(view_update_arm(table, set, where_clause)
-            == SStmt::Update {
-                table,
-                set: seq![(k, view_opt(set[k]))],
-                where_clause: view_opt(where_clause),
-            });
-        assert(seq![(k, view_opt(set[k]))] =~= seq![(items[0].0, view_opt(items[0].1))]);
-    } else {
-        assert(set.dom().len() == items.len());
-        assert(set.dom().len() != 1);
-        assert(view_update_arm(table, set, where_clause) == SStmt::Unsupported);
-    }
+    lemma_update_bijection(set, items);
+    let order = done_keys(items);
+    assert(wf_update(set, order));
+    assert(view_update_arm(table, set, order, where_clause)
+        == SStmt::Update {
+            table,
+            set: view_update_assigns(set, order),
+            where_clause: view_opt(where_clause),
+        });
 }
 
 } // verus!
