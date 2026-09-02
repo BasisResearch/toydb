@@ -1,6 +1,8 @@
 //! Parses raw SQL strings into a structured Abstract Syntax Tree.
 
 pub mod ast;
+#[cfg(test)]
+pub(crate) mod differential;
 pub mod float_trust;
 mod lexer;
 pub mod parse_error;
@@ -21,6 +23,7 @@ pub mod verified_roundtrip;
 pub mod verified_simple_statement;
 pub mod verified_statements;
 pub mod verified_stmt;
+pub mod verified_stmt_prec;
 
 pub use lexer::{Keyword, Lexer, Token, is_ident};
 pub use parser::Parser;
