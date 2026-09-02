@@ -1,15 +1,18 @@
+#[cfg(test)]
 use std::ops::Add;
 
 #[cfg(test)]
 use super::stream::SliceTokenStream;
 #[cfg(test)]
 use super::stream::TokenStream;
-use super::stream::{BufferedTokenStream, PeekStream};
-use super::{
-    Keyword, Token, ast, float_trust, verified_control, verified_integer, verified_precedence,
-};
+#[cfg(test)]
+use super::stream::PeekStream;
+use super::{Token, ast, verified_control};
+#[cfg(test)]
+use super::{Keyword, float_trust, verified_integer};
 use crate::errinput;
 use crate::error::Result;
+#[cfg(test)]
 use crate::sql::types::DataType;
 
 /// The SQL parser takes tokens from the lexer and parses the SQL syntax into an
@@ -23,6 +26,12 @@ use crate::sql::types::DataType;
 pub struct Parser;
 
 /// The parser implementation, generic over its streaming token source.
+///
+/// This is the legacy handcrafted recursive-descent parser, retained only as a
+/// `cfg(test)` differential oracle against the verified parser. Production code
+/// never constructs it (see `Parser::parse`), so it is compiled out of
+/// non-test builds — if any production path referenced it, the build would fail.
+#[cfg(test)]
 struct StreamingParser<S> {
     stream: S,
 }
@@ -117,6 +126,7 @@ impl Parser {
     }
 }
 
+#[cfg(test)]
 impl<S: PeekStream> StreamingParser<S> {
     /// Creates a parser over a streaming token source.
     fn new(stream: S) -> Self {
@@ -183,21 +193,6 @@ impl<S: PeekStream> StreamingParser<S> {
 
     /// Parses a SQL statement.
     fn parse_statement(&mut self) -> Result<ast::Statement> {
-        if let Some((tokens, pos)) = self.stream.buffer() {
-            let (opt, consumed, perr) = verified_control::parse_control_at(tokens, pos);
-            match opt {
-                Some(statement) => {
-                    self.stream.set_pos(consumed);
-                    return Ok(statement);
-                }
-                None => {
-                    return Err(perr
-                        .expect("the verified parser always reports an error on rejection")
-                        .render());
-                }
-            }
-        }
-
         let Some(token) = self.peek()? else {
             return errinput!("unexpected end of input");
         };
@@ -701,16 +696,6 @@ impl<S: PeekStream> StreamingParser<S> {
     ///   op = parse_infix_operator(prec=0) = None (end of expression)
     ///   return lhs = ((2 ^ (3 ^ 2)) - (4 * 3))
     fn parse_expression(&mut self) -> Result<ast::Expression> {
-        let verified = if let Some((tokens, pos)) = self.stream.buffer() {
-            let fuel = 2usize.saturating_mul(tokens.len().saturating_sub(pos)).saturating_add(3);
-            Some(verified_precedence::parse_expression_at(tokens, pos, 0, fuel))
-        } else {
-            None
-        };
-        if let Some((Some(expression), consumed, _err)) = verified {
-            self.stream.set_pos(consumed);
-            return Ok(expression);
-        }
         self.parse_expression_at(0)
     }
 
@@ -896,14 +881,17 @@ impl<S: PeekStream> StreamingParser<S> {
 }
 
 /// Operator precedence.
+#[cfg(test)]
 type Precedence = u8;
 
 /// Operator associativity.
+#[cfg(test)]
 enum Associativity {
     Left,
     Right,
 }
 
+#[cfg(test)]
 impl Add<Associativity> for Precedence {
     type Output = Self;
 
@@ -918,12 +906,14 @@ impl Add<Associativity> for Precedence {
 }
 
 /// Prefix operators.
+#[cfg(test)]
 enum PrefixOperator {
     Minus, // -a
     Not,   // NOT a
     Plus,  // +a
 }
 
+#[cfg(test)]
 impl PrefixOperator {
     /// The operator precedence.
     fn precedence(&self) -> Precedence {
@@ -951,6 +941,7 @@ impl PrefixOperator {
 }
 
 /// Infix operators.
+#[cfg(test)]
 enum InfixOperator {
     Add,                // a + b
     And,                // a AND b
@@ -969,6 +960,7 @@ enum InfixOperator {
     Subtract,           // a - b
 }
 
+#[cfg(test)]
 impl InfixOperator {
     /// The operator precedence.
     ///
@@ -1022,12 +1014,14 @@ impl InfixOperator {
 }
 
 /// Postfix operators.
+#[cfg(test)]
 enum PostfixOperator {
     Factorial,           // a!
     Is(ast::Literal),    // a IS NULL | NAN
     IsNot(ast::Literal), // a IS NOT NULL | NAN
 }
 
+#[cfg(test)]
 impl PostfixOperator {
     // The operator precedence.
     fn precedence(&self) -> Precedence {
