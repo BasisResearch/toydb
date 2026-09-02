@@ -30,14 +30,32 @@ struct StreamingParser<S> {
 impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
     /// be parsed as a single statement, ending with an optional semicolon.
+    ///
+    /// Production parsing goes directly through the verified parser
+    /// (`verified_control::parse_control_at`); it never touches the legacy
+    /// recursive-descent `StreamingParser`, which is a `cfg(test)`-only
+    /// differential oracle.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
-        let statement = parser.parse_statement()?;
-        parser.skip(Token::Semicolon);
-        if let Some(token) = parser.stream.next()? {
-            return errinput!("unexpected token {token}");
+        let tokens: Vec<Token> = super::Lexer::new(statement).collect::<Result<_>>()?;
+
+        let (opt, consumed, perr) = verified_control::parse_control_at(&tokens, 0);
+        match opt {
+            Some(statement) => {
+                // Skip an optional trailing semicolon, then reject any leftover
+                // tokens with the same error the legacy parser produced.
+                let mut pos = consumed;
+                if tokens.get(pos) == Some(&Token::Semicolon) {
+                    pos += 1;
+                }
+                if let Some(token) = tokens.get(pos) {
+                    return errinput!("unexpected token {token}");
+                }
+                Ok(statement)
+            }
+            None => Err(perr
+                .expect("the verified parser always reports an error on rejection")
+                .render()),
         }
-        Ok(statement)
     }
 
     #[cfg(test)]
