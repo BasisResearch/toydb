@@ -25,6 +25,26 @@ approval_mode = "approve"
 [mcp_servers.verus.tools.verify]
 approval_mode = "approve"
 
+# --- PreToolUse hook (solver + branch guards) --------------------------------
+# Codex >= 0.152 fires PreToolUse with the Claude-compatible hook JSON
+# (tool_name / tool_input) on stdin; exit 2 blocks the call and feeds stderr
+# back to the agent. Both guards filter to shell tools themselves, so no
+# matcher is needed. The solver guard enforces that verus/z3/cvc5 are only
+# ever run through the Verus MCP server (pinned, hash-verified binaries with
+# telemetry), never manually from the shell; the branch guard enforces the
+# branch discipline that previously relied on the .githooks backstop alone.
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '/usr/bin/python3 "$(git rev-parse --show-toplevel)/.claude/hooks/solver_guard.py"'
+timeout = 10
+statusMessage = "Checking solver policy"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '/usr/bin/python3 "$(git rev-parse --show-toplevel)/.claude/hooks/branch_guard.py"'
+timeout = 10
+statusMessage = "Checking branch policy"
+
 # --- Stop hook (capture) ------------------------------------------------------
 # Fail-soft session-trace capture at every turn end. The command resolves the
 # clone's git root (hook commands run with the session cwd as their working

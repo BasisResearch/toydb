@@ -376,16 +376,36 @@ def _block(probs):
     return 2
 
 
+# Shell-tool names across agents: Claude Code's Bash, Codex's shell variants.
+SHELL_TOOL_NAMES = {"bash", "shell", "local_shell", "exec", "exec_command"}
+
+
+def command_from_tool_input(tool_input):
+    """The shell command string from a PreToolUse tool_input, tolerating both
+    Claude Code's string form and Codex's argv-list form (where the script is
+    the last element of e.g. ["bash", "-lc", "<script>"])."""
+    cmd = (tool_input or {}).get("command")
+    if isinstance(cmd, str):
+        return cmd
+    if isinstance(cmd, list):
+        toks = [str(t) for t in cmd]
+        if len(toks) >= 3 and os.path.basename(toks[0]) in ("bash", "sh", "zsh", "dash"):
+            return toks[-1]
+        return " ".join(toks)
+    return ""
+
+
 def cmd_claude_hook():
-    """Default mode: Claude Code PreToolUse hook (hook JSON on stdin)."""
+    """Default mode: PreToolUse hook JSON on stdin (Claude Code and Codex,
+    which fires the same tool_name/tool_input shape as of 0.152)."""
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
     except Exception:
         return 0
-    if data.get("tool_name") != "Bash":
+    if str(data.get("tool_name") or "").lower() not in SHELL_TOOL_NAMES:
         return 0
-    command = (data.get("tool_input") or {}).get("command") or ""
+    command = command_from_tool_input(data.get("tool_input"))
     if not command:
         return 0
     probs = violations(command)
