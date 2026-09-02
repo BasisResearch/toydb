@@ -157,7 +157,7 @@ fn expression_strategy(include_all: bool) -> BoxedStrategy<Expression> {
     .boxed();
     let leaf = if include_all { prop_oneof![Just(Expression::All), atom].boxed() } else { atom };
 
-    leaf.prop_recursive(5, 128, 8, |inner| {
+    leaf.prop_recursive(8, 192, 8, |inner| {
         let binary = (0u8..15, inner.clone(), inner.clone()).prop_map(|(kind, lhs, rhs)| {
             let (lhs, rhs) = (Box::new(lhs), Box::new(rhs));
             Expression::Operator(match kind {
@@ -219,7 +219,7 @@ fn from_items() -> BoxedStrategy<ast::From> {
         .boxed();
     let right_tables = tables.clone();
     tables
-        .prop_recursive(3, 32, 2, move |left| {
+        .prop_recursive(4, 48, 2, move |left| {
             let cross = (left.clone(), right_tables.clone()).prop_map(|(left, right)| From::Join {
                 left: Box::new(left),
                 right: Box::new(right),
@@ -363,6 +363,23 @@ proptest! {
         let tokens = super::print_statement(&statement)
             .expect("the strategy only generates parser-producible statements");
         check_statement(&render_tokens(&tokens));
+    }
+
+    /// Old vs new agree on *minimally*-parenthesised expressions rendered to
+    /// SQL text. The canonical printer brackets every operator node, so the
+    /// lens above can never produce bare precedence or associativity spines;
+    /// the phase-3 min-parens printer emits exactly those (`1 - 2 - 3`,
+    /// `NOT a AND b`, `-2 ^ 2`), turning the concrete-syntax corpus below
+    /// from a fixed sample into a generative property.
+    #[test]
+    fn expression_parsers_agree_minparens(expression in expressions()) {
+        // A successful canonical print certifies the expression is inside the
+        // printable domain, which is `print_min_expr`'s Verus precondition
+        // (no-panic is proven only there).
+        super::print_expr(&expression)
+            .expect("the strategy only generates parser-producible expressions");
+        let tokens = super::verified_minparen::print_min_expr(&expression);
+        check_expression(&render_tokens(&tokens));
     }
 }
 
