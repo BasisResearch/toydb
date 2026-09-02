@@ -65,6 +65,9 @@ use super::{verified_production, verified_roundtrip, verified_stmt, verified_stm
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_roundtrip::SExpr;
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::verified_stmt::SStmt;
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 
@@ -78,16 +81,40 @@ verus! {
 /// `parse_statement` dispatches. The `decreases` measure pairs with
 /// `parse_explain_at` for their mutual recursion (`EXPLAIN <statement>`): the
 /// second component orders the two functions at an equal token position.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(200000)]
 pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        // Full refinement against the top-level dispatch twin `sparse_control`,
+        // up to `view_stmt`, on all realistically-sized inputs.
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
     decreases toks.len() - pos, 0int,
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+    proof { verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int)); }
     if pos >= toks.len() {
         return (None, pos, Some(ParseError::UnexpectedEof));
+    }
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        reveal(verified_production::token_view);
+        assert(input.drop_first() == verified_production::token_views(
+            toks@.subrange((pos + 1) as int, toks@.len() as int)));
     }
     match &toks[pos] {
         Token::Keyword(Keyword::Commit) => (Some(ast::Statement::Commit), pos + 1, None),
@@ -111,22 +138,72 @@ pub fn parse_control_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::State
 /// (`1int` vs `parse_control_at`'s `0int`) breaks the equal-position mutual
 /// recursion: `parse_explain_at(pos)` calls `parse_control_at(pos)` at the same
 /// `pos`, and `1int > 0int` makes that call strictly smaller.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(100000)]
 fn parse_explain_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        // Full refinement against `sparse_control_explain`, up to `view_stmt`.
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_explain(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
     decreases toks.len() - pos, 1int,
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
+    proof {
+        verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+        if pos < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, pos as int);
+            reveal(verified_production::token_view);
+        }
+    }
     // Nested EXPLAIN is disallowed; defer to legacy for the specific error.
     if pos < toks.len() && matches!(toks[pos], Token::Keyword(Keyword::Explain)) {
+        proof {
+            if sized {
+                assert(input.len() >= 1 && input[0] == verified_production::TokenView::Keyword(
+                    Keyword::Explain));
+                assert(verified_stmt_prec::sparse_control_explain(input).0 is None);
+            }
+        }
         return (None, pos, Some(ParseError::NestedExplain));
     }
     let (opt, newpos, e) = parse_control_at(toks, pos);
     match opt {
-        Some(inner) => (Some(ast::Statement::Explain(Box::new(inner))), newpos, None),
-        None => (None, pos, e),
+        Some(inner) => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control(input)
+                        == (Some(verified_stmt::view_stmt(inner)),
+                            verified_production::token_views(
+                                toks@.subrange(newpos as int, toks@.len() as int))));
+                    assert(verified_stmt::view_stmt(ast::Statement::Explain(Box::new(inner)))
+                        == SStmt::Explain(Box::new(verified_stmt::view_stmt(inner))));
+                }
+            }
+            (Some(ast::Statement::Explain(Box::new(inner))), newpos, None)
+        },
+        None => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control(input).0 is None);
+                    assert(verified_stmt_prec::sparse_control_explain(input).0 is None);
+                }
+            }
+            (None, pos, e)
+        },
     }
 }
 
@@ -167,40 +244,130 @@ fn parse_clause_expr_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Expre
 /// keyword: the select list, then optional `FROM` / `WHERE` / `GROUP BY` /
 /// `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`. Mirrors `parse_select`; a
 /// malformed clause yields `(None, pos)` so the caller falls back to legacy.
+/// Refines `sparse_control_select` (the composition of the per-clause spec
+/// twins) up to `view_stmt`, on all realistically-sized inputs.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(600000)]
 fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_select(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
     // Select list (the `SELECT` keyword is already consumed).
     let (sopt, c1, serr) = parse_select_list_at(toks, pos);
     let select = match sopt {
         Some(s) => s,
-        None => return (None, pos, serr),
+        None => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_select_list(input).0 is None);
+                    assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                }
+            }
+            return (None, pos, serr);
+        },
     };
     let mut cur = c1;
+    // `r1` — the suffix past the select list, pinned by the list refinement.
+    let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_select_list(input)
+                == (Some(verified_stmt::view_select_list(select@)), r1));
+        }
+    }
 
     // FROM
     let (fopt, c2, ferr) = parse_from_clause_at(toks, cur);
     let from = match fopt {
         Some(f) => f,
-        None => return (None, pos, ferr),
+        None => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_from(r1).0 is None);
+                    assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                }
+            }
+            return (None, pos, ferr);
+        },
     };
     cur = c2;
+    let ghost r2 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_from(r1)
+                == (Some(verified_stmt::view_froms(from@)), r2));
+        }
+    }
 
     // WHERE
     let mut where_clause: Option<ast::Expression> = None;
+    proof {
+        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
+        }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
         cur = cur + 1;
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r2.drop_first() == verified_production::token_views(
+                toks@.subrange(cur as int, toks@.len() as int)));
+        }
         let (opt, c, werr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r2, Keyword::Where)
+                            == (Some(Some(verified_roundtrip::view_expr(e))),
+                                verified_production::token_views(
+                                    toks@.subrange(c as int, toks@.len() as int))));
+                    }
+                }
                 where_clause = Some(e);
                 cur = c;
             },
-            None => return (None, pos, werr),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r2, Keyword::Where).0 is None);
+                        assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                    }
+                }
+                return (None, pos, werr);
+            },
+        }
+    } else {
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_kw_expr(r2, Keyword::Where)
+                    == (Some(None::<SExpr>), r2));
+            }
+        }
+    }
+    let ghost r3 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_kw_expr(r2, Keyword::Where)
+                == (Some(verified_stmt::view_opt(where_clause)), r3));
         }
     }
 
@@ -208,21 +375,78 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let (gopt, cg, gerr) = parse_group_by_at(toks, cur);
     let group_by = match gopt {
         Some(g) => g,
-        None => return (None, pos, gerr),
+        None => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_group_by(r3).0 is None);
+                    assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                }
+            }
+            return (None, pos, gerr);
+        },
     };
     cur = cg;
+    let ghost r4 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_group_by(r3)
+                == (Some(verified_roundtrip::view_args(group_by@)), r4));
+        }
+    }
 
     // HAVING
     let mut having: Option<ast::Expression> = None;
+    proof {
+        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
+        }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Having)) {
         cur = cur + 1;
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r4.drop_first() == verified_production::token_views(
+                toks@.subrange(cur as int, toks@.len() as int)));
+        }
         let (opt, c, herr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r4, Keyword::Having)
+                            == (Some(Some(verified_roundtrip::view_expr(e))),
+                                verified_production::token_views(
+                                    toks@.subrange(c as int, toks@.len() as int))));
+                    }
+                }
                 having = Some(e);
                 cur = c;
             },
-            None => return (None, pos, herr),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r4, Keyword::Having).0 is None);
+                        assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                    }
+                }
+                return (None, pos, herr);
+            },
+        }
+    } else {
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_kw_expr(r4, Keyword::Having)
+                    == (Some(None::<SExpr>), r4));
+            }
+        }
+    }
+    let ghost r5 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_kw_expr(r4, Keyword::Having)
+                == (Some(verified_stmt::view_opt(having)), r5));
         }
     }
 
@@ -230,35 +454,134 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
     let (oopt, co, oerr) = parse_order_by_at(toks, cur);
     let order_by = match oopt {
         Some(o) => o,
-        None => return (None, pos, oerr),
+        None => {
+            proof {
+                if sized {
+                    assert(verified_stmt_prec::sparse_control_order_by(r5).0 is None);
+                    assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                }
+            }
+            return (None, pos, oerr);
+        },
     };
     cur = co;
+    let ghost r6 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_order_by(r5)
+                == (Some(verified_stmt::view_order_list(order_by@)), r6));
+        }
+    }
 
     // LIMIT
     let mut limit: Option<ast::Expression> = None;
+    proof {
+        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
+        }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Limit)) {
         cur = cur + 1;
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r6.drop_first() == verified_production::token_views(
+                toks@.subrange(cur as int, toks@.len() as int)));
+        }
         let (opt, c, lerr) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r6, Keyword::Limit)
+                            == (Some(Some(verified_roundtrip::view_expr(e))),
+                                verified_production::token_views(
+                                    toks@.subrange(c as int, toks@.len() as int))));
+                    }
+                }
                 limit = Some(e);
                 cur = c;
             },
-            None => return (None, pos, lerr),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r6, Keyword::Limit).0 is None);
+                        assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                    }
+                }
+                return (None, pos, lerr);
+            },
+        }
+    } else {
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_kw_expr(r6, Keyword::Limit)
+                    == (Some(None::<SExpr>), r6));
+            }
+        }
+    }
+    let ghost r7 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_kw_expr(r6, Keyword::Limit)
+                == (Some(verified_stmt::view_opt(limit)), r7));
         }
     }
 
     // OFFSET
     let mut offset: Option<ast::Expression> = None;
+    proof {
+        verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+        if cur < toks.len() {
+            verified_roundtrip::token_views_suffix(toks@, cur as int);
+            reveal(verified_production::token_view);
+        }
+    }
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Offset)) {
         cur = cur + 1;
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            assert(r7.drop_first() == verified_production::token_views(
+                toks@.subrange(cur as int, toks@.len() as int)));
+        }
         let (opt, c, ferr2) = parse_clause_expr_at(toks, cur);
         match opt {
             Some(e) => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r7, Keyword::Offset)
+                            == (Some(Some(verified_roundtrip::view_expr(e))),
+                                verified_production::token_views(
+                                    toks@.subrange(c as int, toks@.len() as int))));
+                    }
+                }
                 offset = Some(e);
                 cur = c;
             },
-            None => return (None, pos, ferr2),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_stmt_prec::sparse_control_kw_expr(r7, Keyword::Offset).0 is None);
+                        assert(verified_stmt_prec::sparse_control_select(input).0 is None);
+                    }
+                }
+                return (None, pos, ferr2);
+            },
+        }
+    } else {
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_kw_expr(r7, Keyword::Offset)
+                    == (Some(None::<SExpr>), r7));
+            }
+        }
+    }
+    let ghost r8 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_kw_expr(r7, Keyword::Offset)
+                == (Some(verified_stmt::view_opt(offset)), r8));
         }
     }
 
@@ -272,6 +595,31 @@ fn parse_select_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
         offset,
         limit,
     };
+    proof {
+        if sized {
+            assert(verified_stmt_prec::sparse_control_select(input)
+                == (Some(SStmt::Select {
+                    select: verified_stmt::view_select_list(select@),
+                    from: verified_stmt::view_froms(from@),
+                    where_clause: verified_stmt::view_opt(where_clause),
+                    group_by: verified_roundtrip::view_args(group_by@),
+                    having: verified_stmt::view_opt(having),
+                    order_by: verified_stmt::view_order_list(order_by@),
+                    limit: verified_stmt::view_opt(limit),
+                    offset: verified_stmt::view_opt(offset),
+                }), r8));
+            assert(verified_stmt::view_stmt(statement) == SStmt::Select {
+                select: verified_stmt::view_select_list(select@),
+                from: verified_stmt::view_froms(from@),
+                where_clause: verified_stmt::view_opt(where_clause),
+                group_by: verified_roundtrip::view_args(group_by@),
+                having: verified_stmt::view_opt(having),
+                order_by: verified_stmt::view_order_list(order_by@),
+                limit: verified_stmt::view_opt(limit),
+                offset: verified_stmt::view_opt(offset),
+            });
+        }
+    }
     (Some(statement), cur, None)
 }
 

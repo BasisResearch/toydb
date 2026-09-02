@@ -381,6 +381,28 @@ proptest! {
         let tokens = super::verified_minparen::print_min_expr(&expression);
         check_expression(&render_tokens(&tokens));
     }
+
+    /// Old vs new agree on *minimally*-parenthesised statements rendered to
+    /// SQL text, mirroring `expression_parsers_agree_minparens` at the
+    /// statement level (phase 6). The canonical statement printer brackets
+    /// every operator node, so generated statements otherwise never reach
+    /// bare-precedence clause syntax (`SELECT 1 + 2 * 3 FROM t WHERE NOT a
+    /// AND b ORDER BY x + 1 DESC`); the min-parens statement printer emits
+    /// exactly that surface.
+    #[test]
+    fn statement_parsers_agree_minparens(statement in statements()) {
+        // A successful canonical print certifies the statement is inside the
+        // canonical printable domain (same guard pattern as the expression
+        // lens): all embedded expressions are printable, which keeps the
+        // min-parens statement printer panic-free. Statements outside the
+        // *verified* min-parens domain (e.g. multi-assignment UPDATEs) may
+        // print a reduced statement, but the differential check still holds:
+        // both parsers see the same rendered text.
+        super::print_statement(&statement)
+            .expect("the strategy only generates parser-producible statements");
+        let tokens = super::verified_minparen_stmt::print_min_stmt(&statement);
+        check_statement(&render_tokens(&tokens));
+    }
 }
 
 // ---- fixed corpus ----------------------------------------------------------
