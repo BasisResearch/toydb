@@ -282,6 +282,20 @@ pub open spec fn sprint_min_args(args: Seq<SExpr>) -> Seq<TokenView>
 // leftmost leaf plus a fold of `(op, right)` steps.
 // ===========================================================================
 
+/// A head token that can never *extend* an expression parse, at any level: not
+/// a binary operator, not the postfix `!` / `IS`, and not one of the
+/// atom-extending `.` / `(`. Clause keywords (`FROM`, `WHERE`, `AS`, `ASC`,
+/// join keywords, ...), `)` / `,`, and identifiers all satisfy this; it is how
+/// the statement layer (phase 6) feeds a clause continuation into `lemma_min`
+/// as an inert tail.
+pub open spec fn neutral_head(t: TokenView) -> bool {
+    verified_expression::binary_from_token(t) is None
+        && t != TokenView::Exclamation
+        && t != TokenView::Keyword(Keyword::Is)
+        && t != TokenView::Period
+        && t != TokenView::OpenParen
+}
+
 /// `tail` cannot extend a parse running at min-precedence `level`: its head is
 /// neither a postfix operator whose precedence clears `level` (`!` at 9, `IS` at
 /// 4) nor a binary operator whose precedence clears `level`. Both continuation
@@ -303,6 +317,9 @@ pub open spec fn inert(tail: Seq<TokenView>, level: u8) -> bool {
         // not re-read as a qualified column or a function call).
         || tail[0] == TokenView::CloseParen
         || tail[0] == TokenView::Comma
+        // Any other non-operator token (clause keywords, identifiers, ...):
+        // level-independent, like `)` / `,`.
+        || neutral_head(tail[0])
 }
 
 /// An inert tail is a `boundary` tail (never opens with `.` or `(`).
@@ -1301,11 +1318,13 @@ pub proof fn lemma_leaf_parse(leaf: SExpr, leaf_ctx: u8, ctx: u8, rest: Seq<Toke
         !descends(leaf, leaf_ctx),
         ctx <= leaf_ctx,
         // rest halts the postfix loop and does not re-read the leaf as qualified
-        // / a call: it is a binary-operator head or a boundary.
+        // / a call: it is a binary-operator head or a boundary (incl. any
+        // neutral non-operator head).
         rest.len() == 0
             || (verified_expression::binary_from_token(rest[0]) is Some
                 && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
-            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma),
+            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
+            || neutral_head(rest[0]),
         // Leaf gap (only needed for an unwrapped *prefix* leaf, whose operand is
         // parsed at `prec_min(leaf)`): the following binary operator binds
         // strictly looser than the leaf, so that operand parse stops before it.
@@ -1524,7 +1543,8 @@ pub proof fn rest_inert_high(rest: Seq<TokenView>, level: u8)
         rest.len() == 0
             || (verified_expression::binary_from_token(rest[0]) is Some
                 && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
-            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma),
+            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
+            || neutral_head(rest[0]),
     ensures
         inert(rest, level),
 {
@@ -1549,7 +1569,8 @@ pub proof fn leaf_rest_inert(rest: Seq<TokenView>, level: u8)
         rest.len() == 0
             || (verified_expression::binary_from_token(rest[0]) is Some
                 && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
-            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma),
+            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
+            || neutral_head(rest[0]),
         rest.len() == 0
             || verified_expression::binary_from_token(rest[0]) is None
             || binary_prec_s(verified_expression::binary_from_token(rest[0])->Some_0) < level,
@@ -1582,7 +1603,8 @@ pub proof fn binary_prec_le_8(t: BinaryTag)
 }
 
 /// An inert tail at a level `<= 8` has the binary-op / boundary head shape
-/// (`!` needs level > 9, `IS` needs level > 8, so neither can head it here).
+/// (`!` needs level > 9, `IS` needs level > 8, so neither can head it here;
+/// a neutral head passes through as its own disjunct).
 pub proof fn inert_shape(tail: Seq<TokenView>, level: u8)
     requires
         inert(tail, level),
@@ -1591,7 +1613,8 @@ pub proof fn inert_shape(tail: Seq<TokenView>, level: u8)
         tail.len() == 0
             || (verified_expression::binary_from_token(tail[0]) is Some
                 && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen)
-            || (tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma),
+            || (tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma)
+            || neutral_head(tail[0]),
 {
     if tail.len() > 0 {
         match verified_expression::binary_from_token(tail[0]) {
@@ -1735,7 +1758,8 @@ pub proof fn atom_boundary_from_rest(rest: Seq<TokenView>)
         rest.len() == 0
             || (verified_expression::binary_from_token(rest[0]) is Some
                 && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
-            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma),
+            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
+            || neutral_head(rest[0]),
     ensures
         super::verified_roundtrip::boundary(rest),
 {
@@ -1869,7 +1893,8 @@ pub proof fn leaf_rest_shape(e: SExpr, ctx: u8, tail: Seq<TokenView>)
         tail.len() == 0
             || (verified_expression::binary_from_token(tail[0]) is Some
                 && tail[0] != TokenView::Period && tail[0] != TokenView::OpenParen)
-            || (tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma),
+            || (tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma)
+            || neutral_head(tail[0]),
     ensures
         ({
             let rest = after_leaf(e, ctx) + tail;
@@ -1877,6 +1902,7 @@ pub proof fn leaf_rest_shape(e: SExpr, ctx: u8, tail: Seq<TokenView>)
                 || (verified_expression::binary_from_token(rest[0]) is Some
                     && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
                 || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
+                || neutral_head(rest[0])
         }),
     decreases e,
 {
