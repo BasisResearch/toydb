@@ -35,3 +35,8 @@ sql::parser::verified_minparen::min_roundtrip_live
 # theorem (any accepted stream parses equal to its min-parens normal form);
 # same category and same phase-5 follow-up as min_roundtrip_live above.
 sql::parser::verified_minparen::min_normalize_live
+# (2026-09-02, phase 6.) stmt_min_roundtrip_live is the exec-carried statement
+# roundtrip theorem (the live parser inverts the min-parens statement printer);
+# print_min_stmt itself IS covered by the statement_parsers_agree_minparens
+# differential lens. Same phase-5 follow-up as the entries above.
+sql::parser::verified_minparen_stmt::stmt_min_roundtrip_live
