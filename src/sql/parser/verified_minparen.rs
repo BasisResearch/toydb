@@ -52,11 +52,23 @@
 //!
 //! Task 4 (a statement-level corollary) is intentionally deferred to a
 //! follow-up; it depends on parallel phase-2 work.
+//!
+//! Phase 7 adds the token-stream dual on top: `min_normal` (the printer's
+//! image, extensionally), `min_dual` (print ∘ parse = id on normal forms),
+//! `min_parse_injective` (parser injectivity on normal forms), the
+//! `sparse_prec_printable` lemma suite (a successful parse result is printable
+//! iff its float literals are — the exact side condition for re-printing), and
+//! `min_normalize_live` (any accepted stream normalises through the live
+//! parser and printer), plus a non-existential fixpoint characterisation of
+//! normality (`min_normal_fix` / `min_normal_fix_iff`). See the bijection
+//! note at `min_roundtrip`.
 
 // Proof/verification scaffolding, not idiomatic library code.
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
+#[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
+use vstd::float::FloatBitsProperties;
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use vstd::prelude::*;
 
@@ -2152,6 +2164,26 @@ pub proof fn binary_tok_tag(tag: BinaryTag)
 /// other, not to an external ground truth. The guards against a consistent swap
 /// are the `op_precedence` goldenscripts and the differential harness restored
 /// in phase 0, which compare the parser against externally-fixed SQL semantics.
+///
+/// # The bijection picture (phase 7)
+///
+/// This theorem is one half of a bijection between printable ASTs and the
+/// printer's image, the *normal-form* token streams (`min_normal`):
+///
+/// - parse ∘ print = id on printable ASTs — this theorem (`min_roundtrip`,
+///   lifted to the live parser by `min_roundtrip_live`);
+/// - print ∘ parse = id on normal-form streams — the dual (`min_dual`), with
+///   parser injectivity on normal forms as a corollary
+///   (`min_parse_injective`);
+/// - arbitrary accepted streams *normalise*: parsing and re-printing lands on
+///   the normal form of the same AST (`min_normalize_live`).
+///
+/// Do NOT attempt the unrestricted dual `print(parse(toks)) == toks` for all
+/// accepted `toks`: it is false for every deterministic printer. `1 + 2`,
+/// `(1 + 2)` and `((1 + 2))` all parse to the same AST, which prints exactly
+/// one way, so at most one of those streams can be reproduced. Restricting to
+/// the printer's image (`min_normal`) is the strongest true statement, and it
+/// is what makes parse/print mutually inverse on ASTs × normal forms.
 pub proof fn min_roundtrip(e: SExpr, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
@@ -2610,6 +2642,530 @@ pub fn min_roundtrip_live(e: &ast::Expression, fuel: usize)
             == Seq::<TokenView>::empty());
     }
     (opt, pos, err)
+}
+
+// ===========================================================================
+// Phase 7 — the token-stream dual: print_min ∘ parse = id on normal forms.
+//
+// The AST-side roundtrip above (`min_roundtrip`) says parse ∘ print = id on
+// printable ASTs. This section adds the other direction, restricted to the
+// printer's image: the *normal forms* `min_normal` (task 1), the dual theorem
+// `min_dual` (task 2), parser injectivity on normal forms
+// (`min_parse_injective`, task 3), and the live-parser normalisation statement
+// for arbitrary accepted streams (`min_normalize_live`, task 4) with its
+// printability side condition made exact by the `sparse_prec_printable` lemma
+// suite (parser-produced ASTs are printable iff their float literals are).
+// ===========================================================================
+
+/// Task 1 — the normal-form predicate, extensionally: `toks` is a minimal-
+/// parenthesisation normal form iff it is the min-parens print of some
+/// printable mirror expression. (`printable_se` is the only well-formedness
+/// `min_roundtrip` assumes, so it is the only one required here.)
+pub open spec fn min_normal(toks: Seq<TokenView>) -> bool {
+    exists|e: SExpr|
+        super::verified_roundtrip::printable_se(e) && #[trigger] sprint_min(e, 0) == toks
+}
+
+/// Task 2 — the dual roundtrip, spec level: on normal-form token streams,
+/// parsing succeeds consuming all tokens and re-printing reproduces the exact
+/// stream:
+///
+///   min_normal(toks) ==> sparse_prec(toks, 0, fuel) == (Some(e'), empty)
+///                        && sprint_min(e', 0) == toks
+///
+/// for adequate fuel (`expr_fuel(toks) == 2 * toks.len() + 3`). Together with
+/// `min_roundtrip` this makes `sprint_min(_, 0)` / `sparse_prec(_, 0, _)` a
+/// bijection between printable ASTs and normal-form streams. A short corollary
+/// of `min_roundtrip`: unpack the existential witness and apply the roundtrip.
+pub proof fn min_dual(toks: Seq<TokenView>, fuel: nat)
+    requires
+        min_normal(toks),
+        fuel >= super::verified_stmt_prec::expr_fuel(toks),
+    ensures
+        sparse_prec(toks, 0, fuel).0 is Some,
+        super::verified_roundtrip::printable_se(sparse_prec(toks, 0, fuel).0->Some_0),
+        sprint_min(sparse_prec(toks, 0, fuel).0->Some_0, 0) == toks,
+        sparse_prec(toks, 0, fuel).1 == Seq::<TokenView>::empty(),
+{
+    let e = choose|e: SExpr|
+        super::verified_roundtrip::printable_se(e) && #[trigger] sprint_min(e, 0) == toks;
+    min_roundtrip(e, fuel);
+}
+
+/// Task 3 — parser injectivity on normal forms: two normal-form streams that
+/// parse to the same expression are the same stream. (Immediate from
+/// `min_dual`: each stream is the print of its own parse result.)
+pub proof fn min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>, f1: nat, f2: nat)
+    requires
+        min_normal(t1),
+        min_normal(t2),
+        f1 >= super::verified_stmt_prec::expr_fuel(t1),
+        f2 >= super::verified_stmt_prec::expr_fuel(t2),
+        sparse_prec(t1, 0, f1).0 == sparse_prec(t2, 0, f2).0,
+    ensures
+        t1 == t2,
+{
+    min_dual(t1, f1);
+    min_dual(t2, f2);
+}
+
+// ---- task 6 (partial) — a non-existential characterisation of min_normal ---
+//
+// The extensional `min_normal` quantifies over an unknown witness expression.
+// `min_normal_fix` eliminates the existential: a stream is normal iff it parses
+// fully and re-printing the (unique) parse result reproduces it exactly — a
+// fixpoint of parse-then-print, computable from the stream alone.
+// `min_normal_fix_iff` proves the two definitions coincide.
+//
+// The remaining (hard) half of task 6 — a fully structural no-redundant-parens
+// grammar over raw token streams, with no reference to the parser or printer —
+// is NOT attempted: stating "this `(`...`)` pair is redundant at this context"
+// requires re-deriving the precedence-indexed normal-form grammar, essentially
+// a fourth encoding of the precedence table plus an equivalence proof in both
+// directions. Timeboxed out; the fixpoint form already gives decidability of
+// normality and is what downstream proofs need.
+
+/// `toks` parses fully at context 0 and re-printing the parse result
+/// reproduces `toks` exactly. Non-existential: everything is computed from
+/// `toks` itself (`expr_fuel(toks)` is always adequate fuel).
+pub open spec fn min_normal_fix(toks: Seq<TokenView>) -> bool {
+    let (sopt, srest) = sparse_prec(toks, 0, super::verified_stmt_prec::expr_fuel(toks));
+    &&& sopt is Some
+    &&& srest.len() == 0
+    &&& super::verified_roundtrip::printable_se(sopt->Some_0)
+    &&& sprint_min(sopt->Some_0, 0) == toks
+}
+
+/// The fixpoint characterisation coincides with the extensional one.
+pub proof fn min_normal_fix_iff(toks: Seq<TokenView>)
+    ensures
+        min_normal(toks) == min_normal_fix(toks),
+{
+    if min_normal(toks) {
+        min_dual(toks, super::verified_stmt_prec::expr_fuel(toks));
+    }
+    if min_normal_fix(toks) {
+        let e = sparse_prec(toks, 0, super::verified_stmt_prec::expr_fuel(toks)).0->Some_0;
+        assert(super::verified_roundtrip::printable_se(e) && sprint_min(e, 0) == toks);
+    }
+}
+
+// ---- task 4 side conditions: which parser-produced ASTs are printable ------
+//
+// `print_min_expr` requires `printable_se`, and the parser can step outside
+// that domain — but ONLY through float literals: the `INFINITY` / `NAN`
+// keyword atoms build non-finite floats, and a `Number` token whose bytes are
+// not all digits goes through the uninterpreted `float_trust::spec_parse`,
+// whose result may be non-finite or sign-negative. Everything else the parser
+// builds is printable: in particular a parsed `Integer` literal is always
+// >= 0 (`parse_i64_spec` reads unsigned digits; a leading `-` lexes as a
+// separate token and parses as `Negate`), and `String` / `Boolean` / `Null` /
+// structural nodes are unconditionally printable. `floats_ok` states the
+// float condition; the `sparse_*_printable` lemmas prove it is the EXACT
+// residual obstruction: any successful parse result with printable floats is
+// printable.
+
+/// Every float literal in `e` is finite and non-sign-negative — the only part
+/// of `printable_se` the parser does not guarantee by construction.
+pub open spec fn floats_ok(e: SExpr) -> bool
+    decreases e,
+{
+    match e {
+        SExpr::Literal(ast::Literal::Float(v)) =>
+            v.is_finite_spec() && !v.is_sign_negative_spec(),
+        SExpr::Literal(_) => true,
+        SExpr::All => true,
+        SExpr::Column(_, _) => true,
+        SExpr::Unary(_, inner) => floats_ok(*inner),
+        SExpr::Factorial(inner) => floats_ok(*inner),
+        SExpr::Is(inner, _) => floats_ok(*inner),
+        SExpr::Binary(_, left, right) => floats_ok(*left) && floats_ok(*right),
+        SExpr::Function(_, args) => all_floats_ok(args),
+    }
+}
+
+/// `floats_ok` over an argument list (structural, mirroring `all_printable_se`).
+pub open spec fn all_floats_ok(args: Seq<SExpr>) -> bool
+    decreases args,
+{
+    args.len() == 0 || (floats_ok(args[0]) && all_floats_ok(args.drop_first()))
+}
+
+/// The invariant the printability induction threads: printable floats suffice
+/// for full printability.
+pub open spec fn cond_printable(e: SExpr) -> bool {
+    floats_ok(e) ==> super::verified_roundtrip::printable_se(e)
+}
+
+/// List form of `cond_printable`.
+pub open spec fn cond_all_printable(args: Seq<SExpr>) -> bool {
+    all_floats_ok(args) ==> super::verified_roundtrip::all_printable_se(args)
+}
+
+/// `cond_printable` is preserved by the unary constructor.
+pub proof fn cond_printable_unary(tag: UnaryTag, inner: SExpr)
+    requires
+        cond_printable(inner),
+    ensures
+        cond_printable(SExpr::Unary(tag, Box::new(inner))),
+{
+    reveal(super::verified_roundtrip::printable_se);
+}
+
+/// `cond_printable` is preserved by the postfix constructors.
+pub proof fn cond_printable_postfix(inner: SExpr, lit: IsLit)
+    requires
+        cond_printable(inner),
+    ensures
+        cond_printable(SExpr::Factorial(Box::new(inner))),
+        cond_printable(SExpr::Is(Box::new(inner), lit)),
+{
+    reveal(super::verified_roundtrip::printable_se);
+}
+
+/// `cond_printable` is preserved by the binary constructor.
+pub proof fn cond_printable_binary(tag: BinaryTag, left: SExpr, right: SExpr)
+    requires
+        cond_printable(left),
+        cond_printable(right),
+    ensures
+        cond_printable(SExpr::Binary(tag, Box::new(left), Box::new(right))),
+{
+    reveal(super::verified_roundtrip::printable_se);
+}
+
+/// `cond_all_printable` for the singleton list.
+pub proof fn cond_all_singleton(e: SExpr)
+    requires
+        cond_printable(e),
+    ensures
+        cond_all_printable(seq![e]),
+{
+    reveal(super::verified_roundtrip::all_printable_se);
+    if all_floats_ok(seq![e]) {
+        assert(floats_ok(e));
+        assert(seq![e].drop_first() =~= Seq::<SExpr>::empty());
+        assert(super::verified_roundtrip::all_printable_se(seq![e].drop_first()));
+    }
+}
+
+/// `cond_all_printable` for the cons cell `seq![e] + more`.
+pub proof fn cond_all_cons(e: SExpr, more: Seq<SExpr>)
+    requires
+        cond_printable(e),
+        cond_all_printable(more),
+    ensures
+        cond_all_printable(seq![e] + more),
+{
+    reveal(super::verified_roundtrip::all_printable_se);
+    let s = seq![e] + more;
+    assert(s[0] == e);
+    assert(s.drop_first() =~= more);
+    if all_floats_ok(s) {
+        assert(floats_ok(e));
+        assert(all_floats_ok(more));
+    }
+}
+
+/// The postfix pass preserves `cond_printable` (it only wraps the lhs in
+/// `Factorial` / `Is` / `NOT ∘ Is`).
+pub proof fn sparse_postfix_printable(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
+    requires
+        cond_printable(lhs),
+    ensures
+        cond_printable(sparse_postfix_loop(lhs, input, min_prec).0),
+    decreases input.len(),
+{
+    reveal_with_fuel(sparse_postfix_loop, 1);
+    if input.len() == 0 {
+    } else if input[0] == TokenView::Exclamation {
+        if 9 >= min_prec {
+            cond_printable_postfix(lhs, IsLit::Null);
+            sparse_postfix_printable(SExpr::Factorial(Box::new(lhs)), input.drop_first(), min_prec);
+        }
+    } else if input[0] == TokenView::Keyword(Keyword::Is) {
+        if 4 >= min_prec {
+            let negated = input.len() >= 2 && input[1] == TokenView::Keyword(Keyword::Not);
+            let p: int = if negated { 2 } else { 1 };
+            if input.len() > p && (input[p] == TokenView::Keyword(Keyword::NaN)
+                || input[p] == TokenView::Keyword(Keyword::Null)) {
+                let lit = if input[p] == TokenView::Keyword(Keyword::NaN) {
+                    IsLit::NaN
+                } else {
+                    IsLit::Null
+                };
+                let is_expr = SExpr::Is(Box::new(lhs), lit);
+                cond_printable_postfix(lhs, lit);
+                let new_lhs = if negated {
+                    cond_printable_unary(UnaryTag::Not, is_expr);
+                    SExpr::Unary(UnaryTag::Not, Box::new(is_expr))
+                } else {
+                    is_expr
+                };
+                sparse_postfix_printable(new_lhs, input.subrange(p + 1, input.len() as int), min_prec);
+            }
+        }
+    }
+}
+
+/// The infix precedence-climbing loop preserves `cond_printable`: each step
+/// folds a `Binary` over the lhs and a recursively parsed right operand.
+pub proof fn sparse_infix_printable(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
+    requires
+        cond_printable(lhs),
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, fuel).0 is Some
+            ==> cond_printable(sparse_infix_loop(lhs, input, min_prec, fuel).0->Some_0),
+    decreases fuel, 2nat,
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+    if fuel == 0 || input.len() == 0 {
+    } else {
+        match verified_expression::binary_from_token(input[0]) {
+            Some(tag) => {
+                if binary_prec_s(tag) >= min_prec {
+                    let next_prec = (binary_prec_s(tag) + binary_assoc_s(tag)) as u8;
+                    sparse_prec_printable(input.drop_first(), next_prec, (fuel - 1) as nat);
+                    match sparse_prec(input.drop_first(), next_prec, (fuel - 1) as nat) {
+                        (Some(right), rest) => {
+                            cond_printable_binary(tag, lhs, right);
+                            sparse_infix_printable(
+                                SExpr::Binary(tag, Box::new(lhs), Box::new(right)),
+                                rest,
+                                min_prec,
+                                (fuel - 1) as nat,
+                            );
+                        },
+                        (None, _) => {},
+                    }
+                }
+            },
+            None => {},
+        }
+    }
+}
+
+/// A successful `sparse_atom` result is printable whenever its floats are. The
+/// only literal the atom parser can build with a value outside the printable
+/// domain is a `Float` (from `INFINITY` / `NAN` / a non-digit `Number` token);
+/// a parsed `Integer` is always >= 0 because `parse_i64_spec` reads unsigned
+/// digits.
+pub proof fn sparse_atom_printable(input: Seq<TokenView>, fuel: nat)
+    ensures
+        sparse_atom(input, fuel).0 is Some
+            ==> cond_printable(sparse_atom(input, fuel).0->Some_0),
+    decreases fuel, 3nat,
+{
+    reveal_with_fuel(sparse_atom, 1);
+    reveal(super::verified_roundtrip::printable_se);
+    if fuel == 0 || input.len() == 0 {
+    } else {
+        match input[0] {
+            TokenView::Number(bytes) => {
+                reveal(verified_production::parse_literal_views);
+                match verified_production::parse_literal_views(seq![TokenView::Number(bytes)]) {
+                    Some(lit) => {
+                        match lit {
+                            ast::Literal::Integer(v) => {
+                                // parse_i64_spec: an unsigned digit scan bounded
+                                // by i64::MAX, so the value is non-negative.
+                                assert(v >= 0);
+                            },
+                            _ => {},
+                        }
+                    },
+                    None => {},
+                }
+            },
+            TokenView::Ident(name) => {
+                if input.len() >= 2 && input[1] == TokenView::OpenParen {
+                    sparse_fn_args_printable(input.subrange(2, input.len() as int), fuel);
+                }
+            },
+            TokenView::OpenParen => {
+                sparse_prec_printable(input.drop_first(), 0, (fuel - 1) as nat);
+            },
+            _ => {},
+        }
+    }
+}
+
+/// A successful argument-list parse yields `cond_all_printable` arguments.
+pub proof fn sparse_fn_args_printable(input: Seq<TokenView>, fuel: nat)
+    ensures
+        verified_precedence::sparse_fn_args(input, fuel).0 is Some
+            ==> cond_all_printable(verified_precedence::sparse_fn_args(input, fuel).0->Some_0),
+    decreases fuel, 2nat,
+{
+    reveal_with_fuel(verified_precedence::sparse_fn_args, 1);
+    reveal(super::verified_roundtrip::all_printable_se);
+    if fuel == 0 || input.len() == 0 {
+    } else if input[0] == TokenView::CloseParen {
+    } else {
+        sparse_fn_args_ne_printable(input, fuel);
+    }
+}
+
+/// Non-empty argument list case of `sparse_fn_args_printable`.
+pub proof fn sparse_fn_args_ne_printable(input: Seq<TokenView>, fuel: nat)
+    ensures
+        verified_precedence::sparse_fn_args_nonempty(input, fuel).0 is Some
+            ==> cond_all_printable(
+                verified_precedence::sparse_fn_args_nonempty(input, fuel).0->Some_0),
+    decreases fuel, 1nat,
+{
+    reveal_with_fuel(verified_precedence::sparse_fn_args_nonempty, 1);
+    if fuel == 0 || input.len() == 0 {
+    } else {
+        sparse_prec_printable(input, 0, (fuel - 1) as nat);
+        match sparse_prec(input, 0, (fuel - 1) as nat) {
+            (Some(e), rest) => {
+                if rest.len() == 0 {
+                } else if rest[0] == TokenView::CloseParen {
+                    cond_all_singleton(e);
+                } else if rest[0] == TokenView::Comma {
+                    sparse_fn_args_ne_printable(rest.drop_first(), (fuel - 1) as nat);
+                    match verified_precedence::sparse_fn_args_nonempty(
+                        rest.drop_first(), (fuel - 1) as nat) {
+                        (Some(more), _) => { cond_all_cons(e, more); },
+                        (None, _) => {},
+                    }
+                }
+            },
+            (None, _) => {},
+        }
+    }
+}
+
+/// The headline printability lemma: any successful `sparse_prec` parse result
+/// whose float literals are finite and non-sign-negative is printable. This
+/// pins task 4's side condition exactly: `floats_ok` is all that must be
+/// assumed on top of acceptance — negative integer literals cannot arise (a
+/// leading `-` parses as `Negate`), and no other constructor leaves the
+/// printable domain.
+pub proof fn sparse_prec_printable(input: Seq<TokenView>, min_prec: u8, fuel: nat)
+    ensures
+        sparse_prec(input, min_prec, fuel).0 is Some
+            ==> cond_printable(sparse_prec(input, min_prec, fuel).0->Some_0),
+    decreases fuel, 3nat,
+{
+    reveal_with_fuel(sparse_prec, 1);
+    if fuel == 0 || input.len() == 0 {
+    } else {
+        // Establish cond_printable for the lhs phase's result (when Some).
+        match verified_expression::prefix_operator(input[0]) {
+            Some(tag) => {
+                if prefix_prec_s(tag) >= min_prec {
+                    sparse_prec_printable(input.drop_first(), prefix_prec_s(tag), (fuel - 1) as nat);
+                    match sparse_prec(input.drop_first(), prefix_prec_s(tag), (fuel - 1) as nat) {
+                        (Some(inner), _) => { cond_printable_unary(tag, inner); },
+                        (None, _) => {},
+                    }
+                } else {
+                    sparse_atom_printable(input, (fuel - 1) as nat);
+                }
+            },
+            None => { sparse_atom_printable(input, (fuel - 1) as nat); },
+        }
+        // Thread it through postfix pass 1, the infix loop, and postfix pass 2.
+        let (lhs_opt, after_lhs) = match verified_expression::prefix_operator(input[0]) {
+            Some(tag) => if prefix_prec_s(tag) >= min_prec {
+                match sparse_prec(input.drop_first(), prefix_prec_s(tag), (fuel - 1) as nat) {
+                    (Some(inner), rest) => (Some(SExpr::Unary(tag, Box::new(inner))), rest),
+                    (None, _) => (None::<SExpr>, input),
+                }
+            } else {
+                sparse_atom(input, (fuel - 1) as nat)
+            },
+            None => sparse_atom(input, (fuel - 1) as nat),
+        };
+        match lhs_opt {
+            None => {},
+            Some(lhs0) => {
+                let (lhs1, cur1) = sparse_postfix_loop(lhs0, after_lhs, min_prec);
+                sparse_postfix_printable(lhs0, after_lhs, min_prec);
+                sparse_infix_printable(lhs1, cur1, min_prec, fuel);
+                match sparse_infix_loop(lhs1, cur1, min_prec, fuel) {
+                    (None, _) => {},
+                    (Some(lhs2), cur2) => {
+                        sparse_postfix_printable(lhs2, cur2, min_prec);
+                    },
+                }
+            },
+        }
+    }
+}
+
+// ---- task 4 — live-parser normalisation of arbitrary accepted streams ------
+
+/// Task 4 — normalisation, exec level: for ANY token stream the live parser
+/// accepts consuming all input (whose parse result has printable floats — the
+/// exact side condition established by `sparse_prec_printable`; integers and
+/// every other constructor are unconditionally fine), printing the result with
+/// `print_min_expr` yields a normal-form stream that the live parser re-parses
+/// to the same AST, again consuming all input.
+///
+/// Returns `(parsed, printed, reparsed, reparse_len)`: the parse of `toks`,
+/// its min-parens print, the parse of that print (the same AST up to
+/// `view_expr`), and the reparse position (all of `printed`).
+///
+/// `refuel` only needs to cover the printed stream (`2 * |printed| + 3`);
+/// the requires states that bound against the spec print.
+pub fn min_normalize_live(toks: &Vec<super::Token>, fuel: usize, refuel: usize)
+    -> (r: (ast::Expression, Vec<super::Token>, ast::Expression, usize))
+    requires
+        fuel >= 2 * toks@.len() + 3,
+        ({
+            let (sopt, srest) =
+                sparse_prec(verified_production::token_views(toks@), 0, fuel as nat);
+            &&& sopt is Some
+            &&& srest.len() == 0
+            &&& floats_ok(sopt->Some_0)
+            &&& refuel >= 2 * sprint_min(sopt->Some_0, 0).len() + 3
+        }),
+    ensures
+        ({
+            let se = sparse_prec(verified_production::token_views(toks@), 0, fuel as nat).0->Some_0;
+            &&& super::verified_roundtrip::view_expr(r.0) == se
+            &&& verified_production::token_views(r.1@) == sprint_min(se, 0)
+            &&& min_normal(verified_production::token_views(r.1@))
+            &&& super::verified_roundtrip::view_expr(r.2) == se
+            &&& r.3 == r.1@.len()
+        }),
+{
+    let ghost input = verified_production::token_views(toks@);
+    let ghost se = sparse_prec(input, 0, fuel as nat).0->Some_0;
+    proof {
+        assert(toks@.subrange(0, toks@.len() as int) =~= toks@);
+    }
+    let (opt, _pos, _err) = verified_precedence::parse_expression_at(toks, 0, 0, fuel);
+    proof {
+        assert(opt is Some);
+        assert(super::verified_roundtrip::view_expr(opt->Some_0) == se);
+        sparse_prec_printable(input, 0, fuel as nat);
+        assert(super::verified_roundtrip::printable_se(se));
+    }
+    let e = opt.unwrap();
+    let printed = print_min_expr(&e);
+    proof {
+        super::verified_roundtrip::token_views_len(printed@);
+        assert(printed@.len() == sprint_min(se, 0).len());
+        assert(printed@.subrange(0, printed@.len() as int) =~= printed@);
+    }
+    let (opt2, pos2, _err2) = verified_precedence::parse_expression_at(&printed, 0, 0, refuel);
+    proof {
+        min_roundtrip(se, refuel as nat);
+        assert(opt2 is Some);
+        assert(super::verified_roundtrip::view_expr(opt2->Some_0) == se);
+        super::verified_roundtrip::token_views_len(
+            printed@.subrange(pos2 as int, printed@.len() as int));
+        assert(pos2 == printed@.len());
+        // The print is a normal form: `se` is the existential witness.
+        assert(super::verified_roundtrip::printable_se(se)
+            && sprint_min(se, 0) == verified_production::token_views(printed@));
+    }
+    let e2 = opt2.unwrap();
+    (e, printed, e2, pos2)
 }
 
 } // verus!
