@@ -191,11 +191,11 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
             },
         },
         // S4: `Update.set` is a `BTreeMap`, whose spec view is an *unordered*
-        // `Map` — a pure `spec fn` cannot canonicalise it to the sorted mirror
-        // sequence in general (see plan). The single-assignment case needs no
-        // ordering: the sole (key, value) is recovered with `dom().choose()`.
-        // Multi-assignment maps map to `Unsupported` until the executable,
-        // sorted-`iter()` bridge lands.
+        // `Map`. The ghost `order` (built by the executable, sorted-`iter()`
+        // bridge) recovers the canonical assignment ordering, so `view_update_arm`
+        // is total over multi-assignment UPDATEs: when `order` is a valid
+        // bijection over `set` (`wf_update`) it builds the sorted mirror
+        // sequence; it only falls to `Unsupported` for a malformed `order`.
         ast::Statement::Update { table, set, order, where_clause } =>
             view_update_arm(table, set@, order@, where_clause),
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),

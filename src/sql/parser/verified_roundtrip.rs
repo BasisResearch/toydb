@@ -860,6 +860,8 @@ pub fn binary_tag_exec(tok: &super::Token) -> (r: Option<BinaryTag>)
         super::Token::LessThan => Some(BinaryTag::LessThan),
         super::Token::LessThanOrEqual => Some(BinaryTag::LessThanOrEqual),
         super::Token::NotEqual => Some(BinaryTag::NotEqual),
+        // `<>` is a second spelling of not-equal; mirrors binary_from_token.
+        super::Token::LessOrGreaterThan => Some(BinaryTag::NotEqual),
         super::Token::Plus => Some(BinaryTag::Add),
         super::Token::Slash => Some(BinaryTag::Divide),
         super::Token::Caret => Some(BinaryTag::Exponentiate),
