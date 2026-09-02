@@ -1,5 +1,13 @@
+//! Token-level lexer model.
 //!
-//! The grammar layer (`verified_stmt` etc.) operates on a clean `Token` stream.
+//! Provides a ghost/spec model of tokenization so the grammar layer
+//! (`verified_stmt` etc.) can reason over a clean `Token` stream. Every theorem
+//! here is stated at the token level.
+//!
+//! Limit: this model is NOT wired to the production `Lexer`. The only lexer code
+//! that actually runs verified is `scan_symbol_bytes` (here) and
+//! `scan_number_bytes` (in `lexer.rs`); the rest of the string -> token stage in
+//! the production lexer is essentially unverified plain Rust.
 
 #![allow(dead_code)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the

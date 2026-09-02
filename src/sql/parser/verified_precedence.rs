@@ -1,3 +1,13 @@
+//! Verified expression parser (precedence climbing).
+//!
+//! The exec `parse_expression_at` is fully functionally refined against the
+//! `sparse_prec` spec: accept produces the matching AST and residual position,
+//! reject agrees with the spec.
+//!
+//! Limit: `sparse_prec` is a same-author spec twin, so this pins exec/spec
+//! agreement, not conformance to SQL's precedence rules per se (see
+//! `verified_minparen` for the precedence-table caveat).
+
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 

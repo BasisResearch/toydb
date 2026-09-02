@@ -1,3 +1,15 @@
+//! Statement-level minimal-parenthesization round-trip theorem.
+//!
+//! Lifts `verified_minparen`'s expression round-trip up to whole statements:
+//! parsing the min-parens print of a statement recovers the statement.
+//!
+//! CRITICAL HEDGE (same as `verified_minparen`): the printer and parser
+//! precedence tables are proved equal to each other, so this proves the parser
+//! inverts the printer, NOT that either implements SQL's precedence — a
+//! consistent permutation of all tables would still verify. SQL conformance
+//! rests on the `cfg(test)` differential oracle and goldenscripts. The print
+//! half is a spec/proof construct, not part of the shipped binary.
+
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 

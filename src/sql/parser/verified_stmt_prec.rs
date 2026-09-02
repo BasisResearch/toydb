@@ -1,3 +1,12 @@
+//! Statement-level spec twins (`sparse_control_*`).
+//!
+//! Defines the pure `sparse_control_*` specification functions that the exec
+//! statement parsers in `verified_control` are refined against.
+//!
+//! Limit: these are same-author mirrors of the exec algorithm. They serve as
+//! the reference for exec/spec agreement; they are not an independent model of
+//! SQL, so a shared misconception would live in both halves.
+
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
