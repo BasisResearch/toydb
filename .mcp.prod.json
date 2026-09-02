@@ -1,10 +1,13 @@
 {
-  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). PINNED / CI / non-dev config. Unlike the dev-default .mcp.json (which expects a running hot-reload HTTP server), this registers verus as a stdio server launched by the self-provisioning script .claude/bin/verus-mcp, which installs and execs a PINNED release of verus-tools-mcp. Use this on the box, in CI, or for colleagues who do not hack on the server. To make it active: rename or symlink this file to .mcp.json (e.g. `ln -sf .mcp.prod.json .mcp.json`), or otherwise select it as the active Claude Code MCP config. See .claude/hooks/README.md.",
+  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). PINNED alias: same per-session stdio launcher as the default .mcp.json, kept as a separate file so older instructions ('switch to .mcp.prod.json') still work. VERUS_MCP_REF in .claude/bin/verus-mcp pins the installed build. See .claude/hooks/README.md.",
   "mcpServers": {
     "verus": {
       "type": "stdio",
       "command": ".claude/bin/verus-mcp",
-      "args": ["stdio"]
+      "args": [
+        "stdio"
+      ],
+      "timeout": 600000
     }
   }
 }

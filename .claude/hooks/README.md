@@ -19,10 +19,13 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
 .claude/
   settings.json              committed hook wiring (PreToolUse guard,
                              SessionStart gate, Stop capture)
-  bin/verus-mcp              self-provisioning pinned stdio launcher (prod/CI)
+  bin/verus-mcp              stdio launcher: workspace + toolchain env, then a
+                             pinned/installed verus-tools-mcp (`--check` to diagnose)
   hooks/
     branch_guard.py          PreToolUse (Bash): branch discipline — initials-
                              prefixed branch names, no commits/pushes to main
+    verus_cli_guard.py       PreToolUse (Bash): no verus / cargo verus /
+                             verify.sh from the shell — Verus goes through MCP
     verus_gate.py            SessionStart: fail-closed MCP probe + drift warning
     verus_stop.py            Stop: fail-soft transcript capture + upload
     mark_branch.py           CLI: mark a branch as a FAILED ATTEMPT (all agents)
@@ -34,7 +37,9 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
       opencode_adapter.py    opencode SQLite session -> envelope
       mcp_probe.py           probe the Verus `version` tool over HTTP or stdio
       branch_mark.py         build + POST a branch outcome mark (failed/cleared)
-    tests/                   fixtures + `test_adapters.py`, `test_branch_mark.py`
+    tests/                   fixtures + `test_adapters.py`, `test_branch_mark.py`,
+                             `test_branch_guard.py`, `test_verus_cli_guard.py`,
+                             `test_smt_capture.py`, `test_gate.py`
   skills/mark-failed/        Claude Code `/mark-failed` skill -> mark_branch.py
 .codex/
   config.toml                project-scoped config (Codex >= 0.150 loads it for
@@ -46,44 +51,63 @@ Source of truth for the schemas is `../../../spec.md` and `../../../CONTRACTS.md
                              via `tool.execute.before`
   plugin/verus_runner.py     Python entry the plugin shells out to
   command/mark-failed.md     opencode `/mark-failed` command -> mark_branch.py
-.mcp.json                    Claude Code TEAM DEFAULT: dev hot-reload HTTP server
-.mcp.prod.json               Claude Code PINNED: stdio launcher for box/CI/non-dev
+.mcp.json                    Claude Code TEAM DEFAULT: per-session stdio server
+                             launched by .claude/bin/verus-mcp
+.mcp.dev.json                Claude Code SERVER-DEV: shared hot-reload HTTP server
+.mcp.prod.json               Pinned alias of the default (older instructions)
 opencode.json                opencode: registers the Verus MCP server (mcp block)
 ```
 
-## MCP config: dev-default HTTP vs pinned stdio
+## MCP config: per-session stdio (default) vs shared HTTP (server dev)
 
-There are two committed Claude Code MCP configs, for two audiences:
+Two committed Claude Code MCP configs, for two audiences:
 
-- **`.mcp.json` (team default) — dev hot-reload over HTTP.** Points Claude Code
-  at `http://127.0.0.1:8765/mcp`. The team runs the server under `cargo watch`
-  from the sibling `verus-tools-mcp` repo:
+- **`.mcp.json` (team default) — one server per session, over stdio.**
+  Registers `verus` as a stdio server whose command is `.claude/bin/verus-mcp`.
+  Claude Code starts one per session, so each session (and each worktree) gets
+  a server pointed at **its own** checkout. The launcher:
 
-  ```sh
-  cd ../verus-tools-mcp && ./scripts/dev-http.sh
-  ```
+  1. exports `VERUS_MCP_WORKSPACE=<this clone>`, so the server verifies and
+     indexes this checkout rather than guessing from its cwd;
+  2. locates a Verus toolchain (`VERUS_PROJECT_ROOT`, `VERUS_CHECKOUTS`, a
+     sibling `verus*` source checkout, an unpacked release under
+     `~/.local/verus/*`, or `verus` already on PATH) and puts `verus` /
+     `cargo-verus` in the server's environment — without this the server
+     answers `version` but fails every `check`;
+  3. uses a `verus-tools-mcp` from PATH or `~/.cargo/bin`, else installs the
+     pinned `VERUS_MCP_REF` into `~/.cache/verus-mcp/<ref>` (idempotent).
 
-  so edits to the server hot-reload without restarting Claude. This is the
-  default because the point of the experiment is to iterate on the MCP tooling.
-
-- **`.mcp.prod.json` (box / CI / non-dev) — pinned stdio launcher.** Not everyone
-  hacks on the server; they need a reproducible install, not a running dev
-  server. This registers verus as a **stdio** server whose command is
-  `.claude/bin/verus-mcp`. That script is self-provisioning: it ensures a
-  **pinned** build of `verus-tools-mcp` is installed (via
-  `cargo install --git https://github.com/BasisResearch/verus-tools-mcp` into a
-  per-ref cache under `~/.cache/verus-mcp/<ref>`), then `exec`s it over stdio.
-  The pin is a single constant near the top of the script,
-  `VERUS_MCP_REF` (default `main`; switch to a release tag to freeze). It is
-  idempotent (skips install when the cached binary exists) and falls back to a
-  `verus-tools-mcp` already on PATH.
-
-  **To make it active** on the box / in CI, select it as the Claude Code MCP
-  config — e.g. symlink or rename it over `.mcp.json`:
+  Diagnose all of that without starting a session:
 
   ```sh
-  ln -sf .mcp.prod.json .mcp.json      # or: cp .mcp.prod.json .mcp.json
+  .claude/bin/verus-mcp --check     # prints workspace, toolchain, binary; exits 1 if incomplete
   ```
+
+- **`.mcp.dev.json` (hacking on the server) — shared hot-reload HTTP.** Points
+  Claude Code at `http://127.0.0.1:8765/mcp`, served by `cargo watch` from the
+  `verus-tools-mcp` repo, so server edits reload without restarting Claude:
+
+  ```sh
+  ln -sf .mcp.dev.json .mcp.json
+  cd ../verus-tools-mcp && ./scripts/dev-http.sh --workspace /path/to/this/clone
+  ```
+
+  Start it **from (or pointed at) the checkout you are editing**, with the
+  Verus release dir on `PATH` (or `VERUS_PROJECT_ROOT` set). One shared server
+  serves ONE workspace: a second worktree must pass an absolute `crate_name`
+  to `check`, and its proof index still covers the other checkout. That is why
+  stdio is the default.
+
+`.mcp.prod.json` is the same per-session stdio launcher, kept so older
+instructions ("switch to `.mcp.prod.json`") keep working.
+
+Both configs set `timeout: 600000` (ms), raising Claude Code's per-call limit
+(60 s on HTTP by default) to the server's own 10-minute cargo-verus bound. Long
+runs should still use `check(background=true)` + `check_result`.
+
+The gate probes **whatever `.mcp.json` selects** (`mcp_probe.active_mcp_config`)
+rather than assuming a transport, so flipping the config flips the probe and the
+gate always reflects the server the session actually talks to.
 
 ## Drift: warn + tag, do not block
 
@@ -92,17 +116,22 @@ The gate probes the server's `version` tool, which returns the precise
 or `git_dirty=true`, marks a **dev / non-release build**.
 
 - **Unreachable / unhealthy server → BLOCK** (fail-closed). The block message
-  tells the user to start the dev HTTP server (`./scripts/dev-http.sh`) or switch
-  to the pinned `.mcp.prod.json`.
+  points at `.claude/bin/verus-mcp --check`, and at the HTTP alternative.
+- **Reachable but the Verus toolchain is not runnable → BLOCK.** `version`
+  reports `toolchain_ok` (both `verus` and `cargo-verus` resolve, and `verus`
+  reports a version) plus a `toolchain_error` saying how to fix it. Such a
+  server answers the probe but fails every `check` / `verify` / `profile`, so
+  letting the session start would hand the agent a tool that cannot work.
+  Server builds that do not report the field are treated as healthy.
 - **Healthy but dirty → ALLOW + WARN** (never block). The user is warned that the
   server is a dev build, that the session is **tagged** with that `mcp_version`,
   and that the dashboard will **exclude it from release comparisons**. Dev work
   is not disrupted.
 
-The probe supports both transports transparently: it uses HTTP when
-`VERUS_MCP_URL` is set (it defaults to the dev endpoint), and the pinned stdio
-binary otherwise (`VERUS_MCP_URL=""` or `VERUS_MCP_TRANSPORT=stdio` forces
-stdio).
+The probe supports both transports transparently and picks the one the active
+`.mcp.json` selects, launching a stdio server exactly as Claude Code does
+(same command, same cwd). `VERUS_MCP_URL` / `VERUS_MCP_TRANSPORT=stdio` /
+`VERUS_MCP_COMMAND` override it for tests and custom installs.
 
 ## How mcp_version tags a session
 
@@ -145,6 +174,76 @@ activated per clone by `git config core.hooksPath .githooks`, which
 `ensure_hooks_path()` self-provisions fail-soft from each agent's session
 hooks (Claude `SessionStart` gate, opencode gate, Codex Stop). It never
 overrides a hooksPath the user set to something else.
+
+## Verus through MCP only (verus_cli_guard.py)
+
+Agents must run Verus through the MCP server (`check` / `profile` /
+`verify`), never from the shell: an MCP call is traced (one record per
+invocation, `smt_log_dir` keyed to the tool call by `smt_capture.py`), a
+`cargo verus` from Bash is invisible to the dashboard — and, via cargo's
+freshness check, can silently replay a stale result (`check` deletes the
+crate's `.fingerprint` entries before every run). The guard reuses
+`branch_guard.py`'s tokenizer and scans each simple-command segment after
+unwrapping `time`, `timeout`, `env`, `nice`, `nohup`, `exec`, `command`,
+leading `VAR=val` assignments, `bash -c "..."`, `bash <script>`, and `$(...)`
+/ backtick substitutions. Blocked: `verus`, `rust_verify`, `cargo-verus`,
+`cargo [+toolchain] verus ...`, and `scripts/verus/verify.sh` (any path).
+Allowed: `--help` / `-h` / `--version` / `-V`, `command -v verus`, `which`,
+and anything that merely mentions verus (grep, cat, echo, heredoc bodies).
+Violations exit 2 with the MCP alternatives (including the `crate_name` to
+pass, since the server's workspace may not be this checkout) on stderr.
+FAIL-OPEN on unparseable input. `VERUS_CLI_GUARD_DISABLE=1` bypasses it —
+for humans debugging the toolchain, not for agents.
+
+| Agent   | Enforcement                                                          |
+|---------|----------------------------------------------------------------------|
+| Claude  | `PreToolUse` hook on Bash (`verus_cli_guard.py`, default stdin mode)  |
+| opencode| plugin `tool.execute.before` shells to `verus_cli_guard.py check`    |
+| Codex   | no pre-tool event → `AGENTS.md` rule only                            |
+
+CI (`.github/workflows/verus-verify.yml`) is not an agent and keeps running
+`scripts/verus/verify.sh` directly; the script stays the source of truth for
+the opted-in module list.
+
+Gaps of the MCP path vs the shell path found on verus-tools-mcp upstream
+`966b3d0`, and how they were closed (so nobody mistakes a blocked command for
+a missing feature):
+
+- `check` could not pass cargo-side flags; toyDB needs `--lib` (the four
+  binaries fail `--verify-module` and were compiled needlessly, and `check`
+  still reported success because it keyed on the lib's summary). Fixed:
+  `--lib` is added automatically for lib+bin packages, `cargo_args`/`lib`
+  override it, and `success` now also requires cargo exit 0.
+- `check` took one `module`; verify.sh runs 18. Fixed: `modules` verifies a
+  list in one run (dedupes, may include the crate root).
+- A full-crate `check` (~70 s) completed on the server but Claude Code's HTTP
+  transport gives one call 60 s. Fixed twice: the configs set `timeout` to
+  10 min, and `check(background=true)` + `check_result` (waits ≤ 50 s per
+  call, results retained) work under any client timeout. `check_cancel`
+  stops a run that is no longer wanted, killing the cargo/verus child.
+- The server resolved its workspace by walking up from its cwd until it
+  found `verus-*` siblings, i.e. `~/Projects`, so the proof index covered
+  other repos and `check` needed an absolute `crate_name`. Fixed: the walk
+  stops at the enclosing git repo, `version` reports
+  `workspace`/`crate_roots`/`cwd`, the gate warns on drift, and the default
+  stdio launcher pins the workspace per session.
+- A server whose Verus was missing answered `version` but failed every run.
+  Fixed: `version` reports `toolchain_ok` / `toolchain_error`, the launcher
+  sets the toolchain up, and the gate blocks when it is unusable.
+- `verify` (bare verus) silently could not handle a crate directory. Fixed:
+  it refuses with a pointer to `check`, and the tool descriptions and
+  server instructions now lead with `check` for cargo crates.
+- A run with many failing functions could overflow the client's tool-result
+  limit. Fixed: `max_errors` (default 20) caps rendered diagnostics and says
+  how many were omitted.
+- A stale dependency artifact after a Verus toolchain switch ("failed to
+  deserialize imported library file libvstd-….vir") is now detected and the
+  dependency rebuilt automatically, instead of needing a manual
+  `cargo clean`.
+
+Remaining, by design: no output filtering beyond `max_errors` (pipe-style
+`grep`/`tail` have no MCP equivalent), and no way to list Verus's own flags
+(`verus --help` from Bash stays allowed by the guard).
 
 ## The two invariants
 

@@ -3,7 +3,10 @@
   "mcp": {
     "verus": {
       "type": "local",
-      "command": ["verus-tools-mcp", "stdio"],
+      "command": [
+        ".claude/bin/verus-mcp",
+        "stdio"
+      ],
       "enabled": true
     }
   }

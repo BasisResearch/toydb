@@ -1,0 +1,10 @@
+{
+  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). SERVER-DEV config: point Claude Code at a hot-reload HTTP server you run yourself, so edits to verus-tools-mcp reload without restarting Claude. Start it FROM THE CHECKOUT YOU ARE EDITING (or pass --workspace) so the server verifies/indexes this repo: `cd ../verus-tools-mcp && ./scripts/dev-http.sh --workspace \"$PWD\"`, with the Verus release dir on PATH (or VERUS_PROJECT_ROOT set) so `check` can run. To use it: `ln -sf .mcp.dev.json .mcp.json`. One shared server serves ONE workspace, so a second worktree must pass an absolute crate_name; the default stdio config in .mcp.json avoids that. `timeout` (ms) raises Claude Code's per-call limit (60 s on HTTP by default) to the server's own 10-minute cargo-verus bound; long runs should still prefer check(background=true) + check_result.",
+  "mcpServers": {
+    "verus": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "timeout": 600000
+    }
+  }
+}

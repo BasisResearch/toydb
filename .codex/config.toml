@@ -16,7 +16,11 @@
 # gate_violation=true if they were not, so ungated runs are visible on the
 # dashboard rather than silently counted.
 [mcp_servers.verus]
-command = "verus-tools-mcp"
+# The shared launcher (.claude/bin/verus-mcp) rather than a bare binary: it
+# pins VERUS_MCP_WORKSPACE to this clone and puts verus/cargo-verus in the
+# server's environment, without which every `check` fails. Codex resolves a
+# relative command against the session cwd (the clone).
+command = ".claude/bin/verus-mcp"
 args = ["stdio"]
 
 [mcp_servers.verus.tools.version]

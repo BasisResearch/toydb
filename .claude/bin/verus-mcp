@@ -2,21 +2,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Basis Research
 #
-# Self-provisioning launcher for the Verus MCP server (verus-tools-mcp).
+# Launcher for the Verus MCP server (verus-tools-mcp). This is the DEFAULT way
+# agents get the server: `.mcp.json` registers it as a stdio server, so Claude
+# Code starts one per session, in this checkout, with the Verus toolchain in
+# its environment. (For hacking on the server itself, `.mcp.dev.json` points at
+# a shared hot-reload HTTP server instead — see .claude/hooks/README.md.)
 #
-# This is the PINNED, reproducible way to run the server for the box / CI /
-# colleagues who do not hack on the server itself. It is referenced by
-# .mcp.prod.json. Unlike the dev-default .mcp.json (a running hot-reload HTTP
-# server), this ensures a specific git ref of verus-tools-mcp is installed into
-# a per-ref cache dir, then execs it over stdio.
+# It does three things before exec'ing the server:
 #
-# Behaviour:
-#   * If `verus-tools-mcp` is already on PATH, use it (assume the operator pinned
-#     it deliberately) and exec it with `stdio` plus any passed args.
-#   * Otherwise install the pinned ref with `cargo install --git ... --root
-#     <per-ref cache>` (idempotent: skipped if the cached binary already exists),
-#     then exec that binary.
-#   * Fail with a clear message if `cargo` is absent.
+#   1. WORKSPACE. Exports VERUS_MCP_WORKSPACE=<this clone> so the server
+#      verifies and indexes THIS checkout. Without it the server guesses from
+#      its cwd, and a worktree can end up indexing a sibling repo.
+#   2. TOOLCHAIN. Locates a Verus installation and exports VERUS_PROJECT_ROOT
+#      (source checkout) and/or prepends its binary dir to PATH, so `verus` and
+#      `cargo-verus` are runnable. A server without them answers `version` but
+#      fails every `check` — the SessionStart gate blocks that case, and
+#      `--check` below diagnoses it.
+#   3. BINARY. Uses `verus-tools-mcp` from PATH if present, else installs the
+#      pinned ref into a per-ref cache (idempotent) and uses that.
+#
+# Usage:
+#   .claude/bin/verus-mcp [stdio]   launch the server (what .mcp.json does)
+#   .claude/bin/verus-mcp --check   print what it resolved and exit 0/1
 #
 # All output except the exec'd server's own stdio protocol goes to stderr so it
 # never corrupts the MCP stdio stream.
@@ -24,9 +31,11 @@
 set -euo pipefail
 
 # --- Pin -------------------------------------------------------------------
-# Git ref / tag of BasisResearch/verus-tools-mcp to install. Pinned to a
-# released tag so the box/CI/non-dev clones run a frozen, comparable build.
-# Bump this when a new server release is cut.
+# Git ref / tag of BasisResearch/verus-tools-mcp to install when the binary is
+# not already on PATH. Bump when a new server release is cut.
+# NOTE: bump this whenever a new server release is cut — a stale pin silently
+# gives agents an older tool surface. A `verus-tools-mcp` already installed on
+# PATH or in ~/.cargo/bin wins over the pin (see step 3).
 VERUS_MCP_REF="${VERUS_MCP_REF:-v0.1.0}"
 
 VERUS_MCP_REPO="https://github.com/BasisResearch/verus-tools-mcp"
@@ -34,21 +43,139 @@ CACHE_ROOT="${VERUS_MCP_CACHE_ROOT:-$HOME/.cache/verus-mcp}"
 CACHE_DIR="$CACHE_ROOT/$VERUS_MCP_REF"
 CACHED_BIN="$CACHE_DIR/bin/verus-tools-mcp"
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 log() { printf '[verus-mcp] %s\n' "$*" >&2; }
 
-# --- 1. Already on PATH? ---------------------------------------------------
-if command -v verus-tools-mcp >/dev/null 2>&1; then
-  log "using verus-tools-mcp from PATH"
-  exec verus-tools-mcp stdio "$@"
+# --- 1. Workspace ----------------------------------------------------------
+# Never override an operator's explicit choice.
+export VERUS_MCP_WORKSPACE="${VERUS_MCP_WORKSPACE:-$REPO_ROOT}"
+
+# --- 2. Toolchain ----------------------------------------------------------
+# A Verus *source checkout* keeps its binaries in source/target-verus/release;
+# an unpacked release zip keeps them directly in the unpacked directory. The
+# first shape sets VERUS_PROJECT_ROOT (the server derives VERUS_BIN and the z3
+# path from it); both get their binary dir prepended to PATH.
+verus_source_bin_dir() { # <checkout root> -> prints bin dir if it looks right
+  local root="$1" dir="$1/source/target-verus/release"
+  [ -x "$dir/verus" ] && printf '%s' "$dir"
+}
+
+resolve_toolchain() {
+  local candidate dir
+
+  # a) Explicit configuration wins.
+  if [ -n "${VERUS_PROJECT_ROOT:-}" ]; then
+    if dir="$(verus_source_bin_dir "$VERUS_PROJECT_ROOT")"; then
+      TOOLCHAIN_DIR="$dir"; TOOLCHAIN_SRC="VERUS_PROJECT_ROOT"
+      return 0
+    fi
+    log "warning: VERUS_PROJECT_ROOT=$VERUS_PROJECT_ROOT has no source/target-verus/release/verus"
+  fi
+
+  # b) A Verus source checkout sitting next to this clone, or named by
+  #    VERUS_CHECKOUTS (colon-separated) for non-standard layouts.
+  local -a roots=()
+  IFS=':' read -r -a roots <<< "${VERUS_CHECKOUTS:-}" || true
+  for candidate in "${roots[@]}" "$REPO_ROOT"/../verus-basis "$REPO_ROOT"/../verus \
+                   "$REPO_ROOT"/../verus-dev "$REPO_ROOT"/verus-dev "$HOME"/Projects/verus-basis; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    if dir="$(verus_source_bin_dir "$candidate")"; then
+      TOOLCHAIN_DIR="$dir"
+      TOOLCHAIN_ROOT="$(cd "$candidate" && pwd)"
+      TOOLCHAIN_SRC="checkout $TOOLCHAIN_ROOT"
+      return 0
+    fi
+  done
+
+  # c) An unpacked release zip (binaries directly in the directory).
+  for candidate in "$HOME"/.local/verus/*/ "$HOME"/verus/*/; do
+    [ -d "$candidate" ] && [ -x "${candidate}verus" ] || continue
+    TOOLCHAIN_DIR="${candidate%/}"; TOOLCHAIN_SRC="release dir $TOOLCHAIN_DIR"
+    return 0
+  done
+
+  # d) Already on PATH (a system install).
+  if command -v verus >/dev/null 2>&1; then
+    TOOLCHAIN_DIR=""; TOOLCHAIN_SRC="PATH ($(command -v verus))"
+    return 0
+  fi
+  return 1
+}
+
+TOOLCHAIN_DIR=""; TOOLCHAIN_ROOT=""; TOOLCHAIN_SRC=""
+if resolve_toolchain; then
+  if [ -n "$TOOLCHAIN_DIR" ]; then
+    export PATH="$TOOLCHAIN_DIR:$PATH"
+  fi
+  if [ -n "$TOOLCHAIN_ROOT" ] && [ -z "${VERUS_PROJECT_ROOT:-}" ]; then
+    export VERUS_PROJECT_ROOT="$TOOLCHAIN_ROOT"
+  fi
+  log "verus toolchain: $TOOLCHAIN_SRC"
+else
+  log 'WARNING: no Verus toolchain found; check/verify/profile will fail.'
+  log "         Set VERUS_PROJECT_ROOT=<verus source checkout>, put verus and"
+  log "         cargo-verus on PATH, or set VERUS_CHECKOUTS=<dir>[:<dir>]."
 fi
 
-# --- 2. Already installed in the per-ref cache? ----------------------------
-if [ -x "$CACHED_BIN" ]; then
-  log "using cached pinned build ($VERUS_MCP_REF): $CACHED_BIN"
-  exec "$CACHED_BIN" stdio "$@"
+# --- Server binary ---------------------------------------------------------
+# An already-installed build wins over the pin: PATH first, then ~/.cargo/bin
+# (a `cargo install` lands there, and it is often absent from a non-interactive
+# PATH), then the per-ref cache. Otherwise the pin is installed below.
+find_server() {
+  local candidate
+  if candidate="$(command -v verus-tools-mcp 2>/dev/null)"; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  for candidate in "${CARGO_HOME:-$HOME/.cargo}/bin/verus-tools-mcp" "$CACHED_BIN"; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --- --check: diagnose and exit -------------------------------------------
+if [ "${1:-}" = "--check" ]; then
+  echo "[verus-mcp] repo (VERUS_MCP_WORKSPACE): $VERUS_MCP_WORKSPACE" >&2
+  echo "[verus-mcp] toolchain: ${TOOLCHAIN_SRC:-NOT FOUND}" >&2
+  echo "[verus-mcp] VERUS_PROJECT_ROOT: ${VERUS_PROJECT_ROOT:-<unset>}" >&2
+  rc=0
+  for exe in verus cargo-verus; do
+    if command -v "$exe" >/dev/null 2>&1; then
+      echo "[verus-mcp] $exe: $(command -v "$exe")" >&2
+    else
+      echo "[verus-mcp] $exe: NOT FOUND" >&2
+      rc=1
+    fi
+  done
+  if server_bin="$(find_server)"; then
+    echo "[verus-mcp] server: $server_bin" >&2
+  elif [ -x "$CACHED_BIN" ]; then
+    echo "[verus-mcp] server: $CACHED_BIN (cached pin $VERUS_MCP_REF)" >&2
+  else
+    echo "[verus-mcp] server: not installed yet (will install pin $VERUS_MCP_REF on first launch)" >&2
+  fi
+  [ "$rc" -eq 0 ] && echo "[verus-mcp] OK" >&2 || echo "[verus-mcp] TOOLCHAIN INCOMPLETE" >&2
+  exit "$rc"
 fi
 
-# --- 3. Install the pinned ref ---------------------------------------------
+# --- 3. Binary -------------------------------------------------------------
+# The transport subcommand: whatever the caller passed (.mcp.json passes
+# "stdio"), defaulting to stdio. Appending our own would produce
+# `verus-tools-mcp stdio stdio`, which clap rejects.
+ARGS=("$@")
+if [ ${#ARGS[@]} -eq 0 ]; then
+  ARGS=(stdio)
+fi
+
+if server_bin="$(find_server)"; then
+  log "using $server_bin"
+  exec "$server_bin" "${ARGS[@]}"
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   log "ERROR: cargo not found on PATH; cannot install verus-tools-mcp."
   log "Install the Rust toolchain (rustup) or put verus-tools-mcp on PATH, then retry."
@@ -76,4 +203,4 @@ if [ ! -x "$CACHED_BIN" ]; then
 fi
 
 log "installed; launching pinned build"
-exec "$CACHED_BIN" stdio "$@"
+exec "$CACHED_BIN" "${ARGS[@]}"

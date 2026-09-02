@@ -1,9 +1,13 @@
 {
-  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). TEAM DEFAULT: point Claude Code at the dev hot-reload HTTP server. The team runs verus-tools-mcp under `cargo watch` (in the verus-tools-mcp repo: `scripts/dev-http.sh`, endpoint http://127.0.0.1:8765/mcp) so edits hot-reload without restarting Claude. The SessionStart gate hook (.claude/hooks/verus_gate.py) probes this endpoint and blocks if it is unreachable. Non-dev colleagues / the box / CI should use the pinned stdio launcher in .mcp.prod.json instead (see .claude/hooks/README.md).",
+  "_comment": "SPDX-License-Identifier: MIT. Verus telemetry (Component 2). TEAM DEFAULT: one Verus MCP server per session, launched over stdio by .claude/bin/verus-mcp. The launcher exports VERUS_MCP_WORKSPACE=<this clone> (so the server verifies and indexes THIS checkout, which matters for worktrees), locates a Verus toolchain and puts verus/cargo-verus in the server's environment, and installs a pinned verus-tools-mcp if none is present. Run `.claude/bin/verus-mcp --check` to see what it resolves. The SessionStart gate (.claude/hooks/verus_gate.py) probes this same launcher and blocks if the server is unreachable or its toolchain cannot run Verus. Hacking on the server itself? Use the hot-reload HTTP config instead: `ln -sf .mcp.dev.json .mcp.json`. See .claude/hooks/README.md.",
   "mcpServers": {
     "verus": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
+      "type": "stdio",
+      "command": ".claude/bin/verus-mcp",
+      "args": [
+        "stdio"
+      ],
+      "timeout": 600000
     }
   }
 }

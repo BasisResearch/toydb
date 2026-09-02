@@ -13,10 +13,11 @@
 //       session.idle   -> fail-soft CAPTURE, fired after each turn. The
 //       ingest endpoint upserts by session_id, so one upload per idle is
 //       idempotent and crash-safe (unlike an end-of-session-only capture).
-//   * `tool.execute.before` — BRANCH GUARD. Check bash commands against the
-//     repo's branch discipline (initials-prefixed branches, no direct
-//     commits/pushes to main; see CLAUDE.md / AGENTS.md), like the Claude
-//     Code PreToolUse hook.
+//   * `tool.execute.before` — BRANCH GUARD + VERUS GUARD. Check bash commands
+//     against the repo's branch discipline (initials-prefixed branches, no
+//     direct commits/pushes to main) and the "Verus goes through the MCP
+//     server, not the shell" rule (see CLAUDE.md / AGENTS.md), like the
+//     Claude Code PreToolUse hooks.
 //
 // Both jobs delegate to committed Python (stdlib only) so the mapping/merge
 // logic is shared with the other adapters. The plugin resolves the repo root
@@ -33,6 +34,7 @@ const REPO_ROOT = join(HERE, "..", "..");
 const PKG_DIR = join(REPO_ROOT, ".claude", "hooks");
 const RUNNER = join(REPO_ROOT, ".opencode", "plugin", "verus_runner.py");
 const BRANCH_GUARD = join(PKG_DIR, "branch_guard.py");
+const VERUS_CLI_GUARD = join(PKG_DIR, "verus_cli_guard.py");
 
 function runPython(args, extraEnv) {
   const env = { ...process.env, PYTHONPATH: PKG_DIR, ...(extraEnv || {}) };
@@ -61,6 +63,19 @@ export const VerusTelemetry = async ({ project, directory }) => {
       if (res.status === 2) {
         throw new Error(
           (res.stderr || "").trim() || "blocked by branch guard"
+        );
+      }
+      // Verus goes through the MCP server, never the shell (traced runs,
+      // captured SMT logs). Same guard script as the Claude Code hook.
+      if (!existsSync(VERUS_CLI_GUARD)) return;
+      const vres = spawnSync(
+        "python3",
+        [VERUS_CLI_GUARD, "check", "--command", String(cmd)],
+        { encoding: "utf-8", timeout: 10000 }
+      );
+      if (vres.status === 2) {
+        throw new Error(
+          (vres.stderr || "").trim() || "blocked by verus guard"
         );
       }
     },

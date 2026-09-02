@@ -40,6 +40,39 @@ Enforcement (`.claude/hooks/branch_guard.py`, one shared guard):
 If blocked, rename the branch (`git branch -m <initials>/<topic>`) and retry —
 do not try to bypass the hooks.
 
+## Verus runs go through the MCP server (MANDATORY)
+
+- **Never run `verus`, `cargo verus` / `cargo-verus`, or
+  `scripts/verus/verify.sh` from the shell.** Use the `verus` MCP tools:
+  - `check` — cargo-verus verification of this crate. `modules` =
+    `["sql::parser::lexer", "src/raft/log.rs"]` verifies several modules in
+    one run (or `module` for one); omit both for the full crate. Verus flags
+    (`--rlimit 60`, `--triggers-mode silent`, `--multiple-errors 20`,
+    `--verify-function f`) go in `extra_args`, cargo flags in `cargo_args`;
+    `--lib` is added automatically. `raw=true` returns the unparsed output.
+    `crate_name` is usually unnecessary: the default `.mcp.json` starts one
+    server per session pinned to this checkout. Pass it (an absolute path)
+    only when `version` reports a different `workspace`.
+  - Full-crate or otherwise long runs: `check` with `background=true`, then
+    `check_result(job_id)` — it waits up to 50 s per call and returns the
+    full result when done; `check_cancel(job_id)` kills one you no longer
+    need. `max_errors` (default 20) caps how many diagnostics come back.
+  - `profile` — per-function SMT time / rlimit breakdown.
+  - `verify` — bare `verus` on a standalone file (scratch models; no cargo
+    deps). It cannot verify this crate and says so.
+  - `version` — versions plus `workspace` and `toolchain_ok`. Call it first
+    if a run fails oddly: `toolchain_ok: false` means the server cannot run
+    Verus at all.
+- Why: every MCP call is traced to the Verus dashboard together with its
+  SMT logs; a shell run is invisible to the experiment. `check` also
+  invalidates cargo's fingerprint, so it never replays a stale result the way
+  a plain `cargo verus` does.
+- Enforcement (`.claude/hooks/verus_cli_guard.py`, one shared guard):
+  Claude Code `PreToolUse` hook on Bash; opencode plugin
+  `tool.execute.before`. Codex has no pre-tool event, so it follows this rule
+  by reading it. `--help`, `--version` and `command -v verus` stay allowed.
+  Humans debugging the toolchain can set `VERUS_CLI_GUARD_DISABLE=1`.
+
 ## Marking a branch as a failed attempt
 
 Some branches are experiments that do not work out. When the user says an

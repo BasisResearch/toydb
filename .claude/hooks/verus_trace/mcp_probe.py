@@ -40,29 +40,77 @@ PROTOCOL_VERSION = "2025-06-18"
 DEFAULT_MCP_URL = "http://127.0.0.1:8765/mcp"
 
 
+def repo_root():
+    """The clone this probe belongs to (…/.claude/hooks/verus_trace/ -> root)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.dirname(here)))
+
+
+def active_mcp_config():
+    """The `verus` server entry of the clone's active `.mcp.json`, or {}.
+
+    The gate must probe what Claude Code actually connects to: whichever
+    transport `.mcp.json` selects (stdio launcher by default, HTTP for the
+    dev hot-reload server). Unreadable/absent config -> {} and the built-in
+    defaults apply.
+    """
+    path = os.path.join(repo_root(), ".mcp.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    entry = servers.get("verus")
+    return entry if isinstance(entry, dict) else {}
+
+
 def _server_command():
     """How the Verus MCP binary is launched over stdio.
 
-    Mirrors the pinned .mcp.prod.json launcher. Overridable via
-    VERUS_MCP_COMMAND (space-separated) for tests / custom installs.
+    `VERUS_MCP_COMMAND` (space-separated) wins, then the active `.mcp.json`
+    stdio entry (its command is resolved relative to the clone, as Claude
+    Code resolves it), then the bare binary.
     """
     override = os.environ.get("VERUS_MCP_COMMAND")
     if override:
         return override.split()
+    entry = active_mcp_config()
+    command = entry.get("command")
+    if isinstance(command, str) and command:
+        args = entry.get("args") or []
+        if not isinstance(args, list):
+            args = []
+        if not os.path.isabs(command):
+            candidate = os.path.join(repo_root(), command)
+            if os.path.exists(candidate):
+                command = candidate
+        cmd = [command] + [str(a) for a in args]
+        return cmd if len(cmd) > 1 else cmd + ["stdio"]
     return ["verus-tools-mcp", "stdio"]
 
 
 def _http_url():
-    """The HTTP endpoint to probe, or None to force the stdio path.
+    """The HTTP endpoint to probe, or None to use the stdio path.
 
-    Default is the dev hot-reload endpoint. An explicitly empty VERUS_MCP_URL,
-    or VERUS_MCP_TRANSPORT=stdio, selects stdio instead.
+    `VERUS_MCP_TRANSPORT=stdio` / an empty `VERUS_MCP_URL` force stdio and an
+    explicit `VERUS_MCP_URL` forces HTTP; otherwise the active `.mcp.json`
+    decides (a stdio entry -> stdio), falling back to the dev endpoint.
     """
     if str(os.environ.get("VERUS_MCP_TRANSPORT", "")).strip().lower() == "stdio":
         return None
     if "VERUS_MCP_URL" in os.environ:
         val = os.environ["VERUS_MCP_URL"].strip()
         return val or None
+    entry = active_mcp_config()
+    kind = str(entry.get("type") or "").strip().lower()
+    if kind == "stdio" or (not kind and entry.get("command")):
+        return None
+    url = entry.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
     return DEFAULT_MCP_URL
 
 
@@ -264,6 +312,9 @@ def probe_version_stdio():
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
+            # Claude Code launches the server with the project as its cwd; the
+            # server resolves its workspace from there, so the probe must too.
+            cwd=repo_root(),
         )
     except Exception as exc:
         return ProbeResult(False, transport="stdio",
