@@ -58,11 +58,40 @@ suite). New strategy and progress:
   `view_stmt` / `view_order_list` / `view_column` / `view_args` (so those
   clauses' concrete AST *is* verified, not just goldenscript-pinned; e.g.
   dropping a column's `PRIMARY KEY` / `NOT NULL` flag now breaks verification).
-  The top-level dispatch `parse_control_at` and
+  ~~The top-level dispatch `parse_control_at` and
   the remaining clause parsers (SELECT list, FROM join tree, INSERT rows, UPDATE
   assignments, EXPLAIN) still have no functional spec; their
   concrete behaviour is pinned only by the goldenscripts and the restored
-  differential oracle.
+  differential oracle.~~ **SUPERSEDED:** phase 2's later milestones added the
+  SELECT list, FROM join tree, INSERT, and UPDATE refinements, and phase 6
+  (below) closed the dispatch, the composed SELECT, and EXPLAIN.
+
+- **Phase 6 (statement-level composition + min-parens statement roundtrip) —
+  COMPLETE (2026-09-02, `plans/phase-6-statement-roundtrip.md`, branch
+  `kg/parser-fix-phase-6-stmt-roundtrip`).** Every statement parser now carries
+  a full functional spec: `sparse_control_select` composes the per-clause twins
+  (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET — the
+  optional keyword-expression clauses via `sparse_control_kw_expr`) and
+  `parse_select_at` refines it; `sparse_control` is the top-level keyword
+  dispatch (COMMIT/ROLLBACK inline) with `sparse_control_explain` for the
+  EXPLAIN mutual recursion, refined by `parse_control_at` / `parse_explain_at`
+  — a dispatch swap (e.g. INSERT routed to the DELETE parser) now fails
+  verification. New module `verified_minparen_stmt`: the min-parens statement
+  printer (spec `sprint_min_stmt`, exec `print_min_stmt` whose token view
+  refines it) whose expression positions are `verified_minparen::sprint_min(e,
+  0)`, and the statement roundtrip theorems `stmt_min_roundtrip` (spec:
+  `sparse_control(sprint_min_stmt(s)) == (Some(s), empty)` for every
+  `printable_stmt` mirror statement) and `stmt_min_roundtrip_live` (exec:
+  `parse_control_at(print_min_stmt(s))` recovers `s` up to `view_stmt`,
+  consuming every token). Enabler: `verified_minparen::inert` gained a
+  `neutral_head` disjunct so clause keywords (`FROM`, `AS`, `ASC`, join
+  keywords, ...) are inert expression tails. The differential harness gained
+  `statement_parsers_agree_minparens`, driving generated statements through
+  the min-parens printer so bare-precedence clause syntax reaches the oracle
+  comparison. Printable domain notes: an UPDATE is printable only with a
+  single assignment (`view_stmt` collapses multi-assignment maps), EXPLAIN
+  wraps a non-EXPLAIN statement, and grammar-mandated one-or-more lists must
+  be non-empty.
 
 - **Delete-twins cleanup — COMPLETE (2026-09-02,
   `plans/phase-4-delete-twins.md`, branch `kg/parser-fix-phase-4-cleanup`).**

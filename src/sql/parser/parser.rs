@@ -44,22 +44,27 @@ impl Parser {
         //     across the whole statement + expression grammar;
         //   * a *functional* specification (refinement to the `sparse_prec`
         //     precedence-climbing model) at the expression level, and — as of
-        //     phase 2 (2026-08-31) — on a subset of the statement clause
-        //     parsers: `parse_delete_at`, `parse_drop_at`, `parse_begin_at`,
-        //     `parse_order_by_at`, `parse_group_by_at`, the `CREATE TABLE`
-        //     pair `parse_create_at` / `parse_create_column_at`, the `SELECT`
-        //     list `parse_select_list_at`, `parse_insert_at`, and the `FROM`
-        //     join tree `parse_from_clause_at` / `parse_from_table_at` refine
-        //     the `sparse_control_*` twins in `verified_stmt_prec` up to
-        //     `view_stmt` / `view_order_list` / `view_select_list` / `view_rows`
-        //     / `view_column` / `view_froms` / `view_args`;
-        //   * print/parse round-trip only on the fully-parenthesised range of
-        //     the printer (see `verified_roundtrip`);
-        //   * the top-level statement dispatch (`parse_control_at`) and the
-        //     remaining clause parsers (UPDATE assignments, EXPLAIN) still have
-        //     no functional spec — that they build the intended AST is pinned
-        //     only by the goldenscript suite and the (test-only) differential
-        //     harness against the legacy oracle.
+        //     phase 2 (2026-08-31, including UPDATE) and phase 6 (2026-09-02)
+        //     — on EVERY statement parser: each clause parser
+        //     (`parse_delete_at`, `parse_drop_at`, `parse_begin_at`,
+        //     `parse_update_at`, `parse_order_by_at`, `parse_group_by_at`, the
+        //     `CREATE TABLE` pair, the `SELECT` list, `parse_insert_at`, the
+        //     `FROM` join tree), the composed `parse_select_at`, and the
+        //     top-level dispatch `parse_control_at` / `parse_explain_at`
+        //     refine the `sparse_control*` twins in `verified_stmt_prec` up to
+        //     `view_stmt` (a dispatch swap now fails verification);
+        //   * print/parse round-trips: the fully-parenthesised printer
+        //     (`verified_roundtrip`), the minimal-parenthesisation expression
+        //     printer (`verified_minparen::min_roundtrip_live`), and — phase 6
+        //     — the minimal-parenthesisation *statement* printer
+        //     (`verified_minparen_stmt::stmt_min_roundtrip_live`):
+        //     `parse_control_at(print_min_stmt(s))` recovers `s` up to
+        //     `view_stmt`, consuming every token, for every printable
+        //     statement;
+        //   * outside the printable domain (e.g. multi-assignment UPDATEs at
+        //     the `view_stmt` boundary), the intended AST is pinned by the
+        //     goldenscript suite and the (test-only) differential harness
+        //     against the legacy oracle.
         let mut parser = StreamingParser::new(BufferedTokenStream::new(statement)?);
         let statement = parser.parse_statement()?;
         parser.skip(Token::Semicolon);
