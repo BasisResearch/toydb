@@ -188,23 +188,46 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
         // ordering: the sole (key, value) is recovered with `dom().choose()`.
         // Multi-assignment maps map to `Unsupported` until the executable,
         // sorted-`iter()` bridge lands.
-        ast::Statement::Update { table, set, where_clause } =>
-            view_update_arm(table, set@, where_clause),
+        ast::Statement::Update { table, set, order, where_clause } =>
+            view_update_arm(table, set@, order@, where_clause),
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
     }
 }
 
+/// Well-formedness of an UPDATE's ghost `order` against its `set` map: the
+/// order lists each assigned column exactly once (`no_dups`) and lists all of
+/// them and only them (`order.to_set() == set.dom()`). Together with the value
+/// map this is a bijection `Seq<(String, Option<SExpr>)> <-> Map<...>` on the
+/// UPDATE assignment set (see `lemma_update_bijection`).
+pub open spec fn wf_update(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
+) -> bool {
+    &&& order.no_duplicates()
+    &&& order.to_set() == set.dom()
+}
+
+/// Build the mirror assignment sequence from the ghost `order`: read the keys in
+/// `order` and pair each with its value from `set`. Total (no `dom().choose()`,
+/// no `len == 1` special case) when `wf_update(set, order)` holds.
+pub open spec fn view_update_assigns(
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
+) -> Seq<(String, Option<SExpr>)> {
+    order.map_values(|k: String| (k, view_opt(set[k])))
+}
+
 pub open spec fn view_update_arm(
     table: String,
     set: vstd::map::Map<String, Option<ast::Expression>>,
+    order: Seq<String>,
     where_clause: Option<ast::Expression>,
 ) -> SStmt {
-    if set.dom().len() == 1 {
-        let k = set.dom().choose();
+    if wf_update(set, order) {
         SStmt::Update {
             table,
-            set: seq![(k, view_opt(set[k]))],
+            set: view_update_assigns(set, order),
             where_clause: view_opt(where_clause),
         }
     } else {

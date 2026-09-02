@@ -237,7 +237,12 @@ fn statements() -> BoxedStrategy<Statement> {
         ),
         proptest::option::of(statement_expressions()),
     )
-        .prop_map(|(table, set, where_clause)| Statement::Update { table, set, where_clause });
+        .prop_map(|(table, set, where_clause)| Statement::Update {
+            table,
+            set,
+            order: ast::AssignOrder::placeholder(),
+            where_clause,
+        });
     let select_item = prop_oneof![
         Just((Expression::All, None)),
         (statement_expressions(), proptest::option::of(strings())),

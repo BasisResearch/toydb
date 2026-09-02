@@ -775,7 +775,7 @@ pub fn print_statement(statement: &ast::Statement) -> Option<Vec<Token>> {
             }
             Some(tokens)
         }
-        ast::Statement::Update { table, set, where_clause } => {
+        ast::Statement::Update { table, set, where_clause, .. } => {
             if set.is_empty() {
                 return None;
             }
@@ -1201,6 +1201,7 @@ mod tests {
             .prop_map(|(table, set, where_clause)| Statement::Update {
                 table,
                 set,
+                order: crate::sql::parser::ast::AssignOrder::placeholder(),
                 where_clause,
             });
         let select_item = prop_oneof![
@@ -1512,6 +1513,7 @@ mod tests {
         roundtrip_statement(Statement::Update {
             table: "items".into(),
             set,
+            order: crate::sql::parser::ast::AssignOrder::placeholder(),
             where_clause: Some(predicate("id")),
         });
 
@@ -1589,6 +1591,7 @@ mod tests {
             super::print_statement(&Statement::Update {
                 table: "t".into(),
                 set: BTreeMap::new(),
+                order: crate::sql::parser::ast::AssignOrder::placeholder(),
                 where_clause: None,
             })
             .is_none()

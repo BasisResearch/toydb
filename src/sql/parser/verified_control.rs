@@ -3301,7 +3301,12 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
                 }
             }
         }
-        return (Some(ast::Statement::Update { table, set, where_clause }), cur, None);
+        let order = Ghost(done.map_values(|kv: (String, Option<ast::Expression>)| kv.0));
+        return (
+            Some(ast::Statement::Update { table, set, order: ast::AssignOrder(order), where_clause }),
+            cur,
+            None,
+        );
     }
 
     proof {
@@ -3329,7 +3334,12 @@ fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>
             }
         }
     }
-    (Some(ast::Statement::Update { table, set, where_clause }), cur, None)
+    let order = Ghost(done.map_values(|kv: (String, Option<ast::Expression>)| kv.0));
+    (
+        Some(ast::Statement::Update { table, set, order: ast::AssignOrder(order), where_clause }),
+        cur,
+        None,
+    )
 }
 
 #[verifier::spinoff_prover]

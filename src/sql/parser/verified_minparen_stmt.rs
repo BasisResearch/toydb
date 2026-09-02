@@ -2919,13 +2919,14 @@ fn print_from_items_slice(s: &[ast::From]) -> (r: Vec<Token>)
 fn print_min_update_stmt(
     table: &String,
     set: &BTreeMap<String, Option<ast::Expression>>,
+    order: Ghost<Seq<String>>,
     where_clause: &Option<ast::Expression>,
 ) -> (r: Vec<Token>)
     requires
-        printable_stmt(verified_stmt::view_update_arm(*table, set@, *where_clause)),
+        printable_stmt(verified_stmt::view_update_arm(*table, set@, order@, *where_clause)),
     ensures
         verified_production::token_views(r@)
-            == sprint_min_stmt(verified_stmt::view_update_arm(*table, set@, *where_clause)),
+            == sprint_min_stmt(verified_stmt::view_update_arm(*table, set@, order@, *where_clause)),
 {
     let ghost vs = verified_stmt::view_update_arm(*table, set@, *where_clause);
     let mut r: Vec<Token> = Vec::new();
@@ -3340,11 +3341,11 @@ pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
             }
             r
         },
-        ast::Statement::Update { table, set, where_clause } => {
+        ast::Statement::Update { table, set, order, where_clause } => {
             proof {
-                assert(vs == verified_stmt::view_update_arm(*table, set@, *where_clause));
+                assert(vs == verified_stmt::view_update_arm(*table, set@, order@, *where_clause));
             }
-            print_min_update_stmt(table, set, where_clause)
+            print_min_update_stmt(table, set, order.0, where_clause)
         },
         ast::Statement::Select {
             select, from, where_clause, group_by, having, order_by, offset, limit,
