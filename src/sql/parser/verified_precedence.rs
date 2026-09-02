@@ -1,9 +1,9 @@
 //! Verified precedence-climbing expression parser (Phase 2 of the parser
 //! cutover, see `verus-parser-cutover-prompt.md`).
 //!
-//! Unlike `verified_roundtrip`'s `parse_expr_exec` — which is the exact inverse
-//! of the canonical printer and accepts only fully-parenthesised forms — this
-//! parser is a 1:1 port of the production precedence-climbing parser in
+//! Unlike `verified_roundtrip`'s mirror parser `sparse` — which is the exact
+//! inverse of the canonical printer and accepts only fully-parenthesised forms
+//! — this parser is a 1:1 port of the production precedence-climbing parser in
 //! `parser.rs`. It accepts the full concrete grammar (`a + b * c`, prefix/infix/
 //! postfix operators with precedence and associativity, function calls,
 //! qualified columns, parenthesised groups) and builds production
@@ -13,9 +13,11 @@
 //!
 //! No panic, no arithmetic overflow, and termination. Every `Vec` index is
 //! bounds-guarded, every `pos + k` / `prec + assoc` is range-bounded, and
-//! recursion terminates on a `fuel` measure. On top of that, the roundtrip lemma
-//! `print_parse_roundtrip` proves this parser inverts the canonical printer
-//! (`parse(print(e))`'s mirror view equals `e`'s). This is the sole production
+//! recursion terminates on a `fuel` measure. On top of that, the parser is
+//! proven to refine the spec model `sparse_prec` (see `parse_expression_full`'s
+//! `ensures`), and the spec-level roundtrip `lemma_prec` proves `sparse_prec`
+//! inverts the canonical printer `sprint` — together: `parse(print(e))`'s
+//! mirror view equals `e`'s. This is the sole production
 //! expression parser; on rejection it returns a structured
 //! [`super::parse_error::ParseError`] (see `parse_expression_full`), rendered to
 //! the production error string at the boundary.
@@ -1042,66 +1044,11 @@ pub fn parse_expression_at(toks: &Vec<Token>, pos: usize, min_prec: u8, fuel: us
     (Some(lhs), cur, None)
 }
 
-/// Local copy of `all_digits_exec` (byte-slice all-ASCII-digit test). Kept here
-/// so this module does not depend on `verified_roundtrip`'s spec surface.
-fn all_digits_exec_local(bytes: &[u8]) -> (r: bool)
-    decreases bytes.len(),
-{
-    if bytes.len() == 0 {
-        true
-    } else {
-        let b = bytes[bytes.len() - 1];
-        if 48u8 <= b && b <= 57u8 {
-            all_digits_exec_local(vstd::slice::slice_subrange(bytes, 0, bytes.len() - 1))
-        } else {
-            false
-        }
-    }
-}
-
-/// Parses a complete expression from a token vector, requiring that the whole
-/// vector is consumed. Returns `None` on any parse failure or trailing tokens.
-/// This is the entry point the cutover routes `Parser::parse_expr` through.
-pub fn parse_expression(toks: &Vec<Token>) -> (r: Option<ast::Expression>)
-    ensures
-        ({
-            let input = verified_production::token_views(toks@.subrange(0, toks@.len() as int));
-            let (sopt, srest) = sparse_prec(input, 0, (2 * toks.len() + 3) as nat);
-            (toks.len() <= (usize::MAX - 3) / 2 && sopt is Some && srest.len() == 0)
-                ==> (r is Some && super::verified_roundtrip::view_expr(r.unwrap()) == sopt.unwrap())
-        }),
-{
-    // `parse_expression_at` needs `2*len + 3` fuel so fuel-stability applies to
-    // every sub-parse (the worst case is a deep run of unmatched `(`). A vector
-    // that large cannot exist in practice; reject it rather than overflow.
-    if toks.len() > (usize::MAX - 3) / 2 {
-        return None;
-    }
-    let fuel = 2 * toks.len() + 3;
-    let (opt, consumed, _err) = parse_expression_at(toks, 0, 0, fuel);
-    proof {
-        if consumed <= toks.len() {
-            super::verified_roundtrip::token_views_len(
-                toks@.subrange(consumed as int, toks@.len() as int));
-        }
-    }
-    match opt {
-        Some(expr) => {
-            if consumed == toks.len() {
-                Some(expr)
-            } else {
-                None
-            }
-        },
-        None => None,
-    }
-}
-
 /// Production entry for a complete expression, returning the parsed value or the
-/// structured `ParseError` on rejection. Same accept/reject boundary as
-/// [`parse_expression`] (which powers the roundtrip proof), but keeps the
-/// rejection reason so `Parser::parse_expr` can report it without the legacy
-/// parser. Leftover tokens after a complete parse become the trailing-token
+/// structured `ParseError` on rejection: parse with fuel `2*len + 3`, require
+/// the whole vector consumed. The `ensures` refines the spec model
+/// `sparse_prec`, which `lemma_prec` proves inverts the canonical printer.
+/// Leftover tokens after a complete parse become the trailing-token
 /// `unexpected token` error, matching `Parser::parse_expr_legacy`.
 pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
     Option<ast::Expression>,
@@ -1139,51 +1086,6 @@ pub fn parse_expression_full(toks: &Vec<Token>) -> (r: (
         None => (None, err),
     }
 }
-
-/// Headline: the verified precedence parser inverts the canonical printer.
-/// Parsing the print of any printable expression recovers an expression with the
-/// same mirror view. Composes `parse_expression`'s refinement of `sparse_prec`
-/// with the spec-level roundtrip `lemma_prec` over `print_expr_exec`'s output.
-pub fn print_parse_roundtrip(e: &ast::Expression) -> (r: Option<ast::Expression>)
-    requires
-        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(*e)),
-        super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e)).len()
-            <= (usize::MAX - 3) / 2,
-    ensures
-        r is Some,
-        super::verified_roundtrip::view_expr(r.unwrap()) == super::verified_roundtrip::view_expr(*e),
-{
-    let toks = super::verified_roundtrip::print_expr_exec(e);
-    proof {
-        super::verified_roundtrip::token_views_len(toks@);
-        lemma_prec(super::verified_roundtrip::view_expr(*e), 0, Seq::<TokenView>::empty(),
-            (2 * toks.len() + 3) as nat);
-        assert(super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e))
-            + Seq::<TokenView>::empty()
-            == super::verified_roundtrip::sprint(super::verified_roundtrip::view_expr(*e)));
-        assert(toks@.subrange(0, toks@.len() as int) == toks@);
-    }
-    parse_expression(&toks)
-}
-
-// ===========================================================================
-// Phase 2.2 — spec-level model of the precedence parser
-// ===========================================================================
-//
-// The executable parser above is a hybrid: `decreases fuel` bounds the
-// recursion depth, but the three inner `while` loops (postfix pass 1, the infix
-// precedence-climbing loop, postfix pass 2) terminate on the token count, not
-// on fuel. The spec model below expresses the whole algorithm as pure
-// recursion so it can carry a functional specification. Each loop becomes a
-// recursive helper; the fuel-vs-token-count gap between the loops and this
-// recursion is bridged by the refinement lemma (Brick 2). This module currently
-// establishes the model and its termination (Brick 1); refinement and the
-// `parse(sprint(e)) == e` roundtrip (Bricks 2-3) build on it.
-//
-// Convention (matching `verified_roundtrip::sparse`): the parser works over a
-// `Seq<TokenView>` *suffix* and returns the remaining suffix. On any parse
-// failure it returns `(None, input)` — the *original* input — mirroring the
-// exec parsers, which return the original `pos` on failure.
 
 /// Spec model of `parse_expression_at`: prefix-or-atom for the left-hand side,
 /// a postfix pass, the infix precedence-climbing loop, then a second postfix
