@@ -226,26 +226,33 @@ pub open spec fn view_stmt(s: ast::Statement) -> SStmt
         // ordering: the sole (key, value) is recovered with `dom().choose()`.
         // Multi-assignment maps map to `Unsupported` until the executable,
         // sorted-`iter()` bridge lands.
-        ast::Statement::Update { table, set, where_clause } => {
-            if set@.dom().len() == 1 {
-                let k = set@.dom().choose();
-                SStmt::Update {
-                    table,
-                    set: seq![(k, match set@[k] {
-                        Some(e) => Some(view_expr(e)),
-                        None => None,
-                    })],
-                    where_clause: match where_clause {
-                        Some(e) => Some(view_expr(e)),
-                        None => None,
-                    },
-                }
-            } else {
-                SStmt::Unsupported
-            }
-        },
+        ast::Statement::Update { table, set, where_clause } =>
+            view_update_arm(table, set@, where_clause),
         ast::Statement::Explain(inner) => SStmt::Explain(Box::new(view_stmt(*inner))),
         _ => SStmt::Unsupported,
+    }
+}
+
+/// `view_stmt`'s `Update` arm, factored out over the `BTreeMap`'s spec view
+/// `set: Map` so it can be reasoned about at the `Map` level (the exec parser
+/// holds a `BTreeMap` whose view is a `Map`, and lemmas over the assignment list
+/// need to talk about `set@` without materialising a `BTreeMap`). Behaviour is
+/// unchanged: a single-entry map is a one-assignment `Update`, anything else is
+/// `Unsupported`.
+pub open spec fn view_update_arm(
+    table: String,
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    where_clause: Option<ast::Expression>,
+) -> SStmt {
+    if set.dom().len() == 1 {
+        let k = set.dom().choose();
+        SStmt::Update {
+            table,
+            set: seq![(k, view_opt(set[k]))],
+            where_clause: view_opt(where_clause),
+        }
+    } else {
+        SStmt::Unsupported
     }
 }
 
@@ -8537,6 +8544,150 @@ pub fn print_parse_roundtrip_stmt(s: &ast::Statement) -> (out: ast::Statement)
             proof { assert(false); }
             ast::Statement::Commit
         },
+    }
+}
+
+// -- UPDATE parse-direction boundary bridge -----------------------------------
+//
+// The parse-direction spec twin (`verified_stmt_prec::sparse_control_update`)
+// models the assignments as a parse-ordered `Seq<(String, Option<SExpr>)>` with
+// all-distinct keys (the exec's duplicate-column rejection succeeded). The exec
+// stores them in a `BTreeMap`, whose spec view `set@` is an order-free `Map`.
+// This bridge equates `view_stmt(Update{set})` with the twin's boundary map
+// (`assign_list_to_sstmt`) given the loop invariant relating `set@` to the
+// ordered list. It is the only new machinery UPDATE needs at the boundary;
+// `view_stmt` itself is untouched.
+
+/// View the *value* of each exec-level assignment pair.
+pub open spec fn view_assign_pairs(items: Seq<(String, Option<ast::Expression>)>)
+    -> Seq<(String, Option<SExpr>)> {
+    items.map_values(|kv: (String, Option<ast::Expression>)| (kv.0, view_opt(kv.1)))
+}
+
+pub proof fn view_assign_pairs_index(items: Seq<(String, Option<ast::Expression>)>)
+    ensures
+        view_assign_pairs(items).len() == items.len(),
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] view_assign_pairs(items)[i]
+            == (items[i].0, view_opt(items[i].1)),
+{
+}
+
+/// A `BTreeMap` view `m` whose domain is exactly the (distinct) key set of a
+/// parse-ordered assignment list `items`, and which maps each key to that list's
+/// value, has domain size `items.len()`. The distinct-key seq has a
+/// same-size element-key set, and the map's domain equals it.
+pub proof fn lemma_assign_dom_len(
+    m: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+)
+    requires
+        m.dom().finite(),
+        forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0,
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] m.dom().contains(items[i].0),
+        forall|k: String| m.dom().contains(k)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
+    ensures
+        m.dom().len() == items.len(),
+    decreases items.len(),
+{
+    if items.len() == 0 {
+        assert(m.dom() =~= vstd::set::Set::<String>::empty()) by {
+            assert forall|k: String| !m.dom().contains(k) by {
+                if m.dom().contains(k) {
+                    let i = choose|i: int| 0 <= i < items.len() && items[i].0 == k;
+                }
+            }
+        }
+    } else {
+        let head = items[0];
+        let rest = items.drop_first();
+        let m2 = m.remove(head.0);
+        assert(m.dom().contains(head.0));
+        assert forall|i: int| 0 <= i < rest.len() implies #[trigger] m2.dom().contains(rest[i].0) by {
+            assert(rest[i] == items[i + 1]);
+            assert(items[0].0 != items[i + 1].0);
+            assert(m.dom().contains(items[i + 1].0));
+        }
+        assert forall|k: String| m2.dom().contains(k) implies
+            exists|i: int| 0 <= i < rest.len() && (#[trigger] rest[i]).0 == k by {
+            assert(m.dom().contains(k));
+            let i = choose|i: int| 0 <= i < items.len() && items[i].0 == k;
+            assert(k != head.0);
+            assert(i != 0);
+            assert(rest[i - 1] == items[i]);
+        }
+        lemma_assign_dom_len(m2, rest);
+        assert(m.dom().len() == m2.dom().len() + 1) by {
+            assert(m.dom().contains(head.0));
+            assert(m2.dom() =~= m.dom().remove(head.0));
+            assert(m.dom().remove(head.0).len() + 1 == m.dom().len());
+        }
+    }
+}
+
+/// The UPDATE boundary bridge, at the pure `view_stmt` level (the twin's
+/// `assign_list_to_sstmt` boundary map is spelled out in the caller so this stays
+/// free of a `verified_stmt_prec` back-dependency). Given the exec loop invariant
+/// relating `set@` to a parse-ordered, distinct-key assignment list `items`:
+///
+///   - a lone assignment: `view_stmt(Update{set})` is
+///     `SStmt::Update { set: seq![(items[0].0, view_opt(items[0].1))] }`;
+///   - any other arity: `view_stmt(Update{set})` is `SStmt::Unsupported`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(60000)]
+pub proof fn lemma_update_view_boundary(
+    table: String,
+    set: vstd::map::Map<String, Option<ast::Expression>>,
+    items: Seq<(String, Option<ast::Expression>)>,
+    where_clause: Option<ast::Expression>,
+)
+    requires
+        set.dom().finite(),
+        forall|i: int, j: int| 0 <= i < j < items.len() ==> items[i].0 != items[j].0,
+        forall|i: int| 0 <= i < items.len() ==> #[trigger] set.dom().contains(items[i].0)
+            && set[items[i].0] == items[i].1,
+        forall|k: String| set.dom().contains(k)
+            ==> exists|i: int| 0 <= i < items.len() && (#[trigger] items[i]).0 == k,
+    ensures
+        items.len() == 1 ==> view_update_arm(table, set, where_clause)
+            == (SStmt::Update {
+                table,
+                set: seq![(items[0].0, view_opt(items[0].1))],
+                where_clause: view_opt(where_clause),
+            }),
+        items.len() != 1 ==> view_update_arm(table, set, where_clause) == SStmt::Unsupported,
+{
+    lemma_assign_dom_len(set, items);
+    if items.len() == 1 {
+        // Single assignment: `view_update_arm` recovers the sole key via `dom().choose()`.
+        assert(set.dom().len() == 1);
+        let k = set.dom().choose();
+        assert(set.dom().contains(k)) by {
+            assert(set.dom().len() == 1);
+            assert(!set.dom().is_empty());
+        }
+        assert(set.dom().contains(items[0].0));
+        assert(k == items[0].0) by {
+            if k != items[0].0 {
+                // Two distinct domain members contradict `len() == 1`.
+                assert(set.dom().contains(k) && set.dom().contains(items[0].0));
+                assert(set.dom().remove(items[0].0).contains(k));
+                assert(set.dom().remove(items[0].0).len() >= 1);
+                assert(set.dom().len() >= 2);
+            }
+        }
+        assert(set[k] == items[0].1);
+        assert(view_update_arm(table, set, where_clause)
+            == SStmt::Update {
+                table,
+                set: seq![(k, view_opt(set[k]))],
+                where_clause: view_opt(where_clause),
+            });
+        assert(seq![(k, view_opt(set[k]))] =~= seq![(items[0].0, view_opt(items[0].1))]);
+    } else {
+        assert(set.dom().len() == items.len());
+        assert(set.dom().len() != 1);
+        assert(view_update_arm(table, set, where_clause) == SStmt::Unsupported);
     }
 }
 

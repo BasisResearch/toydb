@@ -62,6 +62,9 @@ use super::parse_error::ParseError;
 use super::{Keyword, Token, ast, verified_integer, verified_precedence};
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use super::{verified_production, verified_roundtrip, verified_stmt, verified_stmt_prec};
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::verified_roundtrip::SExpr;
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 
@@ -2736,118 +2739,557 @@ proof fn col_input_head(toks: &Vec<Token>, pos: usize)
 /// maps to `None`. A duplicate column, like any malformed form, yields
 /// `(None, pos)` so the caller falls back to the legacy parser (which also
 /// carries the specific error text). Mirrors `parse_update`.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(900000)]
 fn parse_update_at(toks: &Vec<Token>, pos: usize) -> (r: (Option<ast::Statement>, usize, Option<ParseError>))
     requires
         pos <= toks.len(),
     ensures
         pos <= r.1 <= toks.len(),
         r.0 is None ==> r.2 is Some,
+        toks.len() <= (usize::MAX - 3) / 2 ==> ({
+            let input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+            let (sopt, srest) = verified_stmt_prec::sparse_control_update(input);
+            match r.0 {
+                Some(s) => sopt is Some
+                    && verified_stmt::view_stmt(s) == sopt.unwrap()
+                    && srest == verified_production::token_views(
+                        toks@.subrange(r.1 as int, toks@.len() as int)),
+                None => sopt is None,
+            }
+        }),
 {
+    let ghost input = verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int));
+    let ghost sized = toks.len() <= (usize::MAX - 3) / 2;
     // Table name.
     if pos >= toks.len() {
+        proof {
+            verified_roundtrip::token_views_len(toks@.subrange(pos as int, toks@.len() as int));
+            assert(input.len() == 0);
+            assert(verified_stmt_prec::sparse_control_update(input).0 is None);
+        }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, pos as int); }
     let table = match &toks[pos] {
         Token::Ident(name) => name.clone(),
-        _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone()))),
+        _ => {
+            proof {
+                reveal(verified_production::token_view);
+                assert(input.len() >= 1);
+                assert(input[0] == verified_production::token_view(toks@[pos as int]));
+                assert(match input[0] {
+                    verified_production::TokenView::Ident(_) => false,
+                    _ => true,
+                });
+                assert(verified_stmt_prec::sparse_control_update(input).0 is None);
+            }
+            return (None, pos, Some(ParseError::ExpectedIdent(toks[pos].clone())));
+        },
     };
     let mut cur = pos + 1;
+    // r0 — suffix just past `<ident>`.
+    let ghost r0 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, pos as int);
+        assert(r0 == input.drop_first());
+        assert(input[0] == verified_production::TokenView::Ident(table));
+    }
 
     // SET
     if cur >= toks.len() {
+        proof {
+            verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+            assert(r0.len() == 0);
+            assert(verified_stmt_prec::sparse_control_update(input).0 is None);
+        }
         return (None, pos, Some(ParseError::UnexpectedEof));
     }
+    proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
     if !matches!(toks[cur], Token::Keyword(Keyword::Set)) {
+        proof {
+            reveal(verified_production::token_view);
+            assert(r0.len() >= 1);
+            assert(r0[0] == verified_production::token_view(toks@[cur as int]));
+            assert(r0[0] != verified_production::TokenView::Keyword(Keyword::Set));
+            assert(verified_stmt_prec::sparse_control_update(input).0 is None);
+        }
         return (None, pos, Some(ParseError::ExpectedToken(
             Token::Keyword(Keyword::Set),
             toks[cur].clone(),
         )));
     }
     cur = cur + 1;
+    // r1 — the assign-list start (suffix just past `<ident> SET`).
+    let ghost r1 = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    let ghost al_whole = verified_stmt_prec::sparse_control_assign_list(r1);
+    proof {
+        verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+        assert(r1 == r0.drop_first());
+        assert(r0[0] == verified_production::TokenView::Keyword(Keyword::Set));
+    }
 
     // One or more comma-separated `<col> = <value>` assignments.
     let mut set: BTreeMap<String, Option<ast::Expression>> = BTreeMap::new();
+    // `done` — the parse-ordered exec assignment pairs accumulated so far.
+    let ghost mut done: Seq<(String, Option<ast::Expression>)> = Seq::empty();
+    proof {
+        verified_stmt::axiom_string_obeys_cmp();
+        assert(set@ == vstd::map::Map::<String, Option<ast::Expression>>::empty());
+    }
     loop
-        invariant
-            pos <= cur,
+        invariant_except_break
+            pos < cur,
             cur <= toks.len(),
+            sized == (toks.len() <= (usize::MAX - 3) / 2),
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Ident(table),
+            r0 == input.drop_first(),
+            r0.len() >= 1,
+            r0[0] == verified_production::TokenView::Keyword(Keyword::Set),
+            r1 == r0.drop_first(),
+            al_whole == verified_stmt_prec::sparse_control_assign_list(r1),
+            set@.dom().finite(),
+            // `done` <-> `set@` correspondence and distinctness.
+            forall|i: int, j: int| 0 <= i < j < done.len() ==> done[i].0 != done[j].0,
+            forall|i: int| 0 <= i < done.len() ==> #[trigger] set@.dom().contains(done[i].0)
+                && set@[done[i].0] == done[i].1,
+            forall|k: String| set@.dom().contains(k)
+                ==> exists|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == k,
+            // Resumption invariant for the twin (sized inputs only).
+            sized ==> al_whole == verified_stmt_prec::assign_list_prepend(
+                verified_stmt::view_assign_pairs(done),
+                r1,
+                verified_stmt_prec::sparse_control_assign_list(
+                    verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int)))),
+        ensures
+            pos < cur,
+            cur <= toks.len(),
+            input == verified_production::token_views(toks@.subrange(pos as int, toks@.len() as int)),
+            input.len() >= 1,
+            input[0] == verified_production::TokenView::Ident(table),
+            r0 == input.drop_first(),
+            r0[0] == verified_production::TokenView::Keyword(Keyword::Set),
+            r1 == r0.drop_first(),
+            al_whole == verified_stmt_prec::sparse_control_assign_list(r1),
+            set@.dom().finite(),
+            forall|i: int, j: int| 0 <= i < j < done.len() ==> done[i].0 != done[j].0,
+            forall|i: int| 0 <= i < done.len() ==> #[trigger] set@.dom().contains(done[i].0)
+                && set@[done[i].0] == done[i].1,
+            forall|k: String| set@.dom().contains(k)
+                ==> exists|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == k,
+            done.len() >= 1,
+            // At break, the assign list is final and equals the view'd `done`.
+            sized ==> al_whole == (Some(verified_stmt::view_assign_pairs(done)),
+                verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))),
         decreases toks.len() - cur,
     {
+        let ghost cur_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        let ghost done_v = verified_stmt::view_assign_pairs(done);
         // Column name.
         if cur >= toks.len() {
+            proof {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                if sized {
+                    assert(cur_v.len() < 2);
+                    reveal_with_fuel(verified_stmt_prec::sparse_control_assign_list, 1);
+                    assert(verified_stmt_prec::sparse_control_assign(cur_v).0 is None);
+                    assert(verified_stmt_prec::sparse_control_assign_list(cur_v).0 is None);
+                    assert(r1 == input.drop_first().drop_first());
+                    assert(al_whole == verified_stmt_prec::sparse_control_assign_list(r1));
+                    assert(al_whole.0 is None);
+                    assert(r1 == input.drop_first().drop_first());
+                    assert(verified_stmt_prec::sparse_control_assign_list(
+                        input.drop_first().drop_first()).0 is None);
+                    verified_stmt_prec::lemma_update_reject_on_list_none(input, table);
+                    assert(verified_stmt_prec::sparse_control_update(input).0 is None);
+                }
+            }
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         let column = match &toks[cur] {
             Token::Ident(name) => name.clone(),
-            _ => return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone()))),
+            _ => {
+                proof {
+                    reveal(verified_production::token_view);
+                    if sized {
+                        assert(cur_v[0] == verified_production::token_view(toks@[cur as int]));
+                        assert(match cur_v[0] {
+                            verified_production::TokenView::Ident(_) => false,
+                            _ => true,
+                        });
+                        assert(verified_stmt_prec::sparse_control_assign(cur_v).0 is None);
+                        assert(verified_stmt_prec::sparse_control_assign_list(cur_v).0 is None);
+                        assert(al_whole.0 is None);
+                        verified_stmt_prec::lemma_update_reject_on_list_none(input, table);
+                    }
+                }
+                return (None, pos, Some(ParseError::ExpectedIdent(toks[cur].clone())));
+            },
         };
         cur = cur + 1;
+        proof { verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int); }
 
         // `=`
         if cur >= toks.len() {
+            proof {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                if sized {
+                    assert(cur_v.len() < 2);
+                    assert(verified_stmt_prec::sparse_control_assign(cur_v).0 is None);
+                    assert(verified_stmt_prec::sparse_control_assign_list(cur_v).0 is None);
+                    assert(al_whole.0 is None);
+                    verified_stmt_prec::lemma_update_reject_on_list_none(input, table);
+                }
+            }
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         if !matches!(toks[cur], Token::Equal) {
+            proof {
+                reveal(verified_production::token_view);
+                if sized {
+                    assert(cur_v.len() >= 2);
+                    assert(cur_v[1] == verified_production::token_view(toks@[cur as int]));
+                    assert(cur_v[1] != verified_production::TokenView::Equal);
+                    assert(verified_stmt_prec::sparse_control_assign(cur_v).0 is None);
+                    assert(verified_stmt_prec::sparse_control_assign_list(cur_v).0 is None);
+                    assert(al_whole.0 is None);
+                    verified_stmt_prec::lemma_update_reject_on_list_none(input, table);
+                }
+            }
             return (None, pos, Some(ParseError::ExpectedToken(
                 Token::Equal,
                 toks[cur].clone(),
             )));
         }
         cur = cur + 1;
+        // `rest` — suffix just past `<col> =` (the value position).
+        let ghost rest_v = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 2) as int);
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            if sized {
+                assert(cur_v.len() >= 2);
+                assert(cur_v[0] == verified_production::TokenView::Ident(column));
+                assert(cur_v[1] == verified_production::TokenView::Equal);
+                assert(rest_v == cur_v.drop_first().drop_first());
+            }
+        }
 
         // Value: the `DEFAULT` keyword maps to `None`; otherwise an expression.
         let value: Option<ast::Expression>;
+        // `r_after_val` — suffix just past the value.
+        let ghost r_after_val: Seq<verified_production::TokenView>;
         if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Default)) {
+            proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
             cur = cur + 1;
             value = None;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                r_after_val = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+                if sized {
+                    assert(rest_v.len() >= 1);
+                    assert(rest_v[0] == verified_production::TokenView::Keyword(Keyword::Default));
+                    assert(r_after_val == rest_v.drop_first());
+                    assert(verified_stmt_prec::sparse_control_assign(cur_v)
+                        == (Some((column, None::<SExpr>)), r_after_val));
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+            }
             let n = toks.len() - cur;
             if n > (usize::MAX - 3) / 2 {
+                assert(!sized);
                 return (None, pos, Some(ParseError::UnexpectedEof));
             }
             let fuel = 2 * n + 3;
+            proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
             let (opt, consumed, verr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
             match opt {
                 Some(expr) => {
                     value = Some(expr);
+                    proof {
+                        r_after_val = verified_production::token_views(
+                            toks@.subrange(consumed as int, toks@.len() as int));
+                        if sized {
+                            assert(!(rest_v.len() >= 1
+                                && rest_v[0] == verified_production::TokenView::Keyword(Keyword::Default)));
+                            assert(verified_precedence::sparse_prec(rest_v, 0,
+                                verified_stmt_prec::expr_fuel(rest_v))
+                                == (Some(verified_roundtrip::view_expr(expr)), r_after_val));
+                            assert(verified_stmt_prec::sparse_control_assign(cur_v)
+                                == (Some((column, Some(verified_roundtrip::view_expr(expr)))), r_after_val));
+                        }
+                    }
                     cur = consumed;
                 },
-                None => return (None, pos, verr),
+                None => {
+                    proof {
+                        if sized {
+                            assert(!(rest_v.len() >= 1
+                                && rest_v[0] == verified_production::TokenView::Keyword(Keyword::Default)));
+                            assert(verified_precedence::sparse_prec(rest_v, 0,
+                                verified_stmt_prec::expr_fuel(rest_v)).0 is None);
+                            assert(verified_stmt_prec::sparse_control_assign(cur_v).0 is None);
+                            assert(verified_stmt_prec::sparse_control_assign_list(cur_v).0 is None);
+                            assert(al_whole.0 is None);
+                            verified_stmt_prec::lemma_update_reject_on_list_none(input, table);
+                        }
+                    }
+                    return (None, pos, verr);
+                },
+            }
+        }
+        // The assignment `(column, value)` was parsed; the suffix is now `r_after_val`.
+        let ghost a: (String, Option<SExpr>) = (column, verified_stmt::view_opt(value));
+        proof {
+            if sized {
+                assert(verified_stmt_prec::sparse_control_assign(cur_v) == (Some(a), r_after_val));
             }
         }
 
         // Reject a column set twice (legacy owns the error text).
+        proof { verified_stmt::axiom_string_obeys_cmp(); }
         if set.contains_key(&column) {
+            proof {
+                verified_stmt::axiom_string_obeys_cmp();
+                broadcast use vstd::std_specs::btree::group_btree_axioms;
+                // `column` is a duplicate: it already appears among `done`'s keys.
+                assert(set@.contains_key(column));
+                if sized {
+                    let di = choose|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == column;
+                    assert(done[di].0 == column);
+                    verified_stmt::view_assign_pairs_index(done);
+                    // `done_v[di].0 == column == a.0`.
+                    assert(done_v[di].0 == done[di].0);
+                    assert(a.0 == column);
+                    verified_stmt_prec::lemma_update_reject_on_duplicate(
+                        input, table, cur_v, a, r_after_val, done_v, di);
+                }
+            }
             return (None, pos, Some(ParseError::DuplicateColumn(column.clone())));
         }
+        proof {
+            verified_stmt::axiom_string_obeys_cmp();
+            broadcast use vstd::std_specs::btree::group_btree_axioms;
+            assert(!set@.contains_key(column));
+        }
+        let ghost old_set = set@;
+        let ghost old_done = done;
         set.insert(column, value);
+        proof {
+            done = old_done + seq![(column, value)];
+            verified_stmt::axiom_string_obeys_cmp();
+            broadcast use vstd::std_specs::btree::group_btree_axioms;
+            assert(set@ == old_set.insert(column, value));
+            // Re-establish `done` <-> `set@`.
+            assert(forall|i: int, j: int| 0 <= i < j < done.len() ==> done[i].0 != done[j].0) by {
+                assert forall|i: int, j: int| 0 <= i < j < done.len() implies done[i].0 != done[j].0 by {
+                    if j < old_done.len() {
+                    } else {
+                        assert(j == old_done.len());
+                        assert(done[j].0 == column);
+                        assert(done[i] == old_done[i]);
+                        assert(old_set.dom().contains(old_done[i].0));
+                        assert(!old_set.dom().contains(column));
+                    }
+                }
+            }
+            assert forall|i: int| 0 <= i < done.len() implies #[trigger] set@.dom().contains(done[i].0)
+                && set@[done[i].0] == done[i].1 by {
+                if i < old_done.len() {
+                    assert(done[i] == old_done[i]);
+                    assert(old_done[i].0 != column) by {
+                        assert(old_set.dom().contains(old_done[i].0));
+                    }
+                } else {
+                    assert(done[i] == (column, value));
+                }
+            }
+            assert forall|k: String| set@.dom().contains(k) implies
+                exists|i: int| 0 <= i < done.len() && (#[trigger] done[i]).0 == k by {
+                if k == column {
+                    assert(done[old_done.len() as int].0 == column);
+                } else {
+                    assert(old_set.dom().contains(k));
+                    let oi = choose|i: int| 0 <= i < old_done.len() && (#[trigger] old_done[i]).0 == k;
+                    assert(done[oi] == old_done[oi]);
+                }
+            }
+            verified_stmt::view_assign_pairs_index(done);
+            verified_stmt::view_assign_pairs_index(old_done);
+            assert(verified_stmt::view_assign_pairs(done)
+                =~= verified_stmt::view_assign_pairs(old_done) + seq![a]);
+        }
 
+        let ghost r_before_comma = r_after_val;
         if cur < toks.len() && matches!(toks[cur], Token::Comma) {
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+                if sized {
+                    assert(r_after_val == verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int)));
+                    assert(r_after_val.len() >= 1);
+                    assert(r_after_val[0] == verified_production::TokenView::Comma);
+                    verified_stmt_prec::lemma_assign_list_step(cur_v, a, r_after_val);
+                }
+            }
             cur = cur + 1;
+            proof {
+                verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+                assert(r_before_comma.drop_first() == verified_production::token_views(
+                    toks@.subrange(cur as int, toks@.len() as int)));
+                if sized {
+                    verified_stmt_prec::lemma_assign_list_resume_step(
+                        r1, cur_v, r_before_comma.drop_first(),
+                        done_v, a, al_whole);
+                    assert(verified_stmt::view_assign_pairs(done) == done_v + seq![a]);
+                }
+            }
         } else {
+            proof {
+                if cur < toks.len() {
+                    verified_roundtrip::token_views_suffix(toks@, cur as int);
+                } else {
+                    verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+                }
+                if sized {
+                    assert(r_after_val == verified_production::token_views(
+                        toks@.subrange(cur as int, toks@.len() as int)));
+                    assert(!(r_after_val.len() >= 1 && r_after_val[0] == verified_production::TokenView::Comma));
+                    verified_stmt_prec::lemma_assign_list_last(cur_v, a, r_after_val);
+                    assert(verified_stmt_prec::sparse_control_assign_list(cur_v) == (Some(seq![a]), r_after_val));
+                    assert(al_whole == (Some(done_v + seq![a]), r_after_val));
+                    assert(verified_stmt::view_assign_pairs(done) == done_v + seq![a]);
+                }
+            }
             break;
+        }
+    }
+
+    // At this point `done` (>= 1) holds the parsed assignments with distinct keys.
+    let ghost items_v = verified_stmt::view_assign_pairs(done);
+    let ghost al_rest = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+    proof {
+        if sized {
+            assert(al_whole == (Some(items_v), al_rest));
+            // Distinct keys: the twin's boundary duplicate check passes.
+            verified_stmt::view_assign_pairs_index(done);
+            assert(verified_stmt_prec::assign_keys_distinct(items_v)) by {
+                assert forall|i: int, j: int| 0 <= i < j < items_v.len()
+                    implies items_v[i].0 != items_v[j].0 by {
+                    assert(items_v[i].0 == done[i].0);
+                    assert(items_v[j].0 == done[j].0);
+                }
+            }
         }
     }
 
     // Optional WHERE <expr>.
     let mut where_clause: Option<ast::Expression> = None;
     if cur < toks.len() && matches!(toks[cur], Token::Keyword(Keyword::Where)) {
+        proof { verified_roundtrip::token_views_suffix(toks@, cur as int); }
         cur = cur + 1;
+        let ghost we_in = verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int));
+        proof {
+            verified_roundtrip::token_views_suffix(toks@, (cur - 1) as int);
+            if sized {
+                assert(al_rest.len() >= 1);
+                assert(al_rest[0] == verified_production::TokenView::Keyword(Keyword::Where));
+                assert(we_in == al_rest.drop_first());
+            }
+        }
         let n = toks.len() - cur;
         if n > (usize::MAX - 3) / 2 {
+            assert(!sized);
             return (None, pos, Some(ParseError::UnexpectedEof));
         }
         let fuel = 2 * n + 3;
+        proof { verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int)); }
         let (opt, consumed, werr) = verified_precedence::parse_expression_at(toks, cur, 0, fuel);
         match opt {
             Some(expr) => {
                 where_clause = Some(expr);
+                proof {
+                    if sized {
+                        assert(verified_precedence::sparse_prec(we_in, 0,
+                            verified_stmt_prec::expr_fuel(we_in))
+                            == (Some(verified_roundtrip::view_expr(expr)),
+                                verified_production::token_views(
+                                    toks@.subrange(consumed as int, toks@.len() as int))));
+                    }
+                }
                 cur = consumed;
             },
-            None => return (None, pos, werr),
+            None => {
+                proof {
+                    if sized {
+                        assert(verified_precedence::sparse_prec(we_in, 0,
+                            verified_stmt_prec::expr_fuel(we_in)).0 is None);
+                        assert(al_whole == (Some(items_v), al_rest));
+                        assert(we_in == al_rest.drop_first());
+                        verified_stmt_prec::lemma_update_reject_on_where_none(
+                            input, table, items_v, al_rest);
+                    }
+                }
+                return (None, pos, werr);
+            },
         }
+        let ghost we = verified_roundtrip::view_expr(where_clause->0);
+        proof {
+            if sized {
+                verified_stmt::lemma_update_view_boundary(table, set@, done, where_clause);
+                verified_stmt::view_assign_pairs_index(done);
+                // The twin unfolds to `assign_list_to_sstmt(table, items_v, Some(we))`.
+                assert(verified_stmt::view_opt(where_clause) == Some(we));
+                assert(verified_stmt_prec::sparse_control_update(input)
+                    == (Some(verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we))),
+                        verified_production::token_views(toks@.subrange(cur as int, toks@.len() as int))));
+                assert(verified_stmt::view_update_arm(table, set@, where_clause)
+                    == verified_stmt_prec::assign_list_to_sstmt(table, items_v, Some(we))) by {
+                    if done.len() == 1 {
+                        assert(items_v[0] == (done[0].0, verified_stmt::view_opt(done[0].1)));
+                    }
+                }
+            }
+        }
+        return (Some(ast::Statement::Update { table, set, where_clause }), cur, None);
     }
 
+    proof {
+        if sized {
+            if cur < toks.len() {
+                verified_roundtrip::token_views_suffix(toks@, cur as int);
+            } else {
+                verified_roundtrip::token_views_len(toks@.subrange(cur as int, toks@.len() as int));
+            }
+            assert(al_rest == verified_production::token_views(
+                toks@.subrange(cur as int, toks@.len() as int)));
+            assert(!(al_rest.len() >= 1
+                && al_rest[0] == verified_production::TokenView::Keyword(Keyword::Where)));
+            verified_stmt::lemma_update_view_boundary(table, set@, done, where_clause);
+            verified_stmt::view_assign_pairs_index(done);
+            assert(where_clause is None);
+            assert(verified_stmt::view_opt(where_clause) == None::<SExpr>);
+            assert(verified_stmt_prec::sparse_control_update(input)
+                == (Some(verified_stmt_prec::assign_list_to_sstmt(table, items_v, None)), al_rest));
+            assert(verified_stmt::view_update_arm(table, set@, where_clause)
+                == verified_stmt_prec::assign_list_to_sstmt(table, items_v, None)) by {
+                if done.len() == 1 {
+                    assert(items_v[0] == (done[0].0, verified_stmt::view_opt(done[0].1)));
+                }
+            }
+        }
+    }
     (Some(ast::Statement::Update { table, set, where_clause }), cur, None)
 }
 
