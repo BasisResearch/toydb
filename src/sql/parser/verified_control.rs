@@ -1,4 +1,3 @@
-
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
@@ -7,16 +6,16 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)]
 use super::parse_error::ParseError;
-#[allow(unused_imports)]
-use super::{Keyword, Token, ast, verified_integer, verified_precedence};
-#[allow(unused_imports)]
-use super::{verified_production, verified_roundtrip, verified_stmt, verified_stmt_prec};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_roundtrip::SExpr;
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_stmt::SStmt;
+#[allow(unused_imports)]
+use super::{Keyword, Token, ast, verified_integer, verified_precedence};
+#[allow(unused_imports)]
+use super::{verified_production, verified_roundtrip, verified_stmt, verified_stmt_prec};
 use crate::sql::types::DataType;
 use std::collections::BTreeMap;
 

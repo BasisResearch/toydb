@@ -1697,7 +1697,6 @@ mod tests {
         );
     }
 
-
     fn int(value: i64) -> Expression {
         Expression::Literal(Literal::Integer(value))
     }

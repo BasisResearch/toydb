@@ -1,22 +1,23 @@
-
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
 #[allow(unused_imports)]
 use vstd::prelude::*;
 
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use super::verified_precedence::sparse_prec;
 #[allow(unused_imports)]
 use super::verified_production::TokenView;
 #[allow(unused_imports)]
 use super::verified_roundtrip::SExpr;
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
-use super::verified_precedence::sparse_prec;
-#[cfg(verus_keep_ghost)]
-#[allow(unused_imports)]
 use super::verified_stmt::{SColumn, SFrom, SStmt};
 #[allow(unused_imports)]
-use super::{Keyword, ast, verified_precedence, verified_production, verified_roundtrip, verified_stmt};
+use super::{
+    Keyword, ast, verified_precedence, verified_production, verified_roundtrip, verified_stmt,
+};
 #[allow(unused_imports)]
 use crate::sql::types::DataType;
 

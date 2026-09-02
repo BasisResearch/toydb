@@ -1,4 +1,3 @@
-
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
@@ -6,30 +5,30 @@
 use vstd::prelude::*;
 
 #[allow(unused_imports)]
+use super::parse_error::ParseError;
+#[allow(unused_imports)]
 use super::verified_expression::{BinaryTag, UnaryTag};
-#[allow(unused_imports)]
-use super::verified_production::TokenView;
-#[allow(unused_imports)]
-use super::verified_roundtrip::SExpr;
-#[allow(unused_imports)]
-use super::verified_stmt::{SColumn, SFrom, SJoinStep, SStmt};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_minparen::{inert, lemma_min, neutral_head, sprint_min, sprint_min_len};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_precedence::sparse_prec;
+#[allow(unused_imports)]
+use super::verified_production::TokenView;
+#[allow(unused_imports)]
+use super::verified_roundtrip::SExpr;
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_roundtrip::printable_se;
+#[allow(unused_imports)]
+use super::verified_stmt::{SColumn, SFrom, SJoinStep, SStmt};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_stmt::{apply_step, fold_joins, from_head, from_steps, is_cross};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_stmt_prec::expr_fuel;
-#[allow(unused_imports)]
-use super::parse_error::ParseError;
 #[allow(unused_imports)]
 use super::{
     Keyword, Token, ast, verified_control, verified_integer, verified_minparen,

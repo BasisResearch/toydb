@@ -1,4 +1,3 @@
-
 #![cfg(test)]
 
 use super::ast::{self, Expression, Literal, Operator, Statement};
@@ -74,7 +73,6 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-
 
 use proptest::prelude::*;
 
@@ -283,7 +281,6 @@ fn statements() -> BoxedStrategy<Statement> {
         .boxed()
 }
 
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -317,7 +314,6 @@ proptest! {
         check_statement(&render_tokens(&tokens));
     }
 }
-
 
 const CONCRETE_SYNTAX_CORPUS: &[&str] = &[
     "SELECT 1 + 2 * 3",

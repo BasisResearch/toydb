@@ -1,4 +1,3 @@
-
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
 
@@ -9,16 +8,16 @@ use vstd::prelude::*;
 
 #[allow(unused_imports)]
 use super::verified_expression::{BinaryTag, UnaryTag};
-#[allow(unused_imports)]
-use super::verified_production::TokenView;
-#[allow(unused_imports)]
-use super::verified_roundtrip::{IsLit, SExpr};
 #[cfg(verus_keep_ghost)]
 #[allow(unused_imports)]
 use super::verified_precedence::{
     binary_assoc_s, binary_prec_s, prefix_prec_s, sparse_atom, sparse_infix_loop,
     sparse_postfix_loop, sparse_prec,
 };
+#[allow(unused_imports)]
+use super::verified_production::TokenView;
+#[allow(unused_imports)]
+use super::verified_roundtrip::{IsLit, SExpr};
 #[allow(unused_imports)]
 use super::{
     Keyword, Token, ast, float_trust, verified_expression, verified_precedence, verified_production,
