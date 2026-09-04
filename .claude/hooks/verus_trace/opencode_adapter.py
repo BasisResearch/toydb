@@ -46,6 +46,31 @@ def _connect(db_path):
     return sqlite3.connect(uri, uri=True)
 
 
+def dump_session_jsonl(db_path, session_id):
+    """The session's raw rows (session, message, part) as JSONL bytes, one
+    `{"table": ..., <columns>}` line each, oldest first — opencode's
+    equivalent of a transcript file, for the local session archive."""
+    conn = _connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = []
+        for table, sql in (
+            ("session", "SELECT * FROM session WHERE id = ?"),
+            ("message", "SELECT * FROM message WHERE session_id = ? "
+                        "ORDER BY time_created ASC, id ASC"),
+            ("part", "SELECT * FROM part WHERE message_id IN "
+                     "(SELECT id FROM message WHERE session_id = ?) "
+                     "ORDER BY time_created ASC, id ASC"),
+        ):
+            for row in conn.execute(sql, (session_id,)):
+                doc = {"table": table}
+                doc.update(dict(row))
+                rows.append(json.dumps(doc, default=str))
+    finally:
+        conn.close()
+    return "".join(r + "\n" for r in rows).encode("utf-8")
+
+
 def parse_session(db_path, session_id):
     """Parse one opencode session into (turns, tool_calls, meta)."""
     conn = _connect(db_path)

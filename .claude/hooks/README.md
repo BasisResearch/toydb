@@ -180,6 +180,21 @@ dashboard keyed to the exact tool call:
    tool_call by the adapters — is the join key the dashboard uses to attach
    captures to transcript entries exactly (no timestamp heuristics).
 
+**Local session archive.** Every capture path also keeps the session
+itself next to its captures, so a session can be rebuilt or re-uploaded
+without the dashboard: `~/.verus-trace/smt/<session_id>/transcript.jsonl.zst`
+(the agent's raw record: the Claude transcript, which Claude Code itself
+deletes after 30 days; the Codex rollout; or, for opencode, the session's
+rows dumped from its SQLite store as JSONL) and `session.json.zst` (the
+envelope as posted), snapshotted on every Stop / idle and written before
+the upload is attempted. The `<tool_use_id>/` dirs beside
+them hold that call's SMT artifacts, so the whole tree is:
+
+    ~/.verus-trace/smt/<session_id>/
+      session.json.zst          envelope (rewritten on every Stop)
+      transcript.jsonl.zst      raw transcript (snapshot on every Stop)
+      <tool_use_id>/            one Verus run: meta.json + *.zst artifacts
+
 The library lives in `verus_trace/smt_capture.py` and is shared by the
 `verus-verify` CI workflow, which uploads the same capture per commit with
 `source=ci` under a synthetic `ci:<run>` session. An empty log dir (cargo
