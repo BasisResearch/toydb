@@ -170,6 +170,45 @@ class SmtCaptureLibTest(unittest.TestCase):
         # transcripts/smt2 first
         self.assertEqual({x["kind"] for x in body["files"]}, {"smt2", "smt_transcript"})
 
+    def test_upload_reads_zstd_artifacts(self):
+        from compression.zstd import compress
+
+        dest = self._collected()
+        path = os.path.join(dest, "m.smt2")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        with open(path + ".zst", "wb") as fh:
+            fh.write(compress(raw))
+        os.remove(path)
+        self.assertTrue(smt.upload(dest, url=self.url, token=TOKEN))
+        (post,) = _Capture.posts
+        f = [x for x in post["body"]["files"] if x["filename"] == "m.smt2"][0]
+        self.assertEqual(f["kind"], "smt2")
+        self.assertEqual(gzip.decompress(base64.b64decode(f["data_b64"])), raw)
+        self.assertEqual(f["sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_archive_session_writes_transcript_and_envelope(self):
+        from compression.zstd import decompress
+
+        tr = os.path.join(self.tmp, "t.jsonl")
+        with open(tr, "w", encoding="utf-8") as fh:
+            fh.write('{"type":"user"}\n' * 50)
+        env_doc = {"session_id": "sess-arc", "tool_calls": [{"tool_use_id": "tu_1"}]}
+        dest = smt.archive_session("sess-arc", env_doc, tr, root=self.tmp)
+        self.assertEqual(dest, os.path.join(self.tmp, "sess-arc"))
+        with open(os.path.join(dest, "transcript.jsonl.zst"), "rb") as fh:
+            self.assertEqual(decompress(fh.read()), open(tr, "rb").read())
+        with open(os.path.join(dest, "session.json.zst"), "rb") as fh:
+            self.assertEqual(json.loads(decompress(fh.read())), env_doc)
+        # Session files never show up as pending captures.
+        self.assertEqual(smt.pending(root=self.tmp), [])
+        # Raw bytes (opencode) take the place of a transcript file.
+        dest = smt.archive_session("sess-arc", None, transcript_bytes=b"{}\n", root=self.tmp)
+        with open(os.path.join(dest, "transcript.jsonl.zst"), "rb") as fh:
+            self.assertEqual(decompress(fh.read()), b"{}\n")
+        # Missing transcript / no envelope is fail-soft, not an error.
+        self.assertIsNotNone(smt.archive_session("sess-arc", None, "/nonexistent", root=self.tmp))
+
     def test_upload_batches_large_captures(self):
         old = smt.BATCH_GZ_BYTES
         smt.BATCH_GZ_BYTES = 64  # force one file per batch

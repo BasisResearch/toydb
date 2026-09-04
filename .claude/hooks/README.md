@@ -162,8 +162,11 @@ triggers, call graphs — not the huge Z3 trace profiles) and ships them to the
 dashboard keyed to the exact tool call:
 
 1. `scripts/verus/verify.sh` logs into a fresh dir under
-   `~/.verus-trace/smt/pending/` and prints `verus-smt-log-dir: <path>` on
-   stderr (opt out: `VERUS_SMT_LOG_DISABLE=1`).
+   `~/.verus-trace/smt/pending/`, zstd's every artifact in place once Verus
+   exits (`x` -> `x.zst`, ~25x smaller; the MCP server does the same) and
+   prints `verus-smt-log-dir: <path>` on stderr (opt out:
+   `VERUS_SMT_LOG_DISABLE=1`). The uploader decompresses transparently, so
+   the wire format and the server are unchanged.
 2. The `PostToolUse` hook (`smt_capture.py`, matcher `Bash|mcp__verus__verify`)
    finds that marker — or an `smt_log_dir` field in the MCP verify result — in
    `tool_response`, moves the dir to
@@ -176,6 +179,21 @@ dashboard keyed to the exact tool call:
    re-runs are idempotent. `tool_use_id` — now persisted on every envelope
    tool_call by the adapters — is the join key the dashboard uses to attach
    captures to transcript entries exactly (no timestamp heuristics).
+
+**Local session archive.** Every capture path also keeps the session
+itself next to its captures, so a session can be rebuilt or re-uploaded
+without the dashboard: `~/.verus-trace/smt/<session_id>/transcript.jsonl.zst`
+(the agent's raw record: the Claude transcript, which Claude Code itself
+deletes after 30 days; the Codex rollout; or, for opencode, the session's
+rows dumped from its SQLite store as JSONL) and `session.json.zst` (the
+envelope as posted), snapshotted on every Stop / idle and written before
+the upload is attempted. The `<tool_use_id>/` dirs beside
+them hold that call's SMT artifacts, so the whole tree is:
+
+    ~/.verus-trace/smt/<session_id>/
+      session.json.zst          envelope (rewritten on every Stop)
+      transcript.jsonl.zst      raw transcript (snapshot on every Stop)
+      <tool_use_id>/            one Verus run: meta.json + *.zst artifacts
 
 The library lives in `verus_trace/smt_capture.py` and is shared by the
 `verus-verify` CI workflow, which uploads the same capture per commit with

@@ -34,6 +34,15 @@ def main():
         sys.stderr.write("[verus-trace] transcript not found: %s\n" % transcript_path)
         return 0
 
+    from verus_trace import smt_capture
+
+    # Local archive first: the raw transcript is kept next to this session's
+    # SMT captures whatever happens to the upload below; the envelope joins
+    # it once built.
+    session_id = hook_input.get("session_id") or ""
+    if session_id:
+        smt_capture.archive_session(session_id, transcript_path=transcript_path)
+
     try:
         from verus_trace import claude_adapter, envelope, mcp_probe
 
@@ -60,6 +69,10 @@ def main():
             mcp_version=mcp_version,
             verus_version=verus_version,
         )
+        smt_capture.archive_session(
+            session_id or env_doc.get("session_id"), env_doc,
+            None if session_id else transcript_path,
+        )
         envelope.post_envelope(env_doc)
     except Exception as exc:
         sys.stderr.write("[verus-trace] capture failed (fail-soft): %s\n" % exc)
@@ -68,9 +81,6 @@ def main():
     # detached background upload (smt_capture.py PostToolUse hook) did not
     # finish. Server-side upserts make retries idempotent.
     try:
-        from verus_trace import smt_capture
-
-        session_id = hook_input.get("session_id") or ""
         uploaded, failed = smt_capture.upload_pending(session_id=session_id or None)
         if uploaded or failed:
             sys.stderr.write(

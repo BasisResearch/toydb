@@ -66,8 +66,9 @@ echo "verus: verifying ${#VERIFY_MODULES[@]} module(s): ${VERIFY_MODULES[*]}" >&
 # directory. The `verus-smt-log-dir:` stderr marker is how the capture layer
 # (.claude/hooks/smt_capture.py on the agent side, the CI workflow on the CI
 # side) finds the directory to key, compress, and upload to the dashboard.
-# Logging costs little (~1s and ~500 MB of scratch on a full run) and the
-# directory is inert if nothing collects it. Opt out: VERUS_SMT_LOG_DISABLE=1.
+# Logging costs little (~1s on a full run); the artifacts are zstd'd in place
+# after the run (~25x smaller, ~20 MB) so the directory is inert and cheap if
+# nothing collects it. Opt out: VERUS_SMT_LOG_DISABLE=1.
 # Override the parent dir with VERUS_SMT_LOG_ROOT (CI does).
 smt_log_args=()
 if [[ "${VERUS_SMT_LOG_DISABLE:-0}" != "1" ]]; then
@@ -85,4 +86,10 @@ fi
 # e.g. --output-json) go AFTER `--` so they reach Verus, not `cargo check`
 # (which rejects unknown flags). Caller args come last so they can override
 # the defaults (e.g. a different --log-dir).
-exec cargo verus focus --lib -- "${module_args[@]}" "${smt_log_args[@]}" "$@"
+rc=0
+cargo verus focus --lib -- "${module_args[@]}" "${smt_log_args[@]}" "$@" || rc=$?
+# Compress the artifacts in place (x -> x.zst); no zstd on PATH leaves them raw.
+if [[ -n "${smt_dir:-}" ]] && command -v zstd >/dev/null 2>&1; then
+  zstd -q --rm -T0 -r "$smt_dir" 2>/dev/null || true
+fi
+exit "$rc"

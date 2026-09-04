@@ -90,7 +90,34 @@ def capture_root():
     return os.path.expanduser("~/.verus-trace/smt")
 
 
+def artifact_name(name):
+    """Logical filename: producers zstd artifacts in place (x -> x.zst)."""
+    return name[:-4] if name.endswith(".zst") else name
+
+
+def _zstd_compress(raw):
+    try:
+        from compression.zstd import compress  # stdlib, Python >= 3.14
+    except ImportError:  # pragma: no cover
+        from zstandard import compress  # pip fallback
+    return compress(raw)
+
+
+def _read_artifact(path):
+    """Raw artifact bytes, transparently decompressing producer-side zstd."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if path.endswith(".zst"):
+        try:
+            from compression.zstd import decompress  # stdlib, Python >= 3.14
+        except ImportError:  # pragma: no cover
+            from zstandard import decompress  # pip fallback
+        raw = decompress(raw)
+    return raw
+
+
 def kind_of(filename):
+    filename = artifact_name(filename)
     for suffix, kind in _KIND_SUFFIXES:
         if filename.endswith(suffix):
             return kind
@@ -231,14 +258,13 @@ def upload(dest, url=None, token=None):
     cur, cur_bytes = [], 0
     for name in names:
         try:
-            with open(os.path.join(dest, name), "rb") as fh:
-                raw = fh.read()
-        except OSError as exc:
+            raw = _read_artifact(os.path.join(dest, name))
+        except Exception as exc:
             _log("unreadable artifact %s: %s" % (name, exc))
             continue
         blob = gzip.compress(raw, 6)
         entry = {
-            "filename": name,
+            "filename": artifact_name(name),
             "kind": kind_of(name),
             "encoding": "gzip",
             "sha256": hashlib.sha256(raw).hexdigest(),
@@ -297,6 +323,42 @@ def upload(dest, url=None, token=None):
         except OSError:
             pass
     return ok
+
+
+def archive_session(session_id, envelope=None, transcript_path=None, root=None,
+                    transcript_bytes=None):
+    """Keep the session itself next to its captures, so a session can be
+    rebuilt or re-uploaded without the dashboard:
+
+        <root>/<session_id>/session.json.zst      the envelope as posted
+        <root>/<session_id>/transcript.jsonl.zst  the agent's raw transcript
+
+    The transcript is a file for Claude (transcript JSONL) and Codex (rollout
+    JSONL), or `transcript_bytes` for opencode (its session rows dumped from
+    the SQLite store as JSONL). Called on every Stop; both files are
+    snapshots and simply overwritten (transcripts are append-only, the
+    envelope upserts). Returns the session dir, or None. Never raises."""
+    try:
+        dest = os.path.join(root or capture_root(), _safe_id(session_id))
+        os.makedirs(dest, exist_ok=True)
+        blobs = []
+        if transcript_bytes is not None:
+            blobs.append(("transcript.jsonl.zst", transcript_bytes))
+        elif transcript_path and os.path.isfile(transcript_path):
+            with open(transcript_path, "rb") as fh:
+                blobs.append(("transcript.jsonl.zst", fh.read()))
+        if envelope is not None:
+            blobs.append(("session.json.zst",
+                          json.dumps(envelope, default=str).encode("utf-8")))
+        for name, raw in blobs:
+            tmp = os.path.join(dest, "." + name + ".tmp")
+            with open(tmp, "wb") as fh:
+                fh.write(_zstd_compress(raw))
+            os.replace(tmp, os.path.join(dest, name))
+        return dest
+    except Exception as exc:
+        _log("session archive failed for %s: %s" % (session_id, exc))
+        return None
 
 
 def pending(session_id=None, root=None):
