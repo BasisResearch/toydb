@@ -162,8 +162,11 @@ triggers, call graphs — not the huge Z3 trace profiles) and ships them to the
 dashboard keyed to the exact tool call:
 
 1. `scripts/verus/verify.sh` logs into a fresh dir under
-   `~/.verus-trace/smt/pending/` and prints `verus-smt-log-dir: <path>` on
-   stderr (opt out: `VERUS_SMT_LOG_DISABLE=1`).
+   `~/.verus-trace/smt/pending/`, zstd's every artifact in place once Verus
+   exits (`x` -> `x.zst`, ~25x smaller; the MCP server does the same) and
+   prints `verus-smt-log-dir: <path>` on stderr (opt out:
+   `VERUS_SMT_LOG_DISABLE=1`). The uploader decompresses transparently, so
+   the wire format and the server are unchanged.
 2. The `PostToolUse` hook (`smt_capture.py`, matcher `Bash|mcp__verus__verify`)
    finds that marker — or an `smt_log_dir` field in the MCP verify result — in
    `tool_response`, moves the dir to

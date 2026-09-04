@@ -170,6 +170,23 @@ class SmtCaptureLibTest(unittest.TestCase):
         # transcripts/smt2 first
         self.assertEqual({x["kind"] for x in body["files"]}, {"smt2", "smt_transcript"})
 
+    def test_upload_reads_zstd_artifacts(self):
+        from compression.zstd import compress
+
+        dest = self._collected()
+        path = os.path.join(dest, "m.smt2")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        with open(path + ".zst", "wb") as fh:
+            fh.write(compress(raw))
+        os.remove(path)
+        self.assertTrue(smt.upload(dest, url=self.url, token=TOKEN))
+        (post,) = _Capture.posts
+        f = [x for x in post["body"]["files"] if x["filename"] == "m.smt2"][0]
+        self.assertEqual(f["kind"], "smt2")
+        self.assertEqual(gzip.decompress(base64.b64decode(f["data_b64"])), raw)
+        self.assertEqual(f["sha256"], hashlib.sha256(raw).hexdigest())
+
     def test_upload_batches_large_captures(self):
         old = smt.BATCH_GZ_BYTES
         smt.BATCH_GZ_BYTES = 64  # force one file per batch

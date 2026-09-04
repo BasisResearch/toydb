@@ -90,7 +90,26 @@ def capture_root():
     return os.path.expanduser("~/.verus-trace/smt")
 
 
+def artifact_name(name):
+    """Logical filename: producers zstd artifacts in place (x -> x.zst)."""
+    return name[:-4] if name.endswith(".zst") else name
+
+
+def _read_artifact(path):
+    """Raw artifact bytes, transparently decompressing producer-side zstd."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if path.endswith(".zst"):
+        try:
+            from compression.zstd import decompress  # stdlib, Python >= 3.14
+        except ImportError:  # pragma: no cover
+            from zstandard import decompress  # pip fallback
+        raw = decompress(raw)
+    return raw
+
+
 def kind_of(filename):
+    filename = artifact_name(filename)
     for suffix, kind in _KIND_SUFFIXES:
         if filename.endswith(suffix):
             return kind
@@ -231,14 +250,13 @@ def upload(dest, url=None, token=None):
     cur, cur_bytes = [], 0
     for name in names:
         try:
-            with open(os.path.join(dest, name), "rb") as fh:
-                raw = fh.read()
-        except OSError as exc:
+            raw = _read_artifact(os.path.join(dest, name))
+        except Exception as exc:
             _log("unreadable artifact %s: %s" % (name, exc))
             continue
         blob = gzip.compress(raw, 6)
         entry = {
-            "filename": name,
+            "filename": artifact_name(name),
             "kind": kind_of(name),
             "encoding": "gzip",
             "sha256": hashlib.sha256(raw).hexdigest(),
