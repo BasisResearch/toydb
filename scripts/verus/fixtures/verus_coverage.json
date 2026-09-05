@@ -1,0 +1,13 @@
+{
+  "func-details": {
+    "toydb::parser::reached_exec": {"failed_proof_notes": []},
+    "toydb::parser::dead_exec": {"failed_proof_notes": []},
+    "toydb::parser::a_spec": {"failed_proof_notes": []},
+    "toydb::parser::a_proof": {"failed_proof_notes": []},
+    "vstd::seq::axiom_seq_len": {"failed_proof_notes": []}
+  },
+  "verification-results": {
+    "verified": 4,
+    "errors": 0
+  }
+}

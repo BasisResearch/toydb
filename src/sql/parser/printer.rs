@@ -75,9 +75,7 @@ pub fn print_expr(expression: &ast::Expression) -> Option<Vec<Token>> {
             tokens.push(Token::CloseParen);
             Some(tokens)
         }
-        ast::Expression::Operator(operator) => {
-            print_core_expr(expression).or_else(|| print_operator(operator))
-        }
+        ast::Expression::Operator(operator) => print_operator(operator),
     }
 }
 
@@ -777,7 +775,7 @@ pub fn print_statement(statement: &ast::Statement) -> Option<Vec<Token>> {
             }
             Some(tokens)
         }
-        ast::Statement::Update { table, set, where_clause } => {
+        ast::Statement::Update { table, set, where_clause, .. } => {
             if set.is_empty() {
                 return None;
             }
@@ -989,7 +987,7 @@ fn print_from(from: &ast::From) -> Option<Vec<Token>> {
 
 #[cfg(test)]
 mod tests {
-    use super::print_expr;
+    use super::{Token, print_expr};
     use crate::sql::parser::Parser;
     use crate::sql::parser::ast::{Expression, Literal, Operator};
     use proptest::prelude::*;
@@ -1000,6 +998,18 @@ mod tests {
 
     fn column(name: &str) -> Expression {
         Expression::Column(None, name.into())
+    }
+
+    fn render_tokens(tokens: &[Token]) -> String {
+        tokens
+            .iter()
+            .map(|token| match token {
+                Token::Ident(name) => format!("\"{}\"", name.replace('"', "\"\"")),
+                Token::String(value) => format!("'{}'", value.replace('\'', "''")),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn roundtrip(expression: Expression) {
@@ -1191,6 +1201,7 @@ mod tests {
             .prop_map(|(table, set, where_clause)| Statement::Update {
                 table,
                 set,
+                order: crate::sql::parser::ast::AssignOrder::placeholder(),
                 where_clause,
             });
         let select_item = prop_oneof![
@@ -1259,6 +1270,22 @@ mod tests {
         }
 
         #[test]
+        fn parser_inverts_the_printer_through_sql_source(expression in expressions()) {
+            let tokens = print_expr(&expression)
+                .expect("the strategy only generates parser-producible expressions");
+            let sql = render_tokens(&tokens);
+            prop_assert_eq!(Parser::parse_expr(&sql), Ok(expression), "diverged for {:?}", sql);
+        }
+
+        #[test]
+        fn parser_inverts_the_statement_printer_through_sql_source(statement in statements()) {
+            let tokens = super::print_statement(&statement)
+                .expect("the strategy only generates parser-producible statements");
+            let sql = render_tokens(&tokens);
+            prop_assert_eq!(Parser::parse(&sql), Ok(statement), "diverged for {:?}", sql);
+        }
+
+        #[test]
         fn canonical_expression_printer_is_injective(
             left in expressions(),
             right in expressions(),
@@ -1282,6 +1309,28 @@ mod tests {
             if left_tokens == right_tokens {
                 prop_assert_eq!(left, right);
             }
+        }
+    }
+
+    #[test]
+    fn source_roundtrip_handles_tricky_identifiers_and_strings() {
+        for expression in [
+            column("select"),
+            column("MixedCase"),
+            column(""),
+            Expression::Column(Some("Order".into()), "By".into()),
+            Expression::Function("count".into(), vec![column("x")]),
+            Expression::Literal(Literal::String("a'b".into())),
+            Expression::Literal(Literal::String("has \" quote".into())),
+            Expression::Literal(Literal::String(String::new())),
+        ] {
+            let tokens = print_expr(&expression).expect("expression should be printable");
+            let sql = render_tokens(&tokens);
+            assert_eq!(
+                Parser::parse_expr(&sql),
+                Ok(expression),
+                "source roundtrip diverged for {sql:?}"
+            );
         }
     }
 
@@ -1464,6 +1513,7 @@ mod tests {
         roundtrip_statement(Statement::Update {
             table: "items".into(),
             set,
+            order: crate::sql::parser::ast::AssignOrder::placeholder(),
             where_clause: Some(predicate("id")),
         });
 
@@ -1541,6 +1591,7 @@ mod tests {
             super::print_statement(&Statement::Update {
                 table: "t".into(),
                 set: BTreeMap::new(),
+                order: crate::sql::parser::ast::AssignOrder::placeholder(),
                 where_clause: None,
             })
             .is_none()
@@ -1647,5 +1698,41 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    fn int(value: i64) -> Expression {
+        Expression::Literal(Literal::Integer(value))
+    }
+
+    #[test]
+    fn min_parens_left_assoc_subtract_unbracketed_reparses_left_nested() {
+        use crate::sql::parser::verified_minparen::print_min_expr;
+        let expr = Expression::Operator(Operator::Subtract(
+            boxed(Expression::Operator(Operator::Subtract(boxed(int(1)), boxed(int(2))))),
+            boxed(int(3)),
+        ));
+        let tokens = print_min_expr(&expr);
+        assert!(
+            !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
+            "1 - 2 - 3 should print with no parentheses, got {tokens:?}"
+        );
+        let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
+        assert_eq!(parsed, expr);
+    }
+
+    #[test]
+    fn min_parens_right_assoc_exponent_unbracketed_reparses_right_nested() {
+        use crate::sql::parser::verified_minparen::print_min_expr;
+        let expr = Expression::Operator(Operator::Exponentiate(
+            boxed(int(2)),
+            boxed(Expression::Operator(Operator::Exponentiate(boxed(int(3)), boxed(int(2))))),
+        ));
+        let tokens = print_min_expr(&expr);
+        assert!(
+            !tokens.iter().any(|t| matches!(t, Token::OpenParen | Token::CloseParen)),
+            "2 ^ 3 ^ 2 should print with no parentheses, got {tokens:?}"
+        );
+        let parsed = Parser::parse_expr_tokens(&tokens).expect("min-parens print should parse");
+        assert_eq!(parsed, expr);
     }
 }

@@ -44,6 +44,6 @@ approval_mode = "approve"
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = '/usr/bin/python3 "$(git rev-parse --show-toplevel)/.codex/hooks/verus_stop.py"'
+command = 'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/verus_stop.py"'
 timeout = 60
 statusMessage = "Uploading Verus session trace"

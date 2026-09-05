@@ -7,6 +7,35 @@ use crate::sql::types::DataType;
 
 verus! {
 
+/// Ghost record of an UPDATE's assignment order, wrapping `Ghost<Seq<String>>`.
+///
+/// A bare `Ghost<Seq<String>>` field cannot live inside a `#[derive(Debug, Eq,
+/// PartialEq)]` type under a plain `cargo build`: outside Verus the `verus!`
+/// macro is a passthrough, so the standard derives see the `Ghost` field and
+/// reject it (`Ghost` implements none of those traits). This newtype carries
+/// hand-written trivial impls (all instances are equal and `Debug`-invisible)
+/// so the derives on `Statement` still apply. The wrapped order is pure ghost
+/// state — erased at runtime, no semantic meaning (SQL SET is unordered).
+pub struct AssignOrder(pub Ghost<Seq<String>>);
+
+impl AssignOrder {
+    /// Construct a placeholder ghost order at a non-proof (external Rust) site.
+    /// The erased runtime value is meaningless; verified construction sites
+    /// supply the real parsed order instead.
+    #[verifier::external_body]
+    pub const fn placeholder() -> Self {
+        AssignOrder(Ghost::assume_new())
+    }
+}
+
+impl View for AssignOrder {
+    type V = Seq<String>;
+
+    open spec fn view(&self) -> Seq<String> {
+        self.0@
+    }
+}
+
 #[verifier::external_type_specification]
 #[allow(dead_code)]
 pub struct ExDataType(DataType);
@@ -66,6 +95,13 @@ pub enum Statement {
     Update {
         table: String,
         set: BTreeMap<String, Option<Expression>>, // column → value, None for default value
+        /// Ghost record of the assignment order as parsed. Erased at runtime
+        /// (SQL SET is unordered; the planner reads `set` as a map and resolves
+        /// columns to indices, so this order never reaches the executor). It
+        /// exists solely so the verified `view_stmt` can canonicalise the
+        /// unordered `set` map into the ordered mirror `Seq` without sorting.
+        /// `order@ : Seq<String>` via `AssignOrder`'s `View`.
+        order: AssignOrder,
         where_clause: Option<Expression>,
     },
     /// SELECT: selects rows, possibly from a table.
@@ -160,6 +196,34 @@ pub enum Direction {
 
 } // verus!
 
+// Trait impls for the ghost `AssignOrder` field. Kept outside `verus!` and
+// hand-written (not derived) so `Statement`'s `#[derive(Debug, Eq, PartialEq)]`
+// resolves under a plain `cargo build`, where `verus!` is a no-op passthrough
+// and the derives would otherwise see the trait-less `Ghost` field. All
+// instances are equal and `Debug`-invisible: the order is pure ghost state with
+// no runtime meaning.
+impl Clone for AssignOrder {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for AssignOrder {}
+
+impl std::fmt::Debug for AssignOrder {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl PartialEq for AssignOrder {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AssignOrder {}
+
 impl Clone for Column {
     fn clone(&self) -> Self {
         Self {
@@ -198,9 +262,10 @@ impl Clone for Statement {
                 columns: columns.clone(),
                 values: values.clone(),
             },
-            Self::Update { table, set, where_clause } => Self::Update {
+            Self::Update { table, set, order, where_clause } => Self::Update {
                 table: table.clone(),
                 set: set.clone(),
+                order: *order,
                 where_clause: where_clause.clone(),
             },
             Self::Select {

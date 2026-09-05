@@ -18,6 +18,7 @@ pub const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 pub uninterp spec fn spec_format(x: f64) -> Seq<u8>;
 pub uninterp spec fn spec_parse(s: Seq<u8>) -> Option<f64>;
 pub uninterp spec fn spec_canonical_nan() -> f64;
+pub uninterp spec fn spec_infinity() -> f64;
 
 /// Models the production f64 formatter and parser without exposing their
 /// implementation to the verified parser.
@@ -89,6 +90,13 @@ pub fn canonical_nan() -> (r: f64)
         r.to_bits_spec() == CANONICAL_NAN_BITS,
 {
     f64::NAN
+}
+
+#[verifier::external_body]
+pub fn infinity() -> (r: f64)
+    ensures r == spec_infinity(),
+{
+    f64::INFINITY
 }
 
 /// Connects bit equality to Verus equality for the one NaN payload admitted

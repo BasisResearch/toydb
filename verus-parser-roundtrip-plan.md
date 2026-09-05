@@ -1,7 +1,289 @@
 # toyDB SQL parser: Verus roundtrip verification plan
 
-Status: **LEXER + TOKEN-STREAM CUTOVER LANDED (2026-08-28)** — the production
-`Lexer`/`Parser` now run on the verified surface and the full suite is green.
+Status: **PARSER CUTOVER IN PROGRESS (2026-08-28)** — branch
+`kg/verified-parser-cutover`, tracked in `verus-parser-cutover-prompt.md`.
+Supersedes the old "Phase 4 — production cutover" sketch below (which assumed
+swapping in the canonical `parse_expr_exec`/`parse_stmt_exec`; those accept only
+fully-parenthesised forms, so a straight swap would regress the concrete SQL
+suite). New strategy and progress:
+
+- **Proof target (settled with the user):** Verus proves the production exec
+  parser no-panic / no-overflow / terminating, plus a roundtrip anchor. Real
+  equivalence to the trusted legacy parser is *differential*, not proven — the
+  legacy parser has no formal spec, and `parse(print(e))==e` only pins the
+  parser on the printer's range, never on precedence in concrete SQL (`a-b-c`).
+  **Precedence caveat (important):** the min-parens round-trip does NOT pin
+  precedence to SQL, because the printer's precedence tables are *proved equal*
+  to the parser's tables (`verified_minparen::tables_agree`). The theorem shows
+  "the parser inverts the printer", not "the parser implements SQL's precedence"
+  — a consistent permutation of all precedence tables (a consistent-triple-swap)
+  would still verify. Conformance to real SQL precedence rests on the
+  `cfg(test)` differential oracle and the goldenscripts, not on the round-trip.
+  Both parsers stay compiled; legacy is the oracle.
+- **Types gap already closed:** exec parsers emit production `ast` directly
+  (mirror only in specs via `view_expr`/`view_stmt`); no boundary conversion.
+- **Precedence strategy:** port parser.rs's precedence climbing 1:1 into Verus
+  (not Pratt — avoids associativity divergence from the oracle).
+- **Phase 0** — plan + coverage table + strategy, signed off.
+- **Phase 1 DONE** (`6de8551`): `sql::parser::differential` (test-only). Diffs
+  legacy vs a verified-path seam on every SQL line in `src/sql/testscripts/**`
+  (wired into both goldenscript runners), plus proptest generators and fixed
+  concrete corpora.
+- **Phase 2.1 DONE** (`29c5ca2`): `sql::parser::verified_precedence` — Verus
+  1:1 port of the precedence-climbing parser → `ast::Expression` over
+  `super::Token`. No-panic/overflow/termination proven; the seam is repointed
+  at it, so it now parses every expression under test. Green: 26 expr
+  goldenscripts (incl. op_precedence), 256-case proptest, 35 concrete cases;
+  verify.sh 19 modules / 0 errors. Added `float_trust::infinity()`.
+- **Phase 2.2 (hard goal, user-promoted) — COMPLETE (2026-08-28).** roundtrip-(a)
+  for the precedence parser — `parse(print(e))==e` — is proven end to end, 48
+  verified / 0 errors, axiom-free beyond the pre-existing float trust. The headline
+  `print_parse_roundtrip` (commit `ebbf272`; the exec wrapper was deleted in the
+  2026-09-02 delete-twins cleanup — the theorem content lives in
+  `parse_expression_full`'s refinement `ensures` + `lemma_prec`) proves
+  `view_expr(parse_expression(print_expr_exec(e))) == view_expr(e)` for any printable
+  `e`: the verified precedence-climbing parser provably inverts the canonical printer.
+  Path: spec model (Brick 1) + spec-level roundtrip `lemma_prec` (Brick 3) + full
+  exec→spec refinement of `parse_expression_at`/`parse_atom`/`parse_function_call`
+  (Brick 2, commit `ada869a`) + composition (`parse_expression` refinement `ensures`
+  + `lemma_prec`, fuel `2*len+3`). `verify.sh` green; `cargo build` clean. Brick
+  details below (historical):
+- **Phase 3 (production cutover) — COMPLETE (2026-08-29).** Expressions and every
+  statement kind now run on the verified parser in production. ~~**Legacy fully
+  retired (2026-08-29).**~~ **CORRECTED (Phase 0, 2026-08-31): the legacy parser
+  and differential harness were restored as `#[cfg(test)]` oracles** — see the
+  accuracy note under Phase 4. Running on the verified parser does *not* mean the
+  concrete behaviour is verified: Verus proves no-panic / no-overflow /
+  termination across the whole grammar, a functional spec (refinement to
+  `sparse_prec`) at the *expression* level only, and print/parse round-trip only
+  on the fully-parenthesised range. The statement grammar is **partially**
+  functionally specified as of 2026-08-31: `verified_stmt_prec` carries spec
+  twins (`sparse_control_*`) whose expression positions are `sparse_prec`, and
+  `parse_delete_at` / `parse_drop_at` / `parse_begin_at` / `parse_order_by_at` /
+  `parse_group_by_at` plus the `CREATE TABLE` pair `parse_create_at` /
+  `parse_create_column_at` (milestone 2b) are proven to refine their twins up to
+  `view_stmt` / `view_order_list` / `view_column` / `view_args` (so those
+  clauses' concrete AST *is* verified, not just goldenscript-pinned; e.g.
+  dropping a column's `PRIMARY KEY` / `NOT NULL` flag now breaks verification).
+  ~~The top-level dispatch `parse_control_at` and
+  the remaining clause parsers (SELECT list, FROM join tree, INSERT rows, UPDATE
+  assignments, EXPLAIN) still have no functional spec; their
+  concrete behaviour is pinned only by the goldenscripts and the restored
+  differential oracle.~~ **SUPERSEDED:** phase 2's later milestones added the
+  SELECT list, FROM join tree, INSERT, and UPDATE refinements, and phase 6
+  (below) closed the dispatch, the composed SELECT, and EXPLAIN.
+
+- **Phase 6 (statement-level composition + min-parens statement roundtrip) —
+  COMPLETE (2026-09-02, branch
+  `kg/parser-fix-phase-6-stmt-roundtrip`).** Every statement parser now carries
+  a full functional spec: `sparse_control_select` composes the per-clause twins
+  (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET — the
+  optional keyword-expression clauses via `sparse_control_kw_expr`) and
+  `parse_select_at` refines it; `sparse_control` is the top-level keyword
+  dispatch (COMMIT/ROLLBACK inline) with `sparse_control_explain` for the
+  EXPLAIN mutual recursion, refined by `parse_control_at` / `parse_explain_at`
+  — a dispatch swap (e.g. INSERT routed to the DELETE parser) now fails
+  verification. New module `verified_minparen_stmt`: the min-parens statement
+  printer (spec `sprint_min_stmt`, exec `print_min_stmt` whose token view
+  refines it) whose expression positions are `verified_minparen::sprint_min(e,
+  0)`, and the statement roundtrip theorems `stmt_min_roundtrip` (spec:
+  `sparse_control(sprint_min_stmt(s)) == (Some(s), empty)` for every
+  `printable_stmt` mirror statement) and `stmt_min_roundtrip_live` (exec:
+  `parse_control_at(print_min_stmt(s))` recovers `s` up to `view_stmt`,
+  consuming every token). Enabler: `verified_minparen::inert` gained a
+  `neutral_head` disjunct so clause keywords (`FROM`, `AS`, `ASC`, join
+  keywords, ...) are inert expression tails. The differential harness gained
+  `statement_parsers_agree_minparens`, driving generated statements through
+  the min-parens printer so bare-precedence clause syntax reaches the oracle
+  comparison. Printable-domain notes for THIS round-trip theorem (not parser
+  limits): an UPDATE is printable only with a single assignment (`view_stmt`
+  collapses multi-assignment maps here), EXPLAIN wraps a non-EXPLAIN statement,
+  and grammar-mandated one-or-more lists must be non-empty. (Multi-assignment
+  UPDATE is nonetheless functionally specified — see Phase 8 above.)
+
+- **Delete-twins cleanup — COMPLETE (2026-09-02,
+  branch `kg/parser-fix-phase-4-cleanup`).**
+  The dead verified twins are deleted; **the round trip is carried by the live
+  parser path, not by the exec twins named in the historical sections below.**
+  Gone: `verified.rs` (the Phase-0 proving ground, whole module);
+  `verified_stmt`'s executable layer (`parse_stmt_exec` / `parse_stmt_full_exec`
+  / `print_stmt_exec` / `print_parse_roundtrip_stmt*`, the mirror printer
+  `sprint_stmt` and its roundtrip lemmas, and the `axiom_string_key_obeys_cmp`
+  trust entry that served only them — `verified_stmt` keeps the spec mirror
+  `SStmt` / `view_stmt` / `sparse_stmt` that the live refinement proofs
+  consume); `verified_lexer`'s exec twin (`lex_all_exec` / `lex_mtok_exec` and
+  the per-class exec scanners; the spec scanners, locality lemmas, spec-level
+  roundtrip theorems and the production-called `scan_symbol_bytes` stay);
+  `verified_roundtrip`'s fully-parenthesised exec layer (`parse_expr_exec` /
+  `print_expr_exec` / wraps; `print_lit_exec` stays for `verified_minparen`);
+  `verified_function_list`'s exec demo; `verified_precedence`'s single-shot
+  `parse_expression` demo entry and exec-carried `print_parse_roundtrip`
+  wrapper; `encoding::keycode`'s caller-less bool codec pair. Current carriers
+  of the guarantees: `parse_expression_full` (refines `sparse_prec`, which
+  `lemma_prec` proves inverts `sprint`), the `verified_control` /
+  `verified_stmt_prec` statement refinements, and `verified_minparen`'s
+  min-parens roundtrip (`min_roundtrip` / `min_roundtrip_live`). References to
+  the deleted items in the sections below are historical record; git remembers.
+
+- **Phase 8 (multi-assignment UPDATE specified) — COMPLETE.** `UPDATE`'s
+  multi-assignment `SET` list now carries a functional spec (not just the
+  single-assignment case): the set-list twin roundtrips over the `view_map`
+  headline, so a multi-assignment `UPDATE` is a specified, verified statement.
+  (Historical S4/S5-Update sections below already record the underlying
+  `BTreeMap` / `view_map` machinery.) NOTE: this means the Phase 6 note that "an
+  UPDATE is printable only with a single assignment" describes the *min-parens
+  printer's* `printable_stmt` domain, NOT a limit on what the parser specifies.
+
+- **Phase 9 (`<>` operator + input-driven differential) — COMPLETE.** Restored
+  the `<>` spelling of `NotEqual` (alongside `!=`) through the lexer, verified
+  parser, and printer. The `#[cfg(test)]` differential harness is input-driven:
+  it feeds generated / corpus SQL strings (proptest + fixed corpora) through
+  both the verified path and the legacy oracle and compares — including the
+  min-parens-printed forms so bare-precedence syntax reaches the oracle.
+
+- **Phase 10a (legacy parser genuinely `#[cfg(test)]` + depth guard) —
+  COMPLETE.** The legacy recursive-descent parser (`StreamingParser` and its
+  methods) is now genuinely `#[cfg(test)]`-gated — it is compiled out of the
+  shipped binary and exists only as the differential oracle; production
+  `Parser::parse` calls the verified `parse_control_at` directly with no legacy
+  fallback. Added `MAX_NESTING_DEPTH` (256): a cheap O(n) pre-check rejecting
+  pathologically deep parenthesization with a clean error instead of recursing
+  into a stack overflow (observed to abort the process near depth ~937). This
+  changes behaviour only for input deeper than any real query, goldenscript, or
+  corpus case.
+
+- **Phase 4 (error production + legacy retirement) — COMPLETE (2026-08-29).** The
+  verified parser now produces its own rejection errors and the legacy
+  recursive-descent parser is deleted outright. New `sql::parser::parse_error`:
+  a `ParseError` data enum (in `verus!`) covering all 14 legacy rejection
+  messages, with an untrusted `render()` (outside `verus!`, where `format!` is
+  available) reproducing the exact `Error::InvalidInput` string. Threaded an
+  `Option<ParseError>` as a 3rd return component through `verified_precedence`
+  (expression parser — `.0`/`.1` unchanged so the 48-verified roundtrip proof is
+  untouched; new `parse_expression_full` entry) and all 15 `verified_control`
+  functions, each failure site mapped to the legacy `errinput!` it mirrors
+  (EOF-vs-wrong-token guards split). `Parser::parse`/`parse_expr` render that
+  error directly — no legacy fallback. Confirmed byte-identical via the
+  differential harness upgraded to compare error *messages* (green across
+  proptest + corpus), then **deleted the legacy parser**: all `StreamingParser`
+  recursive-descent methods + operator types, the `parse_legacy`/`parse_expr_legacy`
+  oracles, the differential harness, and the streaming `TokenStream`/
+  `SliceTokenStream`. `parse_expr_tokens`/`parse_statement_tokens` (printer
+  roundtrip proptests) reimplemented on the verified parser. Coverage now rests on
+  the Verus proofs + printer roundtrip proptests + goldenscripts. Gates: verify.sh
+  green (21 modules), cargo build/clippy warning-free, 313 lib + 5 goldenscript
+  integration tests green. Commits `63abf41` (error channel), `2b0da3e` (wire
+  production), `fd10b3c` (differential error-equivalence), `56b67cf` (delete
+  legacy), `df25a7e` (docs).
+  - Residual: the verified parser's reject *control flow* can differ from the old
+    parser on a few untested malformed corners (e.g. `a IS <bad>` halts + trailing
+    error vs erroring inside), since only accept-equivalence + the tested error
+    corpus were pinned; every goldenscript-exercised error string matches exactly.
+  - **CORRECTED (Phase 0, 2026-08-31).** The claim above — "then **deleted the
+    legacy parser** … the differential harness … `TokenStream`/`SliceTokenStream`"
+    — was reverted: the legacy recursive-descent parser (`parse_legacy` /
+    `parse_expr_legacy`), the differential harness, and the streaming/slice sources
+    are back as `#[cfg(test)]` oracles, and the goldenscript per-line hooks are
+    restored. Production is unchanged (`parse_control_at` is still the sole prod
+    parser). Reason: the verified parser's contract is only no-panic / termination
+    / error-on-reject plus an *expression-level* functional spec — a precedence
+    swap and a DESC-parses-as-Ascending bug both verify clean, and outside the
+    goldenscripts only the differential oracle catches them. The `a IS <bad>`
+    residual above is now the one explicitly-encoded, accepted error-message
+    exemption in the harness (`is_accepted_error_divergence`). The oracle stays
+    until stronger statement-level specs land (plan phases 2-3).
+
+  Historical detail of the earlier (expression + statement) cutover follows.
+  - **`Parser::parse_expr` CUT OVER (commit `f25e31b`).** It now parses via
+    `verified_precedence::parse_expression`; the legacy recursive-descent parser is
+    retained as `Parser::parse_expr_legacy` (the differential oracle). Rejection
+    error *text* (which the verified parser can't produce — it returns `Option`) is
+    delegated to legacy on the `None` path, so the `expressions` goldenscripts (which
+    capture exact error strings, e.g. i64 overflow) stay byte-identical. Not a parse
+    fallback: every accepted expression is parsed by the verified parser. Full
+    `cargo test` green (317 lib + goldenscript integration), fmt clean.
+  - **Statement-path expression cutover DONE (commit `2398110`).** The PRODUCTION
+    `Parser::parse` (used by `Session::execute`) now parses every embedded expression
+    (all 16 `self.parse_expression()` sites) via the verified `parse_expression_at`.
+    New `BufferedTokenStream` (owns the lexed `Vec<Token>`, index cursor) +
+    `PeekStream::buffer()`/`set_pos`; `parse_expression` runs the verified parser at
+    the cursor and advances by the consumed count. The streaming `TokenStream` is now
+    test-only, retained with `Parser::parse_legacy` as the differential oracle
+    (`check_statement` compares them). The eager-lex error-timing risk did NOT bite —
+    full `cargo test` (317 lib + queries/isolation/anomalies goldenscripts) green, fmt
+    + clippy clean, build warning-free. So the verified precedence parser now runs in
+    production for EVERY expression (bare and inside every statement kind).
+  - **STATEMENT STRUCTURE CUTOVER — COMPLETE (2026-08-29, `verified_control.rs`, 27
+    verified / 0 errors).** `Parser::parse` now routes EVERY statement kind through a
+    verified concrete statement parser. `verified_control::parse_control_at(toks, pos)`
+    is the entry point; `parse_statement` tries it over the buffered token stream and
+    advances by the consumed count, falling to legacy only for a malformed form's error
+    text (zero untracked accept-path fallbacks). Ports landed one kind per commit:
+    BEGIN/COMMIT/ROLLBACK (`29c5ca2`-era control), DROP TABLE (`2902403`), DELETE
+    (`5698157`), INSERT (`f63c386`), UPDATE (`1ea2aae`, BTreeMap via vstd
+    contains_key/insert), CREATE TABLE (`ad5bd9d`, full column defs), SELECT
+    (`de862aa`, full clause set + FROM join tree), EXPLAIN (`5634993`, mutually
+    recursive with the entry point via a lexicographic `(len-pos, phase)` measure).
+    Each is a 1:1 port of its `parser.rs` routine, proven no-panic / no-overflow /
+    terminating (bounded clause loops `decreases toks.len()-cur`), with all embedded
+    expressions parsed by `verified_precedence::parse_expression_at` under a guarded
+    fuel computation. Equivalence is differential (proptest over all kinds incl. joins
+    + Explain nesting, plus the concrete-syntax corpus), same contract as
+    `verified_precedence`. Gates: 633 verified across all modules, 317 lib + 5
+    goldenscript integration tests, differential harness, fmt + clippy clean.
+    (`verified_stmt.rs`'s `parse_stmt_full_exec` — over the MIRROR types,
+    domain-restricted to `printable_stmt` — was the canonical roundtrip proof, NOT this
+    concrete-grammar cutover; the two are independent.)
+  - **Brick 1 DONE — spec model.** `sparse_prec` / `sparse_atom` /
+    `sparse_infix_loop` / `sparse_postfix_loop` / `sparse_fn_args[_nonempty]`: a
+    pure-recursion model of the hybrid exec (whose 3 inner `while` loops terminate
+    on token count, not fuel). Lexicographic `(fuel, phase)` measure. Added spec
+    twins of the precedence tables + `float_trust::spec_infinity`.
+  - **Brick 3 (spec half) DONE — the precedence induction.** `lemma_atom`
+    (primary, `decreases e`) + `lemma_prec` + `lemma_fn_args[_nonempty]` +
+    `infix_step_binary` / `postfix_step_*` + halt lemmas prove
+    `sparse_prec(sprint(e)+tail) == (Some(e), tail)` for a prec-boundary tail. Key
+    fact confirming the plan's warning: an operand's tail is always `)` / `,` /
+    `!` / `IS` / a single operator, so each loop does ≤1 productive step and
+    precedence never diverges — the naive tail statement is false only for *atom*
+    lhs positions, handled by splitting `lemma_atom` (weaker `boundary` tail, loops
+    may fire) from `lemma_prec` (`prec_boundary` tail, loops halt). Fuel bounds are
+    print-length-based (`fuel >= sprint(e).len()[+1]`) so they compose with the
+    exec's `toks.len()+1`. `lemma_atom` carries `spinoff_prover` + `rlimit(20000)`.
+  - **Brick 2 IN PROGRESS — exec→spec refinement.** Loop building blocks DONE and
+    committed green (`39fd949`, `58f431b`, `a386ebf`; 33 verified / 0 errors):
+    `build_postfix` functional spec (`view_expr(r) == postfix_view(op, view(lhs))`);
+    `parse_postfix_at` fully refined (`forall lhs. sparse_postfix_loop(lhs,
+    views(pos), mp) == postfix_after(r, ...)` — the invariant-preservation fact for
+    both postfix passes); the reusable `token_views_shift` (multi-step
+    `token_views_suffix`); and `lemma_infix_step` / `lemma_infix_stop`. So every one
+    of `parse_expression_at`'s three loops has its step+stop proven.
+    Suffix-monotonicity (`a81e553`, 39v) and fuel-stability (`b23228b`, 44v) now
+    landed (both first try): `lemma_*_slen` (output suffix ≤ input) and `lemma_*_fuel`
+    (`sparse_X(input,f)==sparse_X(input,g)` for `f,g >= 2*len+c`).
+    *Assembly (remaining):* give the three exec fns the same-fuel refinement `ensures`
+    under a `fuel >= 2*len+3` precondition — then fuel stays generous enough that
+    stability applies at every infix step (each step drops `2*len` from the
+    requirement but only 1 from fuel, so the invariant `gfuel >= 2*views(cur).len()+3`
+    holds throughout). Loop invariants use `parse_postfix_at`'s ensures +
+    `lemma_infix_step`/`_stop` + `postfix_halt`. Balanced input (incl. every canonical
+    print) fits in `len+1`, so bumping `parse_expression`'s fuel to `2*len+3` is
+    behaviour-preserving; the headline `parse_expression(print(e)) == Some(e)` then
+    follows via `print_expr_exec` (`token_views==sprint`) + `lemma_prec`.
+- **Phases 3+:** per statement kind route `parse_new` off legacy (with logged,
+  tracked fallback), close surface variants (bare aliases, join types, optional
+  keywords), then flip `Parser::parse`/`parse_expr`; zero untracked fallbacks.
+
+Status: **LEXER + TOKEN-STREAM CUTOVER LANDED (2026-08-28)** — the full suite is
+green. **CORRECTED (2026-09-02): the claim that "the production `Lexer`/`Parser`
+now run on the verified surface" is only partly true.** For the *parser*,
+`Parser::parse` does go straight through the verified `parse_control_at`. For the
+*lexer*, only `scan_symbol_bytes` (in `verified_lexer`) and `scan_number_bytes`
+(in `lexer.rs`) actually run verified; the rest of the production `Lexer`'s
+string→token stage — whitespace handling, identifier/keyword runs, quoted
+strings — is plain Rust. The parser's functional guarantees are therefore stated
+at the *token* level; the string→token stage is outside them. Also note
+`sql::parser::parser` itself is unverified glue (not in `VERIFY_MODULES`).
 `Token::Number` is `Vec<u8>`; `Lexer::scan_symbol` routes through the verified
 `verified_lexer::scan_symbol_bytes` and numbers through `scan_number_bytes`;
 identifiers/keywords fold case via the `unicode_trust` model; literals parse via
@@ -138,8 +420,8 @@ verified parser to the full production grammar:
    keyword prefixes threaded through `sprint_from`/`sparse_from`).
 3. **Multi-assignment Update** — the sorted-`iter()` bridge over `Map` equality
    (the general case `extract_one_entry` was built for the singleton).
-4. **Byte-cursor lexer** — `verified.rs::next_token` as it stands is a **Phase 0
-   toy** (its own 25-variant `Token`; single-digit integers via `b-48`,
+4. **Byte-cursor lexer** — `verified.rs::next_token` (module deleted in the
+   2026-09-02 delete-twins cleanup) was a **Phase 0 toy** (its own 25-variant `Token`; single-digit integers via `b-48`,
    single-byte keywords `t`/`f`/`n`), so it cannot tokenize real SQL. Item 4 is
    therefore "build a production-capable verified byte-cursor lexer" (multi-char
    numbers, identifiers, quoted strings, the full `Keyword` set) plus the
@@ -512,8 +794,10 @@ landed in `src/sql/parser/verified_roundtrip.rs` (opted into `verify.sh`,
   `print_parse_roundtrip_exec` (fully self-contained), and
   `roundtrip_injective`.
 
-Trust surface is unchanged: the only axioms are the three `float_trust`
-assumptions. Everything else is axiom-free.
+Trust surface at the time of E0-E4 was the `float_trust` assumptions only; it has
+since grown (the `String`-law axioms for `UPDATE`'s `BTreeMap`, the
+`unicode_trust` model, and the `ExDataType` external type spec). See the
+corrected "Trust surface (audited)" section for the current accounting.
 
 The expression headline is fuel-free: `print_expr_exec` recurses on the ghost
 measure `sdepth(view_expr(*e))` (a `decreases` may be ghost even for exec code),
@@ -585,18 +869,20 @@ ordered by container difficulty rather than by statement kind.
 
 ### Phase 4 — production cutover (independent of S0-S5)
 
-Replace the two `std::iter::Peekable`s with the verified cursors so the verified
-functions become the production functions (coverage numerator up, denominator
-flat):
+**SUPERSEDED (2026-08-28).** See the "PARSER CUTOVER IN PROGRESS" status block
+at the top of this file. The sketch below is wrong: it swaps in the canonical
+`parse_expr_exec`/`parse_stmt_exec`, which accept only fully-parenthesised
+forms and would regress the concrete SQL suite (`GROUP BY`, `a + b * c`, bare
+aliases, …). The real cutover builds a *new* verified precedence-climbing parser
+accepting the full concrete grammar, gated by a differential harness against the
+retained legacy parser. Original (obsolete) sketch:
 
-- `Lexer.chars : Peekable<Chars>` -> the byte cursor `next_token(&[u8], pos)`
-  from `verified.rs`.
-- `Parser.lexer : Peekable<Lexer>` -> the `TokenStream` / `PeekStream` leaf.
-- Swap `parse.rs`'s recursive-descent expression/statement parsers for
-  `parse_expr_exec` / `parse_stmt_exec`, and delete the std-iterator plumbing.
-- Run the existing SQL suite green. Budget the ripple onto `verified_production`
-  / `verified_statements` (the spec-parser-backed statement proofs) — migrate
-  them onto the executable parser, then retire the spec parser.
+- ~~`Lexer.chars : Peekable<Chars>` -> the byte cursor `next_token(&[u8], pos)`.~~
+- ~~`Parser.lexer : Peekable<Lexer>` -> the `TokenStream` / `PeekStream` leaf.~~
+- ~~Swap `parse.rs`'s recursive-descent parsers for `parse_expr_exec` /
+  `parse_stmt_exec`, and delete the std-iterator plumbing.~~
+- ~~Run the existing SQL suite green; migrate the spec-parser proofs, then retire
+  the spec parser.~~
 
 ### Phase 5 — optional refinements
 
@@ -615,7 +901,11 @@ Prove `parse(print(e)) == e` (print-parse roundtrip, "Style B") for parser-produ
 
 - keeping the parser **streaming** (single pass, O(1) token buffer, no `Vec<Token>` materialisation),
 - shipping a **single implementation** (no digital twin, no differential test),
-- keeping the **trusted surface tiny and audited** (one file, three float assumptions; everything else axiom-free).
+- keeping the **trusted surface small and audited** (see the corrected "Trust
+  surface (audited)" section below — it spans `float_trust.rs`,
+  `unicode_trust.rs`, two `String`-law axioms in `verified_stmt.rs`, and the
+  `ExDataType` external type spec; the "one file, three float assumptions"
+  framing here was the original aspiration, not the shipped reality).
 
 This grows the verified coverage surface in the pure-logic style already proven to work in
 this repo (keycode), on code entirely disjoint from `storage/mvcc.rs`.
@@ -765,18 +1055,29 @@ uninterpreted `spec_display`/`spec_parse`, the axiom relating them, and that `f6
 bit-equality (to match toyDB's `to_bits` `Literal` equality). Integer literals get a **native** exact
 proof (`parse_i64(display_i64(n)) == n`), no trust.
 
-## Trust surface (audited, small)
+## Trust surface (audited)
 
-Exactly three assumptions, all in `float_trust.rs`:
+**CORRECTED (2026-09-02).** The original "exactly three assumptions, all in
+`float_trust.rs`, everything else axiom-free" claim (and its `display_f64`
+helper) is stale — the trust surface is larger and spread across several files.
+Counts below were verified by grep against this commit:
 
-1. `display_f64` / `parse_f64` faithfully model `<f64 as Display>` / `<f64 as FromStr>`.
-2. `axiom_f64_finite_roundtrip` (true, but trusts rustc's formatter/parser instead of proving them).
-3. `f64` spec-equality is bit-equality.
+- **`float_trust.rs`** — 4 `uninterp spec fn` + 2 `axiom` proof fns
+  (`axiom_canonical_nan`, `axiom_f64_finite_roundtrip`) + 7
+  `#[verifier::external_body]` items (the two axiom bodies plus 5 modelling
+  wrappers; there is no `display_f64` — the sketch's name for it never landed).
+- **`unicode_trust.rs`** — 3 `uninterp spec fn` + 3 `#[verifier::external_body]`
+  items (the whitespace / case-fold model the production lexer uses for
+  non-ASCII).
+- **`verified_stmt.rs`** — 2 axioms: `axiom_string_obeys_cmp` and
+  `axiom_string_concrete_eq` (`String`'s `Ord`/equality laws, needed for the
+  `BTreeMap` set of `UPDATE`).
+- **`ast.rs`** — the `ExDataType` `#[verifier::external_type_specification]`
+  (an external type spec for `DataType`).
 
-Everything else (the `PeekStream` contract, the `TokenStream` leaf, the parser, all
-integer/string/bool/null literals, the whole roundtrip proof) is fully verified with no axioms.
-Review rule: any new `PeekStream` implementer must be verified Rust; an `external_body` implementer
-would silently re-introduce trust.
+Everything else (the parser, the roundtrip proofs, integer/bool/null literals)
+is verified without further axioms. Review rule: any new `external_body` /
+`uninterp` / `axiom` grows this surface and must be audited.
 
 ## Properties delivered
 

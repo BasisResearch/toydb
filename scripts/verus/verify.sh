@@ -27,19 +27,24 @@ VERIFY_MODULES=(
   sql::parser::ast
   sql::parser::float_trust
   sql::parser::lexer
+  sql::parser::parse_error
   sql::parser::printer
   sql::parser::unicode_trust
-  sql::parser::verified
+  sql::parser::verified_control
   sql::parser::verified_expression
   sql::parser::verified_lexer
   sql::parser::verified_function_list
   sql::parser::verified_integer
   sql::parser::verified_lists
+  sql::parser::verified_minparen
+  sql::parser::verified_minparen_stmt
+  sql::parser::verified_precedence
   sql::parser::verified_production
   sql::parser::verified_roundtrip
   sql::parser::verified_simple_statement
   sql::parser::verified_statements
   sql::parser::verified_stmt
+  sql::parser::verified_stmt_prec
 )
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

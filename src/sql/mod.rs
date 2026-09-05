@@ -207,6 +207,8 @@ mod tests {
             let input = &command.name;
             let mut tags = context.tags.clone();
 
+            super::parser::differential::check_statement(input);
+
             // Output the plan if requested.
             if tags.remove("plan") {
                 let ast = Parser::parse(input)?;
@@ -316,6 +318,8 @@ mod tests {
             }
             let input = &command.name;
             let mut tags = context.tags.clone();
+
+            super::parser::differential::check_expression(input);
 
             // Parse and build the expression.
             let ast = Parser::parse_expr(input)?;

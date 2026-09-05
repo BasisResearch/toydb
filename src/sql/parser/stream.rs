@@ -1,9 +1,15 @@
 //! Streaming token lookahead for the SQL parser.
 
+#[cfg(test)]
 use super::{Lexer, Token};
+#[cfg(test)]
 use crate::error::Result;
 
 /// A token source with one-token lookahead.
+///
+/// Only the legacy `cfg(test)` differential-oracle parser consumes tokens
+/// through this trait; production parsing operates on a `Vec<Token>` directly.
+#[cfg(test)]
 pub(crate) trait PeekStream {
     /// Returns the next token without consuming it.
     fn peek(&mut self) -> Result<Option<&Token>>;
@@ -18,11 +24,13 @@ pub(crate) trait PeekStream {
 ///
 /// - `lookahead` contains at most one token or lexer error.
 /// - Peeking never advances past the cached item.
+#[cfg(test)]
 pub(crate) struct TokenStream<'a> {
     lexer: Lexer<'a>,
     lookahead: Option<Result<Option<Token>>>,
 }
 
+#[cfg(test)]
 impl<'a> TokenStream<'a> {
     /// Creates a token stream over `input`.
     pub(crate) fn new(input: &'a str) -> Self {
@@ -34,6 +42,7 @@ impl<'a> TokenStream<'a> {
     }
 }
 
+#[cfg(test)]
 impl PeekStream for TokenStream<'_> {
     fn peek(&mut self) -> Result<Option<&Token>> {
         if self.lookahead.is_none() {

@@ -172,41 +172,11 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
 // --- Verus-verified core of the bool key encoding --------------------------
 //
 // A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
-// `serialize_bool` / `deserialize_bool`). The round trip is trivial but we
-// state it so the encoder/decoder are pinned to the same byte convention.
 
 /// The single-byte key for a bool: 1 for true, 0 for false.
 pub open spec fn bool_key(b: bool) -> u8 {
     if b { 1u8 } else { 0u8 }
 }
-
-/// Executable encoder, proven to compute `bool_key`.
-pub fn encode_bool_key(b: bool) -> (r: u8)
-    ensures r == bool_key(b),
-{
-    if b { 1u8 } else { 0u8 }
-}
-
-/// Executable decoder, proven to invert the encoding for the two valid bytes.
-pub fn decode_bool_key(byte: u8) -> (r: bool)
-    requires byte == 0u8 || byte == 1u8,
-    ensures bool_key(r) == byte,
-{
-    byte == 1u8
-}
-
-// --- Verus-verified core of the byte-string key encoding -------------------
-//
-// A byte slice is encoded by escaping each 0x00 as the pair `0x00 0xff` and
-// appending a `0x00 0x00` terminator (see `serialize_bytes` /
-// `decode_next_bytes` below). This makes the encoding self-terminating and,
-// because the terminator `0x00 0x00` is <= any escaped continuation, order-
-// preserving so that a prefix orders before a longer string.
-//
-// `bytes_enc` is the mathematical encoding; `bytes_dec` is its parser, returning
-// the decoded content together with the bytes that follow the terminator.
-// `bytes_roundtrip` proves they are inverse on every input, which is exactly the
-// property keycode relies on to deserialize a key unambiguously.
 
 /// The escaped bytes of `v` *without* the terminator: each `0x00` becomes the
 /// pair `0x00 0xff`, every other byte is copied verbatim.
