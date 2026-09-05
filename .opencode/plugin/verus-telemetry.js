@@ -33,6 +33,7 @@ const REPO_ROOT = join(HERE, "..", "..");
 const PKG_DIR = join(REPO_ROOT, ".claude", "hooks");
 const RUNNER = join(REPO_ROOT, ".opencode", "plugin", "verus_runner.py");
 const BRANCH_GUARD = join(PKG_DIR, "branch_guard.py");
+const SOLVER_GUARD = join(PKG_DIR, "solver_guard.py");
 
 function runPython(args, extraEnv) {
   const env = { ...process.env, PYTHONPATH: PKG_DIR, ...(extraEnv || {}) };
@@ -45,23 +46,27 @@ function runPython(args, extraEnv) {
 
 export const VerusTelemetry = async ({ project, directory }) => {
   return {
-    // ---- Branch-discipline guard on bash commands -----------------------
-    // Same policy and same guard script as the Claude Code PreToolUse hook.
-    // Exit 2 => violation (throw blocks the call, message reaches the agent);
-    // anything else fails open so the guard never bricks the bash tool.
+    // ---- Branch-discipline + solver guards on bash commands --------------
+    // Same policies and same guard scripts as the Claude Code / Codex
+    // PreToolUse hooks. The solver guard blocks manual verus/z3/cvc5 runs
+    // (they must go through the Verus MCP server's pinned binaries); the
+    // branch guard enforces branch discipline. Exit 2 => violation (throw
+    // blocks the call, message reaches the agent); anything else fails open
+    // so the guards never brick the bash tool.
     "tool.execute.before": async (input, output) => {
       if (!input || input.tool !== "bash") return;
       const cmd = output && output.args && output.args.command;
-      if (!cmd || !existsSync(BRANCH_GUARD)) return;
-      const res = spawnSync(
-        "python3",
-        [BRANCH_GUARD, "check", "--command", String(cmd)],
-        { encoding: "utf-8", timeout: 10000 }
-      );
-      if (res.status === 2) {
-        throw new Error(
-          (res.stderr || "").trim() || "blocked by branch guard"
+      if (!cmd) return;
+      for (const guard of [SOLVER_GUARD, BRANCH_GUARD]) {
+        if (!existsSync(guard)) continue;
+        const res = spawnSync(
+          "python3",
+          [guard, "check", "--command", String(cmd)],
+          { encoding: "utf-8", timeout: 10000 }
         );
+        if (res.status === 2) {
+          throw new Error((res.stderr || "").trim() || "blocked by guard");
+        }
       }
     },
 

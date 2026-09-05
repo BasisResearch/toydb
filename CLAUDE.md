@@ -38,6 +38,22 @@ Codex and humans — the same rules apply to every agent (see `AGENTS.md`). If
 it blocks you, rename the branch (`git branch -m <initials>/<topic>`) and
 retry — do not try to bypass the hook.
 
+## Solver policy (MANDATORY, mechanically enforced)
+
+**Never run `verus`, `z3`, `cvc5`/`cvc4`, `rust_verify`, or `cargo verus`
+manually from the shell.** All verification and solver work goes through the
+Verus MCP server (`verus-tools-mcp`) tools (`verify`, `profile`, `version`,
+...). The MCP server downloads pinned, hash-verified solver builds from the
+BasisResearch `z3`/`cvc5` forks on launch and records the telemetry every
+session depends on; a manual run bypasses the version pinning *and* drops the
+run from the dashboard.
+
+This is enforced by `.claude/hooks/solver_guard.py`, a PreToolUse hook on the
+shell tool for Claude Code and Codex, and via the opencode plugin's
+`tool.execute.before` handler. If it blocks you, use the corresponding MCP
+tool; if no MCP tool covers what you need, tell the user instead of shelling
+out.
+
 ## Marking a branch as a failed attempt
 
 Some branches are experiments that do not work out. When the user says an
