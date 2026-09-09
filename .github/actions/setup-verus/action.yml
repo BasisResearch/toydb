@@ -87,4 +87,4 @@ runs:
       shell: bash
       env:
         SOLVER: ${{ inputs.solver }}
-      run: scripts/verus/setup-upstream-verus.sh "$SOLVER"
+      run: bash scripts/verus/setup-upstream-verus.sh "$SOLVER"
