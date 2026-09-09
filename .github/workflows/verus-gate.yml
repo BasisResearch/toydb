@@ -8,18 +8,14 @@
 # non-blocking telemetry workflow in verus-verify.yml: that one measures
 # progress and never fails; this one holds the line on what is already proven.
 #
-# Re-pinning: keep RUST_TOOLCHAIN / VERUS_VERSION equal to verus-verify.yml and
-# the vstd pin in Cargo.toml.
+# Pins: scripts/verus/pins.env, via the setup-verus action (shared with
+# verus-verify.yml and verus-coverage.yml).
 
 name: verus-gate
 on: [push, pull_request, workflow_dispatch]
 
 permissions:
   contents: read
-
-env:
-  RUST_TOOLCHAIN: "1.97.1"
-  VERUS_VERSION: "release/0.2026.08.23.fbbbbcf"
 
 jobs:
   verus-gate:
@@ -29,12 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          # cargo-verus links rustc internals; it needs rustc-dev + llvm-tools.
-          components: rustc-dev, llvm-tools
+      - name: Install pinned Basis Verus (scripts/verus/pins.env)
+        id: verus
+        uses: ./.github/actions/setup-verus
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -42,29 +35,10 @@ jobs:
           path: |
             ~/.cargo/registry
             target
-          key: verus-gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install pinned Verus (verus + cargo-verus)
-        run: |
-          set -euo pipefail
-          VERUS_TAG="${VERUS_VERSION}"
-          VER_STEM="${VERUS_TAG##*/}"
-          ASSET="verus-${VER_STEM}-x86-linux.zip"
-          URL="https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${ASSET}"
-          echo "Installing Verus ${VERUS_TAG}"
-          mkdir -p "$HOME/verus"
-          curl -fsSL "$URL" -o /tmp/verus.zip
-          unzip -q /tmp/verus.zip -d "$HOME/verus"
-          # The zip ships `verus` and `cargo-verus` in the same dir; put it on PATH.
-          VERUS_BIN_DIR="$(dirname "$(find "$HOME/verus" -name cargo-verus -type f | head -1)")"
-          test -n "$VERUS_BIN_DIR"
-          echo "$VERUS_BIN_DIR" >> "$GITHUB_PATH"
-          "$VERUS_BIN_DIR/verus" --version
-
-      - name: Raise ulimit (Verus spawns many Z3 processes)
-        run: ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
+          key: verus-gate-${{ runner.os }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify opted-in modules (gating)
         run: |
-          ulimit -u 65535 || true
+          # Verus spawns many Z3 processes; give the runner process headroom.
+          ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
           ./scripts/verus/verify.sh

@@ -10,11 +10,9 @@
 # is attached to every run as a workflow artifact and linked from the job
 # summary, so it works on every PR with no hosting.
 #
-# Pins: VERUS_BASIS_COMMIT is a BasisResearch/verus commit whose basis-build
-# workflow published a `basis-<10-char sha>` release. It carries `--reach`,
-# which the upstream release pinned by verus-gate.yml / verus-verify.yml does
-# not, so this job pins the fork build instead. `verus-reach` is not in the
-# release zip; it is built from the same commit with `cargo install` (cached).
+# Pins: scripts/verus/pins.env, via the setup-verus action (shared with
+# verus-gate.yml and verus-verify.yml). verus-reach is built from the same
+# Verus commit by the action (reach-tool: true).
 
 name: verus-coverage
 on: [push, pull_request, workflow_dispatch]
@@ -27,13 +25,6 @@ env:
   # a binary. Starts at 5 while the verified SQL parser is not yet wired into
   # the product (9% reachable as of 2026-09-09); raise it as it is cut over.
   COVERAGE_MIN_PERCENT: "5"
-  RUST_TOOLCHAIN: "1.97.1"
-  # BasisResearch/verus commit: "Static reachability of verified code" (#12).
-  VERUS_BASIS_COMMIT: "3d6a9addaa3af0186e9fe244a4f21f70692370f5"
-  # cargo-verus and verus from the fork refuse to run unless the caller says
-  # it is the MCP server (VERUS_MCP_ENABLED). CI is the other sanctioned,
-  # pinned caller; see scripts/verus/coverage.sh.
-  VERUS_MCP_ENABLED: "1"
   OUT_DIR: ".verus-out/coverage"
 
 jobs:
@@ -44,12 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Basis Verus + verus-reach (scripts/verus/pins.env)
+        id: verus
+        uses: ./.github/actions/setup-verus
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          # Verus links rustc internals; it needs rustc-dev + llvm-tools.
-          components: rustc-dev, llvm-tools
+          reach-tool: "true"
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -57,34 +47,7 @@ jobs:
           path: |
             ~/.cargo/registry
             target
-          key: verus-coverage-${{ runner.os }}-${{ env.VERUS_BASIS_COMMIT }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install pinned Basis Verus (verus + cargo-verus)
-        run: |
-          set -euo pipefail
-          TAG="basis-${VERUS_BASIS_COMMIT:0:10}"
-          BASE="https://github.com/BasisResearch/verus/releases/download/${TAG}"
-          echo "Installing Verus ${TAG}"
-          mkdir -p "$HOME/verus" && cd "$HOME/verus"
-          curl -fsSL -O "${BASE}/verus-x86-linux.zip"
-          curl -fsSL -O "${BASE}/verus-x86-linux.zip.sha256"
-          sha256sum -c verus-x86-linux.zip.sha256
-          unzip -q verus-x86-linux.zip
-          echo "$HOME/verus/verus-x86-linux" >> "$GITHUB_PATH"
-          "$HOME/verus/verus-x86-linux/verus" --version
-
-      - name: Cache verus-reach
-        id: reach-cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.verus-reach
-          key: verus-reach-${{ runner.os }}-${{ env.VERUS_BASIS_COMMIT }}-${{ env.RUST_TOOLCHAIN }}
-
-      - name: Build verus-reach from the same fork commit
-        if: steps.reach-cache.outputs.cache-hit != 'true'
-        run: |
-          cargo install --locked --git https://github.com/BasisResearch/verus \
-            --rev "$VERUS_BASIS_COMMIT" verus-reach --root "$HOME/.verus-reach"
+          key: verus-coverage-${{ runner.os }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install lcov (genhtml)
         run: |
@@ -93,10 +56,7 @@ jobs:
           genhtml --version
 
       - name: Reachability reports, summary, LCOV, HTML
-        run: |
-          echo "$HOME/.verus-reach/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.verus-reach/bin:$PATH"
-          scripts/verus/coverage.sh --out "$OUT_DIR"
+        run: scripts/verus/coverage.sh --out "$OUT_DIR"
 
       - name: Upload HTML report
         id: upload
@@ -114,6 +74,7 @@ jobs:
             echo ":bar_chart: [Download the HTML report (verus-coverage-html artifact)](${{ steps.upload.outputs.artifact-url }}) and open \`index.html\`."
             echo ''
             echo "Gate: at least ${COVERAGE_MIN_PERCENT}% of verified exec functions reachable from a binary."
+            echo "Verus ${{ steps.verus.outputs.verus_version }} (${{ steps.verus.outputs.verus_tag }}), MCP ${{ steps.verus.outputs.mcp_version }}."
             echo ''
             echo '```'
             cat "$OUT_DIR/summary.txt"

@@ -73,10 +73,12 @@ There are two committed Claude Code MCP configs, for two audiences:
   **pinned** build of `verus-tools-mcp` is installed (via
   `cargo install --git https://github.com/BasisResearch/verus-tools-mcp` into a
   per-ref cache under `~/.cache/verus-mcp/<ref>`), then `exec`s it over stdio.
-  The pin is a single constant near the top of the script,
-  `VERUS_MCP_REF` (default `main`; switch to a release tag to freeze). It is
-  idempotent (skips install when the cached binary exists) and falls back to a
-  `verus-tools-mcp` already on PATH.
+  The pin is `VERUS_MCP_REF` in `scripts/verus/pins.env` (the same file CI
+  reads, so CI runs and pinned sessions record the same `mcp_version`);
+  `VERUS_MCP_REF` in the environment overrides it. A branch name is resolved
+  to its current commit at launch, so the cache is per build. It is idempotent
+  (skips install when the cached binary exists), keeps the newest cached build
+  when offline, and falls back to a `verus-tools-mcp` already on PATH.
 
   **To make it active** on the box / in CI, select it as the Claude Code MCP
   config — e.g. symlink or rename it over `.mcp.json`:

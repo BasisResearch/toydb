@@ -31,7 +31,9 @@
 #                     reachable (verus-reach's own check)
 #
 # Requires `cargo-verus` and `verus-reach` on PATH, built from the same
-# BasisResearch/verus commit (the upstream Verus releases have no `--reach`).
+# BasisResearch/verus commit (the upstream Verus releases have no `--reach`);
+# `scripts/verus/setup-verus.sh resolve && scripts/verus/setup-verus.sh
+# install --reach` installs exactly what CI uses.
 
 set -euo pipefail
 
