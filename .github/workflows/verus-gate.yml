@@ -7,7 +7,8 @@
 # module stops verifying with either upstream Z3 or cvc5. The Basis fork
 # runs separately in verus-verify.yml and verus-coverage.yml for statistics.
 #
-# Pins: scripts/verus/pins.env, installed by setup-upstream-verus.sh.
+# Pins: scripts/verus/pins.env, installed by the setup-verus action in upstream
+# mode.
 
 name: verus-gate
 on: [push, pull_request, workflow_dispatch]
@@ -32,9 +33,10 @@ jobs:
 
       - name: Install pinned upstream Verus and solver
         id: verus
-        env:
-          SOLVER: ${{ matrix.solver }}
-        run: bash scripts/verus/setup-upstream-verus.sh "$SOLVER"
+        uses: ./.github/actions/setup-verus
+        with:
+          distribution: "upstream"
+          solver: ${{ matrix.solver }}
 
       - name: Cache cargo registry
         uses: actions/cache@v6

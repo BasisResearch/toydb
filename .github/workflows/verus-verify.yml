@@ -37,6 +37,8 @@ jobs:
         # Collect telemetry after failures, then enforce the result at the end.
         continue-on-error: true
         uses: ./.github/actions/setup-verus
+        with:
+          distribution: "basis"
 
       - name: Raise ulimit
         run: |

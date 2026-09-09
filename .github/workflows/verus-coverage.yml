@@ -10,9 +10,8 @@
 # is attached to every run as a workflow artifact and linked from the job
 # summary, so it works on every PR with no hosting.
 #
-# Pins: scripts/verus/pins.env, via the setup-verus action (shared with
-# verus-gate.yml and verus-verify.yml). verus-reach is built from the same
-# Verus commit by the action (reach-tool: true).
+# Pins: scripts/verus/pins.env, via the setup-verus action in Basis mode.
+# verus-reach is built from the same Verus commit (reach-tool: true).
 
 name: verus-coverage
 on: [push, pull_request, workflow_dispatch]
@@ -39,6 +38,7 @@ jobs:
         id: verus
         uses: ./.github/actions/setup-verus
         with:
+          distribution: "basis"
           reach-tool: "true"
 
       - name: Cache cargo registry and target
