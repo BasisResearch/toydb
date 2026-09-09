@@ -33,7 +33,7 @@ verify = true
 # plain dependency lets verified code live inline in real modules. Pin tracks
 # the vstd version shipped by the upstream proof gate (scripts/verus/pins.env).
 # Upstream setup rejects version drift; the Basis statistics setup warns.
-vstd = "=0.0.0-2026-09-06-0133"
+vstd = "=0.0.0-2026-08-30-0159"
 bincode = { version = "2.0", features = ["serde"] }
 clap = { version = "4.5", features = ["cargo", "derive"] }
 config = "0.15"

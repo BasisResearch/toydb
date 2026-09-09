@@ -14,6 +14,11 @@
 from the upstream Verus archive. Setup rejects `Cargo.lock` mismatches. Update
 the upstream release and `vstd` pins together when upgrading.
 The cvc5 version follows `source/tools/get-cvc5.sh` at the upstream release.
+The pinned upstream Verus release gives cvc5 one cumulative process-wide
+resource limit, which is exhausted across toyDB's many proof queries. The
+upstream setup routes the official cvc5 binary through
+`cvc5-per-check-rlimit.sh`, translating that option to cvc5's equivalent
+per-query limit while preserving the solver binary and all other arguments.
 
 The Basis installer resolves `VERUS_REF` and installs both solver builds
 specified by that release's `version.json`. `VERUS_MCP_REF` is only for the

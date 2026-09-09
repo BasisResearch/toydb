@@ -20,6 +20,9 @@ class UpstreamSetupTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / "setup-upstream-verus.sh"
         shutil.copyfile(Path(__file__).with_name(self.script.name), self.script)
+        self.wrapper = scripts / "cvc5-per-check-rlimit.sh"
+        shutil.copyfile(Path(__file__).with_name(self.wrapper.name), self.wrapper)
+        self.wrapper.chmod(0o755)
         self.verus_zip = self.root / "verus.zip"
         with zipfile.ZipFile(self.verus_zip, "w") as z:
             z.writestr("verus-x86-linux/version.json", json.dumps({"verus": {
@@ -86,8 +89,27 @@ shutil.copyfile(source, sys.argv[sys.argv.index("-o") + 1])
         result = self.run_setup("cvc5")
         self.assertEqual(result.returncode, 0, result.stderr)
         env = dict(line.split("=", 1) for line in (self.root / "env").read_text().splitlines())
-        self.assertEqual(Path(env["VERUS_CVC5_PATH"]).read_text(), "official cvc5")
+        self.assertEqual(Path(env["VERUS_CVC5_REAL_PATH"]).read_text(), "official cvc5")
+        self.assertEqual(Path(env["VERUS_CVC5_PATH"]).name, "cvc5-per-check-rlimit.sh")
         self.assertEqual(Path(env["VERUS_Z3_PATH"]).read_text(), "bundled upstream z3")
+
+    def test_cvc5_wrapper_translates_only_the_cumulative_rlimit(self):
+        result = self.run_setup("cvc5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = dict(line.split("=", 1) for line in (self.root / "env").read_text().splitlines())
+        real = Path(env["VERUS_CVC5_REAL_PATH"])
+        real.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@"\n')
+        real.chmod(0o755)
+        wrapper_env = dict(self.env, VERUS_CVC5_REAL_PATH=str(real))
+        wrapped = subprocess.run(
+            [env["VERUS_CVC5_PATH"], "--no-interactive", "--rlimit", "1666666",
+             "--user-pat=strict"],
+            env=wrapper_env, capture_output=True, text=True,
+        )
+        self.assertEqual(wrapped.returncode, 0, wrapped.stderr)
+        self.assertEqual(wrapped.stdout.splitlines(), [
+            "--no-interactive", "--rlimit-per=1666666", "--user-pat=strict",
+        ])
 
     def test_rejects_bad_verus_checksum_before_installation(self):
         with self.verus_zip.open("ab") as f:

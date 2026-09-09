@@ -58,7 +58,12 @@ if [[ "$solver" == cvc5 ]]; then
   download "https://github.com/cvc5/cvc5/releases/download/${UPSTREAM_CVC5_TAG}/cvc5-Linux-static.zip" \
     "$dest/cvc5.zip" "$UPSTREAM_CVC5_SHA256"
   unzip -q "$dest/cvc5.zip" -d "$install_dir"
-  setenv VERUS_CVC5_PATH "$install_dir/cvc5-Linux-static/bin/cvc5"
+  # Upstream Verus passes cvc5 a cumulative process-wide --rlimit. Its
+  # long-lived solver processes exhaust that budget after a few checks and
+  # report resourceout for every remaining proof obligation. Use the same
+  # official cvc5 binary with that one option translated to --rlimit-per.
+  setenv VERUS_CVC5_REAL_PATH "$install_dir/cvc5-Linux-static/bin/cvc5"
+  setenv VERUS_CVC5_PATH "$repo_root/scripts/verus/cvc5-per-check-rlimit.sh"
 fi
 [[ -z "${GITHUB_PATH:-}" ]] || echo "$bin" >> "$GITHUB_PATH"
 out verus_tag "$UPSTREAM_VERUS_TAG"
