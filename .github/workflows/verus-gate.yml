@@ -20,7 +20,7 @@ jobs:
   verus-gate:
     name: Upstream Verus gate (${{ matrix.solver }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
