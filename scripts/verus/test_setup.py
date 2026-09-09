@@ -23,9 +23,9 @@ class UpstreamSetupTest(unittest.TestCase):
         self.verus_zip = self.root / "verus.zip"
         with zipfile.ZipFile(self.verus_zip, "w") as z:
             z.writestr("verus-x86-linux/version.json", json.dumps({"verus": {
-                "commit": "a" * 40, "version": "test", "toolchain": "test-toolchain",
+                "commit": "a" * 40, "version": "test",
+                "toolchain": "test-toolchain (overridden by environment variable)",
             }}))
-            z.writestr("verus-x86-linux/vstd/Cargo.toml", '[package]\nversion = "test"\n')
             z.writestr("verus-x86-linux/z3", "bundled upstream z3")
         self.cvc5_zip = self.root / "cvc5.zip"
         with zipfile.ZipFile(self.cvc5_zip, "w") as z:
@@ -34,6 +34,7 @@ class UpstreamSetupTest(unittest.TestCase):
         self.pins.write_text(
             "UPSTREAM_VERUS_TAG=release/test\n"
             f"UPSTREAM_VERUS_SHA256={hashlib.sha256(self.verus_zip.read_bytes()).hexdigest()}\n"
+            "UPSTREAM_VSTD_VERSION=test\n"
             "UPSTREAM_CVC5_TAG=cvc5-test\n"
             f"UPSTREAM_CVC5_SHA256={hashlib.sha256(self.cvc5_zip.read_bytes()).hexdigest()}\n"
         )
@@ -79,6 +80,7 @@ shutil.copyfile(source, sys.argv[sys.argv.index("-o") + 1])
         self.assertNotIn("VERUS_MCP_ENABLED=", env)
         self.assertEqual(len((self.root / "downloads").read_text().splitlines()), 1)
         self.assertIn("verus_commit=" + "a" * 40, (self.root / "output").read_text())
+        self.assertIn("toolchain install test-toolchain ", (self.root / "rustup").read_text())
 
     def test_cvc5_installs_official_cvc5_and_bundled_z3(self):
         result = self.run_setup("cvc5")

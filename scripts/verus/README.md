@@ -9,10 +9,10 @@
 - `verus-coverage` uses the Basis fork's reachability instrumentation and
   `verus-reach`. Fork results do not replace the upstream proof checks.
 
-`pins.env` pins the official upstream release and archive SHA-256, plus the
-official cvc5 release and archive SHA-256. Z3 comes from the upstream Verus
-archive. The upstream release matches the `vstd` dependency in `Cargo.lock`;
-setup rejects mismatches. Update these pins together when upgrading.
+`pins.env` pins the official upstream release, its archive SHA-256 and matching
+`vstd` version, plus the official cvc5 release and archive SHA-256. Z3 comes
+from the upstream Verus archive. Setup rejects `Cargo.lock` mismatches. Update
+the upstream release and `vstd` pins together when upgrading.
 The cvc5 version follows `source/tools/get-cvc5.sh` at the upstream release.
 
 The Basis installer resolves `VERUS_REF` and installs both solver builds

@@ -36,17 +36,17 @@ download "https://github.com/verus-lang/verus/releases/download/${UPSTREAM_VERUS
 install_dir="$(mktemp -d "$dest/install.XXXXXX")"
 unzip -q "$dest/verus.zip" -d "$install_dir"
 bin="$install_dir/verus-x86-linux"
-metadata="$(python3 - "$bin/version.json" "$bin/vstd/Cargo.toml" <<'PY'
+metadata="$(python3 - "$bin/version.json" "$UPSTREAM_VSTD_VERSION" <<'PY'
 import json, sys, tomllib
 with open(sys.argv[1]) as f:
     v = json.load(f)["verus"]
-with open(sys.argv[2], "rb") as f:
-    shipped = tomllib.load(f)["package"]["version"]
+expected = sys.argv[2]
 with open("Cargo.lock", "rb") as f:
     pinned = next(p["version"] for p in tomllib.load(f)["package"] if p["name"] == "vstd")
-if shipped != pinned:
-    sys.exit(f"upstream vstd {shipped} differs from Cargo.lock {pinned}; update the upstream release and crate pins together")
-print(v["commit"], v["version"], v["toolchain"], shipped)
+if expected != pinned:
+    sys.exit(f"upstream vstd pin {expected} differs from Cargo.lock {pinned}; update the upstream release and crate pins together")
+# Some upstream archives append an explanation to the toolchain field.
+print(v["commit"], v["version"], v["toolchain"].split()[0], expected)
 PY
 )"
 read -r commit version toolchain vstd_version <<< "$metadata"
