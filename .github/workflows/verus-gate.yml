@@ -24,9 +24,6 @@ jobs:
       fail-fast: false
       matrix:
         solver: [z3, cvc5]
-    env:
-      # Never restore verification results: both solvers must run on every job.
-      CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-${{ matrix.solver }}
     steps:
       - uses: actions/checkout@v7
 
@@ -49,6 +46,8 @@ jobs:
       - name: Verify opted-in modules (gating)
         env:
           SOLVER: ${{ matrix.solver }}
+          # Use a fresh target per matrix job so both solvers always run.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-${{ matrix.solver }}
         run: |
           # Verus spawns many Z3 processes; give the runner process headroom.
           ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
