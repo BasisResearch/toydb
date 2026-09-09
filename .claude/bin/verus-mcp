@@ -25,9 +25,9 @@ set -euo pipefail
 
 # --- Pin -------------------------------------------------------------------
 # Git ref of BasisResearch/verus-tools-mcp to install: VERUS_MCP_REF from the
-# environment, else the one in scripts/verus/pins.env, which is also what CI
-# records on every datapoint, so box/CI/non-dev sessions and CI runs group
-# under the same mcp_version on the dashboard. A branch name (`main`) is
+# environment, else the one in scripts/verus/pins.env. Agent sessions record
+# the running server version; CI does not run or report an MCP server.
+# A branch name (`main`) is
 # resolved to its current commit below so the per-ref cache is per build.
 VERUS_MCP_REPO="https://github.com/BasisResearch/verus-tools-mcp"
 CACHE_ROOT="${VERUS_MCP_CACHE_ROOT:-$HOME/.cache/verus-mcp}"

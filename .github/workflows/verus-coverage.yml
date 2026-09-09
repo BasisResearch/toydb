@@ -74,7 +74,7 @@ jobs:
             echo ":bar_chart: [Download the HTML report (verus-coverage-html artifact)](${{ steps.upload.outputs.artifact-url }}) and open \`index.html\`."
             echo ''
             echo "Gate: at least ${COVERAGE_MIN_PERCENT}% of verified exec functions reachable from a binary."
-            echo "Verus ${{ steps.verus.outputs.verus_version }} (${{ steps.verus.outputs.verus_tag }}), MCP ${{ steps.verus.outputs.mcp_version }}."
+            echo "Verus ${{ steps.verus.outputs.verus_version }} (${{ steps.verus.outputs.verus_tag }})."
             echo ''
             echo '```'
             cat "$OUT_DIR/summary.txt"

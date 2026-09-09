@@ -9,8 +9,8 @@
 # is left untouched.
 #
 # Pins: scripts/verus/pins.env, via the setup-verus action (shared with
-# verus-gate.yml and verus-coverage.yml). The Verus, Rust and MCP server
-# versions it resolves are recorded on every datapoint.
+# verus-coverage.yml). The Verus and Rust toolchain
+# versions it installs are recorded on every datapoint.
 
 name: verus-verify
 on: [push, pull_request, workflow_dispatch]
@@ -34,8 +34,7 @@ jobs:
 
       - name: Install pinned Basis Verus (scripts/verus/pins.env)
         id: verus
-        # Telemetry must always POST: a toolchain hiccup makes the run
-        # best-effort (verus_ran=false) instead of failing the workflow.
+        # Collect telemetry after failures, then enforce the result at the end.
         continue-on-error: true
         uses: ./.github/actions/setup-verus
 
@@ -69,6 +68,8 @@ jobs:
             bash scripts/verus/verify.sh --output-json \
               > .verus-out/verus.out 2> .verus-out/verus.err
             RC=$?
+            cat .verus-out/verus.out
+            cat .verus-out/verus.err >&2
             echo "verus exit code: $RC"
             echo "verus_ran=true" >> "$GITHUB_OUTPUT"
             echo "verus_rc=$RC" >> "$GITHUB_OUTPUT"
@@ -76,7 +77,7 @@ jobs:
             : > .verus-out/verus.out
             echo "verus_ran=false" >> "$GITHUB_OUTPUT"
           fi
-          # Never fail this step: telemetry must always POST.
+          # Defer failure until telemetry has been collected.
           exit 0
 
       - name: Resolve branch / commit / parents
@@ -186,7 +187,8 @@ jobs:
               "ts": """${{ steps.gitmeta.outputs.ts }}""",
               # Empty when the setup action failed (best-effort run).
               "verus_version": """${{ steps.verus.outputs.verus_version }}""" or "unavailable",
-              "mcp_version": """${{ steps.verus.outputs.mcp_version }}""" or "unavailable",
+              # CI invokes cargo-verus directly; no MCP server participates.
+              "mcp_version": None,
               "rust_toolchain": """${{ steps.verus.outputs.rust_toolchain }}""" or "unavailable",
               "metrics": metrics,
           }
@@ -235,3 +237,23 @@ jobs:
 
       - name: Run extraction self-tests
         run: python3 scripts/verus/test_extract.py
+
+      - name: Upload verification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: basis-verus-verification
+          path: |
+            .verus-out/verus.out
+            .verus-out/verus.err
+            .verus-out/metrics.json
+          if-no-files-found: ignore
+
+      - name: Enforce setup and verification result
+        if: always()
+        env:
+          SETUP_OUTCOME: ${{ steps.verus.outcome }}
+          VERIFY_OUTCOME: ${{ steps.run_verus.outcome }}
+          VERUS_RAN: ${{ steps.run_verus.outputs.verus_ran }}
+          VERUS_RC: ${{ steps.run_verus.outputs.verus_rc }}
+        run: bash scripts/verus/check_verification_result.sh

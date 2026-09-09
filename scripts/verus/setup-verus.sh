@@ -7,10 +7,10 @@
 # scripts/verus/pins.env. Used by .github/actions/setup-verus; runnable by
 # hand (needs gh, curl, unzip, sha256sum, rustup, python3).
 #
-#   setup-verus.sh resolve           resolve the refs to commits, pick the
-#                                    basis-build release, record the MCP version
+#   setup-verus.sh resolve           resolve the Verus ref, pick the
+#                                    basis-build release
 #   setup-verus.sh install [--reach] download + hash-check the release, install
-#                                    its Rust toolchain and pinned z3, export
+#                                    its Rust toolchain and pinned solvers, export
 #                                    PATH / RUSTUP_TOOLCHAIN / VERUS_Z3_PATH /
 #                                    VERUS_MCP_ENABLED; --reach also builds
 #                                    verus-reach from the same commit
@@ -29,7 +29,6 @@ source scripts/verus/pins.env
 
 dest="${VERUS_CI_DIR:-$HOME/.verus-ci}"
 verus_repo="BasisResearch/verus"
-mcp_repo="BasisResearch/verus-tools-mcp"
 
 out() {  # step output
   echo "$1=$2"
@@ -49,8 +48,12 @@ addpath() {
 warn() { echo "::warning::$*"; echo "warning: $*" >&2; }
 
 resolve() {
-  local verus_sha tag latest mcp_sha mcp_semver
-  verus_sha="$(gh api "repos/${verus_repo}/commits/${VERUS_REF}" --jq .sha)"
+  local verus_sha tag latest
+  echo "Resolving ${verus_repo}@${VERUS_REF}" >&2
+  verus_sha="$(gh api "repos/${verus_repo}/commits/${VERUS_REF}" --jq .sha)" || {
+    echo "::error::Could not resolve ${verus_repo}@${VERUS_REF}; check the ref and repository access." >&2
+    return 1
+  }
   tag="basis-${verus_sha:0:10}"
   # basis-build publishes one release per main commit, a few minutes after
   # the push. If that build is still in flight, fall back to the newest one.
@@ -59,17 +62,8 @@ resolve() {
     warn "no basis-build release for ${verus_repo}@${verus_sha:0:10} (VERUS_REF=${VERUS_REF}) yet; using ${latest}"
     tag="$latest"
   fi
-  mcp_sha="$(gh api "repos/${mcp_repo}/commits/${VERUS_MCP_REF}" --jq .sha)"
-  # The server reports `<Cargo.toml version>+g<short sha>` (see its build.rs);
-  # record the same string so CI datapoints group with agent sessions.
-  mcp_semver="$(gh api "repos/${mcp_repo}/contents/Cargo.toml?ref=${mcp_sha}" --jq .content \
-    | base64 -d | awk -F'"' '/^version *=/ { print $2; exit }')"
   setenv VERUS_TAG "$tag"
-  setenv VERUS_MCP_COMMIT "$mcp_sha"
-  setenv VERUS_MCP_VERSION "${mcp_semver}+g${mcp_sha:0:7}"
   out verus_tag "$tag"
-  out mcp_commit "$mcp_sha"
-  out mcp_version "$VERUS_MCP_VERSION"
 }
 
 install() {
@@ -87,17 +81,22 @@ install() {
     && unzip -q verus-x86-linux.zip )
 
   # version.json: the commit and version this build is, its Rust toolchain,
-  # and the solver pins (BasisResearch/z3 release + sha256) the MCP server
-  # installs; CI installs the same z3 so both run identical binaries.
-  local commit version toolchain z3_repo z3_tag z3_asset z3_sha
-  read -r commit version toolchain z3_repo z3_tag z3_asset z3_sha < <(python3 - "$bin/version.json" <<'PY'
+  # and solver pins the MCP server installs. The fork verifies with cvc5;
+  # z3 is also needed for vstd. Install both from this exact release's pins.
+  local metadata commit version toolchain z3_repo z3_tag z3_asset z3_sha
+  local cvc5_repo cvc5_tag cvc5_asset cvc5_sha
+  metadata="$(python3 - "$bin/version.json" <<'PY'
 import json, sys
 v = json.load(open(sys.argv[1]))["verus"]
 z3 = v["solvers"]["z3"]
+cvc5 = v["solvers"]["cvc5"]
 print(v["commit"], v["version"], v["toolchain"].split("-", 1)[0],
-      z3["repo"], z3["tag"], z3["asset_x86_linux"], z3["sha256_x86_linux"])
+      z3["repo"], z3["tag"], z3["asset_x86_linux"], z3["sha256_x86_linux"],
+      cvc5["repo"], cvc5["tag"], cvc5["asset_x86_linux"], cvc5["sha256_x86_linux"])
 PY
-)
+)"
+  read -r commit version toolchain z3_repo z3_tag z3_asset z3_sha \
+    cvc5_repo cvc5_tag cvc5_asset cvc5_sha <<< "$metadata"
 
   rustup toolchain install "$toolchain" --profile minimal \
     --component rustc-dev --component llvm-tools
@@ -107,6 +106,11 @@ PY
   echo "${z3_sha}  $dest/z3" | sha256sum -c
   chmod +x "$dest/z3"
   setenv VERUS_Z3_PATH "$dest/z3"
+
+  curl -fsSL -o "$dest/cvc5" "https://github.com/${cvc5_repo}/releases/download/${cvc5_tag}/${cvc5_asset}"
+  echo "${cvc5_sha}  $dest/cvc5" | sha256sum -c
+  chmod +x "$dest/cvc5"
+  setenv VERUS_CVC5_PATH "$dest/cvc5"
 
   addpath "$bin"
   # The fork's verus/cargo-verus run only for the MCP server or with this
@@ -132,7 +136,7 @@ PY
   out verus_version "$version"
   out rust_toolchain "$toolchain"
   out vstd_version "$vstd_shipped"
-  echo "Verus ${version} (${commit:0:10}) from ${tag}; rust ${toolchain}; z3 ${z3_tag}; MCP ${VERUS_MCP_VERSION:-?}"
+  echo "Verus ${version} (${commit:0:10}) from ${tag}; rust ${toolchain}; z3 ${z3_tag}; cvc5 ${cvc5_tag}"
 }
 
 case "${1:-}" in

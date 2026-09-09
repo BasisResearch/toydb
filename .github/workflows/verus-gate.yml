@@ -4,12 +4,10 @@
 #
 # Verus verification GATE. Runs `scripts/verus/verify.sh` (i.e. `cargo verus
 # focus --lib` over the opted-in modules) and FAILS the PR if any verified
-# module stops verifying. This is the enforcement counterpart to the
-# non-blocking telemetry workflow in verus-verify.yml: that one measures
-# progress and never fails; this one holds the line on what is already proven.
+# module stops verifying with either upstream Z3 or cvc5. The Basis fork
+# runs separately in verus-verify.yml and verus-coverage.yml for statistics.
 #
-# Pins: scripts/verus/pins.env, via the setup-verus action (shared with
-# verus-verify.yml and verus-coverage.yml).
+# Pins: scripts/verus/pins.env, installed by setup-upstream-verus.sh.
 
 name: verus-gate
 on: [push, pull_request, workflow_dispatch]
@@ -19,26 +17,43 @@ permissions:
 
 jobs:
   verus-gate:
-    name: Verus gate (verify opted-in modules)
+    name: Upstream Verus gate (${{ matrix.solver }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        solver: [z3, cvc5]
+    env:
+      # Never restore verification results: both solvers must run on every job.
+      CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-${{ matrix.solver }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned Basis Verus (scripts/verus/pins.env)
-        id: verus
-        uses: ./.github/actions/setup-verus
+      - name: Test toolchain setup and failure reporting
+        run: python3 scripts/verus/test_setup.py
 
-      - name: Cache cargo registry and target
+      - name: Install pinned upstream Verus and solver
+        id: verus
+        env:
+          SOLVER: ${{ matrix.solver }}
+        run: bash scripts/verus/setup-upstream-verus.sh "$SOLVER"
+
+      - name: Cache cargo registry
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
-            target
-          key: verus-gate-${{ runner.os }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
+          key: verus-gate-upstream-${{ runner.os }}-${{ matrix.solver }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify opted-in modules (gating)
+        env:
+          SOLVER: ${{ matrix.solver }}
         run: |
           # Verus spawns many Z3 processes; give the runner process headroom.
           ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
-          ./scripts/verus/verify.sh
+          solver_args=()
+          if [[ "$SOLVER" == cvc5 ]]; then
+            solver_args=(-V cvc5)
+          fi
+          ./scripts/verus/verify.sh "${solver_args[@]}"

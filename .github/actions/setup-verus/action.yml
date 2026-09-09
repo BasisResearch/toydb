@@ -4,9 +4,9 @@
 #
 # Install the Basis Verus toolchain pinned in scripts/verus/pins.env: verus +
 # cargo-verus from the basis-build release of the pinned commit, the Rust
-# toolchain and z3 that release names, and (optionally) verus-reach built from
-# the same commit. Every Verus workflow uses this, so all of them run the same
-# versions and record the same version strings. The work is in
+# toolchain and solvers that release names, and (optionally) verus-reach built
+# from the same commit. Used for Basis telemetry and reachability; the proof
+# gate installs upstream Verus separately. The work is in
 # scripts/verus/setup-verus.sh; this wrapper adds the verus-reach cache.
 
 name: setup-verus
@@ -33,12 +33,6 @@ outputs:
   vstd_version:
     description: vstd version shipped by the release (Cargo.toml should pin this)
     value: ${{ steps.install.outputs.vstd_version }}
-  mcp_commit:
-    description: BasisResearch/verus-tools-mcp commit resolved from VERUS_MCP_REF
-    value: ${{ steps.resolve.outputs.mcp_commit }}
-  mcp_version:
-    description: MCP server version string as the server reports it (<semver>+g<sha7>)
-    value: ${{ steps.resolve.outputs.mcp_version }}
 
 runs:
   using: composite
@@ -57,7 +51,7 @@ runs:
         path: ~/.verus-ci/reach
         key: verus-reach-${{ runner.os }}-${{ steps.resolve.outputs.verus_tag }}
 
-    - name: Install Verus, Rust toolchain, z3
+    - name: Install Verus, Rust toolchain, Z3, cvc5
       id: install
       shell: bash
       run: scripts/verus/setup-verus.sh install ${{ inputs.reach-tool == 'true' && '--reach' || '' }}
