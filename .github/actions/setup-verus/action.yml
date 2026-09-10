@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Basis Research. MIT header over toyDB's Apache-2.0 base;
+# see LICENSE-MIT / NOTICE.
+#
+# Install either the Basis Verus toolchain used for telemetry and reachability
+# or the official upstream toolchain used by the proof gate. Both are pinned in
+# scripts/verus/pins.env. The distribution input makes that choice visible at
+# each workflow call site while the scripts retain their distinct installers.
+
+name: setup-verus
+description: Install a pinned Basis or upstream Verus toolchain
+
+inputs:
+  distribution:
+    description: Verus distribution to install (basis or upstream)
+    default: "basis"
+  solver:
+    description: Solver for the upstream distribution (z3 or cvc5)
+    default: "z3"
+  reach-tool:
+    description: Also build verus-reach from the Basis commit
+    default: "false"
+
+outputs:
+  verus_tag:
+    description: Verus release tag installed
+    value: ${{ steps.upstream.outputs.verus_tag || steps.resolve.outputs.verus_tag }}
+  verus_commit:
+    description: Commit the installed binaries were built from
+    value: ${{ steps.upstream.outputs.verus_commit || steps.install.outputs.verus_commit }}
+  verus_version:
+    description: Verus version string (as `verus --version`)
+    value: ${{ steps.upstream.outputs.verus_version || steps.install.outputs.verus_version }}
+  rust_toolchain:
+    description: Rust toolchain the release was built with (installed + RUSTUP_TOOLCHAIN)
+    value: ${{ steps.upstream.outputs.rust_toolchain || steps.install.outputs.rust_toolchain }}
+  vstd_version:
+    description: vstd version shipped by the release (Cargo.toml should pin this)
+    value: ${{ steps.upstream.outputs.vstd_version || steps.install.outputs.vstd_version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate setup selection
+      shell: bash
+      env:
+        DISTRIBUTION: ${{ inputs.distribution }}
+        SOLVER: ${{ inputs.solver }}
+        REACH_TOOL: ${{ inputs.reach-tool }}
+      run: |
+        case "$DISTRIBUTION" in
+          basis) ;;
+          upstream)
+            case "$SOLVER" in z3|cvc5) ;; *) echo "::error::unsupported upstream solver: $SOLVER"; exit 2;; esac
+            if [[ "$REACH_TOOL" == "true" ]]; then
+              echo "::error::verus-reach is only available with the Basis distribution"
+              exit 2
+            fi
+            ;;
+          *) echo "::error::unsupported Verus distribution: $DISTRIBUTION"; exit 2;;
+        esac
+
+    - name: Resolve pinned Basis Verus
+      id: resolve
+      if: inputs.distribution == 'basis'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: scripts/verus/setup-verus.sh resolve
+
+    - name: Cache verus-reach
+      if: inputs.distribution == 'basis' && inputs.reach-tool == 'true'
+      uses: actions/cache@v6
+      with:
+        path: ~/.verus-ci/reach
+        key: verus-reach-${{ runner.os }}-${{ steps.resolve.outputs.verus_tag }}
+
+    - name: Install Basis Verus, Rust toolchain, Z3, cvc5
+      id: install
+      if: inputs.distribution == 'basis'
+      shell: bash
+      run: scripts/verus/setup-verus.sh install ${{ inputs.reach-tool == 'true' && '--reach' || '' }}
+
+    - name: Install upstream Verus and solver
+      id: upstream
+      if: inputs.distribution == 'upstream'
+      shell: bash
+      env:
+        SOLVER: ${{ inputs.solver }}
+      run: bash scripts/verus/setup-upstream-verus.sh "$SOLVER"

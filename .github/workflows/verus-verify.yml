@@ -3,14 +3,14 @@
 # see LICENSE-MIT / NOTICE.
 #
 # Component 3 of the Verus telemetry project: verification-progress + blueprint
-# graph. Runs on every push and PR, installs a pinned Rust + Verus, runs verus
-# over the repo, extracts the three progress metrics and the blueprint graph,
-# and POSTs both to the dashboard ingest endpoints. Separate from ci.yml, which
-# is left untouched.
+# graph. Runs on every push and PR with pinned upstream Verus and Z3, extracts
+# the three progress metrics and the blueprint graph, and POSTs both to the
+# dashboard ingest endpoints. The Basis fork is reserved for reachability in
+# verus-coverage.yml.
 #
-# Re-pinning: bump VERUS_VERSION below (and RUST_TOOLCHAIN only when the Verus
-# release moves its own rust-toolchain). Keep RUST_TOOLCHAIN equal to toyDB's
-# rust-toolchain file and the MCP repo's toolchain.
+# Pins: scripts/verus/pins.env, via the setup-verus action (shared with
+# verus-coverage.yml). The Verus and Rust toolchain
+# versions it installs are recorded on every datapoint.
 
 name: verus-verify
 on: [push, pull_request, workflow_dispatch]
@@ -19,13 +19,6 @@ permissions:
   contents: read
 
 env:
-  # Single easy-to-bump pins. Verus is the fixed point; Rust follows it.
-  RUST_TOOLCHAIN: "1.97.1"
-  # Latest Verus stable release as of 2026-08-25. Bump this one line to re-pin.
-  VERUS_VERSION: "release/0.2026.08.23.fbbbbcf"
-  # MCP server semver (verus-tools-mcp); recorded on every datapoint. No MCP is
-  # invoked in CI, so this is the pinned contract value until wired.
-  MCP_VERSION: "0.1.0"
   INGEST_BASE: "https://verus.basis.ai/verus/ingest"
 
 jobs:
@@ -39,66 +32,34 @@ jobs:
           # Need history so parent_shas resolve on both push and PR.
           fetch-depth: 0
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install pinned upstream Verus + Z3 (scripts/verus/pins.env)
+        id: verus
+        # Collect telemetry after failures, then enforce the result at the end.
+        continue-on-error: true
+        uses: ./.github/actions/setup-verus
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          # Verus links rustc internals; it needs rustc-dev + llvm-tools.
-          components: rustc-dev, llvm-tools
+          distribution: "upstream"
+          solver: "z3"
 
-      - name: Raise ulimit and record toolchain versions
-        id: env
+      - name: Raise ulimit
         run: |
           # Verus spawns many Z3 processes; give the runner generous process
           # headroom or verification hits posix_spawn EAGAIN (see spec note).
           ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
           ulimit -n 65535 || true
           echo "ulimit -u: $(ulimit -u), -n: $(ulimit -n)"
-          echo "rust_toolchain=${RUST_TOOLCHAIN}" >> "$GITHUB_OUTPUT"
-
-      - name: Install pinned Verus
-        id: verus
-        run: |
-          set -euo pipefail
-          VERUS_TAG="${VERUS_VERSION}"
-          # Release tags look like "release/0.2026.08.23.fbbbbcf"; the asset
-          # version stem is the part after the slash.
-          VER_STEM="${VERUS_TAG##*/}"
-          echo "Installing Verus ${VERUS_TAG} (stem ${VER_STEM})"
-          ASSET="verus-${VER_STEM}-x86-linux.zip"
-          URL="https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${ASSET}"
-          mkdir -p "$HOME/verus"
-          if curl -fsSL "$URL" -o /tmp/verus.zip; then
-            unzip -q /tmp/verus.zip -d "$HOME/verus"
-            # The zip unpacks to a verus-x86-linux/ dir containing the binary.
-            VERUS_BIN_DIR="$(dirname "$(find "$HOME/verus" -name verus -type f | head -1)")"
-            if [ -n "$VERUS_BIN_DIR" ]; then
-              echo "$VERUS_BIN_DIR" >> "$GITHUB_PATH"
-              echo "verus_available=true" >> "$GITHUB_OUTPUT"
-              RESOLVED="$("$VERUS_BIN_DIR/verus" --version 2>/dev/null | head -1 || echo "$VER_STEM")"
-              echo "verus_version=${RESOLVED:-$VER_STEM}" >> "$GITHUB_OUTPUT"
-              echo "Verus installed at $VERUS_BIN_DIR"
-            else
-              echo "verus binary not found after unzip"
-              echo "verus_available=false" >> "$GITHUB_OUTPUT"
-              echo "verus_version=unavailable" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            # Verus not wired over toyDB yet: do not hard-fail the telemetry
-            # path. Metrics/graph steps emit best-effort payloads and still POST.
-            echo "::warning::Verus ${VERUS_TAG} download failed; emitting best-effort telemetry"
-            echo "verus_available=false" >> "$GITHUB_OUTPUT"
-            echo "verus_version=unavailable" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Run Verus over the repo
         id: run_verus
         continue-on-error: true
+        # Leave enough job time to extract and upload diagnostics if the
+        # verifier itself stops making progress.
+        timeout-minutes: 22
         run: |
           set +e
           ulimit -u 65535 || true
           mkdir -p .verus-out
-          if [ "${{ steps.verus.outputs.verus_available }}" = "true" ]; then
+          if [ "${{ steps.verus.outcome }}" = "success" ]; then
             # Verus verifies a Cargo crate through cargo-verus, which supplies the
             # dependency graph. A bare `verus ./src/lib.rs` cannot resolve extern
             # crates (serde, etc.) and so verifies nothing. verify.sh runs
@@ -110,9 +71,12 @@ jobs:
             # this root; the "Upload SMT query capture" step ships it to the
             # dashboard keyed ci:<run>, joined to this commit.
             VERUS_SMT_LOG_ROOT="$PWD/.verus-out/smt" \
-            bash scripts/verus/verify.sh --output-json \
+            timeout --signal=TERM --kill-after=1m 20m \
+              bash scripts/verus/verify.sh --output-json \
               > .verus-out/verus.out 2> .verus-out/verus.err
             RC=$?
+            cat .verus-out/verus.out
+            cat .verus-out/verus.err >&2
             echo "verus exit code: $RC"
             echo "verus_ran=true" >> "$GITHUB_OUTPUT"
             echo "verus_rc=$RC" >> "$GITHUB_OUTPUT"
@@ -120,7 +84,7 @@ jobs:
             : > .verus-out/verus.out
             echo "verus_ran=false" >> "$GITHUB_OUTPUT"
           fi
-          # Never fail this step: telemetry must always POST.
+          # Defer failure until telemetry has been collected.
           exit 0
 
       - name: Resolve branch / commit / parents
@@ -187,7 +151,7 @@ jobs:
               "session_id": sid,
               "tool_use_id": tuid,
               "source": "ci",
-              "invocation": "scripts/verus/verify.sh --output-json (verus-verify workflow)",
+              "invocation": "scripts/verus/verify.sh --output-json (verus-verify workflow, upstream Z3)",
               "cwd": os.getcwd(),
               "branch": os.environ.get("CI_BRANCH"),
               "commit_sha": os.environ.get("CI_SHA"),
@@ -228,9 +192,11 @@ jobs:
               "commit_sha": """${{ steps.gitmeta.outputs.commit_sha }}""",
               "parent_shas": json.loads('''${{ steps.gitmeta.outputs.parent_shas }}'''),
               "ts": """${{ steps.gitmeta.outputs.ts }}""",
-              "verus_version": """${{ steps.verus.outputs.verus_version }}""",
-              "mcp_version": """${{ env.MCP_VERSION }}""",
-              "rust_toolchain": """${{ env.RUST_TOOLCHAIN }}""",
+              # Empty when the setup action failed (best-effort run).
+              "verus_version": """${{ steps.verus.outputs.verus_version }}""" or "unavailable",
+              # CI invokes cargo-verus directly; no MCP server participates.
+              "mcp_version": None,
+              "rust_toolchain": """${{ steps.verus.outputs.rust_toolchain }}""" or "unavailable",
               "metrics": metrics,
           }
           print(json.dumps(payload, indent=2))
@@ -278,3 +244,23 @@ jobs:
 
       - name: Run extraction self-tests
         run: python3 scripts/verus/test_extract.py
+
+      - name: Upload verification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upstream-verus-verification
+          path: |
+            .verus-out/verus.out
+            .verus-out/verus.err
+            .verus-out/metrics.json
+          if-no-files-found: ignore
+
+      - name: Enforce setup and verification result
+        if: always()
+        env:
+          SETUP_OUTCOME: ${{ steps.verus.outcome }}
+          VERIFY_OUTCOME: ${{ steps.run_verus.outcome }}
+          VERUS_RAN: ${{ steps.run_verus.outputs.verus_ran }}
+          VERUS_RC: ${{ steps.run_verus.outputs.verus_rc }}
+        run: bash scripts/verus/check_verification_result.sh

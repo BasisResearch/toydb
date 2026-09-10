@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Basis Research. MIT header over toyDB's Apache-2.0 base;
+# see LICENSE-MIT / NOTICE.
+#
+# Coverage of verified code. Compiles the library and the binaries through
+# Verus with `--reach`, joins the reachability reports with `verus-reach`
+# (scripts/verus/coverage.sh does both), and FAILS the job when fewer than
+# COVERAGE_MIN_PERCENT of the verified exec functions are reachable from a
+# toyDB binary's `main`. The per-file HTML report (genhtml over the LCOV trace)
+# is attached to every run as a workflow artifact and linked from the job
+# summary, so it works on every PR with no hosting.
+#
+# Pins: scripts/verus/pins.env, via the setup-verus action in Basis mode.
+# verus-reach is built from the same Verus commit (reach-tool: true).
+
+name: verus-coverage
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+env:
+  # The gate. Percent of verified exec functions that must be reachable from
+  # a binary. Starts at 5 while the verified SQL parser is not yet wired into
+  # the product (9% reachable as of 2026-09-09); raise it as it is cut over.
+  COVERAGE_MIN_PERCENT: "5"
+  OUT_DIR: ".verus-out/coverage"
+
+jobs:
+  verus-coverage:
+    name: Verus coverage (reachable verified code)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned Basis Verus + verus-reach (scripts/verus/pins.env)
+        id: verus
+        uses: ./.github/actions/setup-verus
+        with:
+          distribution: "basis"
+          reach-tool: "true"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: verus-coverage-${{ runner.os }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install lcov (genhtml)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lcov
+          genhtml --version
+
+      - name: Reachability reports, summary, LCOV, HTML
+        run: scripts/verus/coverage.sh --out "$OUT_DIR"
+
+      - name: Upload HTML report
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: verus-coverage-html
+          path: ${{ env.OUT_DIR }}/html
+          retention-days: 30
+
+      - name: Job summary
+        run: |
+          {
+            echo '## Coverage of verified code'
+            echo ''
+            echo ":bar_chart: [Download the HTML report (verus-coverage-html artifact)](${{ steps.upload.outputs.artifact-url }}) and open \`index.html\`."
+            echo ''
+            echo "Gate: at least ${COVERAGE_MIN_PERCENT}% of verified exec functions reachable from a binary."
+            echo "Verus ${{ steps.verus.outputs.verus_version }} (${{ steps.verus.outputs.verus_tag }})."
+            echo ''
+            echo '```'
+            cat "$OUT_DIR/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce COVERAGE_MIN_PERCENT
+        run: verus-reach --fail-under "$COVERAGE_MIN_PERCENT" "$OUT_DIR/reach" > /dev/null

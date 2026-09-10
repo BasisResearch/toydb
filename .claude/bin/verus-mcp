@@ -24,17 +24,36 @@
 set -euo pipefail
 
 # --- Pin -------------------------------------------------------------------
-# Git ref / tag of BasisResearch/verus-tools-mcp to install. Pinned to a
-# released tag so the box/CI/non-dev clones run a frozen, comparable build.
-# Bump this when a new server release is cut.
-VERUS_MCP_REF="${VERUS_MCP_REF:-v0.1.0}"
-
+# Git ref of BasisResearch/verus-tools-mcp to install: VERUS_MCP_REF from the
+# environment, else the one in scripts/verus/pins.env. Agent sessions record
+# the running server version; CI does not run or report an MCP server.
+# A branch name (`main`) is
+# resolved to its current commit below so the per-ref cache is per build.
 VERUS_MCP_REPO="https://github.com/BasisResearch/verus-tools-mcp"
 CACHE_ROOT="${VERUS_MCP_CACHE_ROOT:-$HOME/.cache/verus-mcp}"
-CACHE_DIR="$CACHE_ROOT/$VERUS_MCP_REF"
-CACHED_BIN="$CACHE_DIR/bin/verus-tools-mcp"
 
 log() { printf '[verus-mcp] %s\n' "$*" >&2; }
+
+if [ -z "${VERUS_MCP_REF:-}" ]; then
+  pins="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/verus/pins.env"
+  VERUS_MCP_REF="$(sed -n 's/^VERUS_MCP_REF=//p' "$pins" 2>/dev/null || true)"
+fi
+: "${VERUS_MCP_REF:=main}"
+if sha="$(git ls-remote "$VERUS_MCP_REPO" "refs/heads/$VERUS_MCP_REF" 2>/dev/null | cut -f1)" \
+   && [ -n "$sha" ]; then
+  log "branch $VERUS_MCP_REF is at ${sha:0:10}"
+  VERUS_MCP_REF="$sha"
+elif [ ! -d "$CACHE_ROOT/$VERUS_MCP_REF" ]; then
+  # Offline (or not a branch and not cached): keep the last build we have.
+  last="$(ls -t "$CACHE_ROOT" 2>/dev/null | head -1 || true)"
+  if [ -n "$last" ] && [ -x "$CACHE_ROOT/$last/bin/verus-tools-mcp" ]; then
+    log "cannot resolve $VERUS_MCP_REF; using the newest cached build ($last)"
+    VERUS_MCP_REF="$last"
+  fi
+fi
+
+CACHE_DIR="$CACHE_ROOT/$VERUS_MCP_REF"
+CACHED_BIN="$CACHE_DIR/bin/verus-tools-mcp"
 
 # --- 1. Already on PATH? ---------------------------------------------------
 if command -v verus-tools-mcp >/dev/null 2>&1; then

@@ -16,3 +16,6 @@
 
 # Verus --log-dir default output (SMT capture uses ~/.verus-trace instead)
 .verus-log/
+
+# Verus reachability/coverage output (scripts/verus/coverage.sh, CI only)
+/.verus-out/
