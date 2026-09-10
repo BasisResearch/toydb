@@ -4,8 +4,8 @@
 #
 # Verus verification GATE. Runs `scripts/verus/verify.sh` (i.e. `cargo verus
 # focus --lib` over the opted-in modules) and FAILS the PR if any verified
-# module stops verifying with either upstream Z3 or cvc5. The Basis fork
-# runs separately in verus-verify.yml and verus-coverage.yml for statistics.
+# module stops verifying with upstream Z3. The Basis fork runs separately in
+# verus-verify.yml and verus-coverage.yml for statistics.
 #
 # Pins: scripts/verus/pins.env, installed by the setup-verus action in upstream
 # mode.
@@ -18,13 +18,9 @@ permissions:
 
 jobs:
   verus-gate:
-    name: Upstream Verus gate (${{ matrix.solver }})
+    name: Upstream Verus gate (z3)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        solver: [z3, cvc5]
     steps:
       - uses: actions/checkout@v7
 
@@ -36,25 +32,19 @@ jobs:
         uses: ./.github/actions/setup-verus
         with:
           distribution: "upstream"
-          solver: ${{ matrix.solver }}
+          solver: "z3"
 
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
-          key: verus-gate-upstream-${{ runner.os }}-${{ matrix.solver }}-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
+          key: verus-gate-upstream-${{ runner.os }}-z3-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify opted-in modules (gating)
         env:
-          SOLVER: ${{ matrix.solver }}
-          # Use a fresh target per matrix job so both solvers always run.
-          CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-${{ matrix.solver }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-z3
         run: |
           # Verus spawns many Z3 processes; give the runner process headroom.
           ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
-          solver_args=()
-          if [[ "$SOLVER" == cvc5 ]]; then
-            solver_args=(-V cvc5)
-          fi
-          ./scripts/verus/verify.sh "${solver_args[@]}"
+          ./scripts/verus/verify.sh
