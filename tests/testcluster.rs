@@ -91,14 +91,17 @@ impl TestServer {
         std::fs::create_dir_all(dir)?;
         std::fs::write(&configfile, Self::build_config(id, dir, ports)?)?;
 
-        // Build the binary.
+        // Build the binary, unless TOYDB_BIN names a prebuilt one (e.g. an
+        // instrumented build for coverage, see scripts/verus/dyncov.sh).
         //
         // TODO: this may contribute to slow tests, consider building once.
-        let build = escargot::CargoBuild::new().bin("toydb").run()?;
+        let mut command = match std::env::var_os("TOYDB_BIN") {
+            Some(bin) => std::process::Command::new(bin),
+            None => escargot::CargoBuild::new().bin("toydb").run()?.command(),
+        };
 
         // Spawn process. Discard output.
-        let child = build
-            .command()
+        let child = command
             .args(["-c", &configfile.to_string_lossy()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -141,8 +144,22 @@ impl TestServer {
 }
 
 impl Drop for TestServer {
-    // Kills the child process when dropped.
+    // Kills the child process when dropped. A prebuilt binary (TOYDB_BIN, an
+    // instrumented coverage build) is first asked to stop with SIGTERM, so
+    // that it can write its coverage profile; it is killed if it lingers.
     fn drop(&mut self) {
+        if std::env::var_os("TOYDB_BIN").is_some() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         self.child.kill().expect("failed to kill node");
         self.child.wait().expect("failed to wait for node to terminate");
     }
