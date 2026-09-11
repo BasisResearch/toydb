@@ -1,0 +1,46 @@
+{
+  "branch": "fixture",
+  "commit_sha": "0",
+  "ts": "2026-01-01T00:00:00+00:00",
+  "nodes": [
+    {"id": "src/sql/parser/parser.rs", "level": "file", "parent": null,
+     "file": "src/sql/parser/parser.rs", "module": null, "function": null,
+     "kind": "file", "status": "unverified"},
+    {"id": "src/sql/parser/parser.rs::sql::parser::parser", "level": "module",
+     "parent": "src/sql/parser/parser.rs", "file": "src/sql/parser/parser.rs",
+     "module": "sql::parser::parser", "function": null, "kind": "mod",
+     "status": "unverified"},
+    {"id": "src/sql/parser/parser.rs::sql::parser::parser::parse",
+     "level": "function", "parent": "src/sql/parser/parser.rs::sql::parser::parser",
+     "file": "src/sql/parser/parser.rs", "module": "sql::parser::parser",
+     "function": "parse", "kind": "fn", "status": "unverified"},
+
+    {"id": "src/parser.rs", "level": "file", "parent": null,
+     "file": "src/parser.rs", "module": null, "function": null,
+     "kind": "file", "status": "unverified"},
+    {"id": "src/parser.rs::parser", "level": "module", "parent": "src/parser.rs",
+     "file": "src/parser.rs", "module": "parser", "function": null,
+     "kind": "mod", "status": "unverified"},
+    {"id": "src/parser.rs::parser::reached_exec", "level": "function",
+     "parent": "src/parser.rs::parser", "file": "src/parser.rs",
+     "module": "parser", "function": "reached_exec", "kind": "fn",
+     "status": "unverified"},
+    {"id": "src/parser.rs::parser::dead_exec", "level": "function",
+     "parent": "src/parser.rs::parser", "file": "src/parser.rs",
+     "module": "parser", "function": "dead_exec", "kind": "fn",
+     "status": "unverified"}
+  ],
+  "edges": [
+    {"from": "src/sql/parser/parser.rs::sql::parser::parser",
+     "to": "src/sql/parser/parser.rs", "level": "module"},
+    {"from": "src/sql/parser/parser.rs::sql::parser::parser::parse",
+     "to": "src/sql/parser/parser.rs::sql::parser::parser", "level": "function"},
+    {"from": "src/parser.rs::parser", "to": "src/parser.rs", "level": "module"},
+    {"from": "src/parser.rs::parser::reached_exec", "to": "src/parser.rs::parser",
+     "level": "function"},
+    {"from": "src/parser.rs::parser::dead_exec", "to": "src/parser.rs::parser",
+     "level": "function"},
+    {"from": "src/sql/parser/parser.rs::sql::parser::parser::parse",
+     "to": "src/parser.rs::parser::reached_exec", "level": "function"}
+  ]
+}

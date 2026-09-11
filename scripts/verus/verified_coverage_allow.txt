@@ -1,0 +1,46 @@
+# verified_coverage_allow.txt -- known-dead verified exec surface.
+#
+# One key per line, optionally followed by a free-form reason. A key is either a
+# module path (sql::parser::verified_stmt) or a module::function qualifier
+# (sql::parser::verified_roundtrip::parse_expr_exec). A flag is suppressed when
+# its own key OR its module is listed. `#` lines and blanks are ignored.
+#
+# Phase 4 ("delete-twins", 2026-09-02) deleted
+# the code behind every phase-1 entry: the dead statement/lexer exec twins
+# (verified_stmt's parse_stmt_exec/parse_stmt_full_exec layer, verified_lexer's
+# lex_all_exec/lex_mtok_exec layer, all of verified.rs) and the per-function
+# dead exec helpers in verified_roundtrip, verified_function_list,
+# verified_precedence and encoding::keycode. New entries require a dated reason
+# naming a scheduled follow-up or a recorded standing decision;
+# `verified_coverage.py --check` fails on any flagged function not listed
+# here, which is the intended ratchet.
+
+# --- phase-3 min-parens surface not yet exercised by the lib test corpus ------
+# (2026-09-02, flagged when phase 4 regenerated this list; phase 3 landed after
+# the phase-1 baseline run.) These are NOT dead twins: the first five are
+# helpers of print_min_expr, which the printer.rs min-parens differential tests
+# execute -- but only on inputs that never take the parenthesise / function-args
+# / IS-affix branches. min_roundtrip_live is phase 3's exec-carried headline
+# theorem (the live parser inverts the min-parens printer), verified but not
+# invoked by any test. Standing decision (2026-09-02): phase 5 (oracle
+# retirement) is CANCELLED -- the legacy parser and differential harness stay
+# permanently under cfg(test) as insurance against the consistent-triple-swap
+# residual. These entries are therefore permanent documented exceptions:
+# exec-carried theorems are verified statements, not features owed test
+# coverage, and the branch helpers are exercised on their main paths by the
+# min-parens differential lenses.
+sql::parser::verified_minparen::wrap_parens
+sql::parser::verified_minparen::print_min_args_slice
+sql::parser::verified_minparen::prepend_tok
+sql::parser::verified_minparen::append_tok
+sql::parser::verified_minparen::append_is
+sql::parser::verified_minparen::min_roundtrip_live
+# (2026-09-02, phase 7.) min_normalize_live is the exec-carried normalisation
+# theorem (any accepted stream parses equal to its min-parens normal form);
+# same standing exception as min_roundtrip_live above.
+sql::parser::verified_minparen::min_normalize_live
+# (2026-09-02, phase 6.) stmt_min_roundtrip_live is the exec-carried statement
+# roundtrip theorem (the live parser inverts the min-parens statement printer);
+# print_min_stmt itself IS covered by the statement_parsers_agree_minparens
+# differential lens. Same standing exception as the entries above.
+sql::parser::verified_minparen_stmt::stmt_min_roundtrip_live

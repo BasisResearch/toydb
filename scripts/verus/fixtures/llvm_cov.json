@@ -1,0 +1,21 @@
+{
+  "type": "llvm.coverage.json.export",
+  "version": "2.0.1",
+  "data": [
+    {
+      "files": [
+        {
+          "filename": "/build/coverage_crate/src/parser.rs",
+          "segments": [
+            [18, 1, 5, true, true, false],
+            [19, 9, 5, true, false, false],
+            [20, 1, 5, true, false, false],
+            [22, 1, 0, true, true, false],
+            [23, 9, 0, true, false, false],
+            [24, 1, 0, true, false, false]
+          ]
+        }
+      ]
+    }
+  ]
+}

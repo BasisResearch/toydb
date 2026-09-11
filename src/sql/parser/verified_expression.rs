@@ -193,6 +193,9 @@ pub open spec fn binary_from_token(token: TokenView) -> Option<BinaryTag> {
         TokenView::LessThan => Some(BinaryTag::LessThan),
         TokenView::LessThanOrEqual => Some(BinaryTag::LessThanOrEqual),
         TokenView::NotEqual => Some(BinaryTag::NotEqual),
+        // `<>` is a second spelling of not-equal (legacy toyDB accepts it). Two
+        // token spellings collapse to one tag; the printer only ever emits `!=`.
+        TokenView::LessOrGreaterThan => Some(BinaryTag::NotEqual),
         TokenView::Plus => Some(BinaryTag::Add),
         TokenView::Slash => Some(BinaryTag::Divide),
         TokenView::Caret => Some(BinaryTag::Exponentiate),

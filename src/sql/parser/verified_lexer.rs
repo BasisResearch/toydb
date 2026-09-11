@@ -1,14 +1,13 @@
-//! Verified production lexer — first brick (L0).
+//! Token-level lexer model.
 //!
-//! The grammar layer (`verified_stmt` etc.) operates on a clean `Token` stream.
-//! This module begins the from-scratch production lexer that will eventually
-//! produce that stream from raw bytes, scanning `Seq<u8>` with an explicit
-//! cursor and producing the *real* production `Token` (not the Phase-0 toy in
-//! `verified.rs`). L0 covers the munch-free single-character punctuation — the
-//! tokens that are never a prefix of a two-character token (so no maximal-munch
-//! reasoning is needed yet). `<`, `>`, `!` and the two-char operators (`<=`,
-//! `>=`, `<>`, `!=`) are deferred to L1 (maximal munch); numbers, strings,
-//! identifiers and keywords to later bricks.
+//! Provides a ghost/spec model of tokenization so the grammar layer
+//! (`verified_stmt` etc.) can reason over a clean `Token` stream. Every theorem
+//! here is stated at the token level.
+//!
+//! Limit: this model is NOT wired to the production `Lexer`. The only lexer code
+//! that actually runs verified is `scan_symbol_bytes` (here) and
+//! `scan_number_bytes` (in `lexer.rs`); the rest of the string -> token stage in
+//! the production lexer is essentially unverified plain Rust.
 
 #![allow(dead_code)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the
@@ -127,50 +126,6 @@ pub proof fn lemma_lscan1_lex_print1(t: Token, tail: Seq<u8>)
     assert(scan_punct1(punct1_byte(t)) == Some(t));
 }
 
-/// Executable L0 scanner, refining `lscan1` at the byte level. `input[pos]` is a
-/// real byte from the source; the returned token matches the spec exactly.
-pub fn scan_punct1_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-    ensures
-        r.0 == lscan1(input@, pos as int).0,
-        r.1 == lscan1(input@, pos as int).1,
-{
-    if pos < input.len() {
-        let b = input[pos];
-        let t: Option<Token> = if b == 46u8 { Some(Token::Period) }
-            else if b == 61u8 { Some(Token::Equal) }
-            else if b == 43u8 { Some(Token::Plus) }
-            else if b == 45u8 { Some(Token::Minus) }
-            else if b == 42u8 { Some(Token::Asterisk) }
-            else if b == 47u8 { Some(Token::Slash) }
-            else if b == 94u8 { Some(Token::Caret) }
-            else if b == 37u8 { Some(Token::Percent) }
-            else if b == 63u8 { Some(Token::Question) }
-            else if b == 44u8 { Some(Token::Comma) }
-            else if b == 59u8 { Some(Token::Semicolon) }
-            else if b == 40u8 { Some(Token::OpenParen) }
-            else if b == 41u8 { Some(Token::CloseParen) }
-            else { None };
-        match t {
-            Some(tok) => (Some(tok), pos + 1),
-            None => (None, pos),
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-// -- L1: maximal-munch operators (`<` `>` `!` and `<=` `>=` `<>` `!=`) ---------
-//
-// These are the first tokens where a byte can begin more than one token, so the
-// scanner must look one byte ahead and commit to the longest match. The two-char
-// forms roundtrip for any tail (nothing extends them). The single-char forms
-// (`<`, `>`, `!`) need a byte-level boundary condition on the tail: a printed `<`
-// followed by `=` or `>` would re-scan as `<=`/`<>`, so the roundtrip holds only
-// when the next byte is not one that extends the operator — the same boundary
-// reasoning the grammar used at the token level, here at the byte level.
-
 /// The maximal-munch operator tokens.
 pub open spec fn is_op(t: Token) -> bool {
     match t {
@@ -281,42 +236,6 @@ pub proof fn lemma_lscan_op(t: Token, tail: Seq<u8>)
     }
 }
 
-/// Executable maximal-munch operator scanner, refining `lscan_op` on real bytes.
-pub fn scan_op_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-    ensures
-        r.0 == lscan_op(input@, pos as int).0,
-        r.1 == lscan_op(input@, pos as int).1,
-{
-    if pos < input.len() {
-        let b0 = input[pos];
-        let has1 = pos + 1 < input.len();
-        if b0 == 60u8 {
-            if has1 && input[pos + 1] == 61u8 { (Some(Token::LessThanOrEqual), pos + 2) }
-            else if has1 && input[pos + 1] == 62u8 { (Some(Token::LessOrGreaterThan), pos + 2) }
-            else { (Some(Token::LessThan), pos + 1) }
-        } else if b0 == 62u8 {
-            if has1 && input[pos + 1] == 61u8 { (Some(Token::GreaterThanOrEqual), pos + 2) }
-            else { (Some(Token::GreaterThan), pos + 1) }
-        } else if b0 == 33u8 {
-            if has1 && input[pos + 1] == 61u8 { (Some(Token::NotEqual), pos + 2) }
-            else { (Some(Token::Exclamation), pos + 1) }
-        } else {
-            (None, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-// -- L2: whitespace skipping --------------------------------------------------
-//
-// The lexer skips ASCII whitespace before each token. `skip_ws` advances the
-// cursor past a maximal run of whitespace bytes; the token scanners run at the
-// returned position. This is the first piece of the inter-token machinery the
-// whole-input token-list roundtrip will need.
-
 /// ASCII whitespace: space, tab, newline, carriage return.
 pub open spec fn is_ws(b: u8) -> bool {
     b == 32 || b == 9 || b == 10 || b == 13
@@ -372,35 +291,6 @@ pub proof fn lemma_skip_ws_nonws(input: Seq<u8>, pos: int)
         skip_ws(input, pos) == pos,
 {
 }
-
-/// Executable whitespace skip, refining `skip_ws`.
-pub fn skip_ws_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
-    requires
-        pos <= input.len(),
-    ensures
-        r == skip_ws(input@, pos as int),
-    decreases input.len() - pos,
-{
-    if pos < input.len() {
-        let b = input[pos];
-        if b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 {
-            skip_ws_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
-    }
-}
-
-// -- L3: number scanning (integer core) ---------------------------------------
-//
-// `Number` is the first token with a payload. The production `scan_number_bytes`
-// (in `lexer.rs`, already verified) consumes digits then an optional `.`-fraction
-// and `e`-exponent, storing the raw bytes. This brick proves the spec-level
-// roundtrip for the integer core: a maximal digit run re-scans to exactly itself,
-// given the following byte does not continue the run. Decimal/exponent extension
-// is deferred to a later brick; the boundary reasoning is identical to L1.
 
 /// ASCII digit `0`-`9`.
 pub open spec fn is_digit(b: u8) -> bool {
@@ -463,34 +353,6 @@ pub proof fn lemma_scan_digits_roundtrip(d: Seq<u8>, tail: Seq<u8>)
     }
     lemma_scan_digits_end_run(input, 0, d.len() as int);
 }
-
-/// Executable maximal digit-run scanner, refining `scan_digits_end`.
-pub fn scan_digits_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
-    requires
-        pos <= input.len(),
-    ensures
-        r == scan_digits_end(input@, pos as int),
-    decreases input.len() - pos,
-{
-    if pos < input.len() {
-        let b = input[pos];
-        if 48u8 <= b && b <= 57u8 {
-            scan_digits_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
-    }
-}
-
-// -- L4: identifier scanning (unquoted char-run) ------------------------------
-//
-// An unquoted identifier is `[A-Za-z_][A-Za-z0-9_]*`. The production lexer then
-// lowercases it and classifies it as a keyword if it matches the keyword table;
-// that canonicalisation (lowercasing, keyword lookup) is a later brick. This
-// brick proves the char-run core: a maximal identifier run re-scans to itself
-// under an identifier-continuation boundary — the same shape as L3.
 
 /// Identifier start byte: `A`-`Z`, `a`-`z`, or `_`.
 pub open spec fn is_ident_start(b: u8) -> bool {
@@ -556,36 +418,6 @@ pub proof fn lemma_scan_ident_roundtrip(d: Seq<u8>, tail: Seq<u8>)
     }
     lemma_scan_ident_end_run(input, 0, d.len() as int);
 }
-
-/// Executable maximal identifier-run scanner, refining `scan_ident_end`.
-pub fn scan_ident_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
-    requires
-        pos <= input.len(),
-    ensures
-        r == scan_ident_end(input@, pos as int),
-    decreases input.len() - pos,
-{
-    if pos < input.len() {
-        let b = input[pos];
-        let cont = ((65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8)
-            || (48u8 <= b && b <= 57u8);
-        if cont {
-            scan_ident_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
-    }
-}
-
-// -- L5: single-token dispatcher ----------------------------------------------
-//
-// Composes L0-L4: skip whitespace, then dispatch on the first byte to the right
-// scanner and return the end position of that one token. This is the backbone of
-// the whole-input token-list scanner (repeatedly apply until end). Deferred token
-// classes (strings, quoted identifiers, comments) yield "no advance" for now, so
-// the dispatcher is total but not yet complete — later bricks fill those arms.
 
 /// Monotonicity/bounds for the digit run (needed to show the dispatcher advances).
 pub proof fn lemma_scan_digits_end_bounds(input: Seq<u8>, pos: int)
@@ -699,44 +531,7 @@ pub proof fn lemma_lex_token_end_progress(input: Seq<u8>, pos: int)
     }
 }
 
-// -- L6: executable dispatcher + spec token-list scanner ----------------------
 //
-// `lex_token_end_exec` is the runnable dispatcher (composes the L0-L5 exec
-// scanners), refining `lex_token_end`. `lex_all_ends` is the spec-level
-// whole-input scanner: the strictly-increasing sequence of token end positions,
-// fuel-bounded (like the parser's `sparse`, to sidestep proving termination
-// through the L5 progress lemma inside a spec fn).
-
-/// Executable "extent of the next token" — skip whitespace, dispatch on the first
-/// byte, return the token's end position. Refines `lex_token_end` exactly.
-pub fn lex_token_end_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
-    requires
-        pos <= input.len(),
-    ensures
-        r == lex_token_end(input@, pos as int),
-{
-    let p = skip_ws_exec(input, pos);
-    proof { lemma_skip_ws_bounds(input@, pos as int); }
-    if p < input.len() {
-        let b = input[p];
-        if 48u8 <= b && b <= 57u8 {
-            scan_digits_exec(input, p)
-        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
-            scan_ident_exec(input, p)
-        } else if b == 60u8 || b == 62u8 || b == 33u8 {
-            let (_t, e) = scan_op_exec(input, p);
-            e
-        } else {
-            let (t, e) = scan_punct1_exec(input, p);
-            match t {
-                Some(_) => e,
-                None => p,
-            }
-        }
-    } else {
-        p
-    }
-}
 
 /// Spec whole-input token-list scanner: the sequence of token end positions from
 /// `pos`, stopping at end-of-input or an unrecognized (deferred-class) byte.
@@ -822,102 +617,10 @@ pub proof fn lemma_lex_all_ends_fuel_stable(input: Seq<u8>, pos: int, fuel: nat)
     }
 }
 
-// -- L8: executable token-list loop -------------------------------------------
-//
-// The runnable whole-input tokenizer skeleton: repeatedly apply the exec
-// dispatcher, collecting token end positions, and prove the result equals the
-// fuel-bounded spec `lex_all_ends` at the canonical fuel. Fuel bookkeeping in the
-// loop invariant is discharged by L7 stability (a fixed ghost fuel `len + 1`
-// suffices at every cursor position).
 
-/// Int view of a `usize` position sequence, for relating the exec `Vec<usize>` to
-/// the spec `Seq<int>` end-position list.
 pub open spec fn ends_int(v: Seq<usize>) -> Seq<int> {
     v.map_values(|x: usize| x as int)
 }
-
-/// Executable whole-input token-list scanner: the end positions of every token
-/// from `start`, refining `lex_all_ends` at the canonical fuel `len + 1`.
-#[verifier::rlimit(40000)]
-pub fn lex_all_ends_exec(input: &Vec<u8>, start: usize) -> (r: Vec<usize>)
-    requires
-        start <= input.len(),
-    ensures
-        ends_int(r@) == lex_all_ends(input@, start as int, input@.len() + 1),
-{
-    let ghost fuel: nat = input@.len() + 1;
-    let ghost whole = lex_all_ends(input@, start as int, fuel);
-    let mut r: Vec<usize> = Vec::new();
-    let mut pos: usize = start;
-    proof {
-        assert(ends_int(r@) =~= Seq::<int>::empty());
-    }
-    while pos < input.len()
-        invariant
-            start <= pos <= input.len(),
-            fuel == input@.len() + 1,
-            whole == lex_all_ends(input@, start as int, fuel),
-            ends_int(r@) + lex_all_ends(input@, pos as int, fuel) == whole,
-        decreases input.len() - pos,
-    {
-        let ghost pos0 = pos as int;
-        let e = lex_token_end_exec(input, pos);
-        proof { lemma_lex_token_end_bounds(input@, pos as int); }
-        if e > pos {
-            let ghost r_old = r@;
-            r.push(e);
-            pos = e;
-            proof {
-                // Unfold lex_all_ends at pos0 (fuel > 0), then use L7 stability to
-                // realign the tail fuel from fuel-1 to fuel.
-                reveal_with_fuel(lex_all_ends, 1);
-                assert(e as int == lex_token_end(input@, pos0));
-                assert(0 <= e as int <= input@.len());
-                assert((fuel - 1) as nat == input@.len());
-                assert((fuel - 1) as nat >= input@.len() - (e as int));
-                assert(lex_all_ends(input@, pos0, fuel)
-                    == seq![e as int] + lex_all_ends(input@, e as int, (fuel - 1) as nat));
-                lemma_lex_all_ends_fuel_stable(input@, e as int, (fuel - 1) as nat);
-                assert(lex_all_ends(input@, e as int, (fuel - 1) as nat)
-                    == lex_all_ends(input@, e as int, fuel));
-                assert(ends_int(r@) =~= ends_int(r_old) + seq![e as int]);
-                assert(ends_int(r@) + lex_all_ends(input@, e as int, fuel)
-                    == ends_int(r_old) + (seq![e as int] + lex_all_ends(input@, e as int, fuel)));
-            }
-        } else {
-            proof {
-                // No progress: e <= pos means an unrecognized (deferred-class)
-                // byte. The spec dispatcher agrees (e == lex_token_end), so the
-                // tail is empty and the invariant already gives the postcondition.
-                reveal_with_fuel(lex_all_ends, 1);
-                assert(e as int == lex_token_end(input@, pos as int));
-                assert(lex_token_end(input@, pos as int) <= pos as int);
-                assert(fuel > 0);
-                assert(lex_all_ends(input@, pos as int, fuel) =~= Seq::<int>::empty());
-            }
-            return r;
-        }
-    }
-    proof {
-        // pos == len: skip_ws stays at len, the dispatcher returns len, tail empty.
-        reveal_with_fuel(lex_all_ends, 1);
-        lemma_skip_ws_bounds(input@, pos as int);
-        assert(pos == input.len());
-        assert(skip_ws(input@, pos as int) == pos as int);
-        assert(lex_token_end(input@, pos as int) == pos as int);
-        assert(fuel > 0);
-        assert(lex_all_ends(input@, pos as int, fuel) =~= Seq::<int>::empty());
-    }
-    r
-}
-
-// -- L9: symbol token scanner (punctuation + operators, token values) ---------
-//
-// L0/L1 proved byte-level roundtrips; this unifies them into a single scanner
-// that produces the actual `Token` value for any symbol (punctuation or
-// operator), with one combined roundtrip. It is the first token-*value*-producing
-// scanner — the shape the whole token-list roundtrip needs (payload tokens,
-// numbers/strings/identifiers, come later).
 
 /// Canonical byte print of a symbol token (punctuation or operator).
 pub open spec fn lex_print_sym(t: Token) -> Seq<u8> {
@@ -982,34 +685,6 @@ pub proof fn lemma_lscan_sym(t: Token, tail: Seq<u8>)
         assert(scan_punct1(punct1_byte(t)) == Some(t));
     }
 }
-
-/// Executable symbol scanner, refining `lscan_sym`.
-pub fn scan_sym_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-    ensures
-        r.0 == lscan_sym(input@, pos as int).0,
-        r.1 == lscan_sym(input@, pos as int).1,
-{
-    if pos < input.len() {
-        let b = input[pos];
-        if b == 60u8 || b == 62u8 || b == 33u8 {
-            scan_op_exec(input, pos)
-        } else {
-            scan_punct1_exec(input, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-// -- L10: number token-value scanner (integer core) ---------------------------
-//
-// The first payload-carrying token scanner: it produces the token *value*
-// `TokenView::Number(bytes)` (the ghost view of the production `Token::Number`),
-// composing L3's digit run. `TokenView::Number(Seq<u8>)` carries the raw bytes,
-// exactly as `token_view(Token::Number(v)) == TokenView::Number(v@)`. The exec
-// byte-collection is already verified in `lexer.rs::scan_number_bytes`.
 
 /// Scan a number (integer core): if the byte at `pos` is a digit, consume the
 /// maximal digit run and produce `Number` carrying those bytes.
@@ -1232,43 +907,6 @@ pub proof fn lemma_lscan_num_full_dec(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
     assert(scan_num_full_end(input, 0) == p);
     assert(input.subrange(0, p) =~= v);
 }
-
-/// Executable full number scanner, refining `scan_num_full_end`.
-pub fn scan_num_full_exec(input: &Vec<u8>, pos: usize) -> (r: usize)
-    requires
-        pos <= input.len(),
-    ensures
-        r == scan_num_full_end(input@, pos as int),
-{
-    let d1 = scan_digits_exec(input, pos);
-    let mut p = d1;
-    if p < input.len() && input[p] == 46u8 {
-        p = scan_digits_exec(input, p + 1);
-    }
-    assert(p == scan_num_dec_end(input@, pos as int));
-    if p < input.len() && (input[p] == 101u8 || input[p] == 69u8) {
-        let mut q = p + 1;
-        if q < input.len() && (input[q] == 43u8 || input[q] == 45u8) {
-            q = q + 1;
-        }
-        scan_digits_exec(input, q)
-    } else {
-        p
-    }
-}
-
-// -- L13: keyword classification table -----------------------------------------
-//
-// The production lexer scans an identifier run, lowercases it, and classifies it
-// as a keyword (via `Keyword::try_from`) or else a plain `Ident`. This brick
-// carries the keyword table at the byte level: `kw_text` (the canonical lowercase
-// bytes), `classify_kw` (byte-run -> keyword, mirroring `try_from`), the table
-// round-trip `lemma_classify_kw_text` (classifying a keyword's own text recovers
-// it — the table is injective), and the executable `classify_kw_exec`. The
-// classifier decides on length + indexed bytes (`byte_at`), never whole-`Seq`
-// equality, which Verus does not resolve automatically. Case-folding of the
-// printed (uppercase `Display`) form into this lowercase key, and the plain-Ident
-// arm, come with the dispatcher brick.
 
 /// Canonical lowercase keyword bytes — the classification key (what the
 /// production lexer matches after lowercasing an identifier run).
@@ -1563,93 +1201,6 @@ pub proof fn lemma_classify_kw_text(k: Keyword)
         Keyword::Table | Keyword::Text | Keyword::Time | Keyword::Transaction | Keyword::True | Keyword::Unique | Keyword::Update | Keyword::Values | Keyword::Varchar | Keyword::Where | Keyword::Write => lemma_classify_kw_text_g5(k),
     }
 }
-
-/// Executable keyword classifier, refining `classify_kw`. Length-guarded byte
-/// comparisons (short-circuit `&&` keeps every index in bounds).
-#[verifier::spinoff_prover]
-pub fn classify_kw_exec(s: &Vec<u8>) -> (r: Option<Keyword>)
-    ensures r == classify_kw(s@),
-{
-    if s.len() == 2 && s[0] == 97u8 && s[1] == 115u8 { return Some(Keyword::As); }
-    if s.len() == 3 && s[0] == 97u8 && s[1] == 115u8 && s[2] == 99u8 { return Some(Keyword::Asc); }
-    if s.len() == 3 && s[0] == 97u8 && s[1] == 110u8 && s[2] == 100u8 { return Some(Keyword::And); }
-    if s.len() == 5 && s[0] == 98u8 && s[1] == 101u8 && s[2] == 103u8 && s[3] == 105u8 && s[4] == 110u8 { return Some(Keyword::Begin); }
-    if s.len() == 4 && s[0] == 98u8 && s[1] == 111u8 && s[2] == 111u8 && s[3] == 108u8 { return Some(Keyword::Bool); }
-    if s.len() == 7 && s[0] == 98u8 && s[1] == 111u8 && s[2] == 111u8 && s[3] == 108u8 && s[4] == 101u8 && s[5] == 97u8 && s[6] == 110u8 { return Some(Keyword::Boolean); }
-    if s.len() == 2 && s[0] == 98u8 && s[1] == 121u8 { return Some(Keyword::By); }
-    if s.len() == 6 && s[0] == 99u8 && s[1] == 111u8 && s[2] == 109u8 && s[3] == 109u8 && s[4] == 105u8 && s[5] == 116u8 { return Some(Keyword::Commit); }
-    if s.len() == 6 && s[0] == 99u8 && s[1] == 114u8 && s[2] == 101u8 && s[3] == 97u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Create); }
-    if s.len() == 5 && s[0] == 99u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 115u8 && s[4] == 115u8 { return Some(Keyword::Cross); }
-    if s.len() == 7 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 97u8 && s[4] == 117u8 && s[5] == 108u8 && s[6] == 116u8 { return Some(Keyword::Default); }
-    if s.len() == 6 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 108u8 && s[3] == 101u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Delete); }
-    if s.len() == 4 && s[0] == 100u8 && s[1] == 101u8 && s[2] == 115u8 && s[3] == 99u8 { return Some(Keyword::Desc); }
-    if s.len() == 6 && s[0] == 100u8 && s[1] == 111u8 && s[2] == 117u8 && s[3] == 98u8 && s[4] == 108u8 && s[5] == 101u8 { return Some(Keyword::Double); }
-    if s.len() == 4 && s[0] == 100u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 112u8 { return Some(Keyword::Drop); }
-    if s.len() == 6 && s[0] == 101u8 && s[1] == 120u8 && s[2] == 105u8 && s[3] == 115u8 && s[4] == 116u8 && s[5] == 115u8 { return Some(Keyword::Exists); }
-    if s.len() == 7 && s[0] == 101u8 && s[1] == 120u8 && s[2] == 112u8 && s[3] == 108u8 && s[4] == 97u8 && s[5] == 105u8 && s[6] == 110u8 { return Some(Keyword::Explain); }
-    if s.len() == 5 && s[0] == 102u8 && s[1] == 97u8 && s[2] == 108u8 && s[3] == 115u8 && s[4] == 101u8 { return Some(Keyword::False); }
-    if s.len() == 5 && s[0] == 102u8 && s[1] == 108u8 && s[2] == 111u8 && s[3] == 97u8 && s[4] == 116u8 { return Some(Keyword::Float); }
-    if s.len() == 4 && s[0] == 102u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 109u8 { return Some(Keyword::From); }
-    if s.len() == 5 && s[0] == 103u8 && s[1] == 114u8 && s[2] == 111u8 && s[3] == 117u8 && s[4] == 112u8 { return Some(Keyword::Group); }
-    if s.len() == 6 && s[0] == 104u8 && s[1] == 97u8 && s[2] == 118u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 103u8 { return Some(Keyword::Having); }
-    if s.len() == 2 && s[0] == 105u8 && s[1] == 102u8 { return Some(Keyword::If); }
-    if s.len() == 5 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 100u8 && s[3] == 101u8 && s[4] == 120u8 { return Some(Keyword::Index); }
-    if s.len() == 8 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 102u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 105u8 && s[6] == 116u8 && s[7] == 121u8 { return Some(Keyword::Infinity); }
-    if s.len() == 5 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 110u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Inner); }
-    if s.len() == 6 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 115u8 && s[3] == 101u8 && s[4] == 114u8 && s[5] == 116u8 { return Some(Keyword::Insert); }
-    if s.len() == 3 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 { return Some(Keyword::Int); }
-    if s.len() == 7 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 && s[3] == 101u8 && s[4] == 103u8 && s[5] == 101u8 && s[6] == 114u8 { return Some(Keyword::Integer); }
-    if s.len() == 4 && s[0] == 105u8 && s[1] == 110u8 && s[2] == 116u8 && s[3] == 111u8 { return Some(Keyword::Into); }
-    if s.len() == 2 && s[0] == 105u8 && s[1] == 115u8 { return Some(Keyword::Is); }
-    if s.len() == 4 && s[0] == 106u8 && s[1] == 111u8 && s[2] == 105u8 && s[3] == 110u8 { return Some(Keyword::Join); }
-    if s.len() == 3 && s[0] == 107u8 && s[1] == 101u8 && s[2] == 121u8 { return Some(Keyword::Key); }
-    if s.len() == 4 && s[0] == 108u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 116u8 { return Some(Keyword::Left); }
-    if s.len() == 4 && s[0] == 108u8 && s[1] == 105u8 && s[2] == 107u8 && s[3] == 101u8 { return Some(Keyword::Like); }
-    if s.len() == 5 && s[0] == 108u8 && s[1] == 105u8 && s[2] == 109u8 && s[3] == 105u8 && s[4] == 116u8 { return Some(Keyword::Limit); }
-    if s.len() == 3 && s[0] == 110u8 && s[1] == 97u8 && s[2] == 110u8 { return Some(Keyword::NaN); }
-    if s.len() == 3 && s[0] == 110u8 && s[1] == 111u8 && s[2] == 116u8 { return Some(Keyword::Not); }
-    if s.len() == 4 && s[0] == 110u8 && s[1] == 117u8 && s[2] == 108u8 && s[3] == 108u8 { return Some(Keyword::Null); }
-    if s.len() == 2 && s[0] == 111u8 && s[1] == 102u8 { return Some(Keyword::Of); }
-    if s.len() == 6 && s[0] == 111u8 && s[1] == 102u8 && s[2] == 102u8 && s[3] == 115u8 && s[4] == 101u8 && s[5] == 116u8 { return Some(Keyword::Offset); }
-    if s.len() == 2 && s[0] == 111u8 && s[1] == 110u8 { return Some(Keyword::On); }
-    if s.len() == 4 && s[0] == 111u8 && s[1] == 110u8 && s[2] == 108u8 && s[3] == 121u8 { return Some(Keyword::Only); }
-    if s.len() == 2 && s[0] == 111u8 && s[1] == 114u8 { return Some(Keyword::Or); }
-    if s.len() == 5 && s[0] == 111u8 && s[1] == 114u8 && s[2] == 100u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Order); }
-    if s.len() == 5 && s[0] == 111u8 && s[1] == 117u8 && s[2] == 116u8 && s[3] == 101u8 && s[4] == 114u8 { return Some(Keyword::Outer); }
-    if s.len() == 7 && s[0] == 112u8 && s[1] == 114u8 && s[2] == 105u8 && s[3] == 109u8 && s[4] == 97u8 && s[5] == 114u8 && s[6] == 121u8 { return Some(Keyword::Primary); }
-    if s.len() == 4 && s[0] == 114u8 && s[1] == 101u8 && s[2] == 97u8 && s[3] == 100u8 { return Some(Keyword::Read); }
-    if s.len() == 10 && s[0] == 114u8 && s[1] == 101u8 && s[2] == 102u8 && s[3] == 101u8 && s[4] == 114u8 && s[5] == 101u8 && s[6] == 110u8 && s[7] == 99u8 && s[8] == 101u8 && s[9] == 115u8 { return Some(Keyword::References); }
-    if s.len() == 5 && s[0] == 114u8 && s[1] == 105u8 && s[2] == 103u8 && s[3] == 104u8 && s[4] == 116u8 { return Some(Keyword::Right); }
-    if s.len() == 8 && s[0] == 114u8 && s[1] == 111u8 && s[2] == 108u8 && s[3] == 108u8 && s[4] == 98u8 && s[5] == 97u8 && s[6] == 99u8 && s[7] == 107u8 { return Some(Keyword::Rollback); }
-    if s.len() == 6 && s[0] == 115u8 && s[1] == 101u8 && s[2] == 108u8 && s[3] == 101u8 && s[4] == 99u8 && s[5] == 116u8 { return Some(Keyword::Select); }
-    if s.len() == 3 && s[0] == 115u8 && s[1] == 101u8 && s[2] == 116u8 { return Some(Keyword::Set); }
-    if s.len() == 6 && s[0] == 115u8 && s[1] == 116u8 && s[2] == 114u8 && s[3] == 105u8 && s[4] == 110u8 && s[5] == 103u8 { return Some(Keyword::String); }
-    if s.len() == 6 && s[0] == 115u8 && s[1] == 121u8 && s[2] == 115u8 && s[3] == 116u8 && s[4] == 101u8 && s[5] == 109u8 { return Some(Keyword::System); }
-    if s.len() == 5 && s[0] == 116u8 && s[1] == 97u8 && s[2] == 98u8 && s[3] == 108u8 && s[4] == 101u8 { return Some(Keyword::Table); }
-    if s.len() == 4 && s[0] == 116u8 && s[1] == 101u8 && s[2] == 120u8 && s[3] == 116u8 { return Some(Keyword::Text); }
-    if s.len() == 4 && s[0] == 116u8 && s[1] == 105u8 && s[2] == 109u8 && s[3] == 101u8 { return Some(Keyword::Time); }
-    if s.len() == 11 && s[0] == 116u8 && s[1] == 114u8 && s[2] == 97u8 && s[3] == 110u8 && s[4] == 115u8 && s[5] == 97u8 && s[6] == 99u8 && s[7] == 116u8 && s[8] == 105u8 && s[9] == 111u8 && s[10] == 110u8 { return Some(Keyword::Transaction); }
-    if s.len() == 4 && s[0] == 116u8 && s[1] == 114u8 && s[2] == 117u8 && s[3] == 101u8 { return Some(Keyword::True); }
-    if s.len() == 6 && s[0] == 117u8 && s[1] == 110u8 && s[2] == 105u8 && s[3] == 113u8 && s[4] == 117u8 && s[5] == 101u8 { return Some(Keyword::Unique); }
-    if s.len() == 6 && s[0] == 117u8 && s[1] == 112u8 && s[2] == 100u8 && s[3] == 97u8 && s[4] == 116u8 && s[5] == 101u8 { return Some(Keyword::Update); }
-    if s.len() == 6 && s[0] == 118u8 && s[1] == 97u8 && s[2] == 108u8 && s[3] == 117u8 && s[4] == 101u8 && s[5] == 115u8 { return Some(Keyword::Values); }
-    if s.len() == 7 && s[0] == 118u8 && s[1] == 97u8 && s[2] == 114u8 && s[3] == 99u8 && s[4] == 104u8 && s[5] == 97u8 && s[6] == 114u8 { return Some(Keyword::Varchar); }
-    if s.len() == 5 && s[0] == 119u8 && s[1] == 104u8 && s[2] == 101u8 && s[3] == 114u8 && s[4] == 101u8 { return Some(Keyword::Where); }
-    if s.len() == 5 && s[0] == 119u8 && s[1] == 114u8 && s[2] == 105u8 && s[3] == 116u8 && s[4] == 101u8 { return Some(Keyword::Write); }
-    None
-}
-
-
-// -- L14: case-folding + keyword-run token scanner -----------------------------
-//
-// The production lexer scans an identifier run, lowercases it, and classifies it
-// (L13) as a keyword or a plain `Ident`. This brick proves the *keyword* arm
-// end to end and axiom-free (keywords carry no `String`, unlike `Ident`, whose
-// UTF-8/`String` payload needs the deferred trust bridge). It carries ASCII
-// case-folding (`ascii_lower`), the `kw_text` shape facts (every keyword is a
-// non-empty lowercase-letter run), and the roundtrip: an identifier run equal to
-// a keyword's lowercase text, under a non-continuation boundary, lowercases to
-// itself and classifies back to that keyword.
 
 /// ASCII lowercase of one byte (upper-case letters map down 32; others fixed).
 pub open spec fn ascii_lower(b: u8) -> u8 {
@@ -2549,111 +2100,7 @@ pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     }
 }
 
-// -- L17: executable top-level lexer (Vec<u8> -> Vec<Token>) --------------------
 //
-// Refines the spec scanners into runnable code producing the real production
-// `Token`. `lscan_token_exec` is the single-token exec dispatcher (refining
-// `lscan_token` at the `token_view` level); `lex_all_exec` is the fuel-free loop
-// refining `lex_all_seq`. The plain-`Ident`/`String` classes still return `None`
-// (their `String` payload needs the deferred UTF-8 trust bridge), so this exec
-// lexer is *sound but incomplete* — it tokenizes numbers, keywords and symbols.
-
-/// Copy `input[p..e]` into a fresh `Vec<u8>`.
-pub fn subrange_vec(input: &Vec<u8>, p: usize, e: usize) -> (r: Vec<u8>)
-    requires
-        p <= e <= input.len(),
-    ensures
-        r@ == input@.subrange(p as int, e as int),
-{
-    let mut out: Vec<u8> = Vec::new();
-    let mut i = p;
-    while i < e
-        invariant
-            p <= i <= e <= input.len(),
-            out@ == input@.subrange(p as int, i as int),
-        decreases e - i,
-    {
-        out.push(input[i]);
-        assert(out@ =~= input@.subrange(p as int, (i + 1) as int));
-        i += 1;
-    }
-    assert(out@ =~= input@.subrange(p as int, e as int));
-    out
-}
-
-/// Copy `input[p..e]` into a fresh `Vec<u8>`, ASCII-lowercasing each byte.
-pub fn to_lower_vec(input: &Vec<u8>, p: usize, e: usize) -> (r: Vec<u8>)
-    requires
-        p <= e <= input.len(),
-    ensures
-        r@ == ascii_lower_seq(input@.subrange(p as int, e as int)),
-{
-    let mut out: Vec<u8> = Vec::new();
-    let mut i = p;
-    while i < e
-        invariant
-            p <= i <= e <= input.len(),
-            out@ == ascii_lower_seq(input@.subrange(p as int, i as int)),
-        decreases e - i,
-    {
-        let b = input[i];
-        let lb = if 65u8 <= b && b <= 90u8 { b + 32 } else { b };
-        out.push(lb);
-        assert(out@ =~= ascii_lower_seq(input@.subrange(p as int, (i + 1) as int)));
-        i += 1;
-    }
-    assert(out@ =~= ascii_lower_seq(input@.subrange(p as int, e as int)));
-    out
-}
-
-/// Single-token exec dispatcher, refining `lscan_token` at the `token_view` level.
-/// Produces the real `Token`; `None` marks end-of-input, a stray non-token byte,
-/// or a plain identifier (deferred `String` bridge).
-pub fn lscan_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-    ensures
-        r.1 == lscan_token(input@, pos as int).1,
-        ({
-            let spec = lscan_token(input@, pos as int).0;
-            match r.0 {
-                Some(t) => spec == Some(token_view(t)),
-                None => spec is None,
-            }
-        }),
-{
-    let p = skip_ws_exec(input, pos);
-    if p < input.len() {
-        let b = input[p];
-        if 48u8 <= b && b <= 57u8 {
-            let e = scan_num_full_exec(input, p);
-            proof { lemma_scan_num_full_bounds(input@, p as int); }
-            let bytes = subrange_vec(input, p, e);
-            (Some(Token::Number(bytes)), e)
-        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
-            let e = scan_ident_exec(input, p);
-            proof { lemma_scan_ident_end_bounds(input@, p as int); }
-            let low = to_lower_vec(input, p, e);
-            match classify_kw_exec(&low) {
-                Some(kw) => (Some(Token::Keyword(kw)), e),
-                None => (None, e),
-            }
-        } else {
-            scan_sym_exec(input, p)
-        }
-    } else {
-        (None, p)
-    }
-}
-
-
-// -- L17 (cont.): scanner locality bridge --------------------------------------
-//
-// The exec loop scans at absolute positions in the full input, but `lex_all_seq`
-// is defined on progressively sliced suffixes. These locality lemmas bridge the
-// two: each forward scanner's result over `input` at `pos` equals `pos` plus its
-// result over the suffix slice `input[pos..]` at `0` (and produces the same token
-// value). They compose up to `lscan_token_local`.
 
 /// `skip_ws` is suffix-local.
 pub proof fn lemma_skip_ws_local(input: Seq<u8>, pos: int)
@@ -3067,81 +2514,6 @@ pub proof fn lemma_lscan_token_progress(input: Seq<u8>, pos: int)
     }
 }
 
-/// Executable whole-input lexer: tokenize `input` into a `Vec<Token>`, refining
-/// `lex_from` (hence, via the bridge, `lex_all_seq`). Stops at the first
-/// non-token byte or plain identifier (deferred `String` bridge), so it is sound
-/// but incomplete — exact for inputs of numbers, keywords and symbols.
-pub fn lex_all_exec(input: &Vec<u8>) -> (r: Vec<Token>)
-    ensures
-        token_views(r@) == lex_from(input@, 0, (input.len() + 1) as nat),
-{
-    let mut acc: Vec<Token> = Vec::new();
-    let mut pos: usize = 0;
-    let ghost fuel0: nat = (input.len() + 1) as nat;
-    let ghost rf: nat = fuel0;
-    assert(token_views(acc@) == Seq::<TokenView>::empty()) by {
-        assert(acc@ =~= Seq::<Token>::empty());
-    }
-    while pos < input.len()
-        invariant
-            pos <= input.len(),
-            acc.len() <= pos,
-            fuel0 == input.len() + 1,
-            rf == fuel0 - acc.len(),
-            token_views(acc@) + lex_from(input@, pos as int, rf) == lex_from(input@, 0, fuel0),
-        decreases input.len() - pos,
-    {
-        let p = skip_ws_exec(input, pos);
-        if p >= input.len() {
-            assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
-            return acc;
-        }
-        let (ot, e) = lscan_token_exec(input, pos);
-        match ot {
-            Some(t) => {
-                let ghost old_acc = acc@;
-                let ghost old_pos = pos as int;
-                let ghost old_rf = rf;
-                proof {
-                    lemma_lscan_token_progress(input@, pos as int);
-                    lemma_lscan_token_bounds(input@, pos as int);
-                    // unfold lex_from once at pos (rf >= 1, p < len, token is Some)
-                    assert(rf >= 1);
-                    assert(skip_ws(input@, pos as int) < input@.len());
-                    assert(lscan_token(input@, pos as int) == (Some(token_view(t)), e as int));
-                    assert(lex_from(input@, old_pos, old_rf)
-                        == seq![token_view(t)] + lex_from(input@, e as int, (old_rf - 1) as nat));
-                    token_views_concat(old_acc, seq![t]);
-                    assert(token_views(seq![t]) == seq![token_view(t)]) by {
-                        reveal_with_fuel(token_views, 2);
-                        assert(seq![t].drop_first() =~= Seq::<Token>::empty());
-                    }
-                }
-                acc.push(t);
-                pos = e;
-                proof {
-                    rf = (old_rf - 1) as nat;
-                    assert(acc@ == old_acc + seq![t]);
-                    assert(token_views(acc@) == token_views(old_acc) + seq![token_view(t)]);
-                    // chain: reassociate and fold the lex_from unfold back in
-                    assert(token_views(acc@) + lex_from(input@, pos as int, rf)
-                        == token_views(old_acc)
-                           + (seq![token_view(t)] + lex_from(input@, pos as int, rf)));
-                    assert(token_views(old_acc)
-                           + (seq![token_view(t)] + lex_from(input@, pos as int, rf))
-                        == token_views(old_acc) + lex_from(input@, old_pos, old_rf));
-                }
-            }
-            None => {
-                assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
-                return acc;
-            }
-        }
-    }
-    assert(lex_from(input@, pos as int, rf) =~= Seq::<TokenView>::empty());
-    acc
-}
-
 /// The printed list is at least as long as the token count (each token prints a
 /// non-empty run plus a separator), so `input.len()+1` is always enough fuel.
 pub proof fn lemma_lex_print_list_len_ge(ts: Seq<TokenView>)
@@ -3163,36 +2535,6 @@ pub proof fn lemma_lex_print_list_len_ge(ts: Seq<TokenView>)
         lemma_lex_print_list_len_ge(rest);
     }
 }
-
-/// End-to-end executable lexer roundtrip: tokenizing the printed form of a
-/// printable byte-determined token list recovers the list. Combines the exec
-/// loop, the position/slice bridge, and the L16 roundtrip.
-pub proof fn lemma_lex_all_exec_roundtrip(ts: Seq<TokenView>, input: Seq<u8>)
-    requires
-        all_printable_tv(ts),
-        input == lex_print_list(ts),
-    ensures
-        lex_from(input, 0, (input.len() + 1) as nat) == ts,
-{
-    lemma_lex_from_eq_seq(input, 0, (input.len() + 1) as nat);
-    assert(input.subrange(0, input.len() as int) =~= input);
-    lemma_lex_print_list_len_ge(ts);
-    assert(ts.len() <= input.len() + 1);
-    lemma_lex_all_seq_roundtrip(ts, (input.len() + 1) as nat);
-}
-
-
-// -- L18: String-payload bridge primitives (ASCII, axiom-free) ------------------
-//
-// `Ident` and `String` tokens carry a `String` payload. Unlike the byte-determined
-// classes, a `String` cannot be constructed in spec (like `Vec`), so these are
-// handled at the exec level with a char-view refinement. The key finding: for
-// ASCII payloads NO trust axiom is needed — Verus proves the `char`<->`u8` cast
-// roundtrip natively, so a char-per-byte encoding is self-inverse. (Production
-// `as_bytes()` is UTF-8, which coincides with this for ASCII; faithfulness to
-// non-ASCII UTF-8 is a separate, later concern.) These primitives build a
-// `String` from a byte run and prove its char view, the basis for the `Ident`/
-// `String` scanners.
 
 /// Char seq -> bytes: each char truncated to its low byte (exact for ASCII).
 pub open spec fn ascii_bytes(cs: Seq<char>) -> Seq<u8> {
@@ -3272,46 +2614,6 @@ pub proof fn lemma_ascii_bytes_chars(bytes: Seq<u8>)
     }
     assert(ascii_bytes(ascii_chars(bytes)) =~= bytes);
 }
-
-/// Build a `String` from an ASCII byte run `input[p..e]`, proving its char view.
-pub fn build_ascii_string(input: &Vec<u8>, p: usize, e: usize) -> (r: String)
-    requires
-        p <= e <= input.len(),
-        forall|i: int| p <= i < e ==> (#[trigger] input[i]) < 128,
-    ensures
-        r@ == ascii_chars(input@.subrange(p as int, e as int)),
-{
-    let mut s = String::new();
-    let mut i = p;
-    assert(s@ =~= ascii_chars(input@.subrange(p as int, p as int)));
-    while i < e
-        invariant
-            p <= i <= e <= input.len(),
-            forall|j: int| p <= j < e ==> (#[trigger] input[j]) < 128,
-            s@ == ascii_chars(input@.subrange(p as int, i as int)),
-        decreases e - i,
-    {
-        let b = input[i];
-        s.push(b as char);
-        assert(s@ =~= ascii_chars(input@.subrange(p as int, (i + 1) as int))) by {
-            assert(input@[i as int] < 128);
-        }
-        i += 1;
-    }
-    s
-}
-
-
-// -- L19: identifier token scanner at the char-view level (ASCII, axiom-free) ---
-//
-// `Ident` is the first token whose value is a `String`. Neither the spec nor the
-// roundtrip can use a `String` (not spec-constructible, and `String` equality is
-// not view-determined). The fix, mirroring `view_expr`'s dodge of `Vec`: work with
-// the char-sequence *view* `Seq<char>` in spec, and refine the exec at the `s@`
-// level. `lscan_ident_m` produces the char view of an identifier (the lowercased
-// run, when it is not a keyword); the exec `scan_ident_token_exec` builds the real
-// `Token::Ident(String)` and is verified so its `@` view matches. Axiom-free for
-// ASCII identifiers.
 
 /// Every char is a lowercase ASCII letter.
 pub open spec fn all_lower_letter_chars(cs: Seq<char>) -> bool {
@@ -3397,60 +2699,6 @@ pub proof fn lemma_ascii_lower_seq_ascii(s: Seq<u8>)
         assert(ascii_lower_seq(s)[i] == ascii_lower(s[i]));
     }
 }
-
-/// Executable identifier-token scanner: builds the real `Token::Ident(String)`,
-/// verified so its `@` char view matches `lscan_ident_m`. `None` when the run is a
-/// keyword or there is no identifier. Requires the identifier run to be ASCII
-/// (the char-per-byte `String` model; UTF-8 idents are a later concern).
-pub fn scan_ident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-        forall|i: int| pos <= i < scan_ident_end(input@, pos as int) ==> (#[trigger] input@[i]) < 128,
-    ensures
-        r.1 == lscan_ident_m(input@, pos as int).1,
-        match (r.0, lscan_ident_m(input@, pos as int).0) {
-            (Some(Token::Ident(s)), Some(cv)) => s@ == cv,
-            (None, None) => true,
-            _ => false,
-        },
-{
-    if pos < input.len() {
-        let b = input[pos];
-        if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
-            let e = scan_ident_exec(input, pos);
-            proof { lemma_scan_ident_end_bounds(input@, pos as int); }
-            let low = to_lower_vec(input, pos, e);
-            proof {
-                lemma_ascii_lower_seq_ascii(input@.subrange(pos as int, e as int));
-                assert(all_ascii_bytes(input@.subrange(pos as int, e as int))) by {
-                    assert forall|i: int| 0 <= i < (e - pos) implies
-                        input@.subrange(pos as int, e as int)[i] < 128 by {
-                        assert(input@.subrange(pos as int, e as int)[i] == input@[pos + i]);
-                    }
-                }
-            }
-            match classify_kw_exec(&low) {
-                Some(_kw) => (None, e),
-                None => {
-                    let s = build_ascii_string(&low, 0, low.len());
-                    (Some(Token::Ident(s)), e)
-                }
-            }
-        } else {
-            (None, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-
-// -- L20: quoted string literal scanner (quote-free ASCII, char-view) -----------
-//
-// `String` is the second String-payload token. Same char-view treatment as L19.
-// A string literal is self-delimiting (a closing `'`), so unlike identifiers it
-// needs no tail boundary. This brick covers quote-free ASCII strings; the `''`
-// escape for an embedded quote is a mechanical extension of the same shape.
 
 /// First index at or after `pos` holding a quote byte `'` (39), or end of input.
 pub open spec fn scan_to_quote(input: Seq<u8>, pos: int) -> int
@@ -3543,55 +2791,6 @@ pub proof fn lemma_lscan_string_m(cs: Seq<char>, tail: Seq<u8>)
     lemma_ascii_chars_bytes(cs);
     assert(ascii_chars(d) == cs);
 }
-
-/// Executable quoted-string scanner: builds the real `Token::String(String)`,
-/// verified so its `@` char view matches `lscan_string_m`. Requires the string
-/// body to be ASCII. Reads to the first closing quote (no `''` escape yet).
-pub fn scan_string_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-        forall|i: int| pos < i < scan_to_quote(input@, pos + 1) ==> (#[trigger] input@[i]) < 128,
-    ensures
-        r.1 == lscan_string_m(input@, pos as int).1,
-        match (r.0, lscan_string_m(input@, pos as int).0) {
-            (Some(Token::String(s)), Some(cv)) => s@ == cv,
-            (None, None) => true,
-            _ => false,
-        },
-{
-    if pos < input.len() && input[pos] == 39u8 {
-        // scan to closing quote
-        let mut i = pos + 1;
-        while i < input.len() && input[i] != 39u8
-            invariant
-                pos + 1 <= i <= input.len(),
-                forall|j: int| pos + 1 <= j < i ==> input@[j] != 39,
-            decreases input.len() - i,
-        {
-            i += 1;
-        }
-        proof {
-            lemma_scan_to_quote_run(input@, pos as int + 1, i as int);
-        }
-        if i < input.len() {
-            let s = build_ascii_string(input, pos + 1, i);
-            (Some(Token::String(s)), i + 1)
-        } else {
-            (None, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-
-// -- L21: unified token mirror MTok + single-token dispatcher -------------------
-//
-// Ties the five scanners into one whole-input roundtrip. The spec token must be
-// spec-constructible, so `Ident`/`String` carry their char-view `Seq<char>` (not a
-// `String`). `tok_view` maps a real `Token` to its `MTok`; the roundtrip and exec
-// refinement are stated over `MTok` (byte-determined variants compared directly,
-// String payloads by char view), exactly as the expression layer used `view_expr`.
 
 /// Spec mirror of a production `Token`: `String` payloads become their char view.
 pub enum MTok {
@@ -4030,51 +3229,6 @@ pub proof fn lemma_lscan_mtok_local(input: Seq<u8>, pos: int)
 
 // -- L25: unified executable lexer (Vec<u8> -> Vec<Token>, all classes) ---------
 
-/// Unified single-token exec dispatcher, refining `lscan_mtok` at the `tok_view`
-/// level, producing the real production `Token`. Requires ASCII input (the
-/// char-per-byte String model; matches the roundtrip domain).
-pub fn lscan_mtok_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-        forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
-    ensures
-        r.1 == lscan_mtok(input@, pos as int).1,
-        match (r.0, lscan_mtok(input@, pos as int).0) {
-            (Some(t), Some(mt)) => tok_view(t) == mt,
-            (None, None) => true,
-            _ => false,
-        },
-{
-    let p = skip_ws_exec(input, pos);
-    if p < input.len() {
-        let b = input[p];
-        if b == 39u8 {
-            proof {
-                lemma_scan_to_quote_bounds(input@, p as int + 1);
-            }
-            scan_string_token_exec(input, p)
-        } else if 48u8 <= b && b <= 57u8 {
-            let e = scan_num_full_exec(input, p);
-            proof { lemma_scan_num_full_bounds(input@, p as int); }
-            let bytes = subrange_vec(input, p, e);
-            (Some(Token::Number(bytes)), e)
-        } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8 {
-            let e = scan_ident_exec(input, p);
-            proof { lemma_scan_ident_end_bounds(input@, p as int); }
-            let low = to_lower_vec(input, p, e);
-            match classify_kw_exec(&low) {
-                Some(kw) => (Some(Token::Keyword(kw)), e),
-                None => scan_ident_token_exec(input, p),
-            }
-        } else {
-            scan_sym_exec(input, p)
-        }
-    } else {
-        (None, p)
-    }
-}
-
-
 /// Map a token list to its mirror list.
 pub open spec fn tok_views(tokens: Seq<Token>) -> Seq<MTok>
     decreases tokens.len(),
@@ -4218,81 +3372,6 @@ pub proof fn lemma_lex_mtok_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
     }
 }
 
-/// Executable unified lexer: tokenize `input` into a `Vec<Token>` (all five
-/// classes), refining `lex_mtok_from` (hence `lex_mtok_seq`). Requires ASCII input.
-pub fn lex_mtok_exec(input: &Vec<u8>) -> (r: Vec<Token>)
-    requires
-        forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
-    ensures
-        tok_views(r@) == lex_mtok_from(input@, 0, (input.len() + 1) as nat),
-{
-    let mut acc: Vec<Token> = Vec::new();
-    let mut pos: usize = 0;
-    let ghost fuel0: nat = (input.len() + 1) as nat;
-    let ghost rf: nat = fuel0;
-    assert(tok_views(acc@) == Seq::<MTok>::empty()) by {
-        assert(acc@ =~= Seq::<Token>::empty());
-    }
-    while pos < input.len()
-        invariant
-            pos <= input.len(),
-            acc.len() <= pos,
-            fuel0 == input.len() + 1,
-            rf == fuel0 - acc.len(),
-            forall|i: int| 0 <= i < input.len() ==> (#[trigger] input@[i]) < 128,
-            tok_views(acc@) + lex_mtok_from(input@, pos as int, rf) == lex_mtok_from(input@, 0, fuel0),
-        decreases input.len() - pos,
-    {
-        let p = skip_ws_exec(input, pos);
-        if p >= input.len() {
-            assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
-            return acc;
-        }
-        let (ot, e) = lscan_mtok_exec(input, pos);
-        match ot {
-            Some(t) => {
-                let ghost old_acc = acc@;
-                let ghost old_pos = pos as int;
-                let ghost old_rf = rf;
-                proof {
-                    lemma_lscan_mtok_progress(input@, pos as int);
-                    lemma_lscan_mtok_bounds(input@, pos as int);
-                    assert(rf >= 1);
-                    assert(skip_ws(input@, pos as int) < input@.len());
-                    assert(lscan_mtok(input@, pos as int) == (Some(tok_view(t)), e as int));
-                    assert(lex_mtok_from(input@, old_pos, old_rf)
-                        == seq![tok_view(t)] + lex_mtok_from(input@, e as int, (old_rf - 1) as nat));
-                    tok_views_concat(old_acc, seq![t]);
-                    assert(tok_views(seq![t]) == seq![tok_view(t)]) by {
-                        reveal_with_fuel(tok_views, 2);
-                        assert(seq![t].drop_first() =~= Seq::<Token>::empty());
-                    }
-                }
-                acc.push(t);
-                pos = e;
-                proof {
-                    rf = (old_rf - 1) as nat;
-                    assert(acc@ == old_acc + seq![t]);
-                    assert(tok_views(acc@) == tok_views(old_acc) + seq![tok_view(t)]);
-                    assert(tok_views(acc@) + lex_mtok_from(input@, pos as int, rf)
-                        == tok_views(old_acc)
-                           + (seq![tok_view(t)] + lex_mtok_from(input@, pos as int, rf)));
-                    assert(tok_views(old_acc)
-                           + (seq![tok_view(t)] + lex_mtok_from(input@, pos as int, rf))
-                        == tok_views(old_acc) + lex_mtok_from(input@, old_pos, old_rf));
-                }
-            }
-            None => {
-                assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
-                return acc;
-            }
-        }
-    }
-    assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
-    acc
-}
-
-
 /// The printed list is at least as long as the token count, so `input.len()+1`
 /// is always enough fuel.
 pub proof fn lemma_mprint_list_len_ge(ms: Seq<MTok>)
@@ -4314,31 +3393,6 @@ pub proof fn lemma_mprint_list_len_ge(ms: Seq<MTok>)
         lemma_mprint_list_len_ge(rest);
     }
 }
-
-/// End-to-end unified lexer roundtrip (spec level, all five token classes):
-/// tokenizing the printed form of a printable token list recovers the list.
-/// Composed with `lex_mtok_exec`'s postcondition, this gives
-/// `tok_views(lex_mtok_exec(mprint_list(ms))@) == ms`.
-pub proof fn lemma_lex_mtok_roundtrip(ms: Seq<MTok>, input: Seq<u8>)
-    requires
-        all_printable_mtok(ms),
-        input == mprint_list(ms),
-    ensures
-        lex_mtok_from(input, 0, (input.len() + 1) as nat) == ms,
-{
-    lemma_lex_mtok_from_eq_seq(input, 0, (input.len() + 1) as nat);
-    assert(input.subrange(0, input.len() as int) =~= input);
-    lemma_mprint_list_len_ge(ms);
-    assert(ms.len() <= input.len() + 1);
-    lemma_lex_mtok_seq_roundtrip(ms, (input.len() + 1) as nat);
-}
-
-
-// -- L26: quoted identifier scanner (quote-free ASCII, char-view) ---------------
-//
-// A `"..."` quoted identifier, analogous to the L20 string but delimited by `"`
-// (34) and case-PRESERVING (no lowercasing, never a keyword). Same char-view
-// treatment. Quote-free ASCII; the `""` escape is a mechanical extension.
 
 /// First index at or after `pos` holding a double-quote byte `"` (34), or end.
 pub open spec fn scan_to_dquote(input: Seq<u8>, pos: int) -> int
@@ -4425,54 +3479,6 @@ pub proof fn lemma_lscan_qident_m(cs: Seq<char>, tail: Seq<u8>)
     lemma_ascii_chars_bytes(cs);
     assert(ascii_chars(d) == cs);
 }
-
-/// Executable quoted-identifier scanner, building the real `Token::Ident` with a
-/// proven `@` view (case preserved). Requires the body to be ASCII.
-pub fn scan_qident_token_exec(input: &Vec<u8>, pos: usize) -> (r: (Option<Token>, usize))
-    requires
-        pos <= input.len(),
-        forall|i: int| pos < i < scan_to_dquote(input@, pos + 1) ==> (#[trigger] input@[i]) < 128,
-    ensures
-        r.1 == lscan_qident_m(input@, pos as int).1,
-        match (r.0, lscan_qident_m(input@, pos as int).0) {
-            (Some(Token::Ident(s)), Some(cv)) => s@ == cv,
-            (None, None) => true,
-            _ => false,
-        },
-{
-    if pos < input.len() && input[pos] == 34u8 {
-        let mut i = pos + 1;
-        while i < input.len() && input[i] != 34u8
-            invariant
-                pos + 1 <= i <= input.len(),
-                forall|j: int| pos + 1 <= j < i ==> input@[j] != 34,
-            decreases input.len() - i,
-        {
-            i += 1;
-        }
-        proof {
-            lemma_scan_to_dquote_run(input@, pos as int + 1, i as int);
-        }
-        if i < input.len() {
-            let s = build_ascii_string(input, pos + 1, i);
-            (Some(Token::Ident(s)), i + 1)
-        } else {
-            (None, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-
-// -- L27: production wiring — verified &[u8] symbol scanner ---------------------
-//
-// A sound single-implementation cutover step (like `scan_number_bytes`): the
-// production `Lexer::scan_symbol` routes through this verified scanner. Symbols
-// are ASCII and UTF-8 is self-synchronising (a non-symbol multibyte char has all
-// bytes >= 128, never colliding with an ASCII symbol byte), so byte-level scanning
-// matches the production char-level behaviour exactly, unicode input included.
-// Takes `&[u8]` (from `str::as_bytes`), refining `lscan_sym`.
 
 pub fn scan_symbol_bytes(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
     requires
