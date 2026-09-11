@@ -4,12 +4,11 @@
 #
 # Verus verification GATE. Runs `scripts/verus/verify.sh` (i.e. `cargo verus
 # focus --lib` over the opted-in modules) and FAILS the PR if any verified
-# module stops verifying. This is the enforcement counterpart to the
-# non-blocking telemetry workflow in verus-verify.yml: that one measures
-# progress and never fails; this one holds the line on what is already proven.
+# module stops verifying with upstream Z3. The Basis fork runs separately in
+# verus-verify.yml and verus-coverage.yml for statistics.
 #
-# Re-pinning: keep RUST_TOOLCHAIN / VERUS_VERSION equal to verus-verify.yml and
-# the vstd pin in Cargo.toml.
+# Pins: scripts/verus/pins.env, installed by the setup-verus action in upstream
+# mode.
 
 name: verus-gate
 on: [push, pull_request, workflow_dispatch]
@@ -17,58 +16,38 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 
-env:
-  RUST_TOOLCHAIN: "1.97.1"
-  VERUS_VERSION: "release/0.2026.08.23.fbbbbcf"
-
 jobs:
   verus-gate:
-    name: Verus gate (verify opted-in modules)
+    name: Upstream Verus gate (z3)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          # cargo-verus links rustc internals; it needs rustc-dev + llvm-tools.
-          components: rustc-dev, llvm-tools
+      - name: Test toolchain setup and failure reporting
+        run: python3 scripts/verus/test_setup.py
 
-      - name: Cache cargo registry and target
+      - name: Install pinned upstream Verus and solver
+        id: verus
+        uses: ./.github/actions/setup-verus
+        with:
+          distribution: "upstream"
+          solver: "z3"
+
+      - name: Cache cargo registry
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
-            target
-          key: verus-gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install pinned Verus (verus + cargo-verus)
-        run: |
-          set -euo pipefail
-          VERUS_TAG="${VERUS_VERSION}"
-          VER_STEM="${VERUS_TAG##*/}"
-          ASSET="verus-${VER_STEM}-x86-linux.zip"
-          URL="https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${ASSET}"
-          echo "Installing Verus ${VERUS_TAG}"
-          mkdir -p "$HOME/verus"
-          curl -fsSL "$URL" -o /tmp/verus.zip
-          unzip -q /tmp/verus.zip -d "$HOME/verus"
-          # The zip ships `verus` and `cargo-verus` in the same dir; put it on PATH.
-          VERUS_BIN_DIR="$(dirname "$(find "$HOME/verus" -name cargo-verus -type f | head -1)")"
-          test -n "$VERUS_BIN_DIR"
-          echo "$VERUS_BIN_DIR" >> "$GITHUB_PATH"
-          "$VERUS_BIN_DIR/verus" --version
-
-      - name: Raise ulimit (Verus spawns many Z3 processes)
-        run: ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
+          key: verus-gate-upstream-${{ runner.os }}-z3-${{ steps.verus.outputs.verus_tag }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify opted-in modules (gating)
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-verus-z3
         run: |
-          ulimit -u 65535 || true
           # Capture the --output-json func-details for the coverage join below;
           # stdout is pure JSON (verify.sh sends its banner to stderr).
+          ulimit -u 65535 || echo "could not raise ulimit -u (soft cap)"
           ./scripts/verus/verify.sh --output-json > "$RUNNER_TEMP/verus.json"
 
       # --- verified-coverage gate ---------------------------------------------

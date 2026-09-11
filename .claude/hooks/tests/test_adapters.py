@@ -150,6 +150,18 @@ class CodexAdapterTest(unittest.TestCase):
 
 
 class OpencodeAdapterTest(unittest.TestCase):
+    def test_dump_session_jsonl_is_the_raw_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "oc.db")
+            self._build_db(path)
+            raw = opencode_adapter.dump_session_jsonl(path, "oc-sess-1")
+            rows = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+            self.assertEqual([r["table"] for r in rows],
+                             ["session", "message", "message", "part", "part", "part"])
+            self.assertEqual(rows[0]["id"], "oc-sess-1")
+            self.assertEqual(json.loads(rows[-1]["data"])["tool"], "verus_verify")
+            self.assertEqual(opencode_adapter.dump_session_jsonl(path, "nope"), b"")
+
     def _build_db(self, path):
         conn = sqlite3.connect(path)
         conn.executescript(

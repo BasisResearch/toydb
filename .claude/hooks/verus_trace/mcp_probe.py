@@ -132,6 +132,18 @@ def _finalize(version, transport):
             False, version=version, transport=transport,
             error="server identity mismatch (got %r)" % version.get("server_name"),
         )
+    # A reachable server whose Verus cannot run is not healthy either: verus
+    # missing, cargo-verus missing, or the pinned solvers not reporting the
+    # versions verus expects (`solver_ok`, the mismatch that would otherwise
+    # surface mid-proof). Only an explicit False blocks, so an older server
+    # that does not report a field is judged on identity alone.
+    for field in ("toolchain_ok", "solver_ok"):
+        if version.get(field) is False:
+            return ProbeResult(
+                False, version=version, transport=transport,
+                error="%s is false: %s" % (
+                    field, version.get("toolchain_error") or "no detail from the server"),
+            )
     return ProbeResult(True, version=version, transport=transport)
 
 

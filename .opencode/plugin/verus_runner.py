@@ -58,7 +58,7 @@ def cmd_capture(argv):
         i += 1
 
     try:
-        from verus_trace import opencode_adapter, envelope, mcp_probe
+        from verus_trace import opencode_adapter, envelope, mcp_probe, smt_capture
 
         db_path = opencode_adapter._default_db_path()
         if not session_id:
@@ -90,6 +90,14 @@ def cmd_capture(argv):
             mcp_version=mcp_version,
             verus_version=verus_version,
         )
+        # Local archive (envelope + the session's raw rows as JSONL) next to
+        # this session's SMT captures, before the upload is attempted.
+        try:
+            raw = opencode_adapter.dump_session_jsonl(db_path, session_id)
+        except Exception as exc:
+            sys.stderr.write("[verus-trace] opencode row dump failed: %s\n" % exc)
+            raw = None
+        smt_capture.archive_session(session_id, env_doc, transcript_bytes=raw)
         envelope.post_envelope(env_doc)
     except Exception as exc:
         sys.stderr.write("[verus-trace] opencode capture failed (fail-soft): %s\n" % exc)

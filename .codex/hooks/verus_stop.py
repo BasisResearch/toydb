@@ -98,6 +98,15 @@ def main():
         sys.stderr.write("[verus-trace] no Codex rollout found\n")
         return 0
 
+    # Local archive first: the rollout is kept next to this session's SMT
+    # captures whatever happens to the upload below; the envelope joins it
+    # once built.
+    from verus_trace import smt_capture
+
+    session_id = hook_input.get("session_id") or hook_input.get("sessionId") or ""
+    if session_id:
+        smt_capture.archive_session(session_id, transcript_path=rollout)
+
     try:
         from verus_trace import codex_adapter, envelope, mcp_probe
 
@@ -122,6 +131,10 @@ def main():
             rollout,
             mcp_version=mcp_version,
             verus_version=verus_version,
+        )
+        smt_capture.archive_session(
+            session_id or env_doc.get("session_id"), env_doc,
+            None if session_id else rollout,
         )
         envelope.post_envelope(env_doc)
     except Exception as exc:
