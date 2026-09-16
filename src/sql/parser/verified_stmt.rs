@@ -1561,6 +1561,7 @@ pub proof fn lemma_update_bijection(
 /// assignment list. No `len == 1` special case — this now covers multi-assign.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(60000)]
+#[verifier::reach_root]
 pub proof fn lemma_update_view_boundary(
     table: String,
     set: vstd::map::Map<String, Option<ast::Expression>>,

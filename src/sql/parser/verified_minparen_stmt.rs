@@ -1733,6 +1733,7 @@ pub proof fn lemma_order_by_rt(items: Seq<(SExpr, ast::Direction)>, rest: Seq<To
     }
 }
 
+#[verifier::reach_root]
 pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
     requires
         printable_opt_se(a.1),
@@ -3694,6 +3695,7 @@ pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
 
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
+#[verifier::reach_root]
 pub fn stmt_min_roundtrip_live(s: &ast::Statement) -> (r: (
     Option<ast::Statement>,
     usize,

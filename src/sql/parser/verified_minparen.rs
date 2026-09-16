@@ -2167,6 +2167,7 @@ pub fn print_min_expr(e: &ast::Expression) -> (r: Vec<super::Token>)
 
 
 #[verifier::rlimit(20000)]
+#[verifier::reach_root]
 pub fn min_roundtrip_live(e: &ast::Expression, fuel: usize)
     -> (r: (Option<ast::Expression>, usize, Option<super::parse_error::ParseError>))
     requires
@@ -2221,6 +2222,7 @@ pub proof fn min_dual(toks: Seq<TokenView>, fuel: nat)
     min_roundtrip(e, fuel);
 }
 
+#[verifier::reach_root]
 pub proof fn min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>, f1: nat, f2: nat)
     requires
         min_normal(t1),
@@ -2558,6 +2560,7 @@ pub proof fn sparse_prec_printable(input: Seq<TokenView>, min_prec: u8, fuel: na
 }
 
 
+#[verifier::reach_root]
 pub fn min_normalize_live(toks: &Vec<super::Token>, fuel: usize, refuel: usize)
     -> (r: (ast::Expression, Vec<super::Token>, ast::Expression, usize))
     requires
