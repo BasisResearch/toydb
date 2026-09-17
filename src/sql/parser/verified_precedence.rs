@@ -4,9 +4,18 @@
 //! `sparse_prec` spec: accept produces the matching AST and residual position,
 //! reject agrees with the spec.
 //!
+//! `lemma_prec` (bottom of this file) is the other half: it proves `sparse_prec`
+//! inverts the fully parenthesized printer `verified_roundtrip::sprint`. With
+//! `verified_minparen::min_roundtrip`, which does the same for the
+//! minimal-parenthesization printer, the parser has two proved-correct input
+//! classes. They are disjoint for every non-atomic expression — `(1 + (2 * 3))`
+//! versus `1 + 2 * 3` — so neither theorem subsumes the other.
+//!
 //! Limit: `sparse_prec` is a same-author spec twin, so this pins exec/spec
 //! agreement, not conformance to SQL's precedence rules per se (see
-//! `verified_minparen` for the precedence-table caveat).
+//! `verified_minparen` for the precedence-table caveat). And both theorems are
+//! about the *printers'* images, not arbitrary SQL text: no theorem here covers
+//! input outside those two classes.
 
 #![allow(dead_code, unused_variables)]
 #![allow(clippy::all)]
@@ -1515,30 +1524,6 @@ pub proof fn lemma_prec_fuel(input: Seq<TokenView>, min_prec: u8, f: nat, g: nat
     }
 }
 
-
-pub open spec fn prec_boundary(tail: Seq<TokenView>) -> bool {
-    tail.len() == 0 || tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma
-}
-
-pub proof fn infix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
-    requires
-        input.len() == 0 || verified_expression::binary_from_token(input[0]) is None,
-    ensures
-        sparse_infix_loop(lhs, input, min_prec, fuel) == (Some(lhs), input),
-{
-    reveal_with_fuel(sparse_infix_loop, 1);
-}
-
-pub proof fn postfix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
-    requires
-        input.len() == 0
-            || (input[0] != TokenView::Exclamation && input[0] != TokenView::Keyword(Keyword::Is)),
-    ensures
-        sparse_postfix_loop(lhs, input, min_prec) == (lhs, input),
-{
-    reveal_with_fuel(sparse_postfix_loop, 1);
-}
-
 pub proof fn lemma_infix_step(
     lhs: SExpr,
     tag: BinaryTag,
@@ -1643,6 +1628,38 @@ pub proof fn lemma_prec_none(
     reveal_with_fuel(sparse_prec, 1);
 }
 
+
+
+// -- Fully parenthesized input class ------------------------------------------
+//
+// `lemma_prec` proves the production parser `sparse_prec` inverts the fully
+// parenthesized printer `verified_roundtrip::sprint`, for any `min_prec` and any
+// boundary tail. Together with `verified_minparen::min_roundtrip` (the
+// minimal-parenthesization class) this gives the parser two proved-correct input
+// classes; they are disjoint for every non-atomic expression, so neither
+// subsumes the other. `lemma_prec` is a reachability root: `sprint` describes an
+// input domain, not a printer anything executes, so nothing calls into it.
+
+pub open spec fn prec_boundary(tail: Seq<TokenView>) -> bool {
+    tail.len() == 0 || tail[0] == TokenView::CloseParen || tail[0] == TokenView::Comma
+}
+pub proof fn infix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
+    requires
+        input.len() == 0 || verified_expression::binary_from_token(input[0]) is None,
+    ensures
+        sparse_infix_loop(lhs, input, min_prec, fuel) == (Some(lhs), input),
+{
+    reveal_with_fuel(sparse_infix_loop, 1);
+}
+pub proof fn postfix_halt(lhs: SExpr, input: Seq<TokenView>, min_prec: u8)
+    requires
+        input.len() == 0
+            || (input[0] != TokenView::Exclamation && input[0] != TokenView::Keyword(Keyword::Is)),
+    ensures
+        sparse_postfix_loop(lhs, input, min_prec) == (lhs, input),
+{
+    reveal_with_fuel(sparse_postfix_loop, 1);
+}
 pub proof fn prec_boundary_halts(lhs: SExpr, input: Seq<TokenView>, min_prec: u8, fuel: nat)
     requires
         prec_boundary(input),
@@ -1662,7 +1679,6 @@ pub proof fn prec_boundary_halts(lhs: SExpr, input: Seq<TokenView>, min_prec: u8
         postfix_halt(lhs, input, min_prec);
     }
 }
-
 #[verifier::spinoff_prover]
 #[verifier::rlimit(20000)]
 pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
@@ -1808,7 +1824,7 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
         },
     }
 }
-
+#[verifier::reach_root]
 pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
@@ -1827,7 +1843,6 @@ pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     lemma_atom(e, tail, (fuel - 1) as nat);
     prec_boundary_halts(e, tail, min_prec, fuel);
 }
-
 pub proof fn lemma_fn_args(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::all_printable_se(args),
@@ -1851,7 +1866,6 @@ pub proof fn lemma_fn_args(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
         lemma_fn_args_nonempty(args, tail, fuel);
     }
 }
-
 pub proof fn lemma_fn_args_nonempty(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::all_printable_se(args),
@@ -1882,8 +1896,6 @@ pub proof fn lemma_fn_args_nonempty(args: Seq<SExpr>, tail: Seq<TokenView>, fuel
         assert(seq![args[0]] + rest =~= args);
     }
 }
-
-
 pub proof fn postfix_step_factorial(inner: SExpr, close_tail: Seq<TokenView>)
     requires
         close_tail.len() > 0,
@@ -1898,7 +1910,6 @@ pub proof fn postfix_step_factorial(inner: SExpr, close_tail: Seq<TokenView>)
     assert(input.drop_first() =~= close_tail);
     postfix_halt(SExpr::Factorial(Box::new(inner)), close_tail, 0);
 }
-
 pub proof fn postfix_step_is(inner: SExpr, lit: IsLit, close_tail: Seq<TokenView>)
     requires
         close_tail.len() > 0,
@@ -1929,7 +1940,6 @@ pub proof fn postfix_step_is(inner: SExpr, lit: IsLit, close_tail: Seq<TokenView
     }
     postfix_halt(SExpr::Is(Box::new(inner), lit), close_tail, 0);
 }
-
 pub proof fn infix_step_binary(
     tag: BinaryTag,
     left: SExpr,

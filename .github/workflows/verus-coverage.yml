@@ -21,8 +21,21 @@ permissions:
 
 env:
   # The gate. Percent of verified exec functions that must be reachable from
-  # a binary. Starts at 5 while the verified SQL parser is not yet wired into
-  # the product (9% reachable as of 2026-09-09); raise it as it is cut over.
+  # a binary.
+  #
+  # History: 5 was set while the verified SQL parser was not yet wired into the
+  # product (9% reachable on 2026-09-09). PR #18 cut the production parser over
+  # (61% reachable), and the parser-coverage cleanup then deleted the dead
+  # scaffolding the remaining 38% consisted of -- the superseded mirror printer
+  # and parser, the test-only fully parenthesized printer and its spec domain,
+  # the unwired lexer token model, and three template modules.
+  #
+  # TODO: raise this. The cleanup should put reachability near 100%, but the
+  # number has not been measured: it needs `scripts/verus/coverage.sh`, and this
+  # repo's solver policy routes all Verus runs through the MCP server, which has
+  # no `--reach` tool. Read the real figure off this job's summary on the first
+  # run and set the gate just under it, so it starts catching regressions
+  # instead of tracking scaffolding.
   COVERAGE_MIN_PERCENT: "5"
   OUT_DIR: ".verus-out/coverage"
 

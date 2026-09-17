@@ -1,26 +1,36 @@
-//! Unified full-grammar expression roundtrip over an executable parser.
+//! Structural mirror of the expression grammar: `SExpr` and `view_expr`.
 //!
-//! `verified_expression` proves the print/parse roundtrip for every
-//! *function-free* production expression, using a `spec fn` parser that builds
-//! `ast::Expression` values directly and compares them with `==`. That path
-//! cannot reach `Expression::Function`, because its `Vec<Expression>` payload
-//! is opaque in the spec logic: Verus has no spec-level `Vec` constructor and
-//! `Vec` equality is not view-determined. `verified_function_list` shows the
-//! escape for functions in isolation — an *executable* parser that builds real
-//! `Vec`s at runtime, verified against a `Seq`-based mirror AST at the level of
-//! a structural view.
+//! `SExpr` is the `Seq`-based mirror of the whole `ast::Expression` grammar
+//! (operator children are `Box<SExpr>`, function arguments are `Seq<SExpr>`).
+//! It exists because `ast::Expression::Function` carries a `Vec<Expression>`,
+//! which is opaque in the spec logic: Verus has no spec-level `Vec` constructor
+//! and `Vec` equality is not view-determined, so a spec-level parser cannot
+//! build or compare a `Function` node. Every mirror component is
+//! spec-constructible and extensional, so theorems about `SExpr` close with a
+//! real `==`, and the exec parser is verified against the mirror at the level of
+//! the structural view `view_expr: ast::Expression -> SExpr`.
 //!
-//! A `Function` can nest under any operator and any expression can be a
-//! function argument, so the two paths cannot be composed piecewise: the whole
-//! expression nest must move to the executable/mirror style at once. This
-//! module is that unification. `SExpr` is the `Seq`-based mirror of the entire
-//! `ast::Expression` grammar (operator children are `Box<SExpr>`, function
-//! arguments are `Seq<SExpr>`); it carries the canonical printer `sprint`, the
-//! fuel measure `sdepth`, the mirror parser `sparse`, and the roundtrip proof
-//! `lemma_sparse_sprint`. Because every mirror component is spec-constructible
-//! and extensional, the mirror roundtrip closes with real `==` on `SExpr`.
+//! What lives here is the mirror *vocabulary* — the type, the view, the
+//! printable domain (`printable_se`), the fuel measure (`sdepth`), the token
+//! boundary (`boundary`), and the small exec helpers the parser shares
+//! (`parse_literal_exec`, `build_unary`, `build_binary`, `print_lit_exec`).
 //!
-//! The bridge to production values is `view_expr: ast::Expression -> SExpr`.
+//! It also carries `sprint` / `sprint_args`, the fully parenthesized canonical
+//! printer. That printer has no executable twin — it is the *domain
+//! description* for `verified_precedence::lemma_prec`, which proves the
+//! production parser inverts it. Fully parenthesized and minimally
+//! parenthesized prints are disjoint token classes for every non-atomic
+//! expression, so `lemma_prec` and `verified_minparen::min_roundtrip` give the
+//! parser two independent proved-correct input classes; neither subsumes the
+//! other.
+//!
+//! The *mirror parser* that used to sit beside `sprint` (`sparse`,
+//! `sparse_operator`, `sparse_args`, with the `mirror_roundtrip` /
+//! `mirror_injective` corollaries) is gone: it was a second parser nothing
+//! executed, and `lemma_prec` states the same round trip over the production
+//! parser instead. The injectivity those corollaries carried is now
+//! `verified_minparen::min_print_injective` and its statement-level counterpart
+//! `verified_minparen_stmt::stmt_min_print_injective`.
 //!
 //! Trust surface is unchanged: the only axioms are the `float_trust` boundary
 //! reused through `literal_views` / `parse_literal_views`.
@@ -206,15 +216,20 @@ pub open spec fn islit_tok(lit: IsLit) -> TokenView {
     }
 }
 
-pub open spec fn islit_literal(lit: IsLit) -> ast::Literal {
-    match lit {
-        IsLit::Null => ast::Literal::Null,
-        IsLit::NaN => ast::Literal::Float(float_trust::spec_canonical_nan()),
-    }
-}
-
 // ---- canonical printer over the mirror -------------------------------------
 
+// ---- fuel measure ----------------------------------------------------------
+
+/// The fully parenthesized canonical printer: every operator node is wrapped in
+/// parentheses, so the token stream determines the tree without consulting any
+/// precedence table.
+///
+/// It has no executable twin — it is the *domain description* for
+/// `verified_precedence::lemma_prec`, which proves the production parser
+/// (`sparse_prec`) inverts it. That makes fully parenthesized SQL a second,
+/// disjoint input class on which the production parser is proved correct,
+/// alongside the minimal-parenthesization class covered by
+/// `verified_minparen::min_roundtrip`.
 pub open spec fn sprint(e: SExpr) -> Seq<TokenView>
     decreases e,
 {
@@ -240,7 +255,6 @@ pub open spec fn sprint(e: SExpr) -> Seq<TokenView>
                 + seq![TokenView::CloseParen],
     }
 }
-
 pub open spec fn sprint_args(args: Seq<SExpr>) -> Seq<TokenView>
     decreases args,
 {
@@ -253,7 +267,43 @@ pub open spec fn sprint_args(args: Seq<SExpr>) -> Seq<TokenView>
     }
 }
 
-// ---- fuel measure ----------------------------------------------------------
+/// The fully parenthesized print starts with a token that can only begin an
+/// atom: never a prefix operator, never a close paren. This is what lets
+/// `lemma_prec` pin the parser's first dispatch.
+pub proof fn sprint_head(e: SExpr)
+    requires printable_se(e),
+    ensures
+        sprint(e).len() > 0,
+        verified_expression::prefix_operator(sprint(e)[0]) is None,
+        sprint(e)[0] != TokenView::CloseParen,
+{
+    reveal(printable_se);
+    match e {
+        SExpr::All => {
+            assert(sprint(e)[0] == TokenView::Asterisk);
+        },
+        SExpr::Column(table, column) => match table {
+            Some(t) => { assert(sprint(e)[0] == TokenView::Ident(t)); },
+            None => { assert(sprint(e)[0] == TokenView::Ident(column)); },
+        },
+        SExpr::Literal(l) => {
+            reveal(verified_production::literal_views);
+            assert(sprint(e) == verified_production::literal_views(l).unwrap());
+            match l {
+                ast::Literal::Null => {},
+                ast::Literal::Boolean(_) => {},
+                ast::Literal::Integer(_) => {},
+                ast::Literal::Float(_) => {},
+                ast::Literal::String(_) => {},
+            }
+        },
+        SExpr::Unary(_, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
+        SExpr::Factorial(_) => { assert(sprint(e)[0] == TokenView::OpenParen); },
+        SExpr::Is(_, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
+        SExpr::Binary(_, _, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
+        SExpr::Function(name, _) => { assert(sprint(e)[0] == TokenView::Ident(name)); },
+    }
+}
 
 pub open spec fn sdepth(e: SExpr) -> nat
     decreases e,
@@ -297,139 +347,6 @@ pub open spec fn boundary(tail: Seq<TokenView>) -> bool {
 
 // ---- mirror parser ---------------------------------------------------------
 
-pub open spec fn sparse(input: Seq<TokenView>, fuel: nat) -> (Option<SExpr>, Seq<TokenView>)
-    decreases fuel, 1nat,
-{
-    if fuel == 0 || input.len() == 0 {
-        (None, input)
-    } else {
-        match input[0] {
-            TokenView::OpenParen => sparse_operator(input, fuel),
-            TokenView::Asterisk => (Some(SExpr::All), input.drop_first()),
-            TokenView::Ident(name) => {
-                if input.len() >= 2 && input[1] == TokenView::OpenParen {
-                    match sparse_args(input.drop_first().drop_first(), (fuel - 1) as nat) {
-                        (Some(args), rest) if rest.len() > 0 && rest[0] == TokenView::CloseParen =>
-                            (Some(SExpr::Function(name, args)), rest.drop_first()),
-                        _ => (None, input),
-                    }
-                } else if input.len() >= 3 && input[1] == TokenView::Period {
-                    match input[2] {
-                        TokenView::Ident(column) => (
-                            Some(SExpr::Column(Some(name), column)),
-                            input.drop_first().drop_first().drop_first(),
-                        ),
-                        _ => (None, input),
-                    }
-                } else {
-                    (Some(SExpr::Column(None, name)), input.drop_first())
-                }
-            },
-            TokenView::Number(bytes) => match verified_production::parse_literal_views(seq![TokenView::Number(bytes)]) {
-                Some(literal) => (Some(SExpr::Literal(literal)), input.drop_first()),
-                None => (None, input),
-            },
-            TokenView::Keyword(Keyword::Null)
-            | TokenView::Keyword(Keyword::True)
-            | TokenView::Keyword(Keyword::False)
-            | TokenView::String(_) => match verified_production::parse_literal_views(seq![input[0]]) {
-                Some(literal) => (Some(SExpr::Literal(literal)), input.drop_first()),
-                None => (None, input),
-            },
-            _ => (None, input),
-        }
-    }
-}
-
-/// The parenthesised operator forms. `input[0]` is known to be `OpenParen`.
-pub open spec fn sparse_operator(input: Seq<TokenView>, fuel: nat) -> (Option<SExpr>, Seq<TokenView>)
-    decreases fuel, 0nat,
-{
-    if fuel == 0 || input.len() < 2 {
-        (None, input)
-    } else {
-        match verified_expression::prefix_operator(input[1]) {
-            Some(tag) => match sparse(input.drop_first().drop_first(), (fuel - 1) as nat) {
-                (Some(inner), rest) if rest.len() > 0 && rest[0] == TokenView::CloseParen =>
-                    (Some(SExpr::Unary(tag, Box::new(inner))), rest.drop_first()),
-                _ => (None, input),
-            },
-            None => match sparse(input.drop_first(), (fuel - 1) as nat) {
-                (Some(left), after_left) if after_left.len() > 0 => {
-                    if after_left[0] == TokenView::Exclamation {
-                        if after_left.len() > 1 && after_left[1] == TokenView::CloseParen {
-                            (
-                                Some(SExpr::Factorial(Box::new(left))),
-                                after_left.drop_first().drop_first(),
-                            )
-                        } else {
-                            (None, input)
-                        }
-                    } else if after_left[0] == TokenView::Keyword(Keyword::Is) {
-                        if after_left.len() >= 3 && after_left[2] == TokenView::CloseParen {
-                            let lit = match after_left[1] {
-                                TokenView::Keyword(Keyword::Null) => Some(IsLit::Null),
-                                TokenView::Keyword(Keyword::NaN) => Some(IsLit::NaN),
-                                _ => None,
-                            };
-                            match lit {
-                                Some(lit) => (
-                                    Some(SExpr::Is(Box::new(left), lit)),
-                                    after_left.drop_first().drop_first().drop_first(),
-                                ),
-                                None => (None, input),
-                            }
-                        } else {
-                            (None, input)
-                        }
-                    } else {
-                        match verified_expression::binary_from_token(after_left[0]) {
-                            Some(tag) => match sparse(after_left.drop_first(), (fuel - 1) as nat) {
-                                (Some(right), rest) if rest.len() > 0 && rest[0] == TokenView::CloseParen =>
-                                    (
-                                        Some(SExpr::Binary(tag, Box::new(left), Box::new(right))),
-                                        rest.drop_first(),
-                                    ),
-                                _ => (None, input),
-                            },
-                            None => (None, input),
-                        }
-                    }
-                },
-                _ => (None, input),
-            },
-        }
-    }
-}
-
-pub open spec fn sparse_args(input: Seq<TokenView>, fuel: nat) -> (Option<Seq<SExpr>>, Seq<TokenView>)
-    decreases fuel, 0nat,
-{
-    if fuel == 0 || input.len() == 0 {
-        (None, input)
-    } else if input[0] == TokenView::CloseParen {
-        (Some(Seq::empty()), input)
-    } else {
-        match sparse(input, (fuel - 1) as nat) {
-            (Some(e), rest) => {
-                if rest.len() == 0 {
-                    (None, input)
-                } else if rest[0] == TokenView::CloseParen {
-                    (Some(seq![e]), rest)
-                } else if rest[0] == TokenView::Comma {
-                    match sparse_args(rest.drop_first(), (fuel - 1) as nat) {
-                        (Some(more), rest2) => (Some(seq![e] + more), rest2),
-                        (None, _) => (None, input),
-                    }
-                } else {
-                    (None, input)
-                }
-            },
-            (None, _) => (None, input),
-        }
-    }
-}
-
 // ---- tag <-> token inverses ------------------------------------------------
 
 pub proof fn unary_tok_prefix(tag: UnaryTag)
@@ -472,44 +389,6 @@ pub proof fn binary_tok_roundtrip(tag: BinaryTag)
 
 // ---- printer head facts ----------------------------------------------------
 
-/// The first token of any printed expression is an atom-start token: never a
-/// prefix-operator token (so parenthesised parsing routes to the postfix/binary
-/// branch), and never `)` (so argument-list parsing does not stop early).
-pub proof fn sprint_head(e: SExpr)
-    requires printable_se(e),
-    ensures
-        sprint(e).len() > 0,
-        verified_expression::prefix_operator(sprint(e)[0]) is None,
-        sprint(e)[0] != TokenView::CloseParen,
-{
-    reveal(printable_se);
-    match e {
-        SExpr::All => {
-            assert(sprint(e)[0] == TokenView::Asterisk);
-        },
-        SExpr::Column(table, column) => match table {
-            Some(t) => { assert(sprint(e)[0] == TokenView::Ident(t)); },
-            None => { assert(sprint(e)[0] == TokenView::Ident(column)); },
-        },
-        SExpr::Literal(l) => {
-            reveal(verified_production::literal_views);
-            assert(sprint(e) == verified_production::literal_views(l).unwrap());
-            match l {
-                ast::Literal::Null => {},
-                ast::Literal::Boolean(_) => {},
-                ast::Literal::Integer(_) => {},
-                ast::Literal::Float(_) => {},
-                ast::Literal::String(_) => {},
-            }
-        },
-        SExpr::Unary(_, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
-        SExpr::Factorial(_) => { assert(sprint(e)[0] == TokenView::OpenParen); },
-        SExpr::Is(_, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
-        SExpr::Binary(_, _, _) => { assert(sprint(e)[0] == TokenView::OpenParen); },
-        SExpr::Function(name, _) => { assert(sprint(e)[0] == TokenView::Ident(name)); },
-    }
-}
-
 // ---- fuel bound: sdepth <= printed length ----------------------------------
 
 pub proof fn sdepth_positive(e: SExpr)
@@ -517,234 +396,7 @@ pub proof fn sdepth_positive(e: SExpr)
 {
 }
 
-pub proof fn sdepth_le_len(e: SExpr)
-    requires printable_se(e),
-    ensures sdepth(e) <= sprint(e).len(),
-    decreases e,
-{
-    reveal(printable_se);
-    match e {
-        SExpr::All => { assert(sprint(e).len() == 1); },
-        SExpr::Column(table, _) => {
-            match table {
-                Some(_) => { assert(sprint(e).len() == 3); },
-                None => { assert(sprint(e).len() == 1); },
-            }
-        },
-        SExpr::Literal(l) => {
-            reveal(verified_production::literal_views);
-            assert(sprint(e) == verified_production::literal_views(l).unwrap());
-            assert(verified_production::literal_views(l).unwrap().len() == 1);
-        },
-        SExpr::Unary(_, inner) => { sdepth_le_len(*inner); },
-        SExpr::Factorial(inner) => { sdepth_le_len(*inner); },
-        SExpr::Is(inner, _) => { sdepth_le_len(*inner); },
-        SExpr::Binary(_, left, right) => {
-            sdepth_le_len(*left);
-            sdepth_le_len(*right);
-        },
-        SExpr::Function(_, args) => { slist_depth_le_len(args); },
-    }
-}
-
 // ---- headline: the mirror roundtrip over the full grammar -------------------
-
-/// Parsing the canonical print of any printable mirror expression, followed by
-/// an arbitrary boundary-respecting tail, recovers the expression exactly and
-/// leaves the tail unconsumed.
-#[verifier::rlimit(4000)]
-pub proof fn lemma_sparse_sprint(e: SExpr, tail: Seq<TokenView>, fuel: nat)
-    requires
-        printable_se(e),
-        fuel >= sdepth(e),
-        boundary(tail),
-    ensures
-        sparse(sprint(e) + tail, fuel) == (Some(e), tail),
-    decreases e,
-{
-    reveal(printable_se);
-    reveal_with_fuel(sparse, 1);
-    let tokens = sprint(e) + tail;
-    match e {
-        SExpr::All => {
-            assert(tokens[0] == TokenView::Asterisk);
-            assert(tokens.drop_first() =~= tail);
-        },
-        SExpr::Column(table, column) => match table {
-            None => {
-                assert(tokens[0] == TokenView::Ident(column));
-                if tokens.len() >= 2 {
-                    assert(tokens[1] == tail[0]);
-                }
-                assert(tokens.drop_first() =~= tail);
-            },
-            Some(t) => {
-                assert(tokens.len() >= 3);
-                assert(tokens[0] == TokenView::Ident(t));
-                assert(tokens[1] == TokenView::Period);
-                assert(tokens[2] == TokenView::Ident(column));
-                assert(tokens.drop_first().drop_first().drop_first() =~= tail);
-            },
-        },
-        SExpr::Literal(l) => {
-            reveal(verified_production::literal_views);
-            reveal(verified_production::parse_literal_views);
-            verified_production::literal_roundtrip(l);
-            let lv = verified_production::literal_views(l).unwrap();
-            assert(sprint(e) == lv);
-            assert(lv.len() == 1);
-            assert(seq![tokens[0]] =~= lv);
-            assert(tokens.drop_first() =~= tail);
-        },
-        SExpr::Unary(tag, inner) => {
-            reveal_with_fuel(sparse_operator, 1);
-            unary_tok_prefix(tag);
-            let inner_tail = seq![TokenView::CloseParen] + tail;
-            lemma_sparse_sprint(*inner, inner_tail, (fuel - 1) as nat);
-            assert(tokens[0] == TokenView::OpenParen);
-            assert(tokens.len() >= 2);
-            assert(tokens[1] == unary_tok(tag));
-            assert(tokens.drop_first().drop_first() =~= sprint(*inner) + inner_tail);
-            assert(inner_tail[0] == TokenView::CloseParen);
-            assert(inner_tail.drop_first() =~= tail);
-        },
-        SExpr::Factorial(inner) => {
-            reveal_with_fuel(sparse_operator, 1);
-            sprint_head(*inner);
-            let inner_tail = seq![TokenView::Exclamation, TokenView::CloseParen] + tail;
-            lemma_sparse_sprint(*inner, inner_tail, (fuel - 1) as nat);
-            assert(tokens[0] == TokenView::OpenParen);
-            assert(tokens.len() >= 2);
-            assert(tokens[1] == sprint(*inner)[0]);
-            assert(tokens.drop_first() =~= sprint(*inner) + inner_tail);
-            assert(inner_tail[0] == TokenView::Exclamation);
-            assert(inner_tail[1] == TokenView::CloseParen);
-            assert(inner_tail.drop_first().drop_first() =~= tail);
-        },
-        SExpr::Is(inner, lit) => {
-            reveal_with_fuel(sparse_operator, 1);
-            sprint_head(*inner);
-            let inner_tail =
-                seq![TokenView::Keyword(Keyword::Is), islit_tok(lit), TokenView::CloseParen] + tail;
-            lemma_sparse_sprint(*inner, inner_tail, (fuel - 1) as nat);
-            assert(tokens[0] == TokenView::OpenParen);
-            assert(tokens.len() >= 2);
-            assert(tokens[1] == sprint(*inner)[0]);
-            assert(tokens.drop_first() =~= sprint(*inner) + inner_tail);
-            assert(inner_tail[0] == TokenView::Keyword(Keyword::Is));
-            assert(inner_tail[1] == islit_tok(lit));
-            assert(inner_tail[2] == TokenView::CloseParen);
-            assert(inner_tail.drop_first().drop_first().drop_first() =~= tail);
-            match lit {
-                IsLit::Null => {},
-                IsLit::NaN => {},
-            }
-        },
-        SExpr::Binary(tag, left, right) => {
-            reveal_with_fuel(sparse_operator, 1);
-            binary_tok_roundtrip(tag);
-            sprint_head(*left);
-            let right_tail = seq![TokenView::CloseParen] + tail;
-            let left_tail = seq![binary_tok(tag)] + sprint(*right) + right_tail;
-            lemma_sparse_sprint(*left, left_tail, (fuel - 1) as nat);
-            lemma_sparse_sprint(*right, right_tail, (fuel - 1) as nat);
-            assert(tokens[0] == TokenView::OpenParen);
-            assert(tokens.len() >= 2);
-            assert(tokens[1] == sprint(*left)[0]);
-            assert(tokens.drop_first() =~= sprint(*left) + left_tail);
-            assert(left_tail[0] == binary_tok(tag));
-            assert(left_tail.drop_first() =~= sprint(*right) + right_tail);
-            assert(right_tail[0] == TokenView::CloseParen);
-            assert(right_tail.drop_first() =~= tail);
-        },
-        SExpr::Function(name, args) => {
-            let inner_tail = seq![TokenView::CloseParen] + tail;
-            lemma_sparse_args_sprint(args, inner_tail, (fuel - 1) as nat);
-            assert(tokens[0] == TokenView::Ident(name));
-            assert(tokens.len() >= 2);
-            assert(tokens[1] == TokenView::OpenParen);
-            assert(tokens.drop_first().drop_first() =~= sprint_args(args) + inner_tail);
-            assert(inner_tail[0] == TokenView::CloseParen);
-            assert(inner_tail.drop_first() =~= tail);
-        },
-    }
-}
-
-/// Comma-list companion: parsing the canonical print of a printable argument
-/// sequence, closed by a `)`-led tail, recovers the sequence exactly.
-pub proof fn lemma_sparse_args_sprint(args: Seq<SExpr>, tail: Seq<TokenView>, fuel: nat)
-    requires
-        all_printable_se(args),
-        fuel >= slist_depth(args),
-        tail.len() > 0,
-        tail[0] == TokenView::CloseParen,
-    ensures
-        sparse_args(sprint_args(args) + tail, fuel) == (Some(args), tail),
-    decreases args,
-{
-    reveal_with_fuel(sparse_args, 1);
-    if args.len() == 0 {
-        assert(sprint_args(args) + tail =~= tail);
-        assert(Seq::<SExpr>::empty() =~= args);
-    } else if args.len() == 1 {
-        sprint_head(args[0]);
-        lemma_sparse_sprint(args[0], tail, (fuel - 1) as nat);
-        assert(sprint_args(args) + tail =~= sprint(args[0]) + tail);
-        assert(seq![args[0]] =~= args);
-    } else {
-        let rest_args = args.drop_first();
-        let comma_tail = seq![TokenView::Comma] + sprint_args(rest_args) + tail;
-        sprint_head(args[0]);
-        lemma_sparse_sprint(args[0], comma_tail, (fuel - 1) as nat);
-        lemma_sparse_args_sprint(rest_args, tail, (fuel - 1) as nat);
-        assert(sprint_args(args) + tail =~= sprint(args[0]) + comma_tail);
-        assert(comma_tail[0] == TokenView::Comma);
-        assert(comma_tail.drop_first() =~= sprint_args(rest_args) + tail);
-        assert(seq![args[0]] + rest_args =~= args);
-    }
-}
-
-/// The canonical mirror printer roundtrips: parsing a full print recovers the
-/// expression and consumes all of it.
-pub proof fn mirror_roundtrip(e: SExpr)
-    requires printable_se(e),
-    ensures sparse(sprint(e), sdepth(e)) == (Some(e), Seq::<TokenView>::empty()),
-{
-    lemma_sparse_sprint(e, Seq::empty(), sdepth(e));
-    assert(sprint(e) + Seq::<TokenView>::empty() =~= sprint(e));
-}
-
-/// The canonical mirror printer is injective on its printable domain.
-pub proof fn mirror_injective(left: SExpr, right: SExpr)
-    requires printable_se(left), printable_se(right),
-    ensures sprint(left) == sprint(right) ==> left == right,
-{
-    if sprint(left) == sprint(right) {
-        let fuel = if sdepth(left) >= sdepth(right) { sdepth(left) } else { sdepth(right) };
-        lemma_sparse_sprint(left, Seq::empty(), fuel);
-        lemma_sparse_sprint(right, Seq::empty(), fuel);
-        assert(sprint(left) + Seq::<TokenView>::empty() =~= sprint(left));
-        assert(sprint(right) + Seq::<TokenView>::empty() =~= sprint(right));
-    }
-}
-
-pub proof fn slist_depth_le_len(args: Seq<SExpr>)
-    requires all_printable_se(args),
-    ensures slist_depth(args) <= sprint_args(args).len() + 1,
-    decreases args,
-{
-    if args.len() == 0 {
-    } else if args.len() == 1 {
-        sdepth_le_len(args[0]);
-        assert(sprint_args(args) == sprint(args[0]));
-        assert(slist_depth(args.drop_first()) == 1);
-    } else {
-        sdepth_le_len(args[0]);
-        slist_depth_le_len(args.drop_first());
-        assert(sprint_args(args)
-            == sprint(args[0]) + seq![TokenView::Comma] + sprint_args(args.drop_first()));
-    }
-}
 
 // ============================================================================
 // E3: executable parser over real `ast::Expression`, refining `sparse`.
@@ -966,20 +618,6 @@ pub proof fn slist_depth_tail_decreases(args: Seq<ast::Expression>)
     ensures slist_depth(view_args(args.drop_first())) < slist_depth(view_args(args)),
 {
     view_args_step(args);
-}
-
-/// Structural injectivity of the canonical printer on the printable domain: two
-/// printable expressions with the same canonical print have the same structural
-/// view. Corollary of `mirror_injective` through the `view_expr` bridge.
-pub proof fn roundtrip_injective(left: ast::Expression, right: ast::Expression)
-    requires
-        printable_se(view_expr(left)),
-        printable_se(view_expr(right)),
-        sprint(view_expr(left)) == sprint(view_expr(right)),
-    ensures
-        view_expr(left) == view_expr(right),
-{
-    mirror_injective(view_expr(left), view_expr(right));
 }
 
 } // verus!
