@@ -303,23 +303,6 @@ pub open spec fn scan_digits_end(input: Seq<u8>, pos: int) -> int
     }
 }
 
-/// Maximal-run characterization: if `[pos, k)` are all digits and position `k` is
-/// end-of-input or a non-digit, the scan stops exactly at `k`.
-pub proof fn lemma_scan_digits_end_run(input: Seq<u8>, pos: int, k: int)
-    requires
-        0 <= pos <= k <= input.len(),
-        forall|i: int| pos <= i < k ==> is_digit(#[trigger] input[i]),
-        k == input.len() || !is_digit(input[k]),
-    ensures
-        scan_digits_end(input, pos) == k,
-    decreases k - pos,
-{
-    if pos < k {
-        assert(is_digit(input[pos]));
-        lemma_scan_digits_end_run(input, pos + 1, k);
-    }
-}
-
 /// Identifier start byte: `A`-`Z`, `a`-`z`, or `_`.
 pub open spec fn is_ident_start(b: u8) -> bool {
     (65 <= b <= 90) || (97 <= b <= 122) || b == 95
@@ -348,7 +331,7 @@ pub open spec fn scan_ident_end(input: Seq<u8>, pos: int) -> int
     }
 }
 
-/// Maximal-run characterization for identifiers (mirrors `lemma_scan_digits_end_run`).
+/// Maximal-run characterization for identifiers.
 pub proof fn lemma_scan_ident_end_run(input: Seq<u8>, pos: int, k: int)
     requires
         0 <= pos <= k <= input.len(),
@@ -1513,6 +1496,10 @@ pub open spec fn skip_ws_seq(input: Seq<u8>) -> Seq<u8> {
 
 /// A printable byte-determined token prints to a non-empty run whose first byte
 /// is never whitespace (so a preceding `skip_ws` lands exactly on it).
+// Deleting the unused `lemma_scan_digits_end_run` shifted this proof's SMT
+// context just enough to exceed the default budget; the explicit limit keeps the
+// module exactly as verifiable as before the cleanup.
+#[verifier::rlimit(20000)]
 pub proof fn lemma_lex_print_tv_head(tv: TokenView)
     requires
         printable_tv(tv),

@@ -1,4 +1,12 @@
 //! Narrow, audited trust boundary for textual finite-f64 round trips.
+//!
+//! `canonical_nan` deliberately promises only `r == spec_canonical_nan()`, not
+//! a bit pattern. It used to also ensure `to_bits_spec() == 0x7ff8...` for a
+//! body returning `f64::NAN`, which Rust does not guarantee: on a target where
+//! that differs, an `external_body` postcondition asserting it would be false,
+//! and a false assumption makes every obligation in the parser's NaN arms
+//! vacuous rather than failing loudly. Nothing consumed the claim, so it was
+//! pure downside and is gone.
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use vstd::float::FloatBitsProperties;
@@ -8,9 +16,6 @@ use vstd::prelude::*;
 use super::verified_integer;
 
 verus! {
-
-/// Raw bits of Rust's canonical quiet NaN value.
-pub const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 /// Mathematical formatter/parser symbols for the canonical runtime encoding.
 /// The formatter uses Rust's `Debug` representation because, unlike `Display`,
@@ -46,7 +51,6 @@ pub fn parse_f64(s: &[u8]) -> (r: Option<f64>)
 pub fn canonical_nan() -> (r: f64)
     ensures
         r == spec_canonical_nan(),
-        r.to_bits_spec() == CANONICAL_NAN_BITS,
 {
     f64::NAN
 }

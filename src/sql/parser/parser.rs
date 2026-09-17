@@ -5,8 +5,9 @@
 //! handcrafted recursive-descent parser in this file is `#[cfg(test)]`-only and
 //! serves purely as a differential oracle against the verified core; it is not
 //! compiled into the shipped binary. `Parser::parse` also applies a cheap
-//! `MAX_NESTING_DEPTH` pre-check to reject pathologically deep parenthesization
-//! before it can overflow the stack.
+//! `MAX_NESTING_DEPTH` pre-check (`check_nesting_depth`) to reject
+//! pathologically deep input before the recursive verified expression parser
+//! can overflow the stack.
 //!
 //! Limit: this module is unverified glue — it is NOT in `VERIFY_MODULES`. The
 //! verified guarantees live in the modules it calls; the lexing and dispatch
@@ -20,9 +21,9 @@ use super::stream::PeekStream;
 #[cfg(test)]
 #[cfg(test)]
 use super::stream::TokenStream;
+use super::{Keyword, Token, ast, verified_control};
 #[cfg(test)]
-use super::{Keyword, float_trust, verified_integer};
-use super::{Token, ast, verified_control};
+use super::{float_trust, verified_integer};
 use crate::errinput;
 use crate::error::Result;
 #[cfg(test)]
@@ -49,16 +50,131 @@ struct StreamingParser<S> {
     stream: S,
 }
 
-/// Robustness bound on parenthesis nesting depth accepted by `Parser::parse`.
+/// Robustness bound on expression nesting depth accepted by the parser.
 ///
-/// The verified control parser is recursive-descent, so pathologically deep
-/// parenthesization (observed to overflow the stack and abort the process at a
-/// depth of ~937) would crash the server. This bound is a cheap O(n) pre-check
-/// that rejects such input with a clean error instead of recursing. 256 is far
-/// above any legitimate query and far below the overflow point, so it changes
-/// behaviour ONLY for pathologically nested input (depth > 256), which no real
-/// query, goldenscript, differential case, or corpus input reaches.
-const MAX_NESTING_DEPTH: usize = 256;
+/// The verified expression parser is recursive-descent, so deeply nested input
+/// would overflow the stack and abort the process. This bound is a cheap O(n)
+/// pre-check that rejects such input with a clean error instead of recursing.
+/// The bound is set from measurement, not guesswork. On the default 2 MiB
+/// thread stack a debug build overflows at roughly 250 nested parentheses, 718
+/// chained prefix operators or `^`, and 1140 function arguments -- parentheses
+/// being the most stack-hungry per unit of the depth measured below. 64 is
+/// therefore a ~4x margin against the worst construct in the worst
+/// configuration, and a much larger one in release, where frames are smaller.
+///
+/// An earlier bound of 256 was unsafe: it was calibrated against an 8 MiB main
+/// thread (the "~937" figure in the history), and parses run on spawned threads
+/// with 2 MiB. 64 is still far above any legitimate query -- nothing real nests
+/// 64 parens, chains 64 unary minuses, or calls a function with 64 arguments --
+/// so this changes behaviour only for pathological input, which no real query,
+/// goldenscript, differential case, or corpus input reaches.
+const MAX_NESTING_DEPTH: usize = 64;
+
+/// One open parenthesis level in the `check_nesting_depth` scan (index 0 is the
+/// statement level, which is never popped).
+struct NestLevel {
+    /// Frames that live until this level closes: function-argument commas and
+    /// right-associative `^` operators.
+    persistent: usize,
+    /// Whether this paren opened a function call, i.e. followed an identifier.
+    /// Only a call's commas recurse; row literals and list commas are parsed by
+    /// loops.
+    is_call: bool,
+}
+
+/// Rejects input whose parse would recurse deeper than `MAX_NESTING_DEPTH`.
+///
+/// This mirrors the recursion of `verified_precedence::parse_expression_at`,
+/// which descends on exactly four things, each measured here:
+///
+/// * `(` -- a parenthesised subexpression or a call's argument list;
+/// * a *prefix* `-`/`+`/`NOT` -- these stack while they await their operand,
+///   and unwind once it arrives, so only a consecutive run counts;
+/// * `^` -- the one right-associative operator, whose right operand is parsed
+///   at the same precedence and so nests for the whole chain. Left-associative
+///   operators are folded by `sparse_infix_loop` and do NOT recurse;
+/// * a comma **inside a function call** -- `parse_fn_args_ne_exec` recurses per
+///   argument. Statement-level lists (SELECT items, VALUES rows) and row
+///   literals are parsed by loops and do not.
+///
+/// Counting more than this would reject legitimate bulk input: a 5000-term sum,
+/// a 5000-item SELECT list, a 5000-row INSERT and a 5000-column row literal all
+/// parse iteratively today and must keep doing so.
+fn check_nesting_depth(tokens: &[Token]) -> Result<()> {
+    let mut levels = vec![NestLevel { persistent: 0, is_call: false }];
+    let mut persistent_total: usize = 0;
+    let mut prefix_run: usize = 0;
+    // True where an operand may start, which is what distinguishes a prefix
+    // `-`/`+` from an infix one.
+    let mut expect_operand = true;
+    let mut prev_ident = false;
+
+    for token in tokens {
+        match token {
+            Token::OpenParen => {
+                levels.push(NestLevel { persistent: 0, is_call: prev_ident });
+                prefix_run = 0;
+                expect_operand = true;
+            }
+            Token::CloseParen => {
+                if levels.len() > 1 {
+                    let level = levels.pop().expect("levels is non-empty");
+                    persistent_total -= level.persistent;
+                }
+                prefix_run = 0;
+                expect_operand = false;
+            }
+            Token::Comma => {
+                let level = levels.last_mut().expect("levels is non-empty");
+                // A statement-level or row-literal comma ends an expression, so
+                // any `^` chain it held is complete.
+                persistent_total -=
+                    level.persistent - if level.is_call { level.persistent } else { 0 };
+                if !level.is_call {
+                    level.persistent = 0;
+                } else {
+                    level.persistent += 1;
+                    persistent_total += 1;
+                }
+                prefix_run = 0;
+                expect_operand = true;
+            }
+            Token::Minus | Token::Plus if expect_operand => prefix_run += 1,
+            Token::Caret => {
+                let level = levels.last_mut().expect("levels is non-empty");
+                level.persistent += 1;
+                persistent_total += 1;
+                expect_operand = true;
+            }
+            Token::Keyword(Keyword::Not) => {
+                prefix_run += 1;
+                expect_operand = true;
+            }
+            Token::Number(_)
+            | Token::String(_)
+            | Token::Ident(_)
+            | Token::Asterisk
+            | Token::Keyword(Keyword::True | Keyword::False | Keyword::Null)
+            | Token::Keyword(Keyword::Infinity | Keyword::NaN)
+                if expect_operand =>
+            {
+                // The operand arrived: the prefix operators awaiting it unwind.
+                prefix_run = 0;
+                expect_operand = false;
+            }
+            _ => {
+                prefix_run = 0;
+                expect_operand = true;
+            }
+        }
+        prev_ident = matches!(token, Token::Ident(_));
+
+        if levels.len() - 1 + persistent_total + prefix_run > MAX_NESTING_DEPTH {
+            return errinput!("expression nesting too deep");
+        }
+    }
+    Ok(())
+}
 
 impl Parser {
     /// Parses the input string into a SQL statement AST. The entire string must
@@ -71,22 +187,10 @@ impl Parser {
     pub fn parse(statement: &str) -> Result<ast::Statement> {
         let tokens: Vec<Token> = super::Lexer::new(statement).collect::<Result<_>>()?;
 
-        // Robustness guard: reject pathologically deep parenthesis nesting up
-        // front, so the recursive verified parser cannot overflow the stack and
-        // abort the process. This is an O(n) scan over the token stream.
-        let mut depth: usize = 0;
-        for token in &tokens {
-            match token {
-                Token::OpenParen => {
-                    depth += 1;
-                    if depth > MAX_NESTING_DEPTH {
-                        return errinput!("expression nesting too deep");
-                    }
-                }
-                Token::CloseParen => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
+        // Robustness guard: reject pathologically deep nesting up front, so the
+        // recursive verified parser cannot overflow the stack and abort the
+        // process. This is an O(n) scan over the token stream.
+        check_nesting_depth(&tokens)?;
 
         let (opt, consumed, perr) = verified_control::parse_control_at(&tokens, 0);
         match opt {
@@ -124,6 +228,7 @@ impl Parser {
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
         let tokens: Vec<Token> = super::Lexer::new(expr).collect::<Result<_>>()?;
+        check_nesting_depth(&tokens)?;
         let (opt, perr) = super::verified_precedence::parse_expression_full(&tokens);
         match opt {
             Some(expression) => Ok(expression),
@@ -1087,5 +1192,63 @@ mod tests {
     fn modest_nesting_still_parses() {
         Parser::parse("SELECT ((1 + 2) * (3 - 4))").expect("modest nesting should parse");
         Parser::parse("SELECT 1 WHERE (((1 = 1)))").expect("modest nesting should parse");
+    }
+}
+
+#[cfg(test)]
+mod nesting_depth_tests {
+    use super::*;
+
+    /// Every construct on which `parse_expression_at` recurses must be rejected
+    /// with a clean error rather than overflowing the stack.
+    ///
+    /// Regression for a confirmed remote, pre-auth process kill: before the
+    /// guard modelled them, each of these aborted the process. The paren case
+    /// was guarded; the other four were not.
+    #[test]
+    fn deep_recursive_constructs_are_rejected_cleanly() {
+        let n = 5_000;
+        for sql in [
+            format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n)), // nested parens
+            format!("SELECT {}1", "-".repeat(n)),                  // prefix minus
+            format!("SELECT {}TRUE", "NOT ".repeat(n)),            // prefix NOT
+            format!("SELECT 1{}", "^1".repeat(n)),                 // right-assoc chain
+            format!("SELECT f(1{})", ",1".repeat(n)),              // function arguments
+        ] {
+            let err = Parser::parse(&sql).expect_err("should reject, not crash").to_string();
+            assert!(err.contains("nesting too deep"), "wrong error for {:.32}: {err}", sql);
+        }
+    }
+
+    /// The guard must not catch input the parser handles iteratively. Each of
+    /// these is a flat construct parsed by a loop, so it costs no stack and
+    /// must keep parsing however long it gets.
+    #[test]
+    fn bulk_iterative_constructs_still_parse() {
+        let n = 5_000;
+        for sql in [
+            format!("SELECT 1{}", "+1".repeat(n)),     // left-assoc chain
+            format!("SELECT 1{}", ",1".repeat(n)),     // SELECT list
+            format!("SELECT -1{}", ",-1".repeat(n)),   // one prefix op per item
+            format!("SELECT 1^1{}", ",1^1".repeat(n)), // one ^ per item
+            format!("INSERT INTO t VALUES (1){}", ",(1)".repeat(n)), // rows
+            format!("INSERT INTO t VALUES (1{})", ",1".repeat(n)), // row literal
+        ] {
+            assert!(Parser::parse(&sql).is_ok(), "should parse: {:.32}", sql);
+        }
+    }
+
+    /// The bound is inclusive, and input just under it still parses -- a guard
+    /// that rejected everything would pass the test above vacuously.
+    #[test]
+    fn depth_at_the_bound_parses_and_past_it_does_not() {
+        let at = MAX_NESTING_DEPTH;
+        let over = MAX_NESTING_DEPTH + 1;
+        assert!(Parser::parse(&format!("SELECT {}1", "-".repeat(at))).is_ok());
+        assert!(Parser::parse(&format!("SELECT {}1", "-".repeat(over))).is_err());
+        assert!(Parser::parse(&format!("SELECT {}1{}", "(".repeat(at), ")".repeat(at))).is_ok());
+        assert!(
+            Parser::parse(&format!("SELECT {}1{}", "(".repeat(over), ")".repeat(over))).is_err()
+        );
     }
 }
