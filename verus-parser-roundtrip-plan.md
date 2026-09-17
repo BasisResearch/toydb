@@ -127,11 +127,16 @@ suite). New strategy and progress:
   - **Still true after the parser-coverage cleanup (2026-09-16,
     branch `yl/parser-coverage-fix`).** That cleanup removed ~9k lines of dead
     scaffolding, and every carrier named above survived it: `lemma_prec` and the
-    `sprint` domain it is stated over are kept (and marked
-    `#[verifier::reach_root]`, since nothing calls into a domain description),
-    as are `verified_lexer`'s spec-level roundtrip theorems
-    `lemma_lex_all_seq_roundtrip` / `lemma_lex_mtok_seq_roundtrip`, which
-    455d790 had deliberately retained for the lexer-cutover milestone. What went
+    `sprint` domain it is stated over are kept, as are `verified_lexer`'s
+    spec-level roundtrip theorems `lemma_lex_all_seq_roundtrip` /
+    `lemma_lex_mtok_seq_roundtrip`, which 455d790 had deliberately retained for
+    the lexer-cutover milestone. Only `lemma_prec` is marked
+    `#[verifier::reach_root]`, and only because its subject `sparse_prec` is the
+    production parser, reachable independently; the mark merely pulls in the
+    `sprint` domain description. The lexer pair is deliberately NOT marked --
+    its subject `lex_all_seq` is a lexer nothing runs, so those ~100 ghost
+    functions stay counted as unreached (see the KNOWN DEBT note in
+    verified_lexer.rs). What went
     was scaffolding with no theorem attached: the mirror *parser* (`sparse`), the
     test-only fully parenthesized exec printer (`printer.rs`) and its spec domain,
     `verified_stmt`'s unreferenced `sparse_*` grammar, three template modules,
