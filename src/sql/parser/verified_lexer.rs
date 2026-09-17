@@ -21,6 +21,28 @@
 //! theorems* for the lexer-cutover milestone, which would otherwise have to
 //! restate them (see commit 455d790, which kept this layer for that reason).
 //!
+//! KNOWN DEBT (2026-09-17). Keeping the theorems and calling them *reachable*
+//! are separate decisions, and only the first is justified. This module is
+//! therefore deliberately NOT marked `#[verifier::reach_root]`: it is a spec of
+//! nothing -- the executable twin it refined was deleted in phase 4 -- so the
+//! coverage gate should go on counting roughly 100 ghost functions here as
+//! unreached. Marking them would have let a gate whose purpose is to find
+//! verified code nothing reaches be satisfied by annotating the code it exists
+//! to find, and `--connected` reserves that attribute for theorems about
+//! *reachable* code that nothing calls. Scheduled follow-up: the lexer-cutover
+//! milestone (issue 1 of verus-parser-coverage-issues.md, option 2 -- wire
+//! `Lexer::scan` through this model), which clears the debt by making the
+//! subject reachable for real. Until then the honest reading of the number is
+//! "~100 verified ghost functions here are about a lexer that does not run".
+//!
+//! `lemma_lscan_sym` IS marked, and legitimately: its subject
+//! (`scan_symbol_bytes`) is called from `lexer.rs`.
+//!
+//! Scope caveat that bounds the value of the debt: `printable_tv` sets
+//! `Ident => false` and `String => false`, so `lemma_lex_all_seq_roundtrip`
+//! proves nothing about identifiers or string literals. `MTok` widens this, but
+//! `MTok` is further still from the production `Token` stream.
+//!
 //! The executable twin these once refined was deleted in phase 4, and the
 //! position-local lemmas that served only it (`lemma_*_local`, `*_bounds`,
 //! `lex_from`, `lex_all_ends`, `lex_token_end`) went with the parser-coverage
@@ -1605,7 +1627,6 @@ pub proof fn lemma_lex_all_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
 
 /// Whole-input token-list roundtrip (byte-determined classes). Printing a
 /// printable token list and re-lexing recovers it, given enough fuel.
-#[verifier::reach_root]
 pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     requires
         all_printable_tv(ts),
@@ -2116,7 +2137,6 @@ pub proof fn lemma_lex_mtok_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
 }
 
 /// Whole-input unified token-list roundtrip (all five classes). Axiom-free.
-#[verifier::reach_root]
 pub proof fn lemma_lex_mtok_seq_roundtrip(ms: Seq<MTok>, fuel: nat)
     requires
         all_printable_mtok(ms),

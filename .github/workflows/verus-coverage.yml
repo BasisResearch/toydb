@@ -30,12 +30,19 @@ env:
   # and parser, the test-only fully parenthesized printer and its spec domain,
   # the unwired lexer token model, and three template modules.
   #
-  # TODO: raise this. The cleanup should put reachability near 100%, but the
-  # number has not been measured: it needs `scripts/verus/coverage.sh`, and this
-  # repo's solver policy routes all Verus runs through the MCP server, which has
-  # no `--reach` tool. Read the real figure off this job's summary on the first
-  # run and set the gate just under it, so it starts catching regressions
-  # instead of tracking scaffolding.
+  # TODO: raise this, but measure first -- do not assume ~99%. A review measured
+  # 662/664 (99%) on the cleanup branch, but that figure was inflated by two
+  # `#[verifier::reach_root]` marks on `verified_lexer`'s round-trip theorems,
+  # which pulled roughly 100 ghost functions of an explicitly-unwired lexer model
+  # into the reachable set. Those marks have been removed (see the KNOWN DEBT
+  # note in verified_lexer.rs), so the real number is materially lower and the
+  # unwired model is once again counted as unreached, which is correct.
+  #
+  # Read the figure off this job's summary and set the gate just under it, so it
+  # starts catching regressions instead of tracking scaffolding. Note the gate
+  # counts verified *exec* functions reachable from a binary `main`; ghost
+  # spec/proof code is a separate concern, tracked by
+  # scripts/verus/verified_coverage.py, which never flags ghost items.
   COVERAGE_MIN_PERCENT: "5"
   OUT_DIR: ".verus-out/coverage"
 
