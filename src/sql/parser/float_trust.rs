@@ -41,47 +41,6 @@ pub fn parse_f64(s: &[u8]) -> (r: Option<f64>)
     }
 }
 
-/// Runtime classifications used by the canonical printer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FloatClass {
-    Printable,
-    CanonicalNan,
-    Other,
-}
-
-/// Models both the finite/nonnegative literal guard and the exact NaN payload
-/// accepted after `IS`.
-#[verifier::external_body]
-pub fn classify_f64(x: f64) -> (r: FloatClass)
-    ensures r == if x.is_finite_spec() && !x.is_sign_negative_spec() {
-        FloatClass::Printable
-    } else if x.to_bits_spec() == CANONICAL_NAN_BITS {
-        FloatClass::CanonicalNan
-    } else {
-        FloatClass::Other
-    },
-{
-    if x.is_finite() && x.is_sign_positive() {
-        FloatClass::Printable
-    } else if x.to_bits() == CANONICAL_NAN_BITS {
-        FloatClass::CanonicalNan
-    } else {
-        FloatClass::Other
-    }
-}
-
-pub fn is_printable_f64(x: f64) -> (r: bool)
-    ensures r == (x.is_finite_spec() && !x.is_sign_negative_spec()),
-{
-    matches!(classify_f64(x), FloatClass::Printable)
-}
-
-pub fn is_canonical_nan(x: f64) -> (r: bool)
-    ensures r == (x.to_bits_spec() == CANONICAL_NAN_BITS),
-{
-    matches!(classify_f64(x), FloatClass::CanonicalNan)
-}
-
 /// Constructs the exact NaN payload used by the production parser.
 #[verifier::external_body]
 pub fn canonical_nan() -> (r: f64)
@@ -97,17 +56,6 @@ pub fn infinity() -> (r: f64)
     ensures r == spec_infinity(),
 {
     f64::INFINITY
-}
-
-/// Connects bit equality to Verus equality for the one NaN payload admitted
-/// by the canonical `IS NAN` syntax.
-#[verifier::external_body]
-pub proof fn axiom_canonical_nan(value: f64)
-    requires value.to_bits_spec() == CANONICAL_NAN_BITS,
-    ensures
-        value == spec_canonical_nan(),
-        spec_canonical_nan().to_bits_spec() == CANONICAL_NAN_BITS,
-{
 }
 
 /// The sole semantic assumption: finite values survive the canonical

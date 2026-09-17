@@ -172,15 +172,6 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
     }
 }
 
-// --- Verus-verified core of the bool key encoding --------------------------
-//
-// A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
-
-/// The single-byte key for a bool: 1 for true, 0 for false.
-pub open spec fn bool_key(b: bool) -> u8 {
-    if b { 1u8 } else { 0u8 }
-}
-
 /// The escaped bytes of `v` *without* the terminator: each `0x00` becomes the
 /// pair `0x00 0xff`, every other byte is copied verbatim.
 pub open spec fn esc_all(v: Seq<u8>) -> Seq<u8>

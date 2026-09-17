@@ -1,13 +1,30 @@
 //! Token-level lexer model.
 //!
-//! Provides a ghost/spec model of tokenization so the grammar layer
-//! (`verified_stmt` etc.) can reason over a clean `Token` stream. Every theorem
-//! here is stated at the token level.
+//! A ghost/spec model of tokenization. Every theorem here is stated at the token
+//! level, over `Seq<u8>` input and a `TokenView`/`MTok` token model.
 //!
-//! Limit: this model is NOT wired to the production `Lexer`. The only lexer code
-//! that actually runs verified is `scan_symbol_bytes` (here) and
-//! `scan_number_bytes` (in `lexer.rs`); the rest of the string -> token stage in
-//! the production lexer is essentially unverified plain Rust.
+//! The headline theorems are the whole-input round trips: printing a token list
+//! with single-space separators and re-lexing recovers the list exactly --
+//! `lemma_lex_all_seq_roundtrip` for the byte-determined classes (numbers,
+//! keywords, all symbols) and `lemma_lex_mtok_seq_roundtrip` for the unified
+//! model that adds identifiers, strings and quoted identifiers. Both are
+//! axiom-free. A space is a universal separator: it satisfies every token's
+//! boundary condition (`num_tail_ok`, the keyword non-continuation boundary,
+//! `op_tail_ok`), so no per-adjacency canonicalisation is needed.
+//!
+//! LIMIT, stated plainly: this model is NOT wired to the production `Lexer`. The
+//! only lexer code that actually runs verified is `scan_symbol_bytes` (here,
+//! under `lemma_lscan_sym`) and `scan_number_bytes` (in `lexer.rs`); the rest of
+//! the production `Lexer`'s string -> token stage is plain Rust. So the parser's
+//! functional guarantees are stated at the *token* level and the string -> token
+//! stage sits outside them. The round-trip theorems above are kept as *stated
+//! theorems* for the lexer-cutover milestone, which would otherwise have to
+//! restate them (see commit 455d790, which kept this layer for that reason).
+//!
+//! The executable twin these once refined was deleted in phase 4, and the
+//! position-local lemmas that served only it (`lemma_*_local`, `*_bounds`,
+//! `lex_from`, `lex_all_ends`, `lex_token_end`) went with the parser-coverage
+//! cleanup; the seq-based layer the theorems above rest on is what remains.
 
 #![allow(dead_code)]
 // Proof/verification scaffolding, not idiomatic library code: exempt from the
@@ -95,35 +112,6 @@ pub open spec fn scan_punct1(b: u8) -> Option<Token> {
 /// Canonical byte print of a single munch-free punctuation token.
 pub open spec fn lex_print1(t: Token) -> Seq<u8> {
     seq![punct1_byte(t)]
-}
-
-/// The L0 byte-cursor scanner: at `pos`, read one munch-free punctuation byte.
-/// Returns the token and the advanced cursor, or `None` at end / on any byte
-/// outside the munch-free set.
-pub open spec fn lscan1(input: Seq<u8>, pos: int) -> (Option<Token>, int) {
-    if 0 <= pos < input.len() {
-        match scan_punct1(input[pos]) {
-            Some(t) => (Some(t), pos + 1),
-            None => (None, pos),
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-/// The scanner inverts the printer for every munch-free punctuation token: the
-/// byte it prints scans straight back to it, regardless of the trailing bytes
-/// (these tokens are never a prefix of a longer token, so no lookahead matters).
-pub proof fn lemma_lscan1_lex_print1(t: Token, tail: Seq<u8>)
-    requires
-        is_punct1(t),
-    ensures
-        lscan1(lex_print1(t) + tail, 0) == (Some(t), 1int),
-{
-    let input = lex_print1(t) + tail;
-    assert(input.len() >= 1);
-    assert(input[0] == punct1_byte(t));
-    assert(scan_punct1(punct1_byte(t)) == Some(t));
 }
 
 /// The maximal-munch operator tokens.
@@ -265,21 +253,6 @@ pub proof fn lemma_skip_ws_bounds(input: Seq<u8>, pos: int)
     }
 }
 
-/// `skip_ws` lands on end-of-input or a non-whitespace byte (its defining
-/// fixpoint): the token scanner that runs there never faces leading whitespace.
-pub proof fn lemma_skip_ws_fixpoint(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        skip_ws(input, pos) == input.len()
-            || !is_ws(input[skip_ws(input, pos)]),
-    decreases input.len() - pos,
-{
-    if 0 <= pos < input.len() && is_ws(input[pos]) {
-        lemma_skip_ws_fixpoint(input, pos + 1);
-    }
-}
-
 /// When the current byte is not whitespace, `skip_ws` is a no-op — so printing a
 /// token whose first byte is non-whitespace (all L0/L1 tokens) means a preceding
 /// `skip_ws` leaves the cursor exactly on it.
@@ -295,11 +268,6 @@ pub proof fn lemma_skip_ws_nonws(input: Seq<u8>, pos: int)
 /// ASCII digit `0`-`9`.
 pub open spec fn is_digit(b: u8) -> bool {
     48 <= b <= 57
-}
-
-/// Every byte of the sequence is a digit.
-pub open spec fn all_digits(s: Seq<u8>) -> bool {
-    forall|i: int| 0 <= i < s.len() ==> is_digit(#[trigger] s[i])
 }
 
 /// End of the maximal digit run starting at `pos`.
@@ -328,30 +296,6 @@ pub proof fn lemma_scan_digits_end_run(input: Seq<u8>, pos: int, k: int)
         assert(is_digit(input[pos]));
         lemma_scan_digits_end_run(input, pos + 1, k);
     }
-}
-
-/// Integer roundtrip: a non-empty digit run followed by a non-digit boundary byte
-/// (or end) re-scans to exactly itself. This is the number analogue of L1's
-/// maximal-munch boundary — the tail must not start with a byte that extends the
-/// run (here, another digit; decimal/exponent bytes are the deferred extension).
-pub proof fn lemma_scan_digits_roundtrip(d: Seq<u8>, tail: Seq<u8>)
-    requires
-        d.len() >= 1,
-        all_digits(d),
-        tail.len() == 0 || !is_digit(tail[0]),
-    ensures
-        scan_digits_end(d + tail, 0) == d.len(),
-{
-    let input = d + tail;
-    assert forall|i: int| 0 <= i < d.len() implies is_digit(#[trigger] input[i]) by {
-        assert(input[i] == d[i]);
-    }
-    if tail.len() == 0 {
-        assert(input.len() == d.len());
-    } else {
-        assert(input[d.len() as int] == tail[0]);
-    }
-    lemma_scan_digits_end_run(input, 0, d.len() as int);
 }
 
 /// Identifier start byte: `A`-`Z`, `a`-`z`, or `_`.
@@ -419,209 +363,6 @@ pub proof fn lemma_scan_ident_roundtrip(d: Seq<u8>, tail: Seq<u8>)
     lemma_scan_ident_end_run(input, 0, d.len() as int);
 }
 
-/// Monotonicity/bounds for the digit run (needed to show the dispatcher advances).
-pub proof fn lemma_scan_digits_end_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        pos <= scan_digits_end(input, pos) <= input.len(),
-    decreases input.len() - pos,
-{
-    if 0 <= pos < input.len() && is_digit(input[pos]) {
-        lemma_scan_digits_end_bounds(input, pos + 1);
-    }
-}
-
-/// Monotonicity/bounds for the identifier run.
-pub proof fn lemma_scan_ident_end_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        pos <= scan_ident_end(input, pos) <= input.len(),
-    decreases input.len() - pos,
-{
-    if 0 <= pos < input.len() && is_ident_cont(input[pos]) {
-        lemma_scan_ident_end_bounds(input, pos + 1);
-    }
-}
-
-/// A byte that begins a token the dispatcher currently recognizes: digit
-/// (number), ident-start (identifier), operator lead (`< > !`), or munch-free
-/// punctuation. Excludes the deferred classes (`'`/`"` strings and quoted idents,
-/// `-`-comment lead handling, etc. — later bricks).
-pub open spec fn is_token_start(b: u8) -> bool {
-    is_digit(b) || is_ident_start(b) || b == 60 || b == 62 || b == 33
-        || scan_punct1(b) is Some
-}
-
-/// End position of the one token starting at `pos` (after skipping whitespace).
-/// Returns `skip_ws(pos)` unchanged when there is no recognized token there.
-pub open spec fn lex_token_end(input: Seq<u8>, pos: int) -> int {
-    let p = skip_ws(input, pos);
-    if 0 <= p < input.len() {
-        let b = input[p];
-        if is_digit(b) {
-            scan_digits_end(input, p)
-        } else if is_ident_start(b) {
-            scan_ident_end(input, p)
-        } else if b == 60 || b == 62 || b == 33 {
-            lscan_op(input, p).1
-        } else if scan_punct1(b) is Some {
-            p + 1
-        } else {
-            p
-        }
-    } else {
-        p
-    }
-}
-
-/// The dispatcher never moves before the whitespace-skipped cursor and never past
-/// the end.
-pub proof fn lemma_lex_token_end_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        skip_ws(input, pos) <= lex_token_end(input, pos) <= input.len(),
-{
-    let p = skip_ws(input, pos);
-    lemma_skip_ws_bounds(input, pos);
-    if 0 <= p < input.len() {
-        let b = input[p];
-        if is_digit(b) {
-            lemma_scan_digits_end_bounds(input, p);
-        } else if is_ident_start(b) {
-            lemma_scan_ident_end_bounds(input, p);
-        }
-    }
-}
-
-/// When a recognized token starts at the whitespace-skipped cursor, the dispatcher
-/// strictly advances — the progress fact the token-list scanner needs to terminate.
-pub proof fn lemma_lex_token_end_progress(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-        skip_ws(input, pos) < input.len(),
-        is_token_start(input[skip_ws(input, pos)]),
-    ensures
-        skip_ws(input, pos) < lex_token_end(input, pos),
-{
-    lemma_skip_ws_bounds(input, pos);
-    let p = skip_ws(input, pos);
-    let b = input[p];
-    if is_digit(b) {
-        assert(lex_token_end(input, pos) == scan_digits_end(input, p));
-        reveal_with_fuel(scan_digits_end, 1);
-        assert(scan_digits_end(input, p) == scan_digits_end(input, p + 1));
-        lemma_scan_digits_end_bounds(input, p + 1);
-    } else if is_ident_start(b) {
-        assert(lex_token_end(input, pos) == scan_ident_end(input, p));
-        assert(is_ident_cont(b));
-        reveal_with_fuel(scan_ident_end, 1);
-        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
-        lemma_scan_ident_end_bounds(input, p + 1);
-    } else if b == 60 || b == 62 || b == 33 {
-        // lscan_op advances by 1 or 2 (its second component is p+1 or p+2).
-        assert(lex_token_end(input, pos) == lscan_op(input, p).1);
-        assert(lscan_op(input, p).1 >= p + 1);
-    } else {
-        // munch-free punctuation: p + 1.
-        assert(scan_punct1(b) is Some);
-        assert(lex_token_end(input, pos) == p + 1);
-    }
-}
-
-//
-
-/// Spec whole-input token-list scanner: the sequence of token end positions from
-/// `pos`, stopping at end-of-input or an unrecognized (deferred-class) byte.
-/// `fuel` bounds the recursion; a fuel of `input.len() + 1` always suffices.
-pub open spec fn lex_all_ends(input: Seq<u8>, pos: int, fuel: nat) -> Seq<int>
-    decreases fuel,
-{
-    if fuel == 0 {
-        Seq::empty()
-    } else {
-        let e = lex_token_end(input, pos);
-        if e > pos {
-            seq![e] + lex_all_ends(input, e, (fuel - 1) as nat)
-        } else {
-            Seq::empty()
-        }
-    }
-}
-
-/// Every token end position is strictly past the start and within the input:
-/// `pos < ends[i] <= len`. The well-formedness the token-list refinement builds on.
-pub proof fn lemma_lex_all_ends_bounded(input: Seq<u8>, pos: int, fuel: nat)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        forall|i: int| 0 <= i < lex_all_ends(input, pos, fuel).len()
-            ==> pos < #[trigger] lex_all_ends(input, pos, fuel)[i] <= input.len(),
-    decreases fuel,
-{
-    if fuel > 0 {
-        let e = lex_token_end(input, pos);
-        lemma_lex_token_end_bounds(input, pos);
-        if e > pos {
-            lemma_lex_all_ends_bounded(input, e, (fuel - 1) as nat);
-            let rest = lex_all_ends(input, e, (fuel - 1) as nat);
-            assert forall|i: int| 0 <= i < lex_all_ends(input, pos, fuel).len()
-                implies pos < #[trigger] lex_all_ends(input, pos, fuel)[i] <= input.len() by {
-                if i == 0 {
-                    assert(lex_all_ends(input, pos, fuel)[0] == e);
-                } else {
-                    assert(lex_all_ends(input, pos, fuel)[i] == rest[i - 1]);
-                    // rest entries are > e > pos and <= len.
-                }
-            }
-        }
-    }
-}
-
-// -- L7: token-list fuel stability --------------------------------------------
-//
-// Each token consumes at least one position, so `lex_all_ends` reaches its fixed
-// result once `fuel >= input.len() - pos`; extra fuel changes nothing. This is
-// what lets a fuel-free executable token-list loop (a later brick) refine the
-// fuel-bounded spec — the same move the parser made from `sparse` to its exec.
-
-pub proof fn lemma_lex_all_ends_fuel_stable(input: Seq<u8>, pos: int, fuel: nat)
-    requires
-        0 <= pos <= input.len(),
-        fuel >= input.len() - pos,
-    ensures
-        lex_all_ends(input, pos, fuel) == lex_all_ends(input, pos, (fuel + 1) as nat),
-    decreases input.len() - pos,
-{
-    let e = lex_token_end(input, pos);
-    lemma_lex_token_end_bounds(input, pos);
-    lemma_skip_ws_bounds(input, pos);
-    if e > pos {
-        // A token was consumed: e >= pos + 1, so the tail has strictly less to do
-        // and still enough fuel. fuel > 0 here since fuel >= len - pos >= e - pos >= 1.
-        assert(fuel >= input.len() - pos);
-        assert(e <= input.len());
-        assert(fuel - 1 >= input.len() - e);
-        lemma_lex_all_ends_fuel_stable(input, e, (fuel - 1) as nat);
-        assert(lex_all_ends(input, pos, fuel)
-            == seq![e] + lex_all_ends(input, e, (fuel - 1) as nat));
-        assert(lex_all_ends(input, pos, (fuel + 1) as nat)
-            == seq![e] + lex_all_ends(input, e, fuel));
-    } else {
-        // No progress (end of input or a deferred-class byte): both are empty.
-        // fuel could be 0 only if len - pos <= 0, i.e. pos == len, where e == pos.
-        assert(lex_all_ends(input, pos, (fuel + 1) as nat) =~= Seq::<int>::empty());
-        assert(lex_all_ends(input, pos, fuel) =~= Seq::<int>::empty());
-    }
-}
-
-
-pub open spec fn ends_int(v: Seq<usize>) -> Seq<int> {
-    v.map_values(|x: usize| x as int)
-}
-
 /// Canonical byte print of a symbol token (punctuation or operator).
 pub open spec fn lex_print_sym(t: Token) -> Seq<u8> {
     if is_op(t) {
@@ -652,6 +393,7 @@ pub open spec fn lscan_sym(input: Seq<u8>, pos: int) -> (Option<Token>, int) {
 /// Combined symbol roundtrip: scanning the print of any symbol token recovers it
 /// and advances by its byte length, under the operator boundary (vacuous for
 /// punctuation and the two-char operators).
+#[verifier::reach_root]
 pub proof fn lemma_lscan_sym(t: Token, tail: Seq<u8>)
     requires
         is_punct1(t) || is_op(t),
@@ -686,43 +428,6 @@ pub proof fn lemma_lscan_sym(t: Token, tail: Seq<u8>)
     }
 }
 
-/// Scan a number (integer core): if the byte at `pos` is a digit, consume the
-/// maximal digit run and produce `Number` carrying those bytes.
-pub open spec fn lscan_num(input: Seq<u8>, pos: int) -> (Option<TokenView>, int) {
-    if 0 <= pos < input.len() && is_digit(input[pos]) {
-        let e = scan_digits_end(input, pos);
-        (Some(TokenView::Number(input.subrange(pos, e))), e)
-    } else {
-        (None, pos)
-    }
-}
-
-/// Number token roundtrip: a non-empty digit run followed by a non-digit boundary
-/// scans to `Number` carrying exactly those bytes, advancing past them. The
-/// token-value analogue of `lemma_scan_digits_roundtrip`.
-pub proof fn lemma_lscan_num(d: Seq<u8>, tail: Seq<u8>)
-    requires
-        d.len() >= 1,
-        all_digits(d),
-        tail.len() == 0 || !is_digit(tail[0]),
-    ensures
-        lscan_num(d + tail, 0) == (Some(TokenView::Number(d)), d.len() as int),
-{
-    let input = d + tail;
-    assert(input[0] == d[0]);
-    assert(is_digit(input[0]));
-    lemma_scan_digits_roundtrip(d, tail);
-    assert(scan_digits_end(input, 0) == d.len());
-    assert(input.subrange(0, d.len() as int) =~= d);
-}
-
-// -- L11: decimal number extension (digits.digits) ----------------------------
-//
-// Extends L3/L10 past the integer core to `digits.digits`. This is the first
-// multi-phase scan (integer run, then a `.`, then a fraction run) and its
-// roundtrip needs two applications of the run characterization with concatenation
-// index bookkeeping. Exponent (`e[+-]digits`) is the next phase, deferred.
-
 /// End of a `digits[.digits]` number scan starting at a digit position: consume
 /// the integer run, then (if a `.` follows) the fraction run.
 pub open spec fn scan_num_dec_end(input: Seq<u8>, pos: int) -> int {
@@ -733,56 +438,6 @@ pub open spec fn scan_num_dec_end(input: Seq<u8>, pos: int) -> int {
         d1
     }
 }
-
-/// Decimal roundtrip: an integer run `a`, a `.`, and a fraction run `b`, followed
-/// by a non-digit boundary, scan to exactly `a.b` (length `|a| + 1 + |b|`). `.` in
-/// the tail is harmless (only one `.` is consumed).
-pub proof fn lemma_scan_num_dec_roundtrip(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
-    requires
-        a.len() >= 1,
-        all_digits(a),
-        b.len() >= 1,
-        all_digits(b),
-        tail.len() == 0 || !is_digit(tail[0]),
-    ensures
-        scan_num_dec_end(a + seq![46u8] + b + tail, 0) == a.len() + 1 + b.len(),
-{
-    let dot = seq![46u8];
-    let input = a + dot + b + tail;
-    // Phase 1: the integer run stops at the `.` (index a.len()).
-    assert forall|i: int| 0 <= i < a.len() implies is_digit(#[trigger] input[i]) by {
-        assert(input[i] == a[i]);
-    }
-    assert(input[a.len() as int] == 46) by {
-        assert(input[a.len() as int] == dot[0]);
-    }
-    lemma_scan_digits_end_run(input, 0, a.len() as int);
-    assert(scan_digits_end(input, 0) == a.len());
-    // Phase 2: from just past the `.`, the fraction run stops at the boundary.
-    let f0: int = a.len() as int + 1;
-    let fend: int = f0 + b.len() as int;
-    assert forall|i: int| f0 <= i < fend implies is_digit(#[trigger] input[i]) by {
-        assert(input[i] == b[i - f0]);
-    }
-    if tail.len() == 0 {
-        assert(input.len() == fend);
-    } else {
-        assert(input[fend] == tail[0]);
-    }
-    lemma_scan_digits_end_run(input, f0, fend);
-    assert(scan_digits_end(input, f0) == fend);
-}
-
-// -- L12: full number token-value scanner (integer[.decimal][exponent]) --------
-//
-// Completes the number scanner to the production shape `digits[.digits][(e|E)
-// [+|-]digits]`, matching `lexer.rs::scan_number_bytes`'s cursor progression, and
-// packages it as a `Number` token-value scanner. Rust's `Display` for `f64` never
-// emits scientific notation, so the *printer* only ever produces the integer or
-// `digits.digits` forms; the exponent phase is therefore not needed for the
-// roundtrip, only to lex arbitrary production input faithfully. Accordingly the
-// two roundtrip lemmas below cover exactly the printed forms (integer, decimal),
-// under one unified number boundary predicate `num_tail_ok`.
 
 /// Exponent marker byte: `e` or `E`.
 pub open spec fn is_exp(b: u8) -> bool {
@@ -822,90 +477,6 @@ pub open spec fn lscan_num_full(input: Seq<u8>, pos: int) -> (Option<TokenView>,
     } else {
         (None, pos)
     }
-}
-
-/// Bounds: the full number scan advances at least past the first digit and stays
-/// in range (given the start is a digit).
-pub proof fn lemma_scan_num_full_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos < input.len(),
-        is_digit(input[pos]),
-    ensures
-        pos < scan_num_full_end(input, pos) <= input.len(),
-{
-    // First byte is a digit, so the integer run advances at least one past `pos`.
-    assert(scan_digits_end(input, pos) == scan_digits_end(input, pos + 1));
-    lemma_scan_digits_end_bounds(input, pos + 1);
-    let d1 = scan_digits_end(input, pos);
-    assert(pos < d1 <= input.len());
-    // Decimal end `p` is either `d1` or a further digit run, both past `pos`.
-    if 0 <= d1 < input.len() && input[d1] == 46 {
-        lemma_scan_digits_end_bounds(input, d1 + 1);
-    }
-    let p = scan_num_dec_end(input, pos);
-    assert(pos < p <= input.len());
-    // Exponent end (if any) is a still-further digit run.
-    if 0 <= p < input.len() && is_exp(input[p]) {
-        let q0 = p + 1;
-        let q = if 0 <= q0 < input.len() && is_num_sign(input[q0]) { q0 + 1 } else { q0 };
-        lemma_scan_digits_end_bounds(input, q);
-    }
-}
-
-/// Integer printed form re-scans exactly: a non-empty digit run followed by a
-/// number boundary (no digit / `.` / exponent) scans to itself, no fraction or
-/// exponent consumed.
-pub proof fn lemma_lscan_num_full_int(d: Seq<u8>, tail: Seq<u8>)
-    requires
-        d.len() >= 1,
-        all_digits(d),
-        num_tail_ok(tail),
-    ensures
-        lscan_num_full(d + tail, 0) == (Some(TokenView::Number(d)), d.len() as int),
-{
-    let input = d + tail;
-    assert(input[0] == d[0]);
-    assert(is_digit(input[0]));
-    // Integer run stops at d.len(); no `.` follows, so the decimal end is d.len().
-    lemma_scan_digits_roundtrip(d, tail);
-    assert(scan_digits_end(input, 0) == d.len());
-    if tail.len() != 0 {
-        assert(input[d.len() as int] == tail[0]);
-    }
-    assert(scan_num_dec_end(input, 0) == d.len());
-    // No exponent follows either.
-    assert(scan_num_full_end(input, 0) == d.len());
-    assert(input.subrange(0, d.len() as int) =~= d);
-}
-
-/// Decimal printed form re-scans exactly: `a.b` followed by a number boundary
-/// scans to itself, no exponent consumed.
-pub proof fn lemma_lscan_num_full_dec(a: Seq<u8>, b: Seq<u8>, tail: Seq<u8>)
-    requires
-        a.len() >= 1,
-        all_digits(a),
-        b.len() >= 1,
-        all_digits(b),
-        num_tail_ok(tail),
-    ensures
-        lscan_num_full(a + seq![46u8] + b + tail, 0)
-            == (Some(TokenView::Number(a + seq![46u8] + b)), (a.len() + 1 + b.len()) as int),
-{
-    let dot = seq![46u8];
-    let input = a + dot + b + tail;
-    let v = a + dot + b;
-    assert(input[0] == a[0]);
-    assert(is_digit(input[0]));
-    lemma_scan_num_dec_roundtrip(a, b, tail);
-    let p = (a.len() + 1 + b.len()) as int;
-    assert(scan_num_dec_end(input, 0) == p);
-    // `input[p]` is the boundary byte (or out of range), never an exponent.
-    assert(v.len() == p);
-    if tail.len() != 0 {
-        assert(input[p] == tail[0]);
-    }
-    assert(scan_num_full_end(input, 0) == p);
-    assert(input.subrange(0, p) =~= v);
 }
 
 /// Canonical lowercase keyword bytes — the classification key (what the
@@ -1637,14 +1208,6 @@ pub proof fn lemma_lscan_keyword(kw: Keyword, tail: Seq<u8>)
     lemma_classify_kw_text(kw);
 }
 
-// -- L15: single-token value dispatcher + roundtrip ----------------------------
-//
-// Composes L9/L12/L14 into one token-*value* scanner over the byte-determined
-// classes (numbers, keywords, all symbols): skip whitespace, dispatch on the
-// first byte, and produce the actual `TokenView`. lemma_lscan_token proves the
-// single-token roundtrip for every such class, axiom-free. `Ident`/`String`
-// (String payloads) are the remaining classes, deferred to the trust bridge.
-
 /// Map a symbol `TokenView` back to its `Token` (unit variants; safe because
 /// symbols carry no payload). Non-symbol views map to `Period` (unused).
 pub open spec fn sym_token_of(tv: TokenView) -> Token {
@@ -1905,17 +1468,6 @@ pub proof fn lemma_lscan_token(tv: TokenView, tail: Seq<u8>)
     }
 }
 
-// -- L16: whole-input token-LIST roundtrip -------------------------------------
-//
-// The lexer headline for the byte-determined classes: printing a token list with
-// single-space separators and re-lexing recovers the list exactly. A space is a
-// universal separator — it satisfies every token's boundary (num_tail_ok, the
-// keyword non-continuation boundary, and op_tail_ok) — so no per-adjacency
-// canonicalisation is needed for these classes. The scanner `lex_all_seq` strips
-// leading whitespace (as a seq slice) *before* each single-token scan, so every
-// scan runs at position 0 and reuses `lemma_lscan_token` directly; the only
-// non-trivial locality fact is a one-byte `skip_ws` shift. Axiom-free.
-
 /// Every token in the list is byte-determined and printable.
 pub open spec fn all_printable_tv(ts: Seq<TokenView>) -> bool {
     forall|i: int| 0 <= i < ts.len() ==> printable_tv(#[trigger] ts[i])
@@ -2053,6 +1605,7 @@ pub proof fn lemma_lex_all_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
 
 /// Whole-input token-list roundtrip (byte-determined classes). Printing a
 /// printable token list and re-lexing recovers it, given enough fuel.
+#[verifier::reach_root]
 pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     requires
         all_printable_tv(ts),
@@ -2100,442 +1653,6 @@ pub proof fn lemma_lex_all_seq_roundtrip(ts: Seq<TokenView>, fuel: nat)
     }
 }
 
-//
-
-/// `skip_ws` is suffix-local.
-pub proof fn lemma_skip_ws_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        skip_ws(input, pos) == pos + skip_ws(input.subrange(pos, input.len() as int), 0),
-    decreases input.len() - pos,
-{
-    let sub = input.subrange(pos, input.len() as int);
-    if pos < input.len() {
-        assert(sub[0] == input[pos]);
-        if is_ws(input[pos]) {
-            lemma_skip_ws_local(input, pos + 1);
-            lemma_skip_ws_local(sub, 1);
-            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
-        }
-    }
-}
-
-/// `scan_digits_end` is suffix-local.
-pub proof fn lemma_scan_digits_end_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        scan_digits_end(input, pos) == pos + scan_digits_end(input.subrange(pos, input.len() as int), 0),
-    decreases input.len() - pos,
-{
-    let sub = input.subrange(pos, input.len() as int);
-    if pos < input.len() {
-        assert(sub[0] == input[pos]);
-        if is_digit(input[pos]) {
-            lemma_scan_digits_end_local(input, pos + 1);
-            lemma_scan_digits_end_local(sub, 1);
-            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
-        }
-    }
-}
-
-/// `scan_ident_end` is suffix-local.
-pub proof fn lemma_scan_ident_end_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        scan_ident_end(input, pos) == pos + scan_ident_end(input.subrange(pos, input.len() as int), 0),
-    decreases input.len() - pos,
-{
-    let sub = input.subrange(pos, input.len() as int);
-    if pos < input.len() {
-        assert(sub[0] == input[pos]);
-        if is_ident_cont(input[pos]) {
-            lemma_scan_ident_end_local(input, pos + 1);
-            lemma_scan_ident_end_local(sub, 1);
-            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
-        }
-    }
-}
-
-
-/// `scan_num_dec_end` is suffix-local.
-pub proof fn lemma_scan_num_dec_end_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        scan_num_dec_end(input, pos) == pos + scan_num_dec_end(input.subrange(pos, input.len() as int), 0),
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    lemma_scan_digits_end_local(input, pos);
-    lemma_scan_digits_end_bounds(sub, 0);
-    let ds = scan_digits_end(sub, 0);
-    let d1 = scan_digits_end(input, pos);
-    assert(d1 == pos + ds);
-    if d1 < n && input[d1] == 46 {
-        assert(ds < sub.len());
-        assert(sub[ds] == input[d1]);
-        lemma_scan_digits_end_local(input, d1 + 1);
-        lemma_scan_digits_end_local(sub, ds + 1);
-        assert(input.subrange(d1 + 1, n) =~= sub.subrange(ds + 1, sub.len() as int));
-    } else {
-        if d1 < n {
-            assert(ds < sub.len());
-            assert(sub[ds] == input[d1]);
-        } else {
-            assert(ds >= sub.len());
-        }
-    }
-}
-
-/// Bounds for `scan_num_dec_end`.
-pub proof fn lemma_scan_num_dec_end_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        pos <= scan_num_dec_end(input, pos) <= input.len(),
-{
-    lemma_scan_digits_end_bounds(input, pos);
-    let d1 = scan_digits_end(input, pos);
-    if 0 <= d1 < input.len() && input[d1] == 46 {
-        lemma_scan_digits_end_bounds(input, d1 + 1);
-    }
-}
-
-/// `scan_num_full_end` is suffix-local.
-pub proof fn lemma_scan_num_full_end_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        scan_num_full_end(input, pos) == pos + scan_num_full_end(input.subrange(pos, input.len() as int), 0),
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    lemma_scan_num_dec_end_local(input, pos);
-    let ps = scan_num_dec_end(sub, 0);
-    let p = scan_num_dec_end(input, pos);
-    assert(p == pos + ps);
-    // bounds on ps
-    lemma_scan_num_dec_end_bounds(input, pos);
-    assert(0 <= ps <= sub.len());
-    if p < n && is_exp(input[p]) {
-        assert(ps < sub.len());
-        assert(sub[ps] == input[p]);
-        let q0 = p + 1;
-        let q0s = ps + 1;
-        let q = if q0 < n && is_num_sign(input[q0]) { q0 + 1 } else { q0 };
-        let qs = if q0s < sub.len() && is_num_sign(sub[q0s]) { q0s + 1 } else { q0s };
-        assert(q == pos + qs) by {
-            if q0 < n {
-                assert(q0s < sub.len());
-                assert(sub[q0s] == input[q0]);
-            } else {
-                assert(q0s >= sub.len());
-            }
-        }
-        lemma_scan_digits_end_local(input, q);
-        lemma_scan_digits_end_local(sub, qs);
-        assert(input.subrange(q, n) =~= sub.subrange(qs, sub.len() as int));
-    } else {
-        if p < n {
-            assert(ps < sub.len());
-            assert(sub[ps] == input[p]);
-        } else {
-            assert(ps >= sub.len());
-        }
-    }
-}
-
-/// `lscan_num_full` is suffix-local (same token value, shifted end).
-pub proof fn lemma_lscan_num_full_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_num_full(input, pos).0 == lscan_num_full(input.subrange(pos, input.len() as int), 0).0,
-        lscan_num_full(input, pos).1 == pos + lscan_num_full(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n && is_digit(input[pos]) {
-        assert(sub[0] == input[pos]);
-        lemma_scan_num_full_end_local(input, pos);
-        let es = scan_num_full_end(sub, 0);
-        let e = scan_num_full_end(input, pos);
-        assert(e == pos + es);
-        lemma_scan_num_full_bounds(input, pos);
-        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
-    } else {
-        if pos < n {
-            assert(sub[0] == input[pos]);
-        }
-    }
-}
-
-
-/// `lscan_op` is suffix-local (non-recursive: reads `pos` and `pos+1`).
-pub proof fn lemma_lscan_op_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_op(input, pos).0 == lscan_op(input.subrange(pos, input.len() as int), 0).0,
-        lscan_op(input, pos).1 == pos + lscan_op(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n {
-        assert(sub[0] == input[pos]);
-        assert((pos + 1 < n) == (1 < sub.len()));
-        if pos + 1 < n {
-            assert(sub[1] == input[pos + 1]);
-        }
-    }
-}
-
-/// `lscan_sym` is suffix-local.
-pub proof fn lemma_lscan_sym_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_sym(input, pos).0 == lscan_sym(input.subrange(pos, input.len() as int), 0).0,
-        lscan_sym(input, pos).1 == pos + lscan_sym(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n {
-        assert(sub[0] == input[pos]);
-        let b = input[pos];
-        if b == 60 || b == 62 || b == 33 {
-            lemma_lscan_op_local(input, pos);
-        }
-    }
-}
-
-/// `lscan_keyword` is suffix-local (same keyword classification, shifted end).
-pub proof fn lemma_lscan_keyword_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_keyword(input, pos).0 == lscan_keyword(input.subrange(pos, input.len() as int), 0).0,
-        lscan_keyword(input, pos).1 == pos + lscan_keyword(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n && is_ident_start(input[pos]) {
-        assert(sub[0] == input[pos]);
-        lemma_scan_ident_end_local(input, pos);
-        lemma_scan_ident_end_bounds(sub, 0);
-        let es = scan_ident_end(sub, 0);
-        let e = scan_ident_end(input, pos);
-        assert(e == pos + es);
-        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
-    }
-}
-
-/// `lscan_token` is suffix-local: scanning at `pos` yields the same token value
-/// as scanning the suffix `input[pos..]` at `0`, with the end shifted by `pos`.
-pub proof fn lemma_lscan_token_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_token(input, pos).0 == lscan_token(input.subrange(pos, input.len() as int), 0).0,
-        lscan_token(input, pos).1 == pos + lscan_token(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    lemma_skip_ws_local(input, pos);
-    lemma_skip_ws_bounds(sub, 0);
-    let ps = skip_ws(sub, 0);
-    let p = skip_ws(input, pos);
-    assert(p == pos + ps);
-    if p < n {
-        assert(ps < sub.len());
-        assert(sub[ps] == input[p]);
-        let b = input[p];
-        if is_digit(b) {
-            lemma_lscan_num_full_local(input, p);
-            lemma_lscan_num_full_local(sub, ps);
-            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
-        } else if is_ident_start(b) {
-            lemma_lscan_keyword_local(input, p);
-            lemma_lscan_keyword_local(sub, ps);
-            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
-        } else {
-            lemma_lscan_sym_local(input, p);
-            lemma_lscan_sym_local(sub, ps);
-            assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
-        }
-    } else {
-        assert(ps >= sub.len());
-    }
-}
-
-
-/// `skip_ws` is idempotent: re-skipping from where it landed is a no-op.
-pub proof fn lemma_skip_ws_idem(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        skip_ws(input, skip_ws(input, pos)) == skip_ws(input, pos),
-{
-    lemma_skip_ws_bounds(input, pos);
-    lemma_skip_ws_fixpoint(input, pos);
-    let s = skip_ws(input, pos);
-    if s < input.len() {
-        assert(!is_ws(input[s]));
-        lemma_skip_ws_nonws(input, s);
-    }
-}
-
-/// Scanning a token at `pos` is the same as scanning it at `skip_ws(input, pos)`
-/// (the token scanner skips leading whitespace itself, and `skip_ws` is idempotent).
-pub proof fn lemma_lscan_token_skip_ws(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_token(input, pos) == lscan_token(input, skip_ws(input, pos)),
-{
-    lemma_skip_ws_bounds(input, pos);
-    lemma_skip_ws_idem(input, pos);
-}
-
-/// The end position of a single-token scan never exceeds the input length.
-pub proof fn lemma_lscan_token_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        0 <= lscan_token(input, pos).1 <= input.len(),
-{
-    lemma_skip_ws_bounds(input, pos);
-    let p = skip_ws(input, pos);
-    if p < input.len() {
-        let b = input[p];
-        if is_digit(b) {
-            lemma_scan_num_full_bounds(input, p);
-        } else if is_ident_start(b) {
-            lemma_scan_ident_end_bounds(input, p);
-        }
-    }
-}
-
-/// Position-based whole-input scanner, mirroring the exec loop exactly: scan a
-/// token at `pos` (which skips leading whitespace), recurse at its end.
-pub open spec fn lex_from(input: Seq<u8>, pos: int, fuel: nat) -> Seq<TokenView>
-    decreases fuel,
-{
-    if fuel == 0 {
-        Seq::empty()
-    } else {
-        let p = skip_ws(input, pos);
-        if 0 <= p < input.len() {
-            let r = lscan_token(input, pos);
-            match r.0 {
-                Some(tv) => seq![tv] + lex_from(input, r.1, (fuel - 1) as nat),
-                None => Seq::empty(),
-            }
-        } else {
-            Seq::empty()
-        }
-    }
-}
-
-/// Bridge: the position-based `lex_from` equals the slice-based `lex_all_seq` on
-/// the suffix. Lets the exec loop (positions) inherit `lex_all_seq`'s roundtrip.
-pub proof fn lemma_lex_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lex_from(input, pos, fuel) == lex_all_seq(input.subrange(pos, input.len() as int), fuel),
-    decreases fuel,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if fuel != 0 {
-        lemma_skip_ws_local(input, pos);
-        lemma_skip_ws_bounds(sub, 0);
-        let p = skip_ws(input, pos);
-        let sp = skip_ws(sub, 0);
-        assert(p == pos + sp);
-        assert(0 <= sp <= sub.len());
-        assert(pos <= p <= n);
-        // stripped == input.subrange(p, n)
-        assert(skip_ws_seq(sub) =~= input.subrange(p, n));
-        if p < n {
-            // token value agreement
-            lemma_lscan_token_skip_ws(input, pos);
-            lemma_lscan_token_local(input, p);
-            // lscan_token(input,pos) == lscan_token(input,p); and lscan_token(input,p)
-            // relates to lscan_token(input.subrange(p,n),0) == lscan_token(skip_ws_seq(sub),0)
-            let r = lscan_token(input, pos);
-            let rp = lscan_token(input, p);
-            assert(r == rp);
-            match r.0 {
-                Some(tv) => {
-                    // recurse
-                    lemma_lscan_token_bounds(input, p);
-                    lemma_lscan_token_bounds(input.subrange(p, n), 0);
-                    assert(rp.1 == p + lscan_token(input.subrange(p, n), 0).1);
-                    let es = lscan_token(input.subrange(p, n), 0).1;
-                    assert(r.1 == p + es);
-                    assert(0 <= es <= n - p);
-                    assert(r.1 <= n);
-                    // sub-side stripped remainder
-                    assert(input.subrange(p, n).subrange(es, (n - p)) =~= input.subrange(r.1, n));
-                    lemma_lex_from_eq_seq(input, r.1, (fuel - 1) as nat);
-                    assert(input.subrange(r.1, n) =~= sub.subrange((r.1 - pos), sub.len() as int));
-                }
-                None => {}
-            }
-        }
-    }
-}
-
-
-/// A recognised token advances strictly past its start (so the exec loop makes
-/// progress and terminates).
-pub proof fn lemma_lscan_token_progress(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-        skip_ws(input, pos) < input.len(),
-        lscan_token(input, pos).0 is Some,
-    ensures
-        lscan_token(input, pos).1 > pos,
-{
-    lemma_skip_ws_bounds(input, pos);
-    let p = skip_ws(input, pos);
-    let b = input[p];
-    if is_digit(b) {
-        lemma_scan_num_full_bounds(input, p);
-    } else if is_ident_start(b) {
-        assert(is_ident_cont(input[p]));
-        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
-        lemma_scan_ident_end_bounds(input, p + 1);
-    }
-}
-
-/// The printed list is at least as long as the token count (each token prints a
-/// non-empty run plus a separator), so `input.len()+1` is always enough fuel.
-pub proof fn lemma_lex_print_list_len_ge(ts: Seq<TokenView>)
-    requires
-        all_printable_tv(ts),
-    ensures
-        lex_print_list(ts).len() >= ts.len(),
-    decreases ts.len(),
-{
-    if ts.len() != 0 {
-        let rest = ts.drop_first();
-        assert(all_printable_tv(rest)) by {
-            assert forall|i: int| 0 <= i < rest.len() implies printable_tv(#[trigger] rest[i]) by {
-                assert(rest[i] == ts[i + 1]);
-            }
-        }
-        assert(printable_tv(ts[0]));
-        lemma_lex_print_tv_head(ts[0]);
-        lemma_lex_print_list_len_ge(rest);
-    }
-}
-
 /// Char seq -> bytes: each char truncated to its low byte (exact for ASCII).
 pub open spec fn ascii_bytes(cs: Seq<char>) -> Seq<u8> {
     Seq::new(cs.len(), |i: int| cs[i] as u8)
@@ -2552,15 +1669,6 @@ pub proof fn lemma_char_u8_char(c: char)
         (c as u32) < 128,
     ensures
         (c as u8) as char == c,
-{
-}
-
-/// `u8`->`char`->`u8` round-trips for ASCII.
-pub proof fn lemma_u8_char_u8(b: u8)
-    requires
-        b < 128,
-    ensures
-        (b as char) as u8 == b,
 {
 }
 
@@ -2597,22 +1705,6 @@ pub proof fn lemma_ascii_chars_bytes(cs: Seq<char>)
         assert(ascii_bytes(cs)[i] == (c as u8));
     }
     assert(ascii_chars(ascii_bytes(cs)) =~= cs);
-}
-
-/// ASCII byte run re-decodes exactly: encoding its chars recovers it.
-pub proof fn lemma_ascii_bytes_chars(bytes: Seq<u8>)
-    requires
-        all_ascii_bytes(bytes),
-    ensures
-        ascii_bytes(ascii_chars(bytes)) == bytes,
-{
-    assert forall|i: int| 0 <= i < bytes.len() implies ascii_bytes(ascii_chars(bytes))[i] == bytes[i] by {
-        let b = bytes[i];
-        assert(b < 128);
-        lemma_u8_char_u8(b);
-        assert(ascii_chars(bytes)[i] == (b as char));
-    }
-    assert(ascii_bytes(ascii_chars(bytes)) =~= bytes);
 }
 
 /// Every char is a lowercase ASCII letter.
@@ -2683,21 +1775,6 @@ pub proof fn lemma_lscan_ident_m(cs: Seq<char>, tail: Seq<u8>)
     // classify is None ⟹ Ident arm; its char view is cs
     lemma_ascii_chars_bytes(cs);
     assert(ascii_chars(d) == cs);
-}
-
-
-/// ASCII-lowercasing preserves ASCII-ness.
-pub proof fn lemma_ascii_lower_seq_ascii(s: Seq<u8>)
-    requires
-        all_ascii_bytes(s),
-    ensures
-        all_ascii_bytes(ascii_lower_seq(s)),
-{
-    assert forall|i: int| 0 <= i < ascii_lower_seq(s).len() implies
-        ascii_lower_seq(s)[i] < 128 by {
-        assert(s[i] < 128);
-        assert(ascii_lower_seq(s)[i] == ascii_lower(s[i]));
-    }
 }
 
 /// First index at or after `pos` holding a quote byte `'` (39), or end of input.
@@ -2801,17 +1878,6 @@ pub enum MTok {
     MSym(TokenView),
 }
 
-/// View a real `Token` as its mirror (String payloads -> `Seq<char>`).
-pub open spec fn tok_view(t: Token) -> MTok {
-    match t {
-        Token::Number(v) => MTok::MNum(v@),
-        Token::Keyword(k) => MTok::MKw(k),
-        Token::Ident(s) => MTok::MIdent(s@),
-        Token::String(s) => MTok::MString(s@),
-        _ => MTok::MSym(token_view(t)),
-    }
-}
-
 /// Unified single-token dispatcher over all five classes, producing an `MTok`.
 pub open spec fn lscan_mtok(input: Seq<u8>, pos: int) -> (Option<MTok>, int) {
     let p = skip_ws(input, pos);
@@ -2852,7 +1918,6 @@ pub open spec fn lscan_mtok(input: Seq<u8>, pos: int) -> (Option<MTok>, int) {
         (None, p)
     }
 }
-
 
 /// Canonical byte print of a mirror token.
 pub open spec fn mprint(mt: MTok) -> Seq<u8> {
@@ -2964,14 +2029,6 @@ pub proof fn lemma_lscan_mtok(mt: MTok, tail: Seq<u8>)
     }
 }
 
-
-// -- L23: whole-input unified token-LIST roundtrip -----------------------------
-//
-// L16 over the unified MTok mirror: print a token list (all five classes) with
-// single-space separators, re-lex, recover it exactly. Same design — the space is
-// a universal separator (self-delimiting strings included) and lex_mtok_seq strips
-// leading whitespace as a seq slice before each scan, so every scan runs at 0.
-
 /// Every mirror token in the list is printable.
 pub open spec fn all_printable_mtok(ms: Seq<MTok>) -> bool {
     forall|i: int| 0 <= i < ms.len() ==> printable_mtok(#[trigger] ms[i])
@@ -3059,6 +2116,7 @@ pub proof fn lemma_lex_mtok_seq_congr(a: Seq<u8>, b: Seq<u8>, fuel: nat)
 }
 
 /// Whole-input unified token-list roundtrip (all five classes). Axiom-free.
+#[verifier::reach_root]
 pub proof fn lemma_lex_mtok_seq_roundtrip(ms: Seq<MTok>, fuel: nat)
     requires
         all_printable_mtok(ms),
@@ -3100,384 +2158,6 @@ pub proof fn lemma_lex_mtok_seq_roundtrip(ms: Seq<MTok>, fuel: nat)
         lemma_lex_mtok_seq_congr(tail, mprint_list(rest), (fuel - 1) as nat);
         lemma_lex_mtok_seq_roundtrip(rest, (fuel - 1) as nat);
     }
-}
-
-
-// -- L24: locality for the string/ident scanners + unified dispatcher -----------
-
-/// `scan_to_quote` is suffix-local.
-pub proof fn lemma_scan_to_quote_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        scan_to_quote(input, pos) == pos + scan_to_quote(input.subrange(pos, input.len() as int), 0),
-    decreases input.len() - pos,
-{
-    let sub = input.subrange(pos, input.len() as int);
-    if pos < input.len() {
-        assert(sub[0] == input[pos]);
-        if input[pos] != 39 {
-            lemma_scan_to_quote_local(input, pos + 1);
-            lemma_scan_to_quote_local(sub, 1);
-            assert(input.subrange(pos + 1, input.len() as int) =~= sub.subrange(1, sub.len() as int));
-        }
-    }
-}
-
-/// Bounds for `scan_to_quote`.
-pub proof fn lemma_scan_to_quote_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        pos <= scan_to_quote(input, pos) <= input.len(),
-    decreases input.len() - pos,
-{
-    if 0 <= pos < input.len() && input[pos] != 39 {
-        lemma_scan_to_quote_bounds(input, pos + 1);
-    }
-}
-
-/// `lscan_string_m` is suffix-local (same char view, shifted end).
-pub proof fn lemma_lscan_string_m_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_string_m(input, pos).0 == lscan_string_m(input.subrange(pos, input.len() as int), 0).0,
-        lscan_string_m(input, pos).1 == pos + lscan_string_m(input.subrange(pos, input.len() as int), 0).1
-            || lscan_string_m(input, pos).0 is None,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n && input[pos] == 39 {
-        assert(sub[0] == input[pos]);
-        lemma_scan_to_quote_local(input, pos + 1);
-        lemma_scan_to_quote_local(sub, 1);
-        lemma_scan_to_quote_bounds(sub, 1);
-        let cs = scan_to_quote(sub, 1);
-        let ci = scan_to_quote(input, pos + 1);
-        assert(input.subrange(pos + 1, n) =~= sub.subrange(1, sub.len() as int));
-        assert(ci == pos + cs);
-        assert((ci < n) == (cs < sub.len()));
-        if ci < n {
-            assert(input.subrange(pos + 1, ci) =~= sub.subrange(1, cs));
-        }
-    }
-}
-
-/// `lscan_ident_m` is suffix-local.
-pub proof fn lemma_lscan_ident_m_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_ident_m(input, pos).0 == lscan_ident_m(input.subrange(pos, input.len() as int), 0).0,
-        lscan_ident_m(input, pos).1 == pos + lscan_ident_m(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if pos < n && is_ident_start(input[pos]) {
-        assert(sub[0] == input[pos]);
-        lemma_scan_ident_end_local(input, pos);
-        lemma_scan_ident_end_bounds(sub, 0);
-        let es = scan_ident_end(sub, 0);
-        let e = scan_ident_end(input, pos);
-        assert(e == pos + es);
-        assert(input.subrange(pos, e) =~= sub.subrange(0, es));
-    }
-}
-
-/// `lscan_mtok` is suffix-local: scanning at `pos` yields the same mirror token as
-/// scanning the suffix at `0`, end shifted by `pos`.
-pub proof fn lemma_lscan_mtok_local(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_mtok(input, pos).0 == lscan_mtok(input.subrange(pos, input.len() as int), 0).0,
-        lscan_mtok(input, pos).1 == pos + lscan_mtok(input.subrange(pos, input.len() as int), 0).1,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    lemma_skip_ws_local(input, pos);
-    lemma_skip_ws_bounds(sub, 0);
-    let ps = skip_ws(sub, 0);
-    let p = skip_ws(input, pos);
-    assert(p == pos + ps);
-    if p < n {
-        assert(ps < sub.len());
-        assert(sub[ps] == input[p]);
-        let b = input[p];
-        assert(input.subrange(p, n) =~= sub.subrange(ps, sub.len() as int));
-        if b == 39 {
-            lemma_lscan_string_m_local(input, p);
-            lemma_lscan_string_m_local(sub, ps);
-        } else if is_digit(b) {
-            lemma_lscan_num_full_local(input, p);
-            lemma_lscan_num_full_local(sub, ps);
-        } else if is_ident_start(b) {
-            lemma_lscan_keyword_local(input, p);
-            lemma_lscan_keyword_local(sub, ps);
-            lemma_lscan_ident_m_local(input, p);
-            lemma_lscan_ident_m_local(sub, ps);
-        } else {
-            lemma_lscan_sym_local(input, p);
-            lemma_lscan_sym_local(sub, ps);
-        }
-    } else {
-        assert(ps >= sub.len());
-    }
-}
-
-
-// -- L25: unified executable lexer (Vec<u8> -> Vec<Token>, all classes) ---------
-
-/// Map a token list to its mirror list.
-pub open spec fn tok_views(tokens: Seq<Token>) -> Seq<MTok>
-    decreases tokens.len(),
-{
-    if tokens.len() == 0 {
-        Seq::empty()
-    } else {
-        seq![tok_view(tokens[0])] + tok_views(tokens.drop_first())
-    }
-}
-
-pub proof fn tok_views_concat(left: Seq<Token>, right: Seq<Token>)
-    ensures tok_views(left + right) == tok_views(left) + tok_views(right),
-    decreases left.len(),
-{
-    reveal_with_fuel(tok_views, 1);
-    if left.len() > 0 {
-        assert(left.drop_first() + right =~= (left + right).drop_first());
-        tok_views_concat(left.drop_first(), right);
-    } else {
-        assert(left + right =~= right);
-    }
-}
-
-/// The unified single-token end never exceeds the input length.
-pub proof fn lemma_lscan_mtok_bounds(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        0 <= lscan_mtok(input, pos).1 <= input.len(),
-{
-    lemma_skip_ws_bounds(input, pos);
-    let p = skip_ws(input, pos);
-    if p < input.len() {
-        let b = input[p];
-        if b == 39 {
-            lemma_scan_to_quote_bounds(input, p + 1);
-        } else if is_digit(b) {
-            lemma_scan_num_full_bounds(input, p);
-        } else if is_ident_start(b) {
-            lemma_scan_ident_end_bounds(input, p);
-        }
-    }
-}
-
-/// A recognised unified token advances strictly past its start.
-pub proof fn lemma_lscan_mtok_progress(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-        skip_ws(input, pos) < input.len(),
-        lscan_mtok(input, pos).0 is Some,
-    ensures
-        lscan_mtok(input, pos).1 > pos,
-{
-    lemma_skip_ws_bounds(input, pos);
-    let p = skip_ws(input, pos);
-    let b = input[p];
-    if b == 39 {
-        lemma_scan_to_quote_bounds(input, p + 1);
-    } else if is_digit(b) {
-        lemma_scan_num_full_bounds(input, p);
-    } else if is_ident_start(b) {
-        assert(is_ident_cont(input[p]));
-        assert(scan_ident_end(input, p) == scan_ident_end(input, p + 1));
-        lemma_scan_ident_end_bounds(input, p + 1);
-    }
-}
-
-/// Position-based unified whole-input scanner (mirrors the exec loop).
-pub open spec fn lex_mtok_from(input: Seq<u8>, pos: int, fuel: nat) -> Seq<MTok>
-    decreases fuel,
-{
-    if fuel == 0 {
-        Seq::empty()
-    } else {
-        let p = skip_ws(input, pos);
-        if 0 <= p < input.len() {
-            let r = lscan_mtok(input, pos);
-            match r.0 {
-                Some(mt) => seq![mt] + lex_mtok_from(input, r.1, (fuel - 1) as nat),
-                None => Seq::empty(),
-            }
-        } else {
-            Seq::empty()
-        }
-    }
-}
-
-/// Scanning a unified token at `pos` equals scanning at `skip_ws(input, pos)`.
-pub proof fn lemma_lscan_mtok_skip_ws(input: Seq<u8>, pos: int)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lscan_mtok(input, pos) == lscan_mtok(input, skip_ws(input, pos)),
-{
-    lemma_skip_ws_bounds(input, pos);
-    lemma_skip_ws_idem(input, pos);
-}
-
-/// Bridge: position-based `lex_mtok_from` equals slice-based `lex_mtok_seq`.
-pub proof fn lemma_lex_mtok_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
-    requires
-        0 <= pos <= input.len(),
-    ensures
-        lex_mtok_from(input, pos, fuel) == lex_mtok_seq(input.subrange(pos, input.len() as int), fuel),
-    decreases fuel,
-{
-    let n = input.len() as int;
-    let sub = input.subrange(pos, n);
-    if fuel != 0 {
-        lemma_skip_ws_local(input, pos);
-        lemma_skip_ws_bounds(sub, 0);
-        let p = skip_ws(input, pos);
-        let sp = skip_ws(sub, 0);
-        assert(p == pos + sp);
-        assert(0 <= sp <= sub.len());
-        assert(pos <= p <= n);
-        assert(skip_ws_seq(sub) =~= input.subrange(p, n));
-        if p < n {
-            lemma_lscan_mtok_skip_ws(input, pos);
-            lemma_lscan_mtok_local(input, p);
-            let r = lscan_mtok(input, pos);
-            let rp = lscan_mtok(input, p);
-            assert(r == rp);
-            match r.0 {
-                Some(mt) => {
-                    lemma_lscan_mtok_bounds(input, p);
-                    lemma_lscan_mtok_bounds(input.subrange(p, n), 0);
-                    assert(rp.1 == p + lscan_mtok(input.subrange(p, n), 0).1);
-                    let es = lscan_mtok(input.subrange(p, n), 0).1;
-                    assert(r.1 == p + es);
-                    assert(0 <= es <= n - p);
-                    assert(r.1 <= n);
-                    assert(input.subrange(p, n).subrange(es, (n - p)) =~= input.subrange(r.1, n));
-                    lemma_lex_mtok_from_eq_seq(input, r.1, (fuel - 1) as nat);
-                    assert(input.subrange(r.1, n) =~= sub.subrange((r.1 - pos), sub.len() as int));
-                }
-                None => {}
-            }
-        }
-    }
-}
-
-/// The printed list is at least as long as the token count, so `input.len()+1`
-/// is always enough fuel.
-pub proof fn lemma_mprint_list_len_ge(ms: Seq<MTok>)
-    requires
-        all_printable_mtok(ms),
-    ensures
-        mprint_list(ms).len() >= ms.len(),
-    decreases ms.len(),
-{
-    if ms.len() != 0 {
-        let rest = ms.drop_first();
-        assert(all_printable_mtok(rest)) by {
-            assert forall|i: int| 0 <= i < rest.len() implies printable_mtok(#[trigger] rest[i]) by {
-                assert(rest[i] == ms[i + 1]);
-            }
-        }
-        assert(printable_mtok(ms[0]));
-        lemma_mprint_head(ms[0]);
-        lemma_mprint_list_len_ge(rest);
-    }
-}
-
-/// First index at or after `pos` holding a double-quote byte `"` (34), or end.
-pub open spec fn scan_to_dquote(input: Seq<u8>, pos: int) -> int
-    decreases input.len() - pos,
-{
-    if 0 <= pos < input.len() && input[pos] != 34 {
-        scan_to_dquote(input, pos + 1)
-    } else {
-        pos
-    }
-}
-
-pub proof fn lemma_scan_to_dquote_run(input: Seq<u8>, pos: int, k: int)
-    requires
-        0 <= pos <= k <= input.len(),
-        forall|i: int| pos <= i < k ==> input[i] != 34,
-        k == input.len() || input[k] == 34,
-    ensures
-        scan_to_dquote(input, pos) == k,
-    decreases k - pos,
-{
-    if pos < k {
-        lemma_scan_to_dquote_run(input, pos + 1, k);
-    }
-}
-
-/// Scan a quoted identifier, producing its char-sequence view (case preserved).
-pub open spec fn lscan_qident_m(input: Seq<u8>, pos: int) -> (Option<Seq<char>>, int) {
-    if 0 <= pos < input.len() && input[pos] == 34 {
-        let close = scan_to_dquote(input, pos + 1);
-        if close < input.len() {
-            (Some(ascii_chars(input.subrange(pos + 1, close))), close + 1)
-        } else {
-            (None, pos)
-        }
-    } else {
-        (None, pos)
-    }
-}
-
-/// A no-dquote ASCII char run encodes to bytes with no dquote byte.
-pub proof fn lemma_qident_bytes_nodquote(cs: Seq<char>)
-    requires
-        all_ascii_chars(cs),
-        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 34,
-    ensures
-        all_ascii_bytes(ascii_bytes(cs)),
-        forall|i: int| 0 <= i < ascii_bytes(cs).len() ==> (#[trigger] ascii_bytes(cs)[i]) != 34,
-{
-    assert forall|i: int| 0 <= i < ascii_bytes(cs).len() implies
-        ascii_bytes(cs)[i] < 128 && ascii_bytes(cs)[i] != 34 by {
-        let c = cs[i];
-        assert((c as u32) < 128);
-        assert((c as u32) != 34);
-        lemma_char_u8_val(c);
-        assert(ascii_bytes(cs)[i] == (c as u8));
-    }
-}
-
-/// Quoted-identifier roundtrip at the char-view level (axiom-free).
-pub proof fn lemma_lscan_qident_m(cs: Seq<char>, tail: Seq<u8>)
-    requires
-        all_ascii_chars(cs),
-        forall|i: int| 0 <= i < cs.len() ==> (#[trigger] cs[i]) as u32 != 34,
-    ensures
-        lscan_qident_m(seq![34u8] + ascii_bytes(cs) + seq![34u8] + tail, 0)
-            == (Some(cs), (cs.len() + 2) as int),
-{
-    let q = seq![34u8];
-    let d = ascii_bytes(cs);
-    let input = q + d + q + tail;
-    lemma_qident_bytes_nodquote(cs);
-    assert(input[0] == 34);
-    assert forall|i: int| 1 <= i < 1 + d.len() implies input[i] != 34 by {
-        assert(input[i] == d[i - 1]);
-    }
-    let close = (1 + d.len()) as int;
-    assert(input[close] == 34) by {
-        assert(input[close] == q[0]);
-    }
-    lemma_scan_to_dquote_run(input, 1, close);
-    assert(close < input.len());
-    assert(input.subrange(1, close) =~= d);
-    lemma_ascii_chars_bytes(cs);
-    assert(ascii_chars(d) == cs);
 }
 
 pub fn scan_symbol_bytes(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
@@ -3534,6 +2214,5 @@ pub fn scan_symbol_bytes(input: &[u8], pos: usize) -> (r: (Option<Token>, usize)
         }
     }
 }
-
 
 } // verus!

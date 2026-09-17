@@ -289,34 +289,103 @@ fn statements() -> BoxedStrategy<Statement> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    #[test]
-    fn expression_parsers_agree(expression in expressions()) {
-        let tokens = super::print_expr(&expression)
-            .expect("the strategy only generates parser-producible expressions");
-        check_expression(&render_tokens(&tokens));
-    }
-
-    #[test]
-    fn statement_parsers_agree(statement in statements()) {
-        let tokens = super::print_statement(&statement)
-            .expect("the strategy only generates parser-producible statements");
-        check_statement(&render_tokens(&tokens));
-    }
-
+    // The fully parenthesized printer that used to drive a second pair of these
+    // tests is gone (it was verified exec code that only tests ever ran); the
+    // min-parens printer is the one the round-trip theorems are stated about,
+    // so it is the one the oracle feeds.
     #[test]
     fn expression_parsers_agree_minparens(expression in expressions()) {
-        super::print_expr(&expression)
-            .expect("the strategy only generates parser-producible expressions");
         let tokens = super::verified_minparen::print_min_expr(&expression);
         check_expression(&render_tokens(&tokens));
     }
 
     #[test]
     fn statement_parsers_agree_minparens(statement in statements()) {
-        super::print_statement(&statement)
-            .expect("the strategy only generates parser-producible statements");
         let tokens = super::verified_minparen_stmt::print_min_stmt(&statement);
         check_statement(&render_tokens(&tokens));
+    }
+
+    // The four tests below are the *source-level* counterparts of the verified
+    // round-trip and injectivity theorems, restated on the min-parens printer
+    // (the printer that survives, and the one the theorems are about). They are
+    // not redundant with the two above: those compare the verified parser
+    // against the legacy oracle, so a printer bug both parsers agreed on would
+    // pass. These assert the round trip lands back on the ORIGINAL AST.
+    //
+    // They matter most for the part no proof covers. `min_roundtrip_live` /
+    // `stmt_min_roundtrip_live` are stated over a `Vec<Token>`; everything
+    // between SQL text and that token vector -- whitespace, case folding,
+    // keyword recognition, quoted identifiers and strings -- is unverified plain
+    // Rust in `Lexer::scan`. Rendering to text and re-lexing is what exercises
+    // it. (Introduced in #18 against the fully parenthesized printer; retargeted
+    // here when that printer was deleted.)
+
+    #[test]
+    fn parser_inverts_the_printer_through_sql_source(expression in expressions()) {
+        let tokens = super::verified_minparen::print_min_expr(&expression);
+        let sql = render_tokens(&tokens);
+        prop_assert_eq!(Parser::parse_expr(&sql), Ok(expression), "diverged for {:?}", sql);
+    }
+
+    #[test]
+    fn parser_inverts_the_statement_printer_through_sql_source(statement in statements()) {
+        let tokens = super::verified_minparen_stmt::print_min_stmt(&statement);
+        let sql = render_tokens(&tokens);
+        prop_assert_eq!(Parser::parse(&sql), Ok(statement), "diverged for {:?}", sql);
+    }
+
+    /// Executable counterpart of `verified_minparen::min_print_injective`.
+    #[test]
+    fn min_parens_expression_printer_is_injective(
+        left in expressions(),
+        right in expressions(),
+    ) {
+        let left_tokens = super::verified_minparen::print_min_expr(&left);
+        let right_tokens = super::verified_minparen::print_min_expr(&right);
+        if left_tokens == right_tokens {
+            prop_assert_eq!(left, right);
+        }
+    }
+
+    /// Executable counterpart of
+    /// `verified_minparen_stmt::stmt_min_print_injective`.
+    #[test]
+    fn min_parens_statement_printer_is_injective(
+        left in statements(),
+        right in statements(),
+    ) {
+        let left_tokens = super::verified_minparen_stmt::print_min_stmt(&left);
+        let right_tokens = super::verified_minparen_stmt::print_min_stmt(&right);
+        if left_tokens == right_tokens {
+            prop_assert_eq!(left, right);
+        }
+    }
+}
+
+/// Targeted source round trip for the lexer corners the generators reach only
+/// by chance: keyword-named, mixed-case, empty and qualified identifiers, and
+/// strings containing quotes or nothing at all. These are exactly the cases
+/// `Lexer::scan` handles in unverified Rust.
+#[test]
+fn source_roundtrip_handles_tricky_identifiers_and_strings() {
+    let column = |name: &str| Expression::Column(None, name.into());
+    for expression in [
+        column("select"),
+        column("MixedCase"),
+        column(""),
+        Expression::Column(Some("Order".into()), "By".into()),
+        Expression::Function("count".into(), vec![column("x")]),
+        Expression::Literal(Literal::String("a'b".into())),
+        Expression::Literal(Literal::String("has \" quote".into())),
+        Expression::Literal(Literal::String(String::new())),
+    ] {
+        let tokens = super::verified_minparen::print_min_expr(&expression);
+        let sql = render_tokens(&tokens);
+        assert_eq!(
+            Parser::parse_expr(&sql),
+            Ok(expression),
+            "source roundtrip diverged for {sql:?}"
+        );
     }
 }
 

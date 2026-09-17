@@ -1030,16 +1030,6 @@ pub proof fn lemma_body_binary(
     lemma_body_leaf_then_spine(e, ctx, tail, fuel);
 }
 
-pub proof fn body_binary_len(e: SExpr, ctx: u8, tail: Seq<TokenView>)
-    requires
-        e is Binary,
-    ensures
-        sprint_body(e).len()
-            == sprint_min(lleaf(e, ctx), lleaf_ctx(e, ctx)).len() + after_leaf(e, ctx).len(),
-{
-    lemma_body_decomp(e, ctx);
-}
-
 #[verifier::spinoff_prover]
 #[verifier::rlimit(40000)]
 pub proof fn lemma_leaf_parse(leaf: SExpr, leaf_ctx: u8, ctx: u8, rest: Seq<TokenView>, fuel: nat)
@@ -1235,31 +1225,6 @@ pub proof fn rest_post_inert(rest: Seq<TokenView>, op: TokenView)
     assert((seq![op] + rest)[0] == op);
 }
 
-pub proof fn rest_inert_high(rest: Seq<TokenView>, level: u8)
-    requires
-        level >= 9,
-        rest.len() == 0
-            || (verified_expression::binary_from_token(rest[0]) is Some
-                && rest[0] != TokenView::Period && rest[0] != TokenView::OpenParen)
-            || (rest[0] == TokenView::CloseParen || rest[0] == TokenView::Comma)
-            || neutral_head(rest[0]),
-    ensures
-        inert(rest, level),
-{
-    if rest.len() > 0 {
-        match verified_expression::binary_from_token(rest[0]) {
-            Some(t) => {
-                binary_prec_le_8(t);
-                assert(binary_prec_s(t) <= 8);
-                super::verified_roundtrip::binary_tok_roundtrip(t);
-            },
-            None => {
-                reveal(verified_expression::binary_from_token);
-            },
-        }
-    }
-}
-
 pub proof fn leaf_rest_inert(rest: Seq<TokenView>, level: u8)
     requires
         rest.len() == 0
@@ -1283,17 +1248,6 @@ pub proof fn leaf_rest_inert(rest: Seq<TokenView>, level: u8)
                 reveal(verified_expression::binary_from_token);
             },
         }
-    }
-}
-
-pub proof fn binary_prec_le_8(t: BinaryTag)
-    ensures
-        binary_prec_s(t) <= 8,
-{
-    tables_agree(t, UnaryTag::Not);
-    match t {
-        BinaryTag::Exponentiate => {},
-        _ => {},
     }
 }
 
@@ -2238,6 +2192,52 @@ pub proof fn min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>, f1: nat
 }
 
 
+/// The min-parens printer is injective on its printable domain: two printable
+/// expressions with the same printed token stream are the same expression.
+///
+/// Production-side statement of the injectivity that used to be proved only
+/// about the fully parenthesized mirror printer (`mirror_injective` /
+/// `roundtrip_injective` in `verified_roundtrip`, `print_expr_injective` in
+/// `verified_expression`). Those printers are gone; this one is the printer the
+/// round-trip theorems and the differential oracle actually use. Corollary of
+/// `min_roundtrip`: the print determines the parse, the parse recovers `e`.
+#[verifier::reach_root]
+pub proof fn min_print_injective(left: SExpr, right: SExpr)
+    requires
+        super::verified_roundtrip::printable_se(left),
+        super::verified_roundtrip::printable_se(right),
+    ensures
+        sprint_min(left, 0) == sprint_min(right, 0) ==> left == right,
+{
+    if sprint_min(left, 0) == sprint_min(right, 0) {
+        let fuel = 2 * sprint_min(left, 0).len() + 3;
+        min_roundtrip(left, fuel);
+        min_roundtrip(right, fuel);
+    }
+}
+
+/// `min_print_injective` through the `view_expr` bridge: printable ASTs whose
+/// min-parens prints agree have the same structural view.
+#[verifier::reach_root]
+pub proof fn min_print_injective_expr(left: ast::Expression, right: ast::Expression)
+    requires
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(left)),
+        super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(right)),
+        sprint_min(super::verified_roundtrip::view_expr(left), 0)
+            == sprint_min(super::verified_roundtrip::view_expr(right), 0),
+    ensures
+        super::verified_roundtrip::view_expr(left) == super::verified_roundtrip::view_expr(right),
+{
+    min_print_injective(
+        super::verified_roundtrip::view_expr(left),
+        super::verified_roundtrip::view_expr(right),
+    );
+}
+
+/// Decidable characterisation of `min_normal`: a stream is a min-parens print
+/// exactly when parsing it and reprinting the result gives the stream back.
+/// Stated over `sparse_prec` and `sprint_min`, i.e. the production parser and
+/// the printer the round-trip theorems use.
 pub open spec fn min_normal_fix(toks: Seq<TokenView>) -> bool {
     let (sopt, srest) = sparse_prec(toks, 0, super::verified_stmt_prec::expr_fuel(toks));
     &&& sopt is Some
@@ -2246,6 +2246,7 @@ pub open spec fn min_normal_fix(toks: Seq<TokenView>) -> bool {
     &&& sprint_min(sopt->Some_0, 0) == toks
 }
 
+#[verifier::reach_root]
 pub proof fn min_normal_fix_iff(toks: Seq<TokenView>)
     ensures
         min_normal(toks) == min_normal_fix(toks),

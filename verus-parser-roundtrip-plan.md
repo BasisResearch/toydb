@@ -124,6 +124,27 @@ suite). New strategy and progress:
   `verified_stmt_prec` statement refinements, and `verified_minparen`'s
   min-parens roundtrip (`min_roundtrip` / `min_roundtrip_live`). References to
   the deleted items in the sections below are historical record; git remembers.
+  - **Still true after the parser-coverage cleanup (2026-09-16,
+    branch `yl/parser-coverage-fix`).** That cleanup removed ~9k lines of dead
+    scaffolding, and every carrier named above survived it: `lemma_prec` and the
+    `sprint` domain it is stated over are kept (and marked
+    `#[verifier::reach_root]`, since nothing calls into a domain description),
+    as are `verified_lexer`'s spec-level roundtrip theorems
+    `lemma_lex_all_seq_roundtrip` / `lemma_lex_mtok_seq_roundtrip`, which
+    455d790 had deliberately retained for the lexer-cutover milestone. What went
+    was scaffolding with no theorem attached: the mirror *parser* (`sparse`), the
+    test-only fully parenthesized exec printer (`printer.rs`) and its spec domain,
+    `verified_stmt`'s unreferenced `sparse_*` grammar, three template modules,
+    and `verified_lexer`'s position-local lemmas, which served only the exec twin
+    deleted in phase 4.
+  - **Strengthened in the same pass.** Injectivity had been stated only on those
+    dead models; it is now stated on the production printers and parsers:
+    `verified_minparen::min_print_injective` / `min_print_injective_expr`, and
+    `verified_minparen_stmt::stmt_min_print_injective` /
+    `stmt_min_print_injective_stmt`. The statement side also gained the dual and
+    parser-injectivity it never had (`stmt_min_normal`, `stmt_min_dual`,
+    `stmt_min_parse_injective`), matching what `min_dual` /
+    `min_parse_injective` already gave expressions.
 
 - **Phase 8 (multi-assignment UPDATE specified) — COMPLETE.** `UPDATE`'s
   multi-assignment `SET` list now carries a functional spec (not just the

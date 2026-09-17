@@ -18,7 +18,6 @@ use std::ops::Add;
 #[cfg(test)]
 use super::stream::PeekStream;
 #[cfg(test)]
-use super::stream::SliceTokenStream;
 #[cfg(test)]
 use super::stream::TokenStream;
 #[cfg(test)]
@@ -142,29 +141,6 @@ impl Parser {
             return errinput!("unexpected token {token}");
         }
         Ok(expression)
-    }
-
-    /// Parses a canonical token sequence as one complete expression.
-    #[cfg(test)]
-    pub(crate) fn parse_expr_tokens(tokens: &[Token]) -> Result<ast::Expression> {
-        let mut parser = StreamingParser::new(SliceTokenStream::new(tokens));
-        let expression = parser.parse_expression()?;
-        if let Some(token) = parser.stream.next()? {
-            return errinput!("unexpected token {token}");
-        }
-        Ok(expression)
-    }
-
-    /// Parses a canonical token sequence as one complete statement.
-    #[cfg(test)]
-    pub(crate) fn parse_statement_tokens(tokens: &[Token]) -> Result<ast::Statement> {
-        let mut parser = StreamingParser::new(SliceTokenStream::new(tokens));
-        let statement = parser.parse_statement()?;
-        parser.skip(Token::Semicolon);
-        if let Some(token) = parser.stream.next()? {
-            return errinput!("unexpected token {token}");
-        }
-        Ok(statement)
     }
 }
 
