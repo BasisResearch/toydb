@@ -1733,7 +1733,7 @@ pub proof fn lemma_order_by_rt(items: Seq<(SExpr, ast::Direction)>, rest: Seq<To
     }
 }
 
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn lemma_assign_rt(a: (String, Option<SExpr>), rest: Seq<TokenView>)
     requires
         printable_opt_se(a.1),
@@ -3693,9 +3693,15 @@ pub fn print_min_stmt(s: &ast::Statement) -> (r: Vec<Token>)
 }
 
 
+// Reachability root; the statement-level counterpart of
+// `verified_minparen::min_roundtrip_live`. Its postcondition is the round trip
+// over `verified_control::parse_control_at` -- the function `Parser::parse`
+// actually calls in production -- and over the real `ast::Statement`. The
+// `proof fn` twin `stmt_min_roundtrip` is stated over `sparse_control`, the spec
+// model, so the two are different theorems and neither implies the other.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(100000)]
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub fn stmt_min_roundtrip_live(s: &ast::Statement) -> (r: (
     Option<ast::Statement>,
     usize,
@@ -3749,7 +3755,7 @@ pub open spec fn stmt_min_normal(toks: Seq<TokenView>) -> bool {
 /// production-side statement of the canonical-form property that used to be
 /// proved only about the toy model in `verified_statements`
 /// (`parse_print_canonical`).
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn stmt_min_dual(toks: Seq<TokenView>)
     requires
         stmt_min_normal(toks),
@@ -3771,7 +3777,7 @@ pub proof fn stmt_min_dual(toks: Seq<TokenView>)
 /// `verified_production`, and `print_injective` in `verified_statements`. Those
 /// covered one statement shape each over printers with no exec twin; this one
 /// covers every printable statement over the printer that actually runs.
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn stmt_min_print_injective(left: SStmt, right: SStmt)
     requires
         printable_stmt(left),
@@ -3788,7 +3794,7 @@ pub proof fn stmt_min_print_injective(left: SStmt, right: SStmt)
 /// The statement parser is injective on printable streams: two normal streams
 /// that parse to the same statement are the same stream. Statement-level
 /// counterpart of `verified_minparen::min_parse_injective`.
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn stmt_min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>)
     requires
         stmt_min_normal(t1),
@@ -3803,7 +3809,7 @@ pub proof fn stmt_min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>)
 
 /// `stmt_min_print_injective` through the `view_stmt` bridge: printable ASTs
 /// whose min-parens prints agree have the same structural view.
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn stmt_min_print_injective_stmt(left: ast::Statement, right: ast::Statement)
     requires
         printable_stmt(verified_stmt::view_stmt(left)),

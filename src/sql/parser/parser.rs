@@ -19,7 +19,6 @@ use std::ops::Add;
 #[cfg(test)]
 use super::stream::PeekStream;
 #[cfg(test)]
-#[cfg(test)]
 use super::stream::TokenStream;
 use super::{Keyword, Token, ast, verified_control};
 #[cfg(test)]
@@ -55,12 +54,26 @@ struct StreamingParser<S> {
 /// The verified expression parser is recursive-descent, so deeply nested input
 /// would overflow the stack and abort the process. This bound is a cheap O(n)
 /// pre-check that rejects such input with a clean error instead of recursing.
-/// The bound is set from measurement, not guesswork. On the default 2 MiB
-/// thread stack a debug build overflows at roughly 250 nested parentheses, 718
-/// chained prefix operators or `^`, and 1140 function arguments -- parentheses
-/// being the most stack-hungry per unit of the depth measured below. 64 is
-/// therefore a ~4x margin against the worst construct in the worst
-/// configuration, and a much larger one in release, where frames are smaller.
+///
+/// The bound is set from measurement, not guesswork, and the measurement is of
+/// the *worst input this guard admits*, not of each construct in isolation --
+/// `check_nesting_depth` counts combined depth, so a staircase that interleaves
+/// prefix operators with parentheses is admitted only to a fraction of 64. On
+/// the default 2 MiB thread stack (`server.rs`, which spawns sessions via
+/// `thread::scope` with no `stack_size` override), bisecting thread stack size
+/// against the deepest admitted instance of every shape gives:
+///
+/// | shape                        | admitted | debug   | release |
+/// |------------------------------|----------|---------|---------|
+/// | nested parentheses           | 64       | 540 KiB |  87 KiB |
+/// | `(1^` staircase              | 32       | 374 KiB |  72 KiB |
+/// | prefix `-` / `^` chain       | 64       | 207 KiB |  56 KiB |
+/// | prefix-into-paren staircase  |  9       | 226 KiB |  54 KiB |
+/// | function arguments           | 63       | 151 KiB |  43 KiB |
+///
+/// So the worst admitted input needs 26% of the stack in a debug build -- a
+/// ~3.8x margin in the worst configuration -- and 4% in release, ~23x. Frames
+/// would have to grow by nearly 4x before the bound stopped holding.
 ///
 /// An earlier bound of 256 was unsafe: it was calibrated against an 8 MiB main
 /// thread (the "~937" figure in the history), and parses run on spawned threads
@@ -71,15 +84,84 @@ struct StreamingParser<S> {
 const MAX_NESTING_DEPTH: usize = 64;
 
 /// One open parenthesis level in the `check_nesting_depth` scan (index 0 is the
-/// statement level, which is never popped).
+/// statement level, which is never popped). Each field is a bucket of live
+/// parser frames, released at a different point.
 struct NestLevel {
-    /// Frames that live until this level closes: function-argument commas and
-    /// right-associative `^` operators.
-    persistent: usize,
-    /// Whether this paren opened a function call, i.e. followed an identifier.
-    /// Only a call's commas recurse; row literals and list commas are parsed by
-    /// loops.
+    /// Prefix operators that were still awaiting their operand when this level
+    /// opened. The parser parses the parenthesised operand *underneath* them,
+    /// so they stay live until this level closes.
+    prefix_held: usize,
+    /// Function-call argument frames: `parse_fn_args_ne_exec` recurses per
+    /// argument, and those frames live until the call's `)`.
+    args: usize,
+    /// `^` frames at this level. `^` is the one right-associative operator, so
+    /// its right operand is parsed at the same precedence and nests for the
+    /// whole chain; the chain completes at any lower-precedence operator, at a
+    /// comma, or at `)`.
+    carets: usize,
+    /// Whether this paren opened a function call. Only a call's commas recurse.
     is_call: bool,
+}
+
+impl NestLevel {
+    fn frames(&self) -> usize {
+        self.prefix_held + self.args + self.carets
+    }
+}
+
+/// Keywords after which a bare *name* follows rather than an expression. An
+/// identifier in one of these positions is a table name, so a `(` after it
+/// opens a DDL/DML column list -- parsed by a loop -- not a call.
+fn introduces_name(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Keyword(
+            Keyword::Table | Keyword::Into | Keyword::From | Keyword::Join | Keyword::Update
+        )
+    )
+}
+
+/// Whether this token, appearing where an *operator* is expected, ends any `^`
+/// chain open at the current level.
+///
+/// `^` is the highest-precedence infix operator, so in operator position every
+/// operator listed here binds less tightly and terminates the chain, as does
+/// any keyword -- a keyword in operator position is either a lower-precedence
+/// infix operator (`AND`, `IS`, `LIKE`) or a clause boundary (`FROM`,
+/// `WHERE`), and both end the expression the chain belongs to.
+///
+/// The `expect_operand` test is load-bearing, not a tidiness check. Where an
+/// operand may start, these same tokens are not infix operators at all and the
+/// chain recurses straight through them: `-`/`+` are *prefix* operators at
+/// precedence 10 against `^`'s 8 (`verified_precedence.rs:72-78`, `:45-63`),
+/// `*` is `Expression::All`, and `TRUE`/`FALSE`/`NULL`/`INFINITY`/`NAN` are
+/// literal atoms. Clearing there let `2^-2^-2...` interleave a cleared counter
+/// with unbounded real recursion and abort the process.
+///
+/// The list is an allowlist, and deliberately conservative: a token is in it
+/// only if it provably cannot continue an operand. `.` is the reason this is
+/// not simply "any token in operator position" -- `a.b` continues the operand
+/// with the `^` frames still live underneath it. Erring towards not clearing
+/// over-counts, which only rejects deeper input; clearing while the frames are
+/// live under-counts and lets the parser overflow the stack.
+fn closes_caret_chain(token: &Token, expect_operand: bool) -> bool {
+    !expect_operand
+        && matches!(
+            token,
+            Token::Keyword(_)
+                | Token::Equal
+                | Token::NotEqual
+                | Token::GreaterThan
+                | Token::GreaterThanOrEqual
+                | Token::LessThan
+                | Token::LessThanOrEqual
+                | Token::LessOrGreaterThan
+                | Token::Plus
+                | Token::Minus
+                | Token::Asterisk
+                | Token::Slash
+                | Token::Percent
+        )
 }
 
 /// Rejects input whose parse would recurse deeper than `MAX_NESTING_DEPTH`.
@@ -88,53 +170,78 @@ struct NestLevel {
 /// which descends on exactly four things, each measured here:
 ///
 /// * `(` -- a parenthesised subexpression or a call's argument list;
-/// * a *prefix* `-`/`+`/`NOT` -- these stack while they await their operand,
-///   and unwind once it arrives, so only a consecutive run counts;
+/// * a *prefix* `-`/`+`/`NOT` -- these stack while they await their operand.
+///   They unwind once it arrives, but the operand may itself be a parenthesised
+///   group or a call, which the parser descends into *underneath* them, so the
+///   pending run is carried into that level rather than discarded;
 /// * `^` -- the one right-associative operator, whose right operand is parsed
 ///   at the same precedence and so nests for the whole chain. Left-associative
 ///   operators are folded by `sparse_infix_loop` and do NOT recurse;
 /// * a comma **inside a function call** -- `parse_fn_args_ne_exec` recurses per
-///   argument. Statement-level lists (SELECT items, VALUES rows) and row
-///   literals are parsed by loops and do not.
+///   argument.
 ///
-/// Counting more than this would reject legitimate bulk input: a 5000-term sum,
-/// a 5000-item SELECT list, a 5000-row INSERT and a 5000-column row literal all
-/// parse iteratively today and must keep doing so.
+/// Counting more than this would reject legitimate bulk input. Statement-level
+/// lists (SELECT items, VALUES rows), row literals, and DDL/DML column lists
+/// (`CREATE TABLE t (...)`, `INSERT INTO t (...)`) are all parsed by loops at
+/// zero stack cost and must keep parsing however wide they get.
 fn check_nesting_depth(tokens: &[Token]) -> Result<()> {
-    let mut levels = vec![NestLevel { persistent: 0, is_call: false }];
-    let mut persistent_total: usize = 0;
+    let mut levels = vec![NestLevel { prefix_held: 0, args: 0, carets: 0, is_call: false }];
+    // Frames held by every open level, maintained incrementally.
+    let mut held_total: usize = 0;
+    // Prefix operators at the current level still awaiting their operand.
     let mut prefix_run: usize = 0;
     // True where an operand may start, which is what distinguishes a prefix
     // `-`/`+` from an infix one.
     let mut expect_operand = true;
-    let mut prev_ident = false;
+    // An identifier may be a call head, which is only settled by the NEXT
+    // token, so its pending prefix run is released one token late.
+    let mut ident_pending = false;
+    let mut after_name_kw = false;
 
     for token in tokens {
+        // An identifier that was not followed by `(` was a plain operand, so
+        // the prefix operators awaiting it have now unwound.
+        if ident_pending && !matches!(token, Token::OpenParen) {
+            prefix_run = 0;
+        }
+        let call_head = ident_pending;
+        ident_pending = false;
+
+        if closes_caret_chain(token, expect_operand) {
+            let level = levels.last_mut().expect("levels is non-empty");
+            held_total -= level.carets;
+            level.carets = 0;
+        }
+
         match token {
             Token::OpenParen => {
-                levels.push(NestLevel { persistent: 0, is_call: prev_ident });
+                // The pending prefix frames stay live while the parser descends
+                // into this group, so they are carried in and released at `)`.
+                levels.push(NestLevel {
+                    prefix_held: prefix_run,
+                    args: 0,
+                    carets: 0,
+                    is_call: call_head,
+                });
+                held_total += prefix_run;
                 prefix_run = 0;
                 expect_operand = true;
             }
             Token::CloseParen => {
                 if levels.len() > 1 {
                     let level = levels.pop().expect("levels is non-empty");
-                    persistent_total -= level.persistent;
+                    held_total -= level.frames();
                 }
                 prefix_run = 0;
                 expect_operand = false;
             }
             Token::Comma => {
                 let level = levels.last_mut().expect("levels is non-empty");
-                // A statement-level or row-literal comma ends an expression, so
-                // any `^` chain it held is complete.
-                persistent_total -=
-                    level.persistent - if level.is_call { level.persistent } else { 0 };
-                if !level.is_call {
-                    level.persistent = 0;
-                } else {
-                    level.persistent += 1;
-                    persistent_total += 1;
+                held_total -= level.carets;
+                level.carets = 0;
+                if level.is_call {
+                    level.args += 1;
+                    held_total += 1;
                 }
                 prefix_run = 0;
                 expect_operand = true;
@@ -142,23 +249,32 @@ fn check_nesting_depth(tokens: &[Token]) -> Result<()> {
             Token::Minus | Token::Plus if expect_operand => prefix_run += 1,
             Token::Caret => {
                 let level = levels.last_mut().expect("levels is non-empty");
-                level.persistent += 1;
-                persistent_total += 1;
+                level.carets += 1;
+                held_total += 1;
                 expect_operand = true;
             }
             Token::Keyword(Keyword::Not) => {
                 prefix_run += 1;
                 expect_operand = true;
             }
+            Token::Ident(_) if expect_operand => {
+                if after_name_kw {
+                    // A table name. A `(` after it opens a DDL/DML column
+                    // list, which is parsed by a loop, not a call.
+                    prefix_run = 0;
+                } else {
+                    // Settled on the next token: `(` makes this a call head.
+                    ident_pending = true;
+                }
+                expect_operand = false;
+            }
             Token::Number(_)
             | Token::String(_)
-            | Token::Ident(_)
             | Token::Asterisk
             | Token::Keyword(Keyword::True | Keyword::False | Keyword::Null)
             | Token::Keyword(Keyword::Infinity | Keyword::NaN)
                 if expect_operand =>
             {
-                // The operand arrived: the prefix operators awaiting it unwind.
                 prefix_run = 0;
                 expect_operand = false;
             }
@@ -167,9 +283,10 @@ fn check_nesting_depth(tokens: &[Token]) -> Result<()> {
                 expect_operand = true;
             }
         }
-        prev_ident = matches!(token, Token::Ident(_));
 
-        if levels.len() - 1 + persistent_total + prefix_run > MAX_NESTING_DEPTH {
+        after_name_kw = introduces_name(token);
+
+        if levels.len() - 1 + held_total + prefix_run > MAX_NESTING_DEPTH {
             return errinput!("expression nesting too deep");
         }
     }
@@ -1235,6 +1352,89 @@ mod nesting_depth_tests {
             format!("INSERT INTO t VALUES (1{})", ",1".repeat(n)), // row literal
         ] {
             assert!(Parser::parse(&sql).is_ok(), "should parse: {:.32}", sql);
+        }
+    }
+
+    /// The guard must measure *combined* depth, not each construct in
+    /// isolation. Prefix frames stay live while the parser descends into a
+    /// parenthesised operand or a call underneath them, so interleaving the two
+    /// multiplies real depth. A staircase -- `n` prefix ops, `(`, `n-1` prefix
+    /// ops, `(`, ... -- reached ~2080 live prefix frames while an earlier
+    /// version of this guard never saw its running maximum exceed the bound,
+    /// and aborted the process in a debug build.
+    #[test]
+    fn interleaved_prefix_and_parens_are_rejected() {
+        for (open, close, lead) in [("(", ")", "-"), ("(", ")", "NOT "), ("f(", ")", "-")] {
+            let mut sql = String::from("SELECT ");
+            let mut depth = 0;
+            for run in (1..=64).rev() {
+                sql.push_str(&lead.repeat(run));
+                sql.push_str(open);
+                depth += 1;
+            }
+            sql.push('1');
+            sql.push_str(&close.repeat(depth));
+            let err = Parser::parse(&sql).expect_err("staircase should be rejected").to_string();
+            assert!(err.contains("nesting too deep"), "staircase admitted: {err}");
+        }
+    }
+
+    /// A `^` chain whose counter is cleared by an interleaved token, while the
+    /// parser keeps recursing through it.
+    ///
+    /// Regression for a remote, pre-auth process abort in a *release* build:
+    /// `closes_caret_chain` cleared the live `^`-frame count on `-`, `+`, `*`
+    /// and on every keyword regardless of position. In operand position none of
+    /// those ends a chain -- `-`/`+` are prefix operators that bind tighter
+    /// than `^`, `*` is `Expression::All`, and `TRUE`/`NULL` are literal atoms
+    /// -- so the counter was zeroed every other token while real depth grew
+    /// once per `^`. `SELECT 2` + `^-2` x3000, about 9 KB, aborted the process.
+    #[test]
+    fn interrupted_caret_chains_are_rejected() {
+        let n = 5_000;
+        for sql in [
+            format!("SELECT 2{}", "^-2".repeat(n)),        // prefix minus
+            format!("SELECT 2{}", "^+2".repeat(n)),        // prefix plus
+            format!("SELECT 2{}", "^*".repeat(n)),         // Expression::All
+            format!("SELECT 2{}", "^NULL ".repeat(n)),     // literal atom
+            format!("SELECT 2{}", "^TRUE ".repeat(n)),     // literal atom
+            format!("SELECT 2{}", "^NOT TRUE ".repeat(n)), // prefix keyword
+            format!("SELECT 2{}", "^-*".repeat(n)),        // prefix then All
+        ] {
+            let err = Parser::parse(&sql).expect_err("should reject, not crash").to_string();
+            assert!(err.contains("nesting too deep"), "chain admitted for {:.32}: {err}", sql);
+        }
+    }
+
+    /// The position test that fixes the case above must not make the guard
+    /// reject ordinary SQL: a `^` chain really is complete at a lower-precedence
+    /// infix operator or a clause keyword, so those still release its frames
+    /// however many times a statement repeats them.
+    #[test]
+    fn caret_chains_closed_by_operators_and_clauses_still_parse() {
+        let n = 1_000;
+        for sql in [
+            format!("SELECT 2^2{}", "+2^2".repeat(n)), // lower-precedence infix
+            format!("SELECT 2^2{}", "*2^2".repeat(n)), // infix asterisk
+            format!("SELECT 1 WHERE 2^2 = 4{}", " AND 2^2 = 4".repeat(n)), // keywords
+            format!("SELECT 2{}", "^-2".repeat(MAX_NESTING_DEPTH / 2)), // under the bound
+        ] {
+            assert!(Parser::parse(&sql).is_ok(), "should parse: {:.48}", sql);
+        }
+    }
+
+    /// Wide DDL/DML column lists are parsed by loops (`verified_control`), not
+    /// by the recursive argument parser, so they must not be counted. The
+    /// identifier before the paren is a table name, not a call head.
+    #[test]
+    fn wide_ddl_and_dml_column_lists_still_parse() {
+        let cols = (0..500).map(|i| format!("c{i}")).collect::<Vec<_>>().join(",");
+        let defs = (0..500).map(|i| format!("c{i} INT")).collect::<Vec<_>>().join(",");
+        let vals = (0..500).map(|_| "1").collect::<Vec<_>>().join(",");
+        for sql in
+            [format!("CREATE TABLE t ({defs})"), format!("INSERT INTO t ({cols}) VALUES ({vals})")]
+        {
+            assert!(Parser::parse(&sql).is_ok(), "should parse: {:.48}", sql);
         }
     }
 

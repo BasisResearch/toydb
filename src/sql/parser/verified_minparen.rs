@@ -2120,8 +2120,19 @@ pub fn print_min_expr(e: &ast::Expression) -> (r: Vec<super::Token>)
 }
 
 
+// Reachability root, and a load-bearing one. The postcondition below IS the
+// round-trip theorem -- printing an expression with `print_min_expr` and parsing
+// the result with `verified_precedence::parse_expression_at` returns the
+// original AST -- stated over the *executable* production parser and the real
+// `ast::Expression` / `Vec<Token>` types. Its `proof fn` twin `min_roundtrip`
+// (:1738) proves the same shape over `sparse_prec`, the spec model, on `SExpr` /
+// `Seq<TokenView>`, so it does NOT subsume this: only the version below
+// discharges the exec-level obligations (the `view_expr`/`token_views` bridge,
+// the fuel and `usize` bounds). Nothing calls it, and nothing should have to:
+// it is a theorem about code that runs, which is exactly what `reach_root` is
+// for. Do not delete it as a dead entry point.
 #[verifier::rlimit(20000)]
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub fn min_roundtrip_live(e: &ast::Expression, fuel: usize)
     -> (r: (Option<ast::Expression>, usize, Option<super::parse_error::ParseError>))
     requires
@@ -2176,7 +2187,7 @@ pub proof fn min_dual(toks: Seq<TokenView>, fuel: nat)
     min_roundtrip(e, fuel);
 }
 
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>, f1: nat, f2: nat)
     requires
         min_normal(t1),
@@ -2201,7 +2212,7 @@ pub proof fn min_parse_injective(t1: Seq<TokenView>, t2: Seq<TokenView>, f1: nat
 /// `verified_expression`). Those printers are gone; this one is the printer the
 /// round-trip theorems and the differential oracle actually use. Corollary of
 /// `min_roundtrip`: the print determines the parse, the parse recovers `e`.
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn min_print_injective(left: SExpr, right: SExpr)
     requires
         super::verified_roundtrip::printable_se(left),
@@ -2218,7 +2229,7 @@ pub proof fn min_print_injective(left: SExpr, right: SExpr)
 
 /// `min_print_injective` through the `view_expr` bridge: printable ASTs whose
 /// min-parens prints agree have the same structural view.
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn min_print_injective_expr(left: ast::Expression, right: ast::Expression)
     requires
         super::verified_roundtrip::printable_se(super::verified_roundtrip::view_expr(left)),
@@ -2246,7 +2257,7 @@ pub open spec fn min_normal_fix(toks: Seq<TokenView>) -> bool {
     &&& sprint_min(sopt->Some_0, 0) == toks
 }
 
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn min_normal_fix_iff(toks: Seq<TokenView>)
     ensures
         min_normal(toks) == min_normal_fix(toks),
@@ -2561,7 +2572,12 @@ pub proof fn sparse_prec_printable(input: Seq<TokenView>, min_prec: u8, fuel: na
 }
 
 
-#[verifier::reach_root]
+// Reachability root; see `min_roundtrip_live`. Its postcondition is the
+// normalisation theorem over the executable `parse_expression_at`: parsing a
+// token vector and re-printing it lands on the min-parens normal form, and
+// re-parsing that yields the same expression. Stated over the running parser,
+// not over `sparse_prec`.
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub fn min_normalize_live(toks: &Vec<super::Token>, fuel: usize, refuel: usize)
     -> (r: (ast::Expression, Vec<super::Token>, ast::Expression, usize))
     requires
