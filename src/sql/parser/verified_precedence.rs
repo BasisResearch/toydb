@@ -1824,7 +1824,7 @@ pub proof fn lemma_atom(e: SExpr, tail: Seq<TokenView>, fuel: nat)
         },
     }
 }
-#[verifier::reach_root]
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn lemma_prec(e: SExpr, min_prec: u8, tail: Seq<TokenView>, fuel: nat)
     requires
         super::verified_roundtrip::printable_se(e),
