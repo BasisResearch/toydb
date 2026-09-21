@@ -63,17 +63,30 @@ struct StreamingParser<S> {
 /// `thread::scope` with no `stack_size` override), bisecting thread stack size
 /// against the deepest admitted instance of every shape gives:
 ///
-/// | shape                        | admitted | debug   | release |
-/// |------------------------------|----------|---------|---------|
-/// | nested parentheses           | 64       | 540 KiB |  87 KiB |
-/// | `(1^` staircase              | 32       | 374 KiB |  72 KiB |
-/// | prefix `-` / `^` chain       | 64       | 207 KiB |  56 KiB |
-/// | prefix-into-paren staircase  |  9       | 226 KiB |  54 KiB |
-/// | function arguments           | 63       | 151 KiB |  43 KiB |
+/// | shape                              | admitted | debug    | release |
+/// |------------------------------------|----------|----------|---------|
+/// | precedence ladder into a call      | 32       | 1101 KiB | 255 KiB |
+/// | precedence ladder into parens      | 32       |  998 KiB | 231 KiB |
+/// | `NOT 1 = (` staircase              | 64       |  896 KiB | 179 KiB |
+/// | nested parentheses                 | 64       |  541 KiB |  87 KiB |
+/// | `(1^` staircase                    | 32       |  462 KiB |  95 KiB |
+/// | prefix `-` / `^` chain             | 64       |  207 KiB |  56 KiB |
+/// | prefix-into-paren staircase        |  9       |  227 KiB |  55 KiB |
+/// | function arguments                 | 63       |  151 KiB |  43 KiB |
 ///
-/// So the worst admitted input needs 26% of the stack in a debug build -- a
-/// ~3.8x margin in the worst configuration -- and 4% in release, ~23x. Frames
-/// would have to grow by nearly 4x before the bound stopped holding.
+/// The worst rows are shapes the guard counts *loosely*. It counts what nests
+/// without bound (parens, prefix runs, `^` chains, call arguments) and ignores
+/// the bounded extra: an infix operator whose precedence is strictly higher than
+/// the enclosing one opens one more `parse_expression_at` frame for its right
+/// operand, and there are only nine precedence levels, so a "ladder"
+/// `1 OR 1 AND NOT 1 = 1 < 1 + 1 * 1 ^ f(` costs about eleven frames for the
+/// two units the guard charges it. That is a constant factor, not a hole, and
+/// the measured worst case is what the bound is judged against: 1101 KiB is
+/// 54% of the stack in a debug build, a ~1.9x margin in the worst
+/// configuration, and 12% in release, ~8x. Frames would have to grow by nearly
+/// 2x in a debug build before the bound stopped holding.
+/// `precedence_ladder_at_the_bound_fits_the_session_stack` pins the worst row
+/// on a real 2 MiB thread.
 ///
 /// An earlier bound of 256 was unsafe: it was calibrated against an 8 MiB main
 /// thread (the "~937" figure in the history), and parses run on spawned threads
@@ -1353,6 +1366,35 @@ mod nesting_depth_tests {
         ] {
             assert!(Parser::parse(&sql).is_ok(), "should parse: {:.32}", sql);
         }
+    }
+
+    /// The worst input the guard admits must parse on the stack the server
+    /// actually gives a session (2 MiB, `server.rs`). A strictly rising
+    /// precedence chain opens one recursive right-operand frame per step, which
+    /// the guard does not count -- there are only nine levels, so it is a
+    /// bounded constant, not a hole -- and repeating the whole ladder into a call
+    /// is the most stack-hungry shape per counted unit. Bisected: 1101 KiB in
+    /// debug, 255 KiB in release, per the `MAX_NESTING_DEPTH` table. This runs
+    /// the deepest admitted instance on a real 2 MiB thread, so a frame-size
+    /// growth that closed the margin would fail here (by abort) rather than in
+    /// production.
+    #[test]
+    fn precedence_ladder_at_the_bound_fits_the_session_stack() {
+        // Each repetition charges the guard 2 units (the `^` and the paren).
+        let n = MAX_NESTING_DEPTH / 2;
+        let ladder = "1 OR 1 AND NOT 1 = 1 < 1 + 1 * 1 ^ f(".repeat(n);
+        let sql = format!("SELECT {ladder}1{}", ")".repeat(n));
+        let one_more =
+            format!("SELECT {ladder}1 OR 1 AND NOT 1 = 1 < 1 + 1 * 1 ^ f(1{}", ")".repeat(n + 1));
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                Parser::parse(&sql).expect("deepest admitted ladder should parse");
+                let err = Parser::parse(&one_more).expect_err("one past the bound").to_string();
+                assert!(err.contains("nesting too deep"), "wrong error: {err}");
+            })
+            .expect("spawn");
+        handle.join().expect("ladder overflowed a 2 MiB stack");
     }
 
     /// The guard must measure *combined* depth, not each construct in
