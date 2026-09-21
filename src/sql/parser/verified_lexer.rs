@@ -346,24 +346,27 @@ pub proof fn lemma_skip_ws_nonws(input: Seq<u8>, pos: int)
 }
 
 
-/// Executable whitespace skip, refining `skip_ws`.
+/// Executable whitespace skip, refining `skip_ws`. A loop, not a recursion:
+/// the spec recurses once per byte, but an exec twin that did the same would
+/// put one stack frame per byte of whitespace on a 2 MiB parse thread, which a
+/// debug build overflows at ~32 KiB of input -- the same remote process kill
+/// `check_nesting_depth` guards against one stage later.
 pub fn skip_ws_exec(input: &[u8], pos: usize) -> (r: usize)
     requires
         pos <= input.len(),
     ensures
         r == skip_ws(input@, pos as int),
-    decreases input.len() - pos,
 {
-    if pos < input.len() {
-        let b = input[pos];
-        if b == 32u8 || (9u8 <= b && b <= 13u8) {
-            skip_ws_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
+    let mut i = pos;
+    while i < input.len() && (input[i] == 32u8 || (9u8 <= input[i] && input[i] <= 13u8))
+        invariant
+            pos <= i <= input.len(),
+            skip_ws(input@, pos as int) == skip_ws(input@, i as int),
+        decreases input.len() - i,
+    {
+        i += 1;
     }
+    i
 }
 
 
@@ -443,24 +446,24 @@ pub proof fn lemma_scan_digits_roundtrip(d: Seq<u8>, tail: Seq<u8>)
 }
 
 
-/// Executable maximal digit-run scanner, refining `scan_digits_end`.
+/// Executable maximal digit-run scanner, refining `scan_digits_end`. A loop,
+/// for the reason given at `skip_ws_exec`.
 pub fn scan_digits_exec(input: &[u8], pos: usize) -> (r: usize)
     requires
         pos <= input.len(),
     ensures
         r == scan_digits_end(input@, pos as int),
-    decreases input.len() - pos,
 {
-    if pos < input.len() {
-        let b = input[pos];
-        if 48u8 <= b && b <= 57u8 {
-            scan_digits_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
+    let mut i = pos;
+    while i < input.len() && 48u8 <= input[i] && input[i] <= 57u8
+        invariant
+            pos <= i <= input.len(),
+            scan_digits_end(input@, pos as int) == scan_digits_end(input@, i as int),
+        decreases input.len() - i,
+    {
+        i += 1;
     }
+    i
 }
 
 /// Identifier start byte: an ASCII letter. `Lexer::scan_ident_or_keyword`
@@ -537,26 +540,26 @@ pub proof fn lemma_scan_ident_roundtrip(d: Seq<u8>, tail: Seq<u8>)
 }
 
 
-/// Executable maximal identifier-run scanner, refining `scan_ident_end`.
+/// Executable maximal identifier-run scanner, refining `scan_ident_end`. A
+/// loop, for the reason given at `skip_ws_exec`.
 pub fn scan_ident_exec(input: &[u8], pos: usize) -> (r: usize)
     requires
         pos <= input.len(),
     ensures
         r == scan_ident_end(input@, pos as int),
-    decreases input.len() - pos,
 {
-    if pos < input.len() {
-        let b = input[pos];
-        let cont = ((65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) || b == 95u8)
-            || (48u8 <= b && b <= 57u8);
-        if cont {
-            scan_ident_exec(input, pos + 1)
-        } else {
-            pos
-        }
-    } else {
-        pos
+    let mut i = pos;
+    while i < input.len()
+        && ((65u8 <= input[i] && input[i] <= 90u8) || (97u8 <= input[i] && input[i] <= 122u8)
+            || input[i] == 95u8 || (48u8 <= input[i] && input[i] <= 57u8))
+        invariant
+            pos <= i <= input.len(),
+            scan_ident_end(input@, pos as int) == scan_ident_end(input@, i as int),
+        decreases input.len() - i,
+    {
+        i += 1;
     }
+    i
 }
 
 
@@ -2148,9 +2151,9 @@ pub fn build_ascii_string(input: &Vec<u8>, p: usize, e: usize) -> (r: String)
 // not view-determined). The fix, mirroring `view_expr`'s dodge of `Vec`: work with
 // the char-sequence *view* `Seq<char>` in spec, and refine the exec at the `s@`
 // level. `lscan_ident_m` produces the char view of an identifier (the lowercased
-// run, when it is not a keyword); the exec `scan_ident_token_exec` builds the real
-// `Token::Ident(String)` and is verified so its `@` view matches. Axiom-free for
-// ASCII identifiers.
+// run, when it is not a keyword); the exec `scan_word_token_exec` builds the real
+// `Token::Keyword` or `Token::Ident(String)` and is verified so its `@` view
+// matches. Axiom-free for ASCII identifiers.
 
 /// An ASCII char run encodes to ASCII bytes.
 pub proof fn lemma_ascii_chars_bytes_ascii(cs: Seq<char>)
@@ -2222,48 +2225,43 @@ pub proof fn lemma_ascii_lower_seq_ascii(s: Seq<u8>)
     }
 }
 
-/// Executable identifier-token scanner: builds the real `Token::Ident(String)`,
-/// verified so its `@` char view matches `lscan_ident_m`. `None` when the run is
-/// a keyword or there is no identifier.
-pub fn scan_ident_token_exec(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
+/// Executable identifier-or-keyword scanner, for a cursor on an identifier
+/// start byte: one scan of the run, one lowercase, one classification, and the
+/// real `Token::Keyword` or `Token::Ident(String)` -- the latter verified so its
+/// `@` char view matches `lscan_ident_m`. Only the run itself needs to be
+/// ASCII, so the precondition asks that of the suffix, not the whole input.
+pub fn scan_word_token_exec(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
     requires
-        pos <= input.len(),
-        forall|i: int| 0 <= i < input@.len() ==> (#[trigger] input@[i]) < 128,
+        pos < input.len(),
+        is_ident_start(input@[pos as int]),
+        forall|i: int| pos <= i < input@.len() ==> (#[trigger] input@[i]) < 128,
     ensures
-        r.1 == lscan_ident_m(input@, pos as int).1,
-        match (r.0, lscan_ident_m(input@, pos as int).0) {
-            (Some(Token::Ident(s)), Some(cv)) => s@ == cv,
-            (None, None) => true,
+        r.1 == scan_ident_end(input@, pos as int),
+        match r.0 {
+            Some(Token::Keyword(kw)) => lscan_keyword(input@, pos as int).0 == Some(kw),
+            Some(Token::Ident(s)) => lscan_keyword(input@, pos as int).0 is None
+                && lscan_ident_m(input@, pos as int).0 == Some(s@),
             _ => false,
         },
 {
-    if pos < input.len() {
-        let b = input[pos];
-        if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) {
-            let e = scan_ident_exec(input, pos);
-            proof { lemma_scan_ident_end_bounds(input@, pos as int); }
-            let low = to_lower_vec(input, pos, e);
+    let e = scan_ident_exec(input, pos);
+    proof { lemma_scan_ident_end_bounds(input@, pos as int); }
+    let low = to_lower_vec(input, pos, e);
+    match classify_kw_exec(&low) {
+        Some(kw) => (Some(Token::Keyword(kw)), e),
+        None => {
             proof {
-                lemma_ascii_lower_seq_ascii(input@.subrange(pos as int, e as int));
                 assert(all_ascii_bytes(input@.subrange(pos as int, e as int))) by {
                     assert forall|i: int| 0 <= i < (e - pos) implies
                         input@.subrange(pos as int, e as int)[i] < 128 by {
                         assert(input@.subrange(pos as int, e as int)[i] == input@[pos + i]);
                     }
                 }
+                lemma_ascii_lower_seq_ascii(input@.subrange(pos as int, e as int));
             }
-            match classify_kw_exec(&low) {
-                Some(_kw) => (None, e),
-                None => {
-                    let s = build_ascii_string(&low, 0, low.len());
-                    (Some(Token::Ident(s)), e)
-                }
-            }
-        } else {
-            (None, pos)
+            let s = build_ascii_string(&low, 0, low.len());
+            (Some(Token::Ident(s)), e)
         }
-    } else {
-        (None, pos)
     }
 }
 
@@ -3561,13 +3559,7 @@ pub fn lscan_mtok_exec(input: &[u8], pos: usize) -> (r: (Option<Token>, usize))
             let bytes = subrange_vec(input, p, e);
             (Some(Token::Number(bytes)), e)
         } else if (65u8 <= b && b <= 90u8) || (97u8 <= b && b <= 122u8) {
-            let e = scan_ident_exec(input, p);
-            proof { lemma_scan_ident_end_bounds(input@, p as int); }
-            let low = to_lower_vec(input, p, e);
-            match classify_kw_exec(&low) {
-                Some(kw) => (Some(Token::Keyword(kw)), e),
-                None => scan_ident_token_exec(input, p),
-            }
+            scan_word_token_exec(input, p)
         } else {
             scan_symbol_bytes(input, p)
         }
@@ -3733,14 +3725,15 @@ pub proof fn lemma_lex_mtok_from_eq_seq(input: Seq<u8>, pos: int, fuel: nat)
 /// The exec tokenizing loop: scan tokens left to right until the input is spent
 /// or a byte no class starts with is reached. Returns the tokens and the
 /// position the scan stopped at, which is the whole input exactly when the model
-/// covers it.
+/// covers it -- in both directions, so a caller that checks the position knows
+/// the model consumed every byte.
 #[verifier::rlimit(120)]
 pub fn lex_mtok_exec(input: &[u8]) -> (r: (Vec<Token>, usize))
     requires
         forall|i: int| 0 <= i < input@.len() ==> (#[trigger] input@[i]) < 128,
     ensures
         tok_views(r.0@) == lex_mtok_from(input@, 0, (input@.len() + 1) as nat),
-        lex_mtok_covers(input@, 0, (input@.len() + 1) as nat) ==> r.1 == input@.len(),
+        r.1 == input@.len() <==> lex_mtok_covers(input@, 0, (input@.len() + 1) as nat),
 {
     let mut acc: Vec<Token> = Vec::new();
     let mut pos: usize = 0;
@@ -3757,15 +3750,20 @@ pub fn lex_mtok_exec(input: &[u8]) -> (r: (Vec<Token>, usize))
             rf == fuel0 - acc.len(),
             forall|i: int| 0 <= i < input@.len() ==> (#[trigger] input@[i]) < 128,
             tok_views(acc@) + lex_mtok_from(input@, pos as int, rf) == lex_mtok_from(input@, 0, fuel0),
-            lex_mtok_covers(input@, 0, fuel0) ==> lex_mtok_covers(input@, pos as int, rf),
+            lex_mtok_covers(input@, 0, fuel0) == lex_mtok_covers(input@, pos as int, rf),
         decreases input.len() - pos,
     {
         let p = skip_ws_exec(input, pos);
         if p >= input.len() {
+            assert(rf >= 1);
             assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
+            assert(lex_mtok_covers(input@, pos as int, rf));
             return (acc, input.len());
         }
-        let (ot, e) = lscan_mtok_exec(input, pos);
+        // Scan from `p`: the dispatcher's own whitespace skip is then a single
+        // byte test rather than a second pass over the run just skipped.
+        proof { lemma_lscan_mtok_skip_ws(input@, pos as int); }
+        let (ot, e) = lscan_mtok_exec(input, p);
         match ot {
             Some(t) => {
                 let ghost old_acc = acc@;
@@ -3808,7 +3806,9 @@ pub fn lex_mtok_exec(input: &[u8]) -> (r: (Vec<Token>, usize))
             }
         }
     }
+    assert(rf >= 1);
     assert(lex_mtok_from(input@, pos as int, rf) =~= Seq::<MTok>::empty());
+    assert(lex_mtok_covers(input@, pos as int, rf));
     (acc, input.len())
 }
 
@@ -4111,15 +4111,19 @@ pub fn all_ascii_exec(input: &[u8]) -> (r: bool)
 ///
 /// `None` means "not covered": the input has a non-ASCII byte, an unterminated
 /// literal, or a byte that starts no token -- cases the char-level lexer handles
-/// (and, for the last two, reports as a parse error). Whenever it answers
-/// `Some`, the token vector is exactly what the model `lex_mtok_from` scans, and
-/// the second postcondition spends that on the round trip: **print any printable
-/// token list and this function returns that very list.** That is the property
-/// the deleted model proved about a lexer nothing ran; here it is proved about
-/// the one the parser runs.
+/// (and, for the last two, reports as a parse error). The first postcondition
+/// states that domain exactly: `Some` if and only if the input is ASCII and the
+/// model's scan consumed every byte of it, which is what makes "neither path
+/// truncates the other" a contract rather than an observation about the code.
+/// Whenever it answers `Some`, the token vector is exactly what the model
+/// `lex_mtok_from` scans, and the third postcondition spends that on the round
+/// trip: **print any printable token list and this function returns that very
+/// list.** That is the property the deleted model proved about a lexer nothing
+/// ran; here it is proved about the one the parser runs.
 #[verifier::rlimit(120)]
 pub fn lex_tokens(input: &[u8]) -> (r: Option<Vec<Token>>)
     ensures
+        r is Some <==> all_ascii_bytes(input@) && lex_mtok_covers(input@, 0, (input@.len() + 1) as nat),
         r matches Some(ts) ==> tok_views(ts@) == lex_mtok_from(input@, 0, (input@.len() + 1) as nat),
         forall|ms: Seq<MTok>|
             all_printable_mtok(ms) && all_ascii_bytes(input@) && input@ == #[trigger] mprint_list(ms)

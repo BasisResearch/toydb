@@ -187,10 +187,30 @@ suite). New strategy and progress:
     *be* the lexer: `is_ident_start` no longer admits `_` (production's
     `char::is_alphabetic` does not, so `_x` is an unexpected character, not an
     identifier); `is_ws` covers `\v` and `\f`; and the `''` / `""` escapes are
-    decoded, with quoted identifiers added as a class of their own. `lex_tokens`
-    answers `None` — deferring to the char-level `Lexer` — for non-ASCII input,
-    unterminated literals, and bytes that start no token, and commits only when
-    the model covered the whole input, so neither path can truncate the other's.
+    decoded, which `scan_sq_body` / `scan_dq_body` do and the escape-blind
+    `scan_to_quote` / `scan_to_dquote` did not.
+
+    **Read the round trip's domain precisely** (corrected 2026-09-21; an earlier
+    draft of this bullet and of `85dbb9e`'s commit message said quoted
+    identifiers were "a class of their own", which they are not). `MTok` has
+    five constructors — `MNum`, `MKw`, `MIdent`, `MString`, `MSym` — and none is
+    a quoted identifier: the *scanner* has a separate branch (`lscan_qident_m`),
+    but it yields `MTok::MIdent`, and `mprint` prints every identifier
+    **unquoted**. So quoting is never round-tripped, and a quoted identifier is
+    in the theorem's domain only when its content already spells a bare one;
+    `"MiXeD"` is outside `printable_mtok` altogether. Two further edges of the
+    same domain: `printable_mtok` excludes strings whose payload contains `'`,
+    so the `''` escape is covered by the first postcondition and the tests
+    rather than by the round trip; and `mprint_list` emits exactly one space
+    after *every* token including the last, while `mprint` renders keywords in
+    lowercase, so the theorem speaks about canonical prints — `select 1 ` — and
+    not about `SELECT 1`. For every other input the guarantee is the first two
+    postconditions: the tokens are the model's, and they span the whole input.
+
+    `lex_tokens` answers `None` — deferring to the char-level `Lexer` — for
+    non-ASCII input, unterminated literals, and bytes that start no token, and
+    commits only when the model covered the whole input, so neither path can
+    truncate the other's.
     `lexer.rs`'s `verified_tokenizer_covers_ordinary_sql` guards against the
     wiring quietly reverting to the fallback, and
     `differential.rs`'s `production_tokenizer_inverts_the_token_printer` runs
@@ -199,6 +219,92 @@ suite). New strategy and progress:
     and four near misses of each through both lexers, because `classify_kw` and
     `Keyword::try_from` are two hand-written tables of the same thing and a
     divergence in one entry shows up on exactly one word.
+
+  - **The exec scanners are loops, not recursions (2026-09-21, review
+    follow-up).** `skip_ws_exec`, `scan_digits_exec` and `scan_ident_exec`
+    mirrored their specs' shape and recursed once per byte, one stack frame
+    each. On the 2 MiB parse threads a debug build overflowed at ~32 KiB of
+    whitespace, digits or identifier bytes — the same pre-auth process kill
+    558f230 closed on the expression path, reopened one stage earlier, where
+    `check_nesting_depth` cannot see it because it runs on tokens that do not
+    exist yet. Release survived only because LLVM happened to turn the self tail
+    calls into loops, which is not a guarantee. All three are `while` loops now,
+    each carrying the invariant that the spec scan from the start equals the
+    spec scan from the cursor; the specs are untouched, so every lemma about
+    them still applies. 1 MiB runs tokenize in debug. Note the general lesson:
+    an exec twin that copies its spec's recursion inherits a stack depth linear
+    in the input, and Verus will not flag it — the proof is equally valid either
+    way.
+
+  - **One identifier scan, not two (2026-09-21, review follow-up).**
+    `lscan_mtok_exec` scanned the identifier run, lowercased it and classified
+    it, then on the non-keyword arm called `scan_ident_token_exec`, which did
+    all three again. `scan_word_token_exec` replaces it: one scan, one
+    lowercase, one classification, returning the keyword or the identifier, with
+    its ASCII precondition on the suffix rather than the whole input. The
+    tokenizing loop also hands the dispatcher the post-whitespace cursor, so the
+    dispatcher's own whitespace skip is a single byte test rather than a second
+    pass over the run just skipped (`lemma_lscan_mtok_skip_ws` is the proof
+    step).
+
+  - **Coverage is a postcondition now, not just an `if` (2026-09-21, review
+    follow-up).** As first landed, `lex_tokens` stated only that its vector was
+    what the model scans. That is weaker than it reads: `lex_mtok_from` stops at
+    the first byte no token class starts with and returns the tokens *before*
+    it, so the postcondition is satisfied by a tokenizer that silently drops a
+    bad tail. Whole-input coverage was enforced solely by the runtime
+    `end == input.len()` test — invisible to the solver. Deleting that test left
+    the module verifying (122 verified, 0 errors) while `lex_tokens` answered
+    `Some([Keyword(Select), Number("1")])` for `SELECT 1 $` and
+    `Parser::parse("SELECT 1 $")` returned `Ok(Select ...)`: a syntax error
+    silently becoming a different valid statement. The `verified_tokenizer_
+    defers_outside_its_domain` test caught it; the proof did not. Fixed by
+    stating it: `lex_mtok_exec` now carries
+    `r.1 == input@.len() <==> lex_mtok_covers(input@, 0, fuel)` (it had only the
+    `==>` half, and the `<==` half is what the guard actually needs), its loop
+    invariant carries the coverage equality rather than one implication, and
+    `lex_tokens` states the whole domain as an iff:
+
+    ```
+    r is Some <==> all_ascii_bytes(input@) && lex_mtok_covers(input@, 0, fuel)
+    ```
+
+    Callers can now rely on `Some` meaning the tokens span the whole input, and
+    on `None` meaning the input really was outside the domain — which is what
+    turns "neither path truncates the other" into a contract rather than an
+    observation about the code.
+
+  - **The residual risk, stated plainly: model fidelity is tested, not proved.**
+    Verification ties `lex_tokens` to `lex_mtok_from`, and `lex_mtok_from` is
+    written in this repo. Nothing proves it agrees with the char-level `Lexer`
+    it took over from, and since `tokenize` now runs the verified lexer on every
+    ASCII input, a divergence would not show up as a failed proof — it would be
+    a silent change in what toyDB parses. This is the one place where the
+    cutover trades a proof for a test, so the tests are sized for it, and all
+    three state the same biconditional — the verified lexer must decline exactly
+    the inputs the char lexer rejects, not merely agree where it commits:
+
+    - `short_ascii_tokenizations_agree_exhaustively` runs **all 2,113,665 ASCII
+      strings of length 3 or less** through both lexers. It asserts a floor of
+      500k inside the verified lexer's domain (609,777 today) so the check
+      cannot pass by vacuity if the domain ever shrinks.
+    - `verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii`
+      (`lexer.rs`) draws bytes uniformly from every class the dispatcher
+      branches on plus the ones no class claims, so it is the one that reaches
+      stray bytes, NUL/DEL and unterminated literals.
+    - `tokenizations_agree_on_lexical_soup` composes whole tokens instead of
+      bytes, which is what reaches deep multi-token inputs: measured over 20k
+      draws, ~86% land inside the domain at ~3 tokens each against the random
+      generator's ~12% at ~1.3, so it is what exercises the scan-to-scan
+      boundaries (maximal munch across `<`/`<=`, a number's tail against the
+      next token, `''` against a string's terminator).
+
+    Beyond those, `keyword_tables_agree_on_every_keyword_and_near_miss` covers
+    the 66-entry tables, and every pre-existing differential test is now a lexer
+    differential too, since `Parser::parse_legacy` still runs the char lexer.
+    Closing the gap properly would mean verifying the char lexer against the
+    same model, which is the natural next step if the fallback path ever needs
+    to shrink.
 
   - **Strengthened in the same pass.** Injectivity had been stated only on those
     dead models; it is now stated on the production printers and parsers:
@@ -751,7 +857,7 @@ char-sequence **view** `Seq<char>` in spec, and refine the exec at the `s@` leve
   proven `@` view.
 - **L19** — identifier token: `lscan_ident_m` produces the lowercased char view
   (`None` when the run is a keyword); `lemma_lscan_ident_m` proves the char-view
-  roundtrip; `scan_ident_token_exec` builds the real `Token::Ident` verified so
+  roundtrip; `scan_word_token_exec` builds the real `Token::Ident` verified so
   its `@` matches. Axiom-free.
 - **L20** — quoted string: self-delimiting (closing `'`), `scan_to_quote` +
   `lscan_string_m` + `lemma_lscan_string_m` + `scan_string_token_exec`. Quote-free

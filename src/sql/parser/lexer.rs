@@ -738,6 +738,26 @@ mod tests {
         );
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// The verified tokenizer and the char lexer agree on every ASCII
+        /// input, errors included: where the char lexer fails, the verified
+        /// one must decline, and where it succeeds they must produce the same
+        /// tokens. The alphabet is every byte class the dispatcher branches on
+        /// plus the ones no class claims (`$`, NUL, DEL, ...), so unterminated
+        /// literals, ragged numbers and stray bytes are all reached, not just
+        /// the well-formed SQL the fixed corpus above lists.
+        #[test]
+        fn verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii(
+            sql in "[ \t\n\x0b\x0c\r'\"a-zA-Z0-9_.eE+\\-<>=!*/^%?,;()$#@`~\\[\\]{}|\\\\:\x00\x7f]{0,24}"
+        ) {
+            let verified = verified_lexer::lex_tokens(sql.as_bytes());
+            let legacy = Lexer::new(&sql).collect::<Result<Vec<Token>>>().ok();
+            proptest::prop_assert_eq!(verified, legacy, "tokenizations diverged for {:?}", sql);
+        }
+    }
+
     #[test]
     fn unterminated_payloads_are_errors() {
         assert_eq!(

@@ -517,6 +517,96 @@ fn every_keyword_relexes_from_its_lowercase_print() {
     }
 }
 
+/// Pieces of every lexical class, including the ragged number shapes and the
+/// `''` / `""` escapes, for the fidelity checks below. Joined without
+/// separators, so token boundaries land in awkward places.
+fn lexical_soup_piece() -> BoxedStrategy<String> {
+    prop_oneof![
+        "[a-zA-Z_][a-zA-Z0-9_]{0,5}",
+        "[0-9]{1,3}(\\.[0-9]{0,3})?([eE][+-]?[0-9]{0,2})?",
+        "'[ -&(-~]{0,5}('')?[ -&(-~]{0,5}'",
+        "\"[ -!#-~]{0,5}(\"\")?[ -!#-~]{0,5}\"",
+        proptest::sample::select(vec![
+            "<", ">", "<=", ">=", "<>", "!=", "=", "+", "-", "*", "/", "^", "%", "!", "?", ",",
+            ";", "(", ")", ".", " ", "\t", "\n", "''", "\"\"", "1.", "1e", "0.0.0", "1..2", "a.b",
+            "select", "SELECT", "nan",
+        ])
+        .prop_map(String::from),
+    ]
+    .boxed()
+}
+
+/// The residual risk of the cutover, checked by exhaustion where exhaustion is
+/// affordable.
+///
+/// Verification ties `lex_tokens` to the model `lex_mtok_from`, and the model is
+/// written in this repo -- nothing *proves* it agrees with the char-level
+/// `Lexer` it took over from. Since `tokenize` now runs the verified lexer on
+/// every ASCII input, a divergence between the two would not be a failed proof;
+/// it would be a silent change in what toyDB parses. So it is tested, and on
+/// short inputs it is tested completely: all 2,113,665 ASCII strings of length
+/// 3 or less.
+///
+/// The assertion is the same biconditional
+/// `verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii` uses -- the
+/// verified lexer must decline exactly the inputs the char lexer rejects, not
+/// merely agree where it commits -- so a domain that quietly drifted in either
+/// direction fails here too.
+#[test]
+fn short_ascii_tokenizations_agree_exhaustively() {
+    let mut source = String::new();
+    let mut covered = 0u64;
+    for len in 0..=3u32 {
+        for n in 0..128u32.pow(len) {
+            source.clear();
+            let mut rest = n;
+            for _ in 0..len {
+                source.push((rest % 128) as u8 as char);
+                rest /= 128;
+            }
+            let verified = super::verified_lexer::lex_tokens(source.as_bytes());
+            covered += u64::from(verified.is_some());
+            let legacy: Result<Vec<Token>> = super::Lexer::new(&source).collect();
+            assert_eq!(
+                verified,
+                legacy.ok(),
+                "the verified tokenizer and the char lexer diverged on {source:?}"
+            );
+        }
+    }
+    // Guards the guard: if the domain ever shrinks to almost nothing this test
+    // would still pass, but it would have stopped exercising the verified path.
+    assert!(covered > 500_000, "only {covered} of the short inputs reached the verified path");
+}
+
+proptest! {
+    /// The same fidelity check on longer, token-shaped inputs than exhaustion
+    /// can reach.
+    ///
+    /// This and `verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii`
+    /// in `lexer.rs` divide the work. That one draws bytes uniformly from every
+    /// class the dispatcher branches on, including the ones no class claims, so
+    /// it is the one that reaches stray bytes and unterminated literals -- but
+    /// measured over 20k draws only ~12% of its inputs land inside the verified
+    /// lexer's domain, at ~1.3 tokens each. This one composes whole tokens, so
+    /// ~86% land inside it at ~3 tokens each (13 at the widest), which is what
+    /// exercises the scan-to-scan boundaries: maximal munch across `<`/`<=`,
+    /// a number's tail against the next token, `''` inside a string against the
+    /// string's own terminator.
+    #[test]
+    fn tokenizations_agree_on_lexical_soup(
+        pieces in proptest::collection::vec(lexical_soup_piece(), 0..8)
+    ) {
+        let source = pieces.join("");
+        let verified = super::verified_lexer::lex_tokens(source.as_bytes());
+        let legacy: Result<Vec<Token>> = super::Lexer::new(&source).collect();
+        prop_assert_eq!(
+            verified, legacy.ok(),
+            "the verified tokenizer and the char lexer diverged on {:?}", source
+        );
+    }
+}
+
 /// Targeted source round trip for the lexer corners the generators reach only
 /// by chance: keyword-named, mixed-case, empty and qualified identifiers, and
 /// strings containing quotes or nothing at all. These are exactly the cases
