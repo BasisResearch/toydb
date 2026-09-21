@@ -124,19 +124,25 @@ suite). New strategy and progress:
   `verified_stmt_prec` statement refinements, and `verified_minparen`'s
   min-parens roundtrip (`min_roundtrip` / `min_roundtrip_live`). References to
   the deleted items in the sections below are historical record; git remembers.
-  - **Still true after the parser-coverage cleanup (2026-09-16,
-    branch `yl/parser-coverage-fix`).** That cleanup removed ~9k lines of dead
-    scaffolding, and every carrier named above survived it: `lemma_prec` and the
-    `sprint` domain it is stated over are kept, as are `verified_lexer`'s
-    spec-level roundtrip theorems `lemma_lex_all_seq_roundtrip` /
-    `lemma_lex_mtok_seq_roundtrip`, which 455d790 had deliberately retained for
-    the lexer-cutover milestone. Only `lemma_prec` is marked
-    `#[verifier::reach_root]`, and only because its subject `sparse_prec` is the
+  - **Mostly still true after the parser-coverage cleanup (2026-09-16 to
+    2026-09-18, branch `yl/parser-coverage-fix`).** That cleanup removed ~9k
+    lines of dead scaffolding. `lemma_prec` and the `sprint` domain it is stated
+    over are kept; `lemma_prec` is marked `#[cfg_attr(verus_reach,
+    verifier::reach_root)]`, and only because its subject `sparse_prec` is the
     production parser, reachable independently; the mark merely pulls in the
-    `sprint` domain description. The lexer pair is deliberately NOT marked --
-    its subject `lex_all_seq` is a lexer nothing runs, so those ~100 ghost
-    functions stay counted as unreached (see the KNOWN DEBT note in
-    verified_lexer.rs). What went
+    `sprint` domain description. One carrier did NOT survive: `verified_lexer`'s
+    spec-level roundtrip theorems `lemma_lex_all_seq_roundtrip` /
+    `lemma_lex_mtok_seq_roundtrip`, which 455d790 had retained for the
+    lexer-cutover milestone, were deleted in 0b935b2 together with the ~90
+    function token model they were stated over. That model was never wired to the
+    production `Lexer` and was 90 of the 91 verified functions the coverage gate
+    counted unreachable; marking it as a root would have satisfied the gate by
+    annotating exactly what it exists to find. `verified_lexer` now keeps only
+    the symbol scanner `lexer.rs` calls (`scan_symbol_bytes`, `lemma_lscan_sym`).
+    The theorems are recoverable from git history if the lexer cutover (issue 1,
+    option 2) is taken up, and their value was always bounded: `printable_tv` set
+    `Ident => false` and `String => false`, so L16/L23 below proved nothing about
+    identifiers or string literals. Everything else that went
     was scaffolding with no theorem attached: the mirror *parser* (`sparse`), the
     test-only fully parenthesized exec printer (`printer.rs`) and its spec domain,
     `verified_stmt`'s unreferenced `sparse_*` grammar, three template modules,
