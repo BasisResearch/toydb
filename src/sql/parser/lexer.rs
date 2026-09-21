@@ -6,6 +6,7 @@ use crate::errinput;
 use crate::error::Result;
 
 use super::unicode_trust;
+use super::verified_lexer;
 
 verus! {
 
@@ -564,6 +565,28 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Tokenizes `input` into the token vector the parser consumes.
+///
+/// This is the production tokenizer, and it runs the *verified* lexer:
+/// `verified_lexer::lex_tokens` is tried first on every input, and its
+/// postcondition ties the vector returned here to `lex_mtok_from`, the lexer
+/// model -- which is what makes the model's round-trip theorem a statement about
+/// production tokens rather than about a model nothing runs.
+///
+/// The verified lexer answers `None` for the inputs outside its domain: a
+/// non-ASCII byte (its `String` payloads are one char per byte), an unterminated
+/// string or quoted identifier, or a byte that starts no token. Those fall
+/// through to the char-level `Lexer` iterator below, which handles Unicode and
+/// reports the two error cases with their messages. Because the verified lexer
+/// commits only when it has covered the whole input, the fallback sees every
+/// input it needs to and neither path can silently truncate the other's.
+pub fn tokenize(input: &str) -> Result<Vec<Token>> {
+    if let Some(tokens) = verified_lexer::lex_tokens(input.as_bytes()) {
+        return Ok(tokens);
+    }
+    Lexer::new(input).collect()
+}
+
 /// Returns true if the entire given string is a single valid identifier.
 pub fn is_ident(ident: &str) -> bool {
     let mut lexer = Lexer::new(ident);
@@ -631,6 +654,88 @@ mod tests {
         assert_eq!(lexer.next(), Some(Err(Error::InvalidInput("unexpected character $".into()))));
         assert_eq!(lexer.pos, 0);
         assert_eq!(lexer.peek(), Some('$'));
+    }
+
+    /// Inputs the verified tokenizer must cover. If `lex_tokens` starts
+    /// answering `None` here, `tokenize` quietly reverts to the char lexer and
+    /// the model's round-trip theorem stops saying anything about the tokens
+    /// production actually parses -- exactly the failure that made the previous
+    /// lexer model a ghost. This corpus is the guard against that.
+    const VERIFIED_PATH_CORPUS: &[&str] = &[
+        "",
+        "   ",
+        "SELECT 1",
+        "select 1",
+        "SELECT * FROM t WHERE a <= 3.5e-2 AND b <> 'x' OR NOT c!;",
+        "INSERT INTO t VALUES (1, 2), (3, 4)",
+        "SELECT a.b, count(x) FROM \"MiXeD\" AS y GROUP BY a.b HAVING count(x) > 1",
+        "SELECT 'it''s', \"a\"\"b\"",
+        "SELECT ''",
+        "SELECT \"\"",
+        "SELECT a_b1, c9 FROM t",
+        "SELECT\t1\u{b}+\u{c}2\r\n",
+        "SELECT 1e5, 1E+5, 1.5e-5, 007",
+        // The two number scanners -- the verified `scan_num_full_exec` on this
+        // path, `scan_number_bytes` on the fallback -- must agree on the ragged
+        // shapes as well as the well-formed ones.
+        "1. 1e 1E+ 1..2 1e5e5 0.0.0",
+        "a<b>=c<=d<>e!=f=g?h%i^j/k*l-m+n.o,p;q(r)s",
+    ];
+
+    #[test]
+    fn verified_tokenizer_covers_ordinary_sql() {
+        for sql in VERIFIED_PATH_CORPUS {
+            assert!(
+                verified_lexer::lex_tokens(sql.as_bytes()).is_some(),
+                "the verified tokenizer stopped covering {sql:?}; tokenize() now \
+                 falls back to the unverified char lexer for it"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_tokenizer_agrees_with_the_char_lexer() {
+        for sql in VERIFIED_PATH_CORPUS {
+            let verified = verified_lexer::lex_tokens(sql.as_bytes()).expect("covered");
+            let legacy: Vec<Token> =
+                Lexer::new(sql).collect::<Result<_>>().expect("char lexer accepts the corpus");
+            assert_eq!(verified, legacy, "tokenizations diverged for {sql:?}");
+        }
+    }
+
+    /// Outside its domain the verified tokenizer must decline rather than
+    /// guess, so `tokenize` can hand the input to the char lexer -- which is
+    /// what still produces Unicode identifiers and the two "unterminated"
+    /// errors.
+    #[test]
+    fn verified_tokenizer_defers_outside_its_domain() {
+        for sql in [
+            "é + 1", // non-ASCII: one char per byte would be wrong
+            "SELECT 'unterminated",
+            "SELECT \"unterminated",
+            "SELECT $",   // no token class starts with `$`
+            "SELECT 1 $", // ... including after a covered prefix
+        ] {
+            assert_eq!(
+                verified_lexer::lex_tokens(sql.as_bytes()),
+                None,
+                "the verified tokenizer claimed {sql:?}, which is outside its domain"
+            );
+        }
+
+        // ... and `tokenize` still answers exactly as the char lexer does.
+        assert_eq!(
+            tokenize("é + 1").unwrap(),
+            vec![Token::Ident("é".into()), Token::Plus, Token::Number(b"1".to_vec())]
+        );
+        assert_eq!(
+            tokenize("SELECT 'unterminated").unwrap_err(),
+            Error::InvalidInput("unexpected end of string literal".into())
+        );
+        assert_eq!(
+            tokenize("SELECT $").unwrap_err(),
+            Error::InvalidInput("unexpected character $".into())
+        );
     }
 
     #[test]

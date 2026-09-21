@@ -54,13 +54,29 @@ env:
   # `verified_precedence::parse_expression_full`, reachable only from the
   # cfg(test) `Parser::parse_expr` (round-1 issue 7, still open).
   #
+  # Where it stands (2026-09-21): 1 of 724, still 0% after flooring, and the one
+  # is the same `parse_expression_full`. The lexer token model is back -- 164
+  # functions of it -- but reachable the way this gate wants rather than by
+  # annotation: `Parser::parse` tokenizes through `lexer.rs`'s `tokenize`, which
+  # calls `verified_lexer::lex_tokens`, so the model hangs off the binaries'
+  # `main` and the round-trip theorem is that function's own postcondition.
+  # `verified_lexer` measures 164/164. Two of its proofs carry a mark --
+  # `lemma_lscan_num_full_int` and `lemma_lscan_num_full_dec`, theorems about
+  # the production `scan_num_full_end` that nothing calls because they are what
+  # a *caller* needs to put a number into the round trip's domain -- and
+  # `lemma_lscan_sym` gave one up, since `lemma_lscan_mtok` now reaches it.
+  #
   # Ratchet, but measure before each turn of it, and read the number for what it
-  # is: 51% of the verified surface (294 of 573 functions) is counted reachable
-  # only because a `#[verifier::reach_root]` mark says so. Against the four
-  # binaries' `main` alone the figure is 279 of 573. That is not in itself a
-  # finding -- `reach_root` exists for theorems about reachable code that nothing
-  # calls, which is a real category -- but it does mean this gate cannot be read
-  # as "no verified code is dead" without checking what the marks carry.
+  # is: as of 2026-09-18, 51% of the verified surface (294 of 573 functions) was
+  # counted reachable only because a `#[verifier::reach_root]` mark said so --
+  # against the four binaries' `main` alone the figure was 279 of 573. That is
+  # not in itself a finding -- `reach_root` exists for theorems about reachable
+  # code that nothing calls, which is a real category -- but it does mean this
+  # gate cannot be read as "no verified code is dead" without checking what the
+  # marks carry. (The mark-free split has not been re-measured since; it takes a
+  # second reachability build with `--cfg verus_reach` off, which coverage.sh
+  # does not do. The 2026-09-21 lexer work moved it in the right direction: 164
+  # functions reached from `main`, two marks added and one dropped.)
   #
   # 245 of those 294 are the minparen cluster, held up by 11 marks. Before
   # trimming any of them, note what the three `*_live` marks actually are:

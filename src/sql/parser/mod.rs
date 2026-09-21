@@ -21,5 +21,5 @@ pub mod verified_roundtrip;
 pub mod verified_stmt;
 pub mod verified_stmt_prec;
 
-pub use lexer::{Keyword, Lexer, Token, is_ident};
+pub use lexer::{Keyword, Lexer, Token, is_ident, tokenize};
 pub use parser::Parser;

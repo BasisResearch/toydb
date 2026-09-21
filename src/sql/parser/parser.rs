@@ -315,7 +315,7 @@ impl Parser {
     /// recursive-descent `StreamingParser`, which is a `cfg(test)`-only
     /// differential oracle.
     pub fn parse(statement: &str) -> Result<ast::Statement> {
-        let tokens: Vec<Token> = super::Lexer::new(statement).collect::<Result<_>>()?;
+        let tokens: Vec<Token> = super::tokenize(statement)?;
 
         // Robustness guard: reject pathologically deep nesting up front, so the
         // recursive verified parser cannot overflow the stack and abort the
@@ -357,7 +357,7 @@ impl Parser {
     /// be parsed as a single expression. Only used in tests.
     #[cfg(test)]
     pub fn parse_expr(expr: &str) -> Result<ast::Expression> {
-        let tokens: Vec<Token> = super::Lexer::new(expr).collect::<Result<_>>()?;
+        let tokens: Vec<Token> = super::tokenize(expr)?;
         check_nesting_depth(&tokens)?;
         let (opt, perr) = super::verified_precedence::parse_expression_full(&tokens);
         match opt {

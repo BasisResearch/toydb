@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::ast::{self, Expression, Literal, Operator, Statement};
-use super::{Parser, Token};
+use super::{Keyword, Parser, Token};
 use crate::error::Result;
 
 pub(crate) fn parse_new(sql: &str) -> Result<Statement> {
@@ -359,6 +359,161 @@ proptest! {
         if left_tokens == right_tokens {
             prop_assert_eq!(left, right);
         }
+    }
+}
+
+/// The `printable_mtok` domain, in Rust: a token whose canonical print re-lexes
+/// to itself. Numbers are a digit run with an optional fraction and an optional
+/// *complete* exponent (`1e` is excluded -- a `+5` tail would extend it, so it
+/// is not in `rescans_num`); identifiers are non-keyword, already-lowercase
+/// identifier runs; strings are quote-free ASCII.
+fn printable_token() -> BoxedStrategy<Token> {
+    let number = (
+        "[0-9]{1,4}",
+        proptest::option::of("[0-9]{1,3}"),
+        proptest::option::of((
+            prop_oneof![Just("e"), Just("E")],
+            prop_oneof![Just(""), Just("+"), Just("-")],
+            "[0-9]{1,2}",
+        )),
+    )
+        .prop_map(|(int, frac, exp)| {
+            let mut text = int;
+            if let Some(frac) = frac {
+                text.push('.');
+                text.push_str(&frac);
+            }
+            if let Some((marker, sign, digits)) = exp {
+                text.push_str(marker);
+                text.push_str(sign);
+                text.push_str(&digits);
+            }
+            Token::Number(text.into_bytes())
+        });
+    let ident = "[a-z][a-z0-9_]{0,7}"
+        .prop_filter("keywords print as keywords", |name: &String| {
+            Keyword::try_from(name.as_str()).is_err()
+        })
+        .prop_map(Token::Ident);
+    let string = proptest::collection::vec(
+        any::<char>().prop_filter("quote-free ASCII", |c| c.is_ascii() && *c != '\''),
+        0..8,
+    )
+    .prop_map(|chars| Token::String(chars.into_iter().collect()));
+    let keyword = proptest::sample::select(KEYWORDS.to_vec()).prop_map(Token::Keyword);
+    let symbol = proptest::sample::select(SYMBOLS.to_vec());
+    prop_oneof![number, ident, string, keyword, symbol].boxed()
+}
+
+/// `mprint_list` in Rust: each token's canonical bytes, then one space. Keywords
+/// print lowercase -- the lexer lowercases before classifying, so that is the
+/// form that re-lexes; `Display` renders them uppercase for humans.
+fn print_mprint_list(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            Token::Number(bytes) => out.push_str(std::str::from_utf8(bytes).expect("ASCII")),
+            Token::Keyword(keyword) => out.push_str(&keyword.to_string().to_lowercase()),
+            Token::Ident(name) => out.push_str(name),
+            Token::String(value) => {
+                out.push('\'');
+                out.push_str(value);
+                out.push('\'');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+        out.push(' ');
+    }
+    out
+}
+
+proptest! {
+    /// The wired lexer round trip, run.
+    ///
+    /// `verified_lexer::lex_tokens` -- the function `tokenize` calls, and so the
+    /// function that produces every token `Parser::parse` sees -- carries the
+    /// postcondition: for any printable token list `ms`, handing it
+    /// `mprint_list(ms)` returns `Some(ms)`. This test is that statement
+    /// executed: `printable_token` generates in the `printable_mtok` domain,
+    /// `print_mprint_list` is `mprint_list`, and the assertion is the
+    /// conclusion. It is a witness, not the proof -- if it ever fails, either
+    /// the Rust printer here or the spec's `mprint` has drifted.
+    #[test]
+    fn production_tokenizer_inverts_the_token_printer(
+        tokens in proptest::collection::vec(printable_token(), 0..12)
+    ) {
+        let source = print_mprint_list(&tokens);
+        prop_assert_eq!(super::verified_lexer::lex_tokens(source.as_bytes()), Some(tokens));
+    }
+}
+
+/// Every keyword, for the round-trip generator and the corpus below.
+#[rustfmt::skip]
+const KEYWORDS: &[Keyword] = &[
+    Keyword::And, Keyword::As, Keyword::Asc, Keyword::Begin, Keyword::Bool, Keyword::Boolean,
+    Keyword::By, Keyword::Commit, Keyword::Create, Keyword::Cross, Keyword::Default,
+    Keyword::Delete, Keyword::Desc, Keyword::Double, Keyword::Drop, Keyword::Exists,
+    Keyword::Explain, Keyword::False, Keyword::Float, Keyword::From, Keyword::Group,
+    Keyword::Having, Keyword::If, Keyword::Index, Keyword::Infinity, Keyword::Inner,
+    Keyword::Insert, Keyword::Int, Keyword::Integer, Keyword::Into, Keyword::Is, Keyword::Join,
+    Keyword::Key, Keyword::Left, Keyword::Like, Keyword::Limit, Keyword::NaN, Keyword::Not,
+    Keyword::Null, Keyword::Of, Keyword::Offset, Keyword::On, Keyword::Only, Keyword::Or,
+    Keyword::Order, Keyword::Outer, Keyword::Primary, Keyword::Read, Keyword::References,
+    Keyword::Right, Keyword::Rollback, Keyword::Select, Keyword::Set, Keyword::String,
+    Keyword::System, Keyword::Table, Keyword::Text, Keyword::Time, Keyword::Transaction,
+    Keyword::True, Keyword::Unique, Keyword::Update, Keyword::Values, Keyword::Varchar,
+    Keyword::Where, Keyword::Write,
+];
+
+/// Every symbol token, in the same role.
+#[rustfmt::skip]
+const SYMBOLS: &[Token] = &[
+    Token::Period, Token::Equal, Token::NotEqual, Token::GreaterThan,
+    Token::GreaterThanOrEqual, Token::LessThan, Token::LessThanOrEqual,
+    Token::LessOrGreaterThan, Token::Plus, Token::Minus, Token::Asterisk, Token::Slash,
+    Token::Caret, Token::Percent, Token::Exclamation, Token::Question, Token::Comma,
+    Token::Semicolon, Token::OpenParen, Token::CloseParen,
+];
+
+/// `classify_kw` (spec, 66 arms on length + indexed bytes) and `Keyword::try_from`
+/// (production, 66 `&str` arms) are two hand-written tables of the same thing.
+/// A divergence in one entry would make the verified tokenizer and the char
+/// lexer disagree on exactly one word and nothing else -- which no sampled
+/// corpus would find. This walks every keyword and four near misses of each.
+#[test]
+fn keyword_tables_agree_on_every_keyword_and_near_miss() {
+    for keyword in KEYWORDS {
+        let text = keyword.to_string().to_lowercase();
+        let mut cases = vec![
+            text.clone(),
+            keyword.to_string(), // uppercase
+            format!("{text}x"),  // one char longer
+            format!("{text}_"),  // still an identifier
+        ];
+        if text.len() > 1 {
+            cases.push(text[..text.len() - 1].to_string()); // one char shorter
+        }
+        for case in cases {
+            let verified = super::verified_lexer::lex_tokens(case.as_bytes());
+            let legacy: Result<Vec<Token>> = super::Lexer::new(&case).collect();
+            assert_eq!(verified, legacy.ok(), "keyword tables diverged on {case:?}");
+        }
+    }
+}
+
+/// Every keyword really does re-lex to itself from its lowercase print -- the
+/// executable counterpart of `lemma_lscan_keyword`, over all 66 at once rather
+/// than the handful a proptest run samples.
+#[test]
+fn every_keyword_relexes_from_its_lowercase_print() {
+    for keyword in KEYWORDS {
+        let tokens = vec![Token::Keyword(*keyword)];
+        let source = print_mprint_list(&tokens);
+        assert_eq!(
+            super::verified_lexer::lex_tokens(source.as_bytes()),
+            Some(tokens),
+            "keyword {keyword} did not re-lex from {source:?}"
+        );
     }
 }
 

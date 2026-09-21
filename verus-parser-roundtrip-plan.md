@@ -142,12 +142,64 @@ suite). New strategy and progress:
     The theorems are recoverable from git history if the lexer cutover (issue 1,
     option 2) is taken up, and their value was always bounded: `printable_tv` set
     `Ident => false` and `String => false`, so L16/L23 below proved nothing about
-    identifiers or string literals. Everything else that went
+    identifiers or string literals. (The cutover was taken up on 2026-09-21 —
+    see the next bullet; the theorems are back, wired, and no longer carry that
+    caveat.) Everything else that went
     was scaffolding with no theorem attached: the mirror *parser* (`sparse`), the
     test-only fully parenthesized exec printer (`printer.rs`) and its spec domain,
     `verified_stmt`'s unreferenced `sparse_*` grammar, three template modules,
     and `verified_lexer`'s position-local lemmas, which served only the exec twin
     deleted in phase 4.
+  - **The lexer round trip is back, and wired (2026-09-21, branch
+    `yl/lexer-model-wired`).** The deleted token model was rebuilt from git
+    history and reconnected to running code, which is what it never was before.
+    `verified_lexer::lex_tokens` is now the production tokenizer: `lexer.rs`'s
+    `tokenize` calls it on every input and `Parser::parse` calls `tokenize`, so
+    every token the verified parser sees comes through it unless it declines.
+    Its postcondition carries the theorem:
+
+    ```
+    forall|ms: Seq<MTok>|
+        all_printable_mtok(ms) && all_ascii_bytes(input@) && input@ == mprint_list(ms)
+            ==> r is Some && tok_views(r->Some_0@) == ms
+    ```
+
+    i.e. print any printable token list and the production tokenizer returns
+    that list. Because it is an `ensures` of the function production runs — not
+    a `proof fn` about a spec twin — the guarantee is bound to production the
+    same way `min_roundtrip_live` binds the parser's.
+    `lemma_lex_mtok_seq_roundtrip` (which tokens come back) and
+    `lemma_lex_mtok_seq_covers_roundtrip` (nothing is left over) are the two
+    halves that discharge it.
+
+    Only `lemma_lex_mtok_seq_roundtrip` came back, under its own name.
+    `lemma_lex_all_seq_roundtrip` did not: it was the same round trip over
+    `TokenView`, restricted to the byte-determined classes, so the `MTok` one
+    covers it and more, and restoring it would have meant a second, weaker copy
+    plus forty-odd functions nothing else reaches.
+
+    The scope caveat that bounded the old theorems is gone with them: the
+    `MTok` model covers identifiers and string literals, where `printable_tv`
+    had set `Ident => false` and `String => false`. `printable_mtok`'s
+    identifier class is any already-lowercase, non-keyword identifier run
+    (`a_b1` included), not just letter runs. Three fidelity gaps that
+    were harmless in a model of nothing had to be closed before the model could
+    *be* the lexer: `is_ident_start` no longer admits `_` (production's
+    `char::is_alphabetic` does not, so `_x` is an unexpected character, not an
+    identifier); `is_ws` covers `\v` and `\f`; and the `''` / `""` escapes are
+    decoded, with quoted identifiers added as a class of their own. `lex_tokens`
+    answers `None` — deferring to the char-level `Lexer` — for non-ASCII input,
+    unterminated literals, and bytes that start no token, and commits only when
+    the model covered the whole input, so neither path can truncate the other's.
+    `lexer.rs`'s `verified_tokenizer_covers_ordinary_sql` guards against the
+    wiring quietly reverting to the fallback, and
+    `differential.rs`'s `production_tokenizer_inverts_the_token_printer` runs
+    the theorem's own statement as a proptest.
+    `keyword_tables_agree_on_every_keyword_and_near_miss` walks all 66 keywords
+    and four near misses of each through both lexers, because `classify_kw` and
+    `Keyword::try_from` are two hand-written tables of the same thing and a
+    divergence in one entry shows up on exactly one word.
+
   - **Strengthened in the same pass.** Injectivity had been stated only on those
     dead models; it is now stated on the production printers and parsers:
     `verified_minparen::min_print_injective` / `min_print_injective_expr`, and
@@ -314,7 +366,14 @@ now run on the verified surface" is only partly true.** For the *parser*,
 (in `lexer.rs`) actually run verified; the rest of the production `Lexer`'s
 string→token stage — whitespace handling, identifier/keyword runs, quoted
 strings — is plain Rust. The parser's functional guarantees are therefore stated
-at the *token* level; the string→token stage is outside them. Also note
+at the *token* level; the string→token stage is outside them. **SUPERSEDED for
+ASCII input (2026-09-21):** `Parser::parse` now tokenizes through
+`lexer.rs::tokenize`, which runs the verified `verified_lexer::lex_tokens` on
+every input and falls back to the char-level `Lexer` only for what that declines
+(non-ASCII, unterminated literals, unexpected bytes). Whitespace, identifier and
+keyword runs, numbers, strings and quoted identifiers are all verified on that
+path, and the round trip is stated over it — so for ASCII input the string→token
+stage is inside the guarantees now, not outside. Also note
 `sql::parser::parser` itself is unverified glue (not in `VERIFY_MODULES`).
 `Token::Number` is `Vec<u8>`; `Lexer::scan_symbol` routes through the verified
 `verified_lexer::scan_symbol_bytes` and numbers through `scan_number_bytes`;
@@ -721,6 +780,17 @@ with an end-to-end roundtrip, over a spec-constructible mirror token `MTok`
 `unicode_trust` model); (3) **ast-equivalence** argument that the verified
 lexer+parser is a sound drop-in; (4) the `parser.rs`/`lexer.rs` swap, run
 `tests/scripts/queries` green.
+
+**CUTOVER DONE (2026-09-21).** (1) landed: quoted identifiers are a class of the
+dispatcher and both escapes are decoded (`scan_sq_body` / `scan_dq_body`). (2) is
+answered by restriction rather than by modelling `to_lowercase`: `lex_tokens`
+declines non-ASCII input outright, so the ASCII-only case-folding and whitespace
+set are exact on everything it accepts, and the char-level `Lexer` keeps Unicode.
+`is_ws` and `is_ident_start` were corrected to match `char::is_whitespace` and
+`char::is_alphabetic` on ASCII. (4) landed: `Parser::parse` and `parse_expr`
+tokenize through `lexer.rs::tokenize`, whole suite green. (3) is unchanged --
+what replaced it in practice is that `Parser::parse_legacy` still runs the char
+lexer, so every differential test is a lexer differential as well.
 
 **Production lexer STARTED (2026-08-28, `verified_lexer.rs`, in verify.sh — 18 modules).**
 Same discipline as the grammar: smallest self-contained verified bricks, produces the
