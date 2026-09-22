@@ -18,17 +18,22 @@
 #      functions (`coverage.lcov`), and, when `genhtml` from the `lcov` package
 #      is on PATH, a browsable HTML report (`html/index.html`).
 #
-# The gate itself is `verus-reach --fail-under N`, run by --fail-under here or
-# by the verus-coverage workflow (see COVERAGE_MIN_PERCENT there).
+# The gate itself is `verus-reach --fail-over N`, run by --fail-over here or by
+# the verus-coverage workflow (see COVERAGE_MAX_UNREACHABLE_PERCENT there).
+# `--fail-under` is kept for ad-hoc use; CI gates on the unreachable share.
 #
 # Roots: by default every binary's `main`, i.e. "used by toydb, toysql, toydump
 # or workload". To measure against the library's public API instead, feed
 # verus-reach only the lib report (`verus-reach $OUT/reach/toydb.lib.json`).
 #
-# Usage: scripts/verus/coverage.sh [--out DIR] [--fail-under PCT]
+# Usage: scripts/verus/coverage.sh [--out DIR] [--fail-under PCT] [--fail-over PCT]
 #   --out DIR         output directory (default .verus-out/coverage)
-#   --fail-under PCT  exit 1 if fewer than PCT% of verified exec functions are
-#                     reachable (verus-reach's own check)
+#   --fail-under PCT  exit 1 if fewer than PCT% of verified functions (exec,
+#                     spec and proof) are reachable (verus-reach's own check)
+#   --fail-over PCT   exit 1 if more than PCT% of them are unreachable. This is
+#                     what CI gates on; to reproduce the verus-coverage job
+#                     locally, pass one below COVERAGE_MAX_UNREACHABLE_PERCENT
+#                     (the check is strictly-greater-than, on a whole percent)
 #
 # Requires `cargo-verus` and `verus-reach` on PATH, built from the same
 # BasisResearch/verus commit (the upstream Verus releases have no `--reach`);
@@ -39,10 +44,12 @@ set -euo pipefail
 
 out=".verus-out/coverage"
 fail_under=""
+fail_over=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) out="$2"; shift 2 ;;
     --fail-under) fail_under="$2"; shift 2 ;;
+    --fail-over) fail_over="$2"; shift 2 ;;
     -h|--help) sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "coverage.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -76,7 +83,15 @@ target_dir="$(cargo metadata --no-deps --format-version 1 \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 cargo clean --quiet --package toydb --target-dir "$target_dir/verus-partial"
 echo "verus: writing reachability reports to $reach_dir" >&2
-cargo verus focus --lib --bins -- --reach "$reach_dir" --no-verify
+# `--cfg verus_reach` turns on the `#[verifier::reach_root]` marks, which are
+# written as `#[cfg_attr(verus_reach, ...)]` so that the upstream Verus release
+# used by the verus-gate job -- which does not know that fork-only attribute and
+# would fail to compile on it -- never sees them. Without this flag the reports
+# would still be produced, but with no roots beyond the binaries' `main`.
+# RUSTFLAGS reaches rustc through cargo-verus; it also re-fingerprints the
+# dependency builds in this target dir, which is why the tree is cleaned above.
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg verus_reach" \
+  cargo verus focus --lib --bins -- --reach "$reach_dir" --no-verify
 if [[ ! -f "$reach_dir/toydb.lib.json" ]]; then
   echo "error: no reachability report for the library in $reach_dir" >&2
   echo "       (cargo replayed a cached build, or verus lacks --reach)" >&2
@@ -98,6 +113,9 @@ else
   echo "genhtml not on PATH (apt/pacman package lcov); skipping the HTML report" >&2
 fi
 
+if [[ -n "$fail_over" ]]; then
+  verus-reach --fail-over "$fail_over" "$reach_dir" > /dev/null
+fi
 if [[ -n "$fail_under" ]]; then
   verus-reach --fail-under "$fail_under" "$reach_dir" > /dev/null
 fi

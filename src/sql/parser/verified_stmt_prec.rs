@@ -1798,6 +1798,7 @@ proof fn sparse_control_assign_list_decreases(input: Seq<TokenView>) {
     lemma_control_assign_slen(input);
 }
 
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn lemma_control_assign_list_slen(input: Seq<TokenView>)
     ensures
         sparse_control_assign_list(input).1.len() <= input.len(),

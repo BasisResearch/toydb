@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::ast::{self, Expression, Literal, Operator, Statement};
-use super::{Parser, Token};
+use super::{Keyword, Parser, Token};
 use crate::error::Result;
 
 pub(crate) fn parse_new(sql: &str) -> Result<Statement> {
@@ -289,34 +289,348 @@ fn statements() -> BoxedStrategy<Statement> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    #[test]
-    fn expression_parsers_agree(expression in expressions()) {
-        let tokens = super::print_expr(&expression)
-            .expect("the strategy only generates parser-producible expressions");
-        check_expression(&render_tokens(&tokens));
-    }
-
-    #[test]
-    fn statement_parsers_agree(statement in statements()) {
-        let tokens = super::print_statement(&statement)
-            .expect("the strategy only generates parser-producible statements");
-        check_statement(&render_tokens(&tokens));
-    }
-
+    // The fully parenthesized printer that used to drive a second pair of these
+    // tests is gone (it was verified exec code that only tests ever ran); the
+    // min-parens printer is the one the round-trip theorems are stated about,
+    // so it is the one the oracle feeds.
     #[test]
     fn expression_parsers_agree_minparens(expression in expressions()) {
-        super::print_expr(&expression)
-            .expect("the strategy only generates parser-producible expressions");
         let tokens = super::verified_minparen::print_min_expr(&expression);
         check_expression(&render_tokens(&tokens));
     }
 
     #[test]
     fn statement_parsers_agree_minparens(statement in statements()) {
-        super::print_statement(&statement)
-            .expect("the strategy only generates parser-producible statements");
         let tokens = super::verified_minparen_stmt::print_min_stmt(&statement);
         check_statement(&render_tokens(&tokens));
+    }
+
+    // The four tests below are the *source-level* counterparts of the verified
+    // round-trip and injectivity theorems, restated on the min-parens printer
+    // (the printer that survives, and the one the theorems are about). They are
+    // not redundant with the two above: those compare the verified parser
+    // against the legacy oracle, so a printer bug both parsers agreed on would
+    // pass. These assert the round trip lands back on the ORIGINAL AST.
+    //
+    // They matter most for the part no proof covers. `min_roundtrip_live` /
+    // `stmt_min_roundtrip_live` are stated over a `Vec<Token>`; everything
+    // between SQL text and that token vector -- whitespace, case folding,
+    // keyword recognition, quoted identifiers and strings -- is unverified plain
+    // Rust in `Lexer::scan`. Rendering to text and re-lexing is what exercises
+    // it. (Introduced in #18 against the fully parenthesized printer; retargeted
+    // here when that printer was deleted.)
+
+    #[test]
+    fn parser_inverts_the_printer_through_sql_source(expression in expressions()) {
+        let tokens = super::verified_minparen::print_min_expr(&expression);
+        let sql = render_tokens(&tokens);
+        prop_assert_eq!(Parser::parse_expr(&sql), Ok(expression), "diverged for {:?}", sql);
+    }
+
+    #[test]
+    fn parser_inverts_the_statement_printer_through_sql_source(statement in statements()) {
+        let tokens = super::verified_minparen_stmt::print_min_stmt(&statement);
+        let sql = render_tokens(&tokens);
+        prop_assert_eq!(Parser::parse(&sql), Ok(statement), "diverged for {:?}", sql);
+    }
+
+    /// Executable counterpart of `verified_minparen::min_print_injective`.
+    #[test]
+    fn min_parens_expression_printer_is_injective(
+        left in expressions(),
+        right in expressions(),
+    ) {
+        let left_tokens = super::verified_minparen::print_min_expr(&left);
+        let right_tokens = super::verified_minparen::print_min_expr(&right);
+        if left_tokens == right_tokens {
+            prop_assert_eq!(left, right);
+        }
+    }
+
+    /// Executable counterpart of
+    /// `verified_minparen_stmt::stmt_min_print_injective`.
+    #[test]
+    fn min_parens_statement_printer_is_injective(
+        left in statements(),
+        right in statements(),
+    ) {
+        let left_tokens = super::verified_minparen_stmt::print_min_stmt(&left);
+        let right_tokens = super::verified_minparen_stmt::print_min_stmt(&right);
+        if left_tokens == right_tokens {
+            prop_assert_eq!(left, right);
+        }
+    }
+}
+
+/// The `printable_mtok` domain, in Rust: a token whose canonical print re-lexes
+/// to itself. Numbers are a digit run with an optional fraction and an optional
+/// *complete* exponent (`1e` is excluded -- a `+5` tail would extend it, so it
+/// is not in `rescans_num`); identifiers are non-keyword, already-lowercase
+/// identifier runs; strings are quote-free ASCII.
+fn printable_token() -> BoxedStrategy<Token> {
+    let number = (
+        "[0-9]{1,4}",
+        proptest::option::of("[0-9]{1,3}"),
+        proptest::option::of((
+            prop_oneof![Just("e"), Just("E")],
+            prop_oneof![Just(""), Just("+"), Just("-")],
+            "[0-9]{1,2}",
+        )),
+    )
+        .prop_map(|(int, frac, exp)| {
+            let mut text = int;
+            if let Some(frac) = frac {
+                text.push('.');
+                text.push_str(&frac);
+            }
+            if let Some((marker, sign, digits)) = exp {
+                text.push_str(marker);
+                text.push_str(sign);
+                text.push_str(&digits);
+            }
+            Token::Number(text.into_bytes())
+        });
+    let ident = "[a-z][a-z0-9_]{0,7}"
+        .prop_filter("keywords print as keywords", |name: &String| {
+            Keyword::try_from(name.as_str()).is_err()
+        })
+        .prop_map(Token::Ident);
+    let string = proptest::collection::vec(
+        any::<char>().prop_filter("quote-free ASCII", |c| c.is_ascii() && *c != '\''),
+        0..8,
+    )
+    .prop_map(|chars| Token::String(chars.into_iter().collect()));
+    let keyword = proptest::sample::select(KEYWORDS.to_vec()).prop_map(Token::Keyword);
+    let symbol = proptest::sample::select(SYMBOLS.to_vec());
+    prop_oneof![number, ident, string, keyword, symbol].boxed()
+}
+
+/// `mprint_list` in Rust: each token's canonical bytes, then one space. Keywords
+/// print lowercase -- the lexer lowercases before classifying, so that is the
+/// form that re-lexes; `Display` renders them uppercase for humans.
+fn print_mprint_list(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            Token::Number(bytes) => out.push_str(std::str::from_utf8(bytes).expect("ASCII")),
+            Token::Keyword(keyword) => out.push_str(&keyword.to_string().to_lowercase()),
+            Token::Ident(name) => out.push_str(name),
+            Token::String(value) => {
+                out.push('\'');
+                out.push_str(value);
+                out.push('\'');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+        out.push(' ');
+    }
+    out
+}
+
+proptest! {
+    /// The wired lexer round trip, run.
+    ///
+    /// `verified_lexer::lex_tokens` -- the function `tokenize` calls, and so the
+    /// function that produces every token `Parser::parse` sees -- carries the
+    /// postcondition: for any printable token list `ms`, handing it
+    /// `mprint_list(ms)` returns `Some(ms)`. This test is that statement
+    /// executed: `printable_token` generates in the `printable_mtok` domain,
+    /// `print_mprint_list` is `mprint_list`, and the assertion is the
+    /// conclusion. It is a witness, not the proof -- if it ever fails, either
+    /// the Rust printer here or the spec's `mprint` has drifted.
+    #[test]
+    fn production_tokenizer_inverts_the_token_printer(
+        tokens in proptest::collection::vec(printable_token(), 0..12)
+    ) {
+        let source = print_mprint_list(&tokens);
+        prop_assert_eq!(super::verified_lexer::lex_tokens(source.as_bytes()), Some(tokens));
+    }
+}
+
+/// Every keyword, for the round-trip generator and the corpus below.
+#[rustfmt::skip]
+const KEYWORDS: &[Keyword] = &[
+    Keyword::And, Keyword::As, Keyword::Asc, Keyword::Begin, Keyword::Bool, Keyword::Boolean,
+    Keyword::By, Keyword::Commit, Keyword::Create, Keyword::Cross, Keyword::Default,
+    Keyword::Delete, Keyword::Desc, Keyword::Double, Keyword::Drop, Keyword::Exists,
+    Keyword::Explain, Keyword::False, Keyword::Float, Keyword::From, Keyword::Group,
+    Keyword::Having, Keyword::If, Keyword::Index, Keyword::Infinity, Keyword::Inner,
+    Keyword::Insert, Keyword::Int, Keyword::Integer, Keyword::Into, Keyword::Is, Keyword::Join,
+    Keyword::Key, Keyword::Left, Keyword::Like, Keyword::Limit, Keyword::NaN, Keyword::Not,
+    Keyword::Null, Keyword::Of, Keyword::Offset, Keyword::On, Keyword::Only, Keyword::Or,
+    Keyword::Order, Keyword::Outer, Keyword::Primary, Keyword::Read, Keyword::References,
+    Keyword::Right, Keyword::Rollback, Keyword::Select, Keyword::Set, Keyword::String,
+    Keyword::System, Keyword::Table, Keyword::Text, Keyword::Time, Keyword::Transaction,
+    Keyword::True, Keyword::Unique, Keyword::Update, Keyword::Values, Keyword::Varchar,
+    Keyword::Where, Keyword::Write,
+];
+
+/// Every symbol token, in the same role.
+#[rustfmt::skip]
+const SYMBOLS: &[Token] = &[
+    Token::Period, Token::Equal, Token::NotEqual, Token::GreaterThan,
+    Token::GreaterThanOrEqual, Token::LessThan, Token::LessThanOrEqual,
+    Token::LessOrGreaterThan, Token::Plus, Token::Minus, Token::Asterisk, Token::Slash,
+    Token::Caret, Token::Percent, Token::Exclamation, Token::Question, Token::Comma,
+    Token::Semicolon, Token::OpenParen, Token::CloseParen,
+];
+
+/// `classify_kw` (spec, 66 arms on length + indexed bytes) and `Keyword::try_from`
+/// (production, 66 `&str` arms) are two hand-written tables of the same thing.
+/// A divergence in one entry would make the verified tokenizer and the char
+/// lexer disagree on exactly one word and nothing else -- which no sampled
+/// corpus would find. This walks every keyword and four near misses of each.
+#[test]
+fn keyword_tables_agree_on_every_keyword_and_near_miss() {
+    for keyword in KEYWORDS {
+        let text = keyword.to_string().to_lowercase();
+        let mut cases = vec![
+            text.clone(),
+            keyword.to_string(), // uppercase
+            format!("{text}x"),  // one char longer
+            format!("{text}_"),  // still an identifier
+        ];
+        if text.len() > 1 {
+            cases.push(text[..text.len() - 1].to_string()); // one char shorter
+        }
+        for case in cases {
+            let verified = super::verified_lexer::lex_tokens(case.as_bytes());
+            let legacy: Result<Vec<Token>> = super::Lexer::new(&case).collect();
+            assert_eq!(verified, legacy.ok(), "keyword tables diverged on {case:?}");
+        }
+    }
+}
+
+/// Every keyword really does re-lex to itself from its lowercase print -- the
+/// executable counterpart of `lemma_lscan_keyword`, over all 66 at once rather
+/// than the handful a proptest run samples.
+#[test]
+fn every_keyword_relexes_from_its_lowercase_print() {
+    for keyword in KEYWORDS {
+        let tokens = vec![Token::Keyword(*keyword)];
+        let source = print_mprint_list(&tokens);
+        assert_eq!(
+            super::verified_lexer::lex_tokens(source.as_bytes()),
+            Some(tokens),
+            "keyword {keyword} did not re-lex from {source:?}"
+        );
+    }
+}
+
+/// Pieces of every lexical class, including the ragged number shapes and the
+/// `''` / `""` escapes, for the fidelity checks below. Joined without
+/// separators, so token boundaries land in awkward places.
+fn lexical_soup_piece() -> BoxedStrategy<String> {
+    prop_oneof![
+        "[a-zA-Z_][a-zA-Z0-9_]{0,5}",
+        "[0-9]{1,3}(\\.[0-9]{0,3})?([eE][+-]?[0-9]{0,2})?",
+        "'[ -&(-~]{0,5}('')?[ -&(-~]{0,5}'",
+        "\"[ -!#-~]{0,5}(\"\")?[ -!#-~]{0,5}\"",
+        proptest::sample::select(vec![
+            "<", ">", "<=", ">=", "<>", "!=", "=", "+", "-", "*", "/", "^", "%", "!", "?", ",",
+            ";", "(", ")", ".", " ", "\t", "\n", "''", "\"\"", "1.", "1e", "0.0.0", "1..2", "a.b",
+            "select", "SELECT", "nan",
+        ])
+        .prop_map(String::from),
+    ]
+    .boxed()
+}
+
+/// The residual risk of the cutover, checked by exhaustion where exhaustion is
+/// affordable.
+///
+/// Verification ties `lex_tokens` to the model `lex_mtok_from`, and the model is
+/// written in this repo -- nothing *proves* it agrees with the char-level
+/// `Lexer` it took over from. Since `tokenize` now runs the verified lexer on
+/// every ASCII input, a divergence between the two would not be a failed proof;
+/// it would be a silent change in what toyDB parses. So it is tested, and on
+/// short inputs it is tested completely: all 2,113,665 ASCII strings of length
+/// 3 or less.
+///
+/// The assertion is the same biconditional
+/// `verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii` uses -- the
+/// verified lexer must decline exactly the inputs the char lexer rejects, not
+/// merely agree where it commits -- so a domain that quietly drifted in either
+/// direction fails here too.
+#[test]
+fn short_ascii_tokenizations_agree_exhaustively() {
+    let mut source = String::new();
+    let mut covered = 0u64;
+    for len in 0..=3u32 {
+        for n in 0..128u32.pow(len) {
+            source.clear();
+            let mut rest = n;
+            for _ in 0..len {
+                source.push((rest % 128) as u8 as char);
+                rest /= 128;
+            }
+            let verified = super::verified_lexer::lex_tokens(source.as_bytes());
+            covered += u64::from(verified.is_some());
+            let legacy: Result<Vec<Token>> = super::Lexer::new(&source).collect();
+            assert_eq!(
+                verified,
+                legacy.ok(),
+                "the verified tokenizer and the char lexer diverged on {source:?}"
+            );
+        }
+    }
+    // Guards the guard: if the domain ever shrinks to almost nothing this test
+    // would still pass, but it would have stopped exercising the verified path.
+    assert!(covered > 500_000, "only {covered} of the short inputs reached the verified path");
+}
+
+proptest! {
+    /// The same fidelity check on longer, token-shaped inputs than exhaustion
+    /// can reach.
+    ///
+    /// This and `verified_tokenizer_agrees_with_the_char_lexer_on_random_ascii`
+    /// in `lexer.rs` divide the work. That one draws bytes uniformly from every
+    /// class the dispatcher branches on, including the ones no class claims, so
+    /// it is the one that reaches stray bytes and unterminated literals -- but
+    /// measured over 20k draws only ~12% of its inputs land inside the verified
+    /// lexer's domain, at ~1.3 tokens each. This one composes whole tokens, so
+    /// ~86% land inside it at ~3 tokens each (13 at the widest), which is what
+    /// exercises the scan-to-scan boundaries: maximal munch across `<`/`<=`,
+    /// a number's tail against the next token, `''` inside a string against the
+    /// string's own terminator.
+    #[test]
+    fn tokenizations_agree_on_lexical_soup(
+        pieces in proptest::collection::vec(lexical_soup_piece(), 0..8)
+    ) {
+        let source = pieces.join("");
+        let verified = super::verified_lexer::lex_tokens(source.as_bytes());
+        let legacy: Result<Vec<Token>> = super::Lexer::new(&source).collect();
+        prop_assert_eq!(
+            verified, legacy.ok(),
+            "the verified tokenizer and the char lexer diverged on {:?}", source
+        );
+    }
+}
+
+/// Targeted source round trip for the lexer corners the generators reach only
+/// by chance: keyword-named, mixed-case, empty and qualified identifiers, and
+/// strings containing quotes or nothing at all. These are exactly the cases
+/// `Lexer::scan` handles in unverified Rust.
+#[test]
+fn source_roundtrip_handles_tricky_identifiers_and_strings() {
+    let column = |name: &str| Expression::Column(None, name.into());
+    for expression in [
+        column("select"),
+        column("MixedCase"),
+        column(""),
+        Expression::Column(Some("Order".into()), "By".into()),
+        Expression::Function("count".into(), vec![column("x")]),
+        Expression::Literal(Literal::String("a'b".into())),
+        Expression::Literal(Literal::String("has \" quote".into())),
+        Expression::Literal(Literal::String(String::new())),
+    ] {
+        let tokens = super::verified_minparen::print_min_expr(&expression);
+        let sql = render_tokens(&tokens);
+        assert_eq!(
+            Parser::parse_expr(&sql),
+            Ok(expression),
+            "source roundtrip diverged for {sql:?}"
+        );
     }
 }
 

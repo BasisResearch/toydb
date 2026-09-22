@@ -71,6 +71,7 @@ pub open spec fn i64_key(v: i64) -> u64 {
 }
 
 /// The encoding is reversible: flipping the sign bit twice is the identity.
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn i64_key_roundtrip(v: i64)
     ensures (i64_key(v) ^ (1u64 << 63)) as i64 == v,
 {
@@ -79,6 +80,7 @@ pub proof fn i64_key_roundtrip(v: i64)
 
 /// The encoding is order-preserving: signed `<=` on values matches unsigned
 /// `<=` on keys, which is what makes lexicographic key scans correct.
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn i64_key_order(a: i64, b: i64)
     ensures a <= b <==> i64_key(a) <= i64_key(b),
 {
@@ -140,6 +142,7 @@ pub open spec fn f64_unkey(key: u64) -> u64 {
 
 /// The encoding is reversible on every bit pattern, so a serialize/deserialize
 /// round trip preserves the exact f64 (including NaN payloads).
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn f64_key_roundtrip(bits: u64)
     ensures f64_unkey(f64_key(bits)) == bits,
 {
@@ -167,15 +170,6 @@ pub fn decode_f64_key(key: u64) -> (r: u64)
     } else {
         !key
     }
-}
-
-// --- Verus-verified core of the bool key encoding --------------------------
-//
-// A bool is stored as a single byte: 0x01 for true, 0x00 for false (see
-
-/// The single-byte key for a bool: 1 for true, 0 for false.
-pub open spec fn bool_key(b: bool) -> u8 {
-    if b { 1u8 } else { 0u8 }
 }
 
 /// The escaped bytes of `v` *without* the terminator: each `0x00` becomes the
@@ -227,6 +221,7 @@ pub open spec fn bytes_dec(s: Seq<u8>) -> (Seq<u8>, Seq<u8>)
 /// trailing bytes untouched: `bytes_dec(bytes_enc(v) + suffix) == (v, suffix)`.
 /// Taking `suffix == []` gives the plain round trip `bytes_dec(bytes_enc(v)).0
 /// == v`.
+#[cfg_attr(verus_reach, verifier::reach_root)]
 pub proof fn bytes_roundtrip(v: Seq<u8>, suffix: Seq<u8>)
     ensures bytes_dec(bytes_enc(v) + suffix) == (v, suffix),
     decreases v.len(),

@@ -4,11 +4,12 @@
 #
 # Coverage of verified code. Compiles the library and the binaries through
 # Verus with `--reach`, joins the reachability reports with `verus-reach`
-# (scripts/verus/coverage.sh does both), and FAILS the job when fewer than
-# COVERAGE_MIN_PERCENT of the verified exec functions are reachable from a
-# toyDB binary's `main`. The per-file HTML report (genhtml over the LCOV trace)
-# is attached to every run as a workflow artifact and linked from the job
-# summary, so it works on every PR with no hosting.
+# (scripts/verus/coverage.sh does both), and FAILS the job when
+# COVERAGE_MAX_UNREACHABLE_PERCENT or more of the verified functions -- exec,
+# spec and proof alike -- are unreachable from a toyDB binary's `main` or from
+# a `#[verifier::reach_root]` mark. The per-file HTML report (genhtml over the
+# LCOV trace) is attached to every run as a workflow artifact and linked from
+# the job summary, so it works on every PR with no hosting.
 #
 # Pins: scripts/verus/pins.env, via the setup-verus action in Basis mode.
 # verus-reach is built from the same Verus commit (reach-tool: true).
@@ -20,10 +21,74 @@ permissions:
   contents: read
 
 env:
-  # The gate. Percent of verified exec functions that must be reachable from
-  # a binary. Starts at 5 while the verified SQL parser is not yet wired into
-  # the product (9% reachable as of 2026-09-09); raise it as it is cut over.
-  COVERAGE_MIN_PERCENT: "5"
+  # The gate: the share of verified functions that may be unreachable, i.e.
+  # verified code that no binary's `main` and no `#[verifier::reach_root]` mark
+  # leads to. At or above this share the job fails. Unreachable verified code is
+  # code the SMT solver pays for on every run and the product never uses.
+  #
+  # This counts verified *exec, spec and proof* functions, because that is what
+  # `verus-reach` measures -- `pct(total - reached, total)` over
+  # `graph.coverage()` in tools/verus-reach. An earlier version of this comment
+  # claimed the gate was exec-only. It never was, and exec-only would be the
+  # wrong reading anyway: ghost code is the bulk of the verified surface here
+  # (583 of 663 functions at the time of writing), so an exec-only gate would
+  # hide almost everything this job exists to find. The exec-only view is a
+  # separate concern, tracked by scripts/verus/verified_coverage.py.
+  #
+  # History: this was `COVERAGE_MIN_PERCENT: "5"`, a floor on the *reachable*
+  # share -- "at least 5% reachable", which nothing could ever fail (the tree
+  # was at 9% reachable on 2026-09-09, and 61% after PR #18 cut the production
+  # parser over). Inverting it into a ceiling on waste makes it a ratchet
+  # instead of a record of wherever we happened to land.
+  #
+  # Where it stands (2026-09-18): 1 of 573 verified functions unreachable, which
+  # floors to 0%, so the gate passes with room. It was 91 of 663 (13%) and
+  # failing; 90 of those were the `verified_lexer` token model, a ~90-function
+  # spec of nothing -- never wired to the production `Lexer`, and refining an
+  # executable twin that was deleted in phase 4. It was deleted rather than
+  # annotated: marking it `#[verifier::reach_root]` would have satisfied this
+  # gate by annotating exactly the code it exists to find. `verified_lexer` now
+  # keeps only the symbol scanner `lexer.rs` actually calls.
+  #
+  # The one remaining unreachable function is
+  # `verified_precedence::parse_expression_full`, reachable only from the
+  # cfg(test) `Parser::parse_expr` (round-1 issue 7, still open).
+  #
+  # Where it stands (2026-09-21): 1 of 724, still 0% after flooring, and the one
+  # is the same `parse_expression_full`. The lexer token model is back -- 164
+  # functions of it -- but reachable the way this gate wants rather than by
+  # annotation: `Parser::parse` tokenizes through `lexer.rs`'s `tokenize`, which
+  # calls `verified_lexer::lex_tokens`, so the model hangs off the binaries'
+  # `main` and the round-trip theorem is that function's own postcondition.
+  # `verified_lexer` measures 164/164. Two of its proofs carry a mark --
+  # `lemma_lscan_num_full_int` and `lemma_lscan_num_full_dec`, theorems about
+  # the production `scan_num_full_end` that nothing calls because they are what
+  # a *caller* needs to put a number into the round trip's domain -- and
+  # `lemma_lscan_sym` gave one up, since `lemma_lscan_mtok` now reaches it.
+  #
+  # Ratchet, but measure before each turn of it, and read the number for what it
+  # is: as of 2026-09-18, 51% of the verified surface (294 of 573 functions) was
+  # counted reachable only because a `#[verifier::reach_root]` mark said so --
+  # against the four binaries' `main` alone the figure was 279 of 573. That is
+  # not in itself a finding -- `reach_root` exists for theorems about reachable
+  # code that nothing calls, which is a real category -- but it does mean this
+  # gate cannot be read as "no verified code is dead" without checking what the
+  # marks carry. (The mark-free split has not been re-measured since; it takes a
+  # second reachability build with `--cfg verus_reach` off, which coverage.sh
+  # does not do. The 2026-09-21 lexer work moved it in the right direction: 164
+  # functions reached from `main`, two marks added and one dropped.)
+  #
+  # 245 of those 294 are the minparen cluster, held up by 11 marks. Before
+  # trimming any of them, note what the three `*_live` marks actually are:
+  # `min_roundtrip_live`, `min_normalize_live` and `stmt_min_roundtrip_live` are
+  # exec functions whose *postconditions* are the round-trip theorem stated over
+  # the executable production parsers -- `parse_expression_at` and
+  # `parse_control_at`, the latter being exactly what `Parser::parse` calls. The
+  # `proof fn` twins (`min_roundtrip`, `stmt_min_roundtrip`) are stated over the
+  # spec models `sparse_prec` / `sparse_control` instead, so they do NOT subsume
+  # them. Dropping the three marks would read as a 10% improvement in waste while
+  # actually dropping the only proofs that bind the round trip to running code.
+  COVERAGE_MAX_UNREACHABLE_PERCENT: "5"
   OUT_DIR: ".verus-out/coverage"
 
 jobs:
@@ -73,7 +138,7 @@ jobs:
             echo ''
             echo ":bar_chart: [Download the HTML report (verus-coverage-html artifact)](${{ steps.upload.outputs.artifact-url }}) and open \`index.html\`."
             echo ''
-            echo "Gate: at least ${COVERAGE_MIN_PERCENT}% of verified exec functions reachable from a binary."
+            echo "Gate: fewer than ${COVERAGE_MAX_UNREACHABLE_PERCENT}% of verified functions (exec, spec and proof) may be unreachable from a binary or a reach_root mark."
             echo "Verus ${{ steps.verus.outputs.verus_version }} (${{ steps.verus.outputs.verus_tag }})."
             echo ''
             echo '```'
@@ -81,5 +146,19 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Enforce COVERAGE_MIN_PERCENT
-        run: verus-reach --fail-under "$COVERAGE_MIN_PERCENT" "$OUT_DIR/reach" > /dev/null
+      - name: Enforce COVERAGE_MAX_UNREACHABLE_PERCENT
+        # `--fail-over T` fails when the unreachable share is *strictly* greater
+        # than T, and that share is floored to a whole percent. So the ceiling
+        # we want -- fail at COVERAGE_MAX_UNREACHABLE_PERCENT and above -- is
+        # `--fail-over` one below it: at 5, `--fail-over 4` passes 4% and fails
+        # 5%.
+        #
+        # 0 is the end state of the ratchet and has to be clamped, not
+        # decremented: `--fail-over` takes a u64, so -1 would die on clap's
+        # argument parse rather than report a coverage verdict. `--fail-over 0`
+        # is the strictest the tool can express -- it fails as soon as a whole
+        # percent of the verified surface is unreachable.
+        run: |
+          threshold="$COVERAGE_MAX_UNREACHABLE_PERCENT"
+          if [ "$threshold" -gt 0 ]; then threshold=$((threshold - 1)); fi
+          verus-reach --fail-over "$threshold" "$OUT_DIR/reach" > /dev/null

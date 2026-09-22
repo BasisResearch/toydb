@@ -62,35 +62,6 @@ impl PeekStream for TokenStream<'_> {
     }
 }
 
-/// A borrowed token stream used to test the token-level parser contract.
-#[cfg(test)]
-pub(crate) struct SliceTokenStream<'a> {
-    tokens: &'a [Token],
-    pos: usize,
-}
-
-#[cfg(test)]
-impl<'a> SliceTokenStream<'a> {
-    pub(crate) fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
-    }
-}
-
-#[cfg(test)]
-impl PeekStream for SliceTokenStream<'_> {
-    fn peek(&mut self) -> Result<Option<&Token>> {
-        Ok(self.tokens.get(self.pos))
-    }
-
-    fn next(&mut self) -> Result<Option<Token>> {
-        let token = self.tokens.get(self.pos).cloned();
-        if token.is_some() {
-            self.pos += 1;
-        }
-        Ok(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{PeekStream, TokenStream};

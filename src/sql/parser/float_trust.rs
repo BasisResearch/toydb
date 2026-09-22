@@ -1,4 +1,12 @@
 //! Narrow, audited trust boundary for textual finite-f64 round trips.
+//!
+//! `canonical_nan` deliberately promises only `r == spec_canonical_nan()`, not
+//! a bit pattern. It used to also ensure `to_bits_spec() == 0x7ff8...` for a
+//! body returning `f64::NAN`, which Rust does not guarantee: on a target where
+//! that differs, an `external_body` postcondition asserting it would be false,
+//! and a false assumption makes every obligation in the parser's NaN arms
+//! vacuous rather than failing loudly. Nothing consumed the claim, so it was
+//! pure downside and is gone.
 
 #[allow(unused_imports)] // Used by Verus; erased from normal Rust builds.
 use vstd::float::FloatBitsProperties;
@@ -8,9 +16,6 @@ use vstd::prelude::*;
 use super::verified_integer;
 
 verus! {
-
-/// Raw bits of Rust's canonical quiet NaN value.
-pub const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 /// Mathematical formatter/parser symbols for the canonical runtime encoding.
 /// The formatter uses Rust's `Debug` representation because, unlike `Display`,
@@ -41,53 +46,11 @@ pub fn parse_f64(s: &[u8]) -> (r: Option<f64>)
     }
 }
 
-/// Runtime classifications used by the canonical printer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FloatClass {
-    Printable,
-    CanonicalNan,
-    Other,
-}
-
-/// Models both the finite/nonnegative literal guard and the exact NaN payload
-/// accepted after `IS`.
-#[verifier::external_body]
-pub fn classify_f64(x: f64) -> (r: FloatClass)
-    ensures r == if x.is_finite_spec() && !x.is_sign_negative_spec() {
-        FloatClass::Printable
-    } else if x.to_bits_spec() == CANONICAL_NAN_BITS {
-        FloatClass::CanonicalNan
-    } else {
-        FloatClass::Other
-    },
-{
-    if x.is_finite() && x.is_sign_positive() {
-        FloatClass::Printable
-    } else if x.to_bits() == CANONICAL_NAN_BITS {
-        FloatClass::CanonicalNan
-    } else {
-        FloatClass::Other
-    }
-}
-
-pub fn is_printable_f64(x: f64) -> (r: bool)
-    ensures r == (x.is_finite_spec() && !x.is_sign_negative_spec()),
-{
-    matches!(classify_f64(x), FloatClass::Printable)
-}
-
-pub fn is_canonical_nan(x: f64) -> (r: bool)
-    ensures r == (x.to_bits_spec() == CANONICAL_NAN_BITS),
-{
-    matches!(classify_f64(x), FloatClass::CanonicalNan)
-}
-
 /// Constructs the exact NaN payload used by the production parser.
 #[verifier::external_body]
 pub fn canonical_nan() -> (r: f64)
     ensures
         r == spec_canonical_nan(),
-        r.to_bits_spec() == CANONICAL_NAN_BITS,
 {
     f64::NAN
 }
@@ -97,17 +60,6 @@ pub fn infinity() -> (r: f64)
     ensures r == spec_infinity(),
 {
     f64::INFINITY
-}
-
-/// Connects bit equality to Verus equality for the one NaN payload admitted
-/// by the canonical `IS NAN` syntax.
-#[verifier::external_body]
-pub proof fn axiom_canonical_nan(value: f64)
-    requires value.to_bits_spec() == CANONICAL_NAN_BITS,
-    ensures
-        value == spec_canonical_nan(),
-        spec_canonical_nan().to_bits_spec() == CANONICAL_NAN_BITS,
-{
 }
 
 /// The sole semantic assumption: finite values survive the canonical

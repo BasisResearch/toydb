@@ -18,7 +18,18 @@ doctest = false
 # `use` imports behind it, so register the cfg here to keep `cargo build`/`clippy`
 # from warning about an "unexpected cfg condition name".
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }
+# `verus_reach` is set only by the reachability tooling (scripts/verus/coverage.sh
+# and the verus-coverage job), which builds with the BasisResearch Verus fork. It
+# gates the `#[verifier::reach_root]` marks: `reach_root` is a fork-only
+# attribute, and the upstream Verus release the gating verus-gate job installs
+# rejects it outright ("unrecognized verifier attribute"), so an unconditional
+# mark makes that job fail to COMPILE before it checks a single proof. Writing the
+# marks as `#[cfg_attr(verus_reach, verifier::reach_root)]` keeps them for the
+# fork's reachability runs and makes them invisible to everyone else.
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_reach)',
+] }
 
 # Verus progressive verification. `cargo verus focus --lib` verifies the modules
 # opted in via `verus!` blocks; everything else is external-by-default and
