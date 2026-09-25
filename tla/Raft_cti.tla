@@ -55,6 +55,9 @@ CtiOneStep == TLCGet("level") < 2
 NoopEntry(t) == [term |-> t, cmd |-> Nil]
 Ent(t, c)    == [term |-> t, cmd |-> c]
 
+\* Some client command, so the seed's non-noop entries stay inside Entry.
+SomeCmd == CHOOSE c \in Command : TRUE
+
 L1      == << NoopEntry(1) >>
 ZeroRec == [term |-> 0, ci |-> 0, q |-> EmptyFn]
 Rec1    == [term |-> 1, ci |-> 1, q |-> [x \in {0, 1} |-> 1]]
@@ -71,8 +74,8 @@ CtiExtra(lg2) ==
 
 \* A small, representative set of logs for the free node.
 CtiLogs ==
-    { << >>, L1, << Ent(1, "cmd") >>, << NoopEntry(2) >>,
-      << NoopEntry(1), Ent(1, "cmd") >> }
+    { << >>, L1, << Ent(1, SomeCmd) >>, << NoopEntry(2) >>,
+      << NoopEntry(1), Ent(1, SomeCmd) >> }
 
 \* Node 0: the term-1 leader, with the commit it justified.
 CtiHost0 ==

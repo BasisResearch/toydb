@@ -29,7 +29,7 @@
 (*       model never inspects a command's bytes -- `cmd` occurs only in    *)
 (*       entry equality -- so any two-or-more-element set is as            *)
 (*       discriminating as `Seq<u8>`.                                      *)
-(*  (A3) The four unbounded-growth transitions carry the bound in their    *)
+(*  (A3) The five unbounded-growth transitions carry the bound in their    *)
 (*       guard, not only in the state constraint: `t_bump_term` picks      *)
 (*       `t \in (h.term+1)..MaxTerm`; `t_campaign` requires                *)
 (*       `h.term < MaxTerm`; `t_become_leader` and `t_propose` require     *)
@@ -64,9 +64,7 @@
 (*       an unbounded existential plus a membership guard.  These are      *)
 (*       logically identical; the message-set form is what TLC can         *)
 (*       enumerate.                                                        *)
-(*  (A7) `read_seq` is bounded by MaxRead through the state constraint     *)
-(*       only (the action itself is unbounded, as in the Rust).            *)
-(*  (A8) The network is monotone -- `net` only ever grows -- so the number *)
+(*  (A7) The network is monotone -- `net` only ever grows -- so the number *)
 (*       of reachable `net` values is what makes the model blow up.        *)
 (*       CONSTRAINT bounds `Cardinality(net)` by MaxMsgs.  Unlike (A3)     *)
 (*       this one needs no action-level guard: every `inv_*` conjunct and  *)
@@ -88,8 +86,8 @@ CONSTANTS
     N,        \* cluster size; GState.n (A1)
     MaxTerm,  \* term bound, enforced by Constraint
     MaxLog,   \* log-length bound, enforced by Constraint
-    MaxRead,  \* read-sequence bound, enforced by Constraint (A7)
-    MaxMsgs,  \* |net| bound, enforced by Constraint (A8)
+    MaxRead,  \* read-sequence bound, enforced by Constraint (A3)
+    MaxMsgs,  \* |net| bound, enforced by Constraint (A7)
     Command,  \* the abstract command alphabet, standing for Seq<u8> (A2)
     Nil       \* the None of Option<int> / Option<Seq<u8>>
 
@@ -875,6 +873,23 @@ Inv ==
     /\ inv_host_commits
     /\ inv_commit_leaders
     /\ inv_reads
+
+\* ---------------------------------------------------------------------------
+\* Vacuity witnesses.  Not part of safety.rs.  Each is the negation of the
+\* antecedent of a conjunct that is easy to satisfy vacuously; a run that
+\* *violates* the witness proves the antecedent is reachable, so the conjunct
+\* was checked non-vacuously at those bounds.  At Raft.cfg's bounds both
+\* hold on every reachable state (both conjuncts are vacuous there); the
+\* Raft_deep_*_witness.cfg runs violate them.
+\* ---------------------------------------------------------------------------
+
+\* inv_leader_completeness's antecedent: a commit and a strictly later
+\* elected term.
+NoLC == ~(\E rec \in commits : \E u \in DOMAIN leader_log : u > rec.term)
+
+\* read_rec_ok's R2 antecedent: a read record whose born set holds a commit
+\* of a higher term than the read's own.
+NoR2 == ~(\E r \in reads : \E rec \in r.born : rec.term > r.term)
 
 \* ---------------------------------------------------------------------------
 \* The bounding state constraint.  Terms, log lengths and read sequence
