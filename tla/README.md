@@ -77,8 +77,9 @@ own witness record is reachable (81,702 states) — but no reachable state has
 read record's `born` set ever contains a commit of a higher term, so
 `read_rec_ok`'s R2 clause, the linearizability core of `inv_reads`, is never
 satisfied either (`NoR2`). With one command, a second election after a
-commit first appears at nine messages with three nodes and at ten with two;
-a read by an old leader after a newer term committed needs twelve (three
+commit first appears inside the model at ten messages, with two nodes and
+with three alike (at nine, three nodes meet it only as a successor one step
+past the bound, the same effect as for R2 below); a read by an old leader after a newer term committed needs twelve (three
 nodes, `MaxLog = 1`).
 The rest of `inv_reads` (`read_msg_ok`, `confirm_msg_ok`, the
 sequence-number bounds) and all four commit conjuncts (`inv_commits`,
@@ -103,8 +104,12 @@ and is **expected to fail**: the counterexample is the reachability witness.
 `Raft_deep_lc.cfg` — `N = 2`, `MaxTerm = 2`, `MaxLog = 2`, `MaxRead = 1`,
 `MaxMsgs = 10`. With two nodes every quorum is both nodes, and ten is the
 least budget at which a term-2 election follows a commit (`NoLC` holds at
-nine). Three nodes reach it at nine; that configuration was not run with the
-invariants, given how the ten-message three-node space behaved above. TLC exhausts it in **1 min 59 s** on four
+nine). Three nodes also need ten: at nine, TLC reports `NoLC` violated only
+by a ten-message successor one step past the bound (the term-1 leader
+commits after term 2 has elected), and `NoLC \/ Cardinality(net) > 9`
+exhausts with no violation (7,854,995 distinct states). The three-node
+ten-message configuration was not run with the invariants, given how that
+space behaved above. TLC exhausts it in **1 min 59 s** on four
 workers: 4,404,097 states generated, **390,622 distinct**, diameter **20**, no
 invariant violated. All sixteen actions fire, `t_send_commit` included (973
 distinct states). `Raft_deep_lc_witness.cfg` violates `NoLC` in 4 s with a
@@ -238,8 +243,9 @@ With the jar from the fork's build (`tlaplus/tlatools/org.lamport.tlatools/dist/
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock Raft.tla
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -coverage 1 Raft.tla
 
-`-deadlock` is needed because a state where every host is a follower at
-`MaxTerm` with a full log has no successor, and that is not an error here.
+`-deadlock` is only a precaution: `t_restart(i)` with `c = 0` is enabled in
+every state, so no reachable state is deadlocked, and the runs complete
+without the flag too.
 The CTI probes want an explicit config and `-continue`, so that one run
 reports every conjunct:
 
