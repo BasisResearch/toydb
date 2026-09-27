@@ -27,7 +27,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }
 [package.metadata.verus]
 verify = true
 
+[features]
+# Trace validation: log every model step the Raft shell takes (see
+# `tla-trace/` and `tla/Raft_trace.tla`); the node tests then write one log
+# per goldenscript under target/tla-traces/. A test build, never verified.
+tla-trace = ["dep:tla-trace"]
+
 [dependencies]
+tla-trace = { path = "tla-trace", optional = true }
 # vstd is Verus's verified std. Published on crates.io; it compiles under a
 # normal `cargo build` (the `verus!` macro erases ghost code), so keeping it a
 # plain dependency lets verified code live inline in real modules. Pin tracks
