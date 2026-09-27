@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "tool": "inductive_loop",
+  "request": {
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_path": "src/raft/safety.rs",
+    "state_type": "GState",
+    "typing": "CtiSeed",
+    "proof": {
+      "init": "init_implies_inv(s);",
+      "step": "let step = choose|step: TStep| next_step(pre, post, step);\nstep_preserves_inv(pre, post, step);"
+    },
+    "budget": {
+      "screen_ms": 1800000,
+      "cti_ms": 600000,
+      "verus_check_secs": 300
+    },
+    "candidates": [
+      {
+        "name": "inv_reads"
+      }
+    ],
+    "screen_only": true
+  },
+  "status": "done",
+  "summary": {
+    "success": null,
+    "crate_name": null,
+    "scope": null,
+    "verified": null,
+    "errors": 0,
+    "warnings": null,
+    "total": 1,
+    "shown": 0,
+    "duration_ms": 13571
+  },
+  "data": {
+    "round_id": "303416090c0c",
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_backend": "tlc",
+    "candidates": [
+      {
+        "name": "inv_reads",
+        "verus": "inv_reads(s)",
+        "tla": "inv_reads"
+      }
+    ],
+    "typing": "CtiSeed",
+    "dropped_by_reachability": [],
+    "reachability_complete": true,
+    "unscreened": [],
+    "dropped_by_induction": [],
+    "cti_runs": [
+      {
+        "conjunction": [
+          "inv_reads"
+        ],
+        "finished": true,
+        "verdict": "ok",
+        "init_states": 10560,
+        "steps": 233824,
+        "dropped": [],
+        "error": null,
+        "messages": null,
+        "ms": 7835
+      }
+    ],
+    "induction_screen_complete": true,
+    "survivors": [
+      "inv_reads"
+    ],
+    "verus": {
+      "verdict": "not_run",
+      "scratch_path": null,
+      "scratch_text": null,
+      "session_id": null,
+      "snapshot_id": null,
+      "session_open": false,
+      "model_trusted": true,
+      "model_session_verified": null,
+      "obligations": [],
+      "failing": [],
+      "error": null,
+      "diagnostics_tail": null
+    },
+    "verdict": "screened",
+    "cost": {
+      "screen_ms": 5735,
+      "trace_ms": 0,
+      "stored_states": 597764,
+      "scanned_states": 597764,
+      "cti_ms": 7835,
+      "cti_runs": 1,
+      "cti_init_states": 10560,
+      "cti_steps": 233824,
+      "verus_open_ms": 0,
+      "verus_checks": 0,
+      "verus_check_ms": 0,
+      "verus_solver_ms": 0,
+      "total_ms": 13571
+    },
+    "notes": []
+  }
+}

@@ -1,0 +1,3 @@
+round 12ca4bd1584f: 1 candidates, 0 dropped by reachability, 0 by induction, 1 survive; verdict screened
+  verus: not_run (0 of 0 obligations valid)
+  cost: total 14985 ms; screen 4954 ms over 597764 states; 1 CTI searches 10030 ms (10560 initial states, 233824 steps); verus open 0 ms, 0 checks 0 ms (solver 0 ms)
