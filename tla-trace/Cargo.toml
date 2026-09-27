@@ -1,0 +1,9 @@
+[package]
+name = "tla-trace"
+version = "0.1.0"
+description = "Log an implementation's protocol steps for TLA+ trace validation"
+license = "MIT"
+edition = "2024"
+publish = false
+
+[dependencies]
