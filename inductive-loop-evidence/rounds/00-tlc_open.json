@@ -1,0 +1,395 @@
+{
+  "schema_version": 1,
+  "tool": "tlc_open",
+  "request": {
+    "spec": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft_cti.tla",
+    "config": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft.cfg",
+    "workers": 8,
+    "coverage": false,
+    "metadir": "/Users/kirancodes/tmp/vtm-il-raft-mO1Bbf/states"
+  },
+  "status": "done",
+  "summary": {
+    "success": null,
+    "crate_name": null,
+    "scope": "Raft_cti",
+    "verified": null,
+    "errors": null,
+    "warnings": null,
+    "total": 54,
+    "shown": 10,
+    "duration_ms": null
+  },
+  "data": {
+    "session_id": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "spec": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft_cti.tla",
+    "root_module": "Raft_cti",
+    "metadir": "/Users/kirancodes/tmp/vtm-il-raft-mO1Bbf/states/26-09-27-01-55-39.949",
+    "workers": 8,
+    "check_deadlock": true,
+    "coverage": false,
+    "tlc_version": "env",
+    "catalogue": {
+      "actions": [
+        {
+          "id": 1,
+          "name": "t_campaign",
+          "location": "<t_campaign(0) line 219, col 9 to line 225, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 2,
+          "name": "t_campaign",
+          "location": "<t_campaign(1) line 219, col 9 to line 225, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 3,
+          "name": "t_campaign",
+          "location": "<t_campaign(2) line 219, col 9 to line 225, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 4,
+          "name": "t_grant",
+          "location": "<t_grant(0) line 230, col 5 to line 243, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 5,
+          "name": "t_grant",
+          "location": "<t_grant(1) line 230, col 5 to line 243, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 6,
+          "name": "t_grant",
+          "location": "<t_grant(2) line 230, col 5 to line 243, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 7,
+          "name": "t_collect_vote",
+          "location": "<t_collect_vote(0) line 249, col 9 to line 258, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 8,
+          "name": "t_collect_vote",
+          "location": "<t_collect_vote(1) line 249, col 9 to line 258, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 9,
+          "name": "t_collect_vote",
+          "location": "<t_collect_vote(2) line 249, col 9 to line 258, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 10,
+          "name": "t_become_leader",
+          "location": "<t_become_leader(0) line 264, col 9 to line 276, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 11,
+          "name": "t_become_leader",
+          "location": "<t_become_leader(1) line 264, col 9 to line 276, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 12,
+          "name": "t_become_leader",
+          "location": "<t_become_leader(2) line 264, col 9 to line 276, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 13,
+          "name": "t_propose",
+          "location": "<t_propose(0) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 14,
+          "name": "t_propose",
+          "location": "<t_propose(0) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 15,
+          "name": "t_propose",
+          "location": "<t_propose(0) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 16,
+          "name": "t_propose",
+          "location": "<t_propose(1) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 17,
+          "name": "t_propose",
+          "location": "<t_propose(1) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 18,
+          "name": "t_propose",
+          "location": "<t_propose(1) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 19,
+          "name": "t_propose",
+          "location": "<t_propose(2) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 20,
+          "name": "t_propose",
+          "location": "<t_propose(2) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 21,
+          "name": "t_propose",
+          "location": "<t_propose(2) line 284, col 13 to line 291, col 25 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 22,
+          "name": "t_send_append",
+          "location": "<t_send_append(0) line 298, col 9 to line 304, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 23,
+          "name": "t_send_append",
+          "location": "<t_send_append(1) line 298, col 9 to line 304, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 24,
+          "name": "t_send_append",
+          "location": "<t_send_append(2) line 298, col 9 to line 304, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 25,
+          "name": "t_recv_append",
+          "location": "<t_recv_append(0) line 309, col 5 to line 330, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 26,
+          "name": "t_recv_append",
+          "location": "<t_recv_append(1) line 309, col 5 to line 330, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 27,
+          "name": "t_recv_append",
+          "location": "<t_recv_append(2) line 309, col 5 to line 330, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 28,
+          "name": "t_send_ack",
+          "location": "<t_send_ack(0) line 336, col 9 to line 340, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 29,
+          "name": "t_send_ack",
+          "location": "<t_send_ack(1) line 336, col 9 to line 340, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 30,
+          "name": "t_send_ack",
+          "location": "<t_send_ack(2) line 336, col 9 to line 340, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 31,
+          "name": "t_leader_commit",
+          "location": "<t_leader_commit(0) line 346, col 9 to line 362, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 32,
+          "name": "t_leader_commit",
+          "location": "<t_leader_commit(1) line 346, col 9 to line 362, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 33,
+          "name": "t_leader_commit",
+          "location": "<t_leader_commit(2) line 346, col 9 to line 362, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 34,
+          "name": "t_send_commit",
+          "location": "<t_send_commit(0) line 367, col 9 to line 371, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 35,
+          "name": "t_send_commit",
+          "location": "<t_send_commit(1) line 367, col 9 to line 371, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 36,
+          "name": "t_send_commit",
+          "location": "<t_send_commit(2) line 367, col 9 to line 371, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 37,
+          "name": "t_recv_commit",
+          "location": "<t_recv_commit(0) line 376, col 5 to line 390, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 38,
+          "name": "t_recv_commit",
+          "location": "<t_recv_commit(1) line 376, col 5 to line 390, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 39,
+          "name": "t_recv_commit",
+          "location": "<t_recv_commit(2) line 376, col 5 to line 390, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 40,
+          "name": "t_bump_term",
+          "location": "<t_bump_term(0) line 396, col 9 to line 400, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 41,
+          "name": "t_bump_term",
+          "location": "<t_bump_term(1) line 396, col 9 to line 400, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 42,
+          "name": "t_bump_term",
+          "location": "<t_bump_term(2) line 396, col 9 to line 400, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 43,
+          "name": "t_step_down",
+          "location": "<t_step_down(0) line 405, col 9 to line 408, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 44,
+          "name": "t_step_down",
+          "location": "<t_step_down(1) line 405, col 9 to line 408, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 45,
+          "name": "t_step_down",
+          "location": "<t_step_down(2) line 405, col 9 to line 408, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 46,
+          "name": "t_restart",
+          "location": "<t_restart(0) line 414, col 9 to line 419, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 47,
+          "name": "t_restart",
+          "location": "<t_restart(1) line 414, col 9 to line 419, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 48,
+          "name": "t_restart",
+          "location": "<t_restart(2) line 414, col 9 to line 419, col 21 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 49,
+          "name": "t_submit_read",
+          "location": "<t_submit_read(0) line 425, col 9 to line 433, col 47 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 50,
+          "name": "t_submit_read",
+          "location": "<t_submit_read(1) line 425, col 9 to line 433, col 47 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 51,
+          "name": "t_submit_read",
+          "location": "<t_submit_read(2) line 425, col 9 to line 433, col 47 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 52,
+          "name": "t_confirm_read",
+          "location": "<t_confirm_read(0) line 438, col 5 to line 449, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 53,
+          "name": "t_confirm_read",
+          "location": "<t_confirm_read(1) line 438, col 5 to line 449, col 28 of module Raft>",
+          "internal": false
+        },
+        {
+          "id": 54,
+          "name": "t_confirm_read",
+          "location": "<t_confirm_read(2) line 438, col 5 to line 449, col 28 of module Raft>",
+          "internal": false
+        }
+      ],
+      "invariants": [
+        "TypeOK",
+        "inv_wf",
+        "inv_hosts",
+        "inv_msgs",
+        "inv_lterms",
+        "inv_ack_persist",
+        "inv_vote_persist",
+        "inv_commits",
+        "inv_leader_completeness",
+        "inv_commit_msgs",
+        "inv_host_commits",
+        "inv_commit_leaders",
+        "inv_reads"
+      ],
+      "implied_actions": [],
+      "implied_inits": [],
+      "temporal_properties": [],
+      "implied_temporals": [],
+      "variables": [
+        "reads",
+        "leader_log",
+        "leader_of",
+        "read_hwm",
+        "net",
+        "hosts",
+        "elect_votes",
+        "voters",
+        "elect_log",
+        "commits"
+      ],
+      "state_constraints": 1,
+      "action_constraints": 0,
+      "symmetry": false
+    }
+  }
+}

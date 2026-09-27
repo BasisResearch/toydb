@@ -1,0 +1,14 @@
+verdict ok, run finished; 7324630 generated, 597764 distinct, 0 queued, diameter 18, 212975 ms exploring
+  invariant TypeOK: no_violation_found
+  invariant inv_wf: no_violation_found
+  invariant inv_hosts: no_violation_found
+  invariant inv_msgs: no_violation_found
+  invariant inv_lterms: no_violation_found
+  invariant inv_ack_persist: no_violation_found
+  invariant inv_vote_persist: no_violation_found
+  invariant inv_commits: no_violation_found
+  invariant inv_leader_completeness: no_violation_found
+  invariant inv_commit_msgs: no_violation_found
+  invariant inv_host_commits: no_violation_found
+  invariant inv_commit_leaders: no_violation_found
+  invariant inv_reads: no_violation_found
