@@ -15,6 +15,15 @@ entry `k` models implementation index `k+1`; TLA+ sequences are 1-based, so
 the TLA+ index *is* the implementation index, and every index expression is
 shifted accordingly (`h.log[b - 1].term` becomes `h.log[b].term`).
 
+`export/` holds what Verus's TLA+ exporter (`verus -V tla-export`) writes
+for the same `safety.rs`, with no hand edits, and `EXPORT.md` compares it
+with this module under TLC. The two agree on distinct states, diameter and
+verdicts. In the CTI probe the same six conjuncts have CTIs, produced by the
+same transitions, but the counts differ (for `inv_msgs`, 162 here against
+432; for `inv_lterms`, 2,904 against 3,672), and the export's
+`inv_ack_persist` probe stops at an off-domain map read. `EXPORT.md` traces
+each difference to this module's (A3) guards or its (A5) total-map reads.
+
 `Raft_cti.tla` is the inductiveness probe: it replaces `INIT` with the
 invariant and takes one step, the question Verus's `step_preserves_inv` is
 asking.
@@ -132,9 +141,11 @@ fire; `t_propose` cannot (every log is full after its noop) and
 `MaxLog = 1` every commit index is 1 and the re-announcement is the message
 `t_leader_commit` already sent (counts from `-coverage` on an
 invariant-free run of the same constants).
-`Raft_deep_reads_witness.cfg` violates `NoR2` with a 15-state trace: terms 1
-and 2 both elect, term 2 commits its noop, and the term-1 leader then submits
-a read whose `born` set holds the term-2 commit.
+`Raft_deep_reads_witness.cfg` violates `NoR2` with a 14-state trace (the
+shortest: a one-worker run finds 14; an earlier multi-worker run reported a
+15-state one, since TLC's breadth-first search is exact only with one
+worker): terms 1 and 2 both elect, term 2 commits its noop, and the term-1
+leader then submits a read whose `born` set holds the term-2 commit.
 
 ## Approximations
 
@@ -257,8 +268,16 @@ to report a violation):
 
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_lc.cfg Raft.tla
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 16 -deadlock -config Raft_deep_reads.cfg Raft.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_lc_witness.cfg Raft.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_reads_witness.cfg Raft.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -deadlock -config Raft_deep_lc_witness.cfg Raft.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -deadlock -config Raft_deep_reads_witness.cfg Raft.tla
+
+The witnesses run with one worker because only then is TLC's search
+breadth-first, so the trace it returns is a shortest one (13 and 14 states).
+With several workers the trace can be longer: four workers have given a
+15-state reads witness. For the same reason, the depth TLC reports with
+several workers is only an upper bound on the diameter. The 16-worker
+`Raft_deep_reads.cfg` run gives the verdicts; its diameter, 24, comes from
+a one-worker run.
 
 `Raft_cti_small.cfg` names `CtiInit_all`; edit its `INIT` to
 `CtiInit_<conjunct>` and its `INVARIANTS` to that one conjunct to reproduce a
