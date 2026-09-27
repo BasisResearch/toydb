@@ -27,6 +27,7 @@ reproduces the export's counts exactly.
 | `RaftExportMC.tla` | extends the export with only what the report asks for: values for the three hole constants, the one variable `Init` leaves unassigned, and `Raft.tla`'s state constraint |
 | `RaftExportMC*.cfg` | `Raft.cfg`, `Raft_deep_lc.cfg`, `Raft_deep_reads.cfg` and the two witness configurations, with the same bounds |
 | `RaftExportCti.tla`, `.cfg`, `cti.sh` | `Raft_cti.tla`'s seed family `CtiSeed`, restated in the export's representation, and the per-conjunct probe loop |
+| `oracle.sh`, `Raft_noA3.cfg`, `Raft_deep_lc_noA3.cfg` | the oracle columns: `oracle.sh a3` runs the same probe loop on `Raft_cti.tla`; `oracle.sh noa3` deletes `Raft.tla`'s four (A3) guard lines in a temporary copy and runs `Raft.cfg` and `Raft_deep_lc.cfg` without `TypeOK` (the two `_noA3.cfg`s), then the probe loop |
 
 The export is taken with the twelve conjuncts named:
 `-V tla-export=safety:inv_wf,...,inv_reads`. Without that, the exporter's
@@ -45,6 +46,14 @@ variable `Init` leaves unassigned.
 | hole `Dom_TStep_BumpTerm_term`: `t_bump_term`'s `t: nat` | `1..MaxTerm` | the guard `t > h.term >= 0` gives `t >= 1`. A `t > MaxTerm` would leave the constraint. This is the oracle's `(h.term + 1)..MaxTerm`. |
 | `init_unassigned: [hosts]` | `MCInit == n = N /\ hosts = [k \in 1..N \|-> init_host] /\ Init` | `init` says `s.n >= 1`, `s.hosts.len() == s.n` and `s.hosts[i] == init_host()` for every `i`, so `hosts` is determined once `n` is. Fixing `n = N` is `Raft.tla`'s (A1), and every step keeps `post.n == pre.n`. |
 | (no `CONSTRAINT`) | `MCConstraint`: `Raft.tla`'s `Constraint` on the export's variables | the same bound: terms, log lengths, read sequence numbers, leader-log lengths, and `Cardinality(net) <= MaxMsgs`. |
+
+Of the three holes, only `q` is a ghost payload. The plan's acceptance
+criterion (`plans/tla_export.md`: "the holes list is empty or names only
+ghost-payload quantifiers") therefore holds only in part. The command
+payload and `t_bump_term`'s term are real step parameters that no guard
+bounds from above: `Seq<u8>` is unbounded, and `t > h.term` is the only
+guard on `t`. No exporter could bound them, and the values above are the
+ones the oracle itself uses.
 
 Everything else is exported as written, in the exporter's general
 representation: `n` stays a variable, `hosts` is a sequence (node `i` at
@@ -90,6 +99,9 @@ one-worker run of each model gives 24 for both, with the oracle generating
 159,660,571 states and the export 185,460,271. The export's one-worker run
 steps with `next` rather than `Next == next /\ TypeOK'`, to cut its time,
 and finds the same 10,849,481 states, so `TypeOK'` excludes nothing there.
+At `Raft.cfg`'s and `Raft_deep_lc.cfg`'s bounds, one-worker runs of the
+export (with `Next`, as configured) give the same diameters as the table, 18
+and 20.
 
 `README.md` gave the reads witness as a 15-state trace; it now says 14.
 TLC's breadth-first search returns a shortest trace only with one worker. Run
@@ -184,7 +196,14 @@ With these fixes, nothing in the export is hand-edited.
   `inv_msgs`, and `t_become_leader` past `MaxLog` for `inv_lterms`.
   Deleting the four guards from a copy of `Raft.tla` reproduces every one
   of the export's numbers: 8,796,586 and 5,075,165 generated, 432 and
-  3,672 CTIs. The export's own invariants need no such guards, because
+  3,672 CTIs (`export/oracle.sh noa3`). That copy has to be checked
+  without `Raft.tla`'s `TypeOK`: without the guards, TLC evaluates the
+  invariants on a successor one step past `MaxTerm`, `MaxLog` or `MaxRead`
+  before the constraint drops it, and `TypeOK`'s bounded domains
+  (`1 .. MaxTerm`, `Logs`, `1 .. MaxRead`) do not contain it. That is
+  exactly what the guards are for, so `Raft_noA3.cfg` and
+  `Raft_deep_lc_noA3.cfg` are `Raft.cfg` and `Raft_deep_lc.cfg` without
+  `TypeOK`. The export's own invariants need no such guards, because
   they have no bounded type domains to leave.
 - **(A5): Verus's `Map` is total; TLA+ functions are not.** `safety.rs`
   reads `s.leader_log[t]` in places where only a sibling conjunct
@@ -209,10 +228,16 @@ With these fixes, nothing in the export is hand-edited.
     not for others. A proof by induction must cover every value, so the
     oracle's CTI is a real obligation for the proof. TLC, however, cannot
     enumerate an unspecified value. The probe restricted to acks whose term
-    has a leader log
-    (`inv_ack_persist_dom` in `RaftExportCti.tla`, and the same restriction
-    in a copy of `Raft_cti.tla`) gives 384 CTIs in both models. The other
-    1,728 of the oracle's 2,112 all rest on `LL` returning `<< >>`.
+    has a leader log, `inv_ack_persist_dom` (in `RaftExportCti.tla`, and in
+    `Raft_cti.tla` over the oracle's representation), gives 384 CTIs in
+    both models. The other 1,728 of the oracle's 2,112 all rest on `LL`
+    returning `<< >>`. Both sides seed and check it the same way: `INIT` is
+    `CtiInit_ack_persist`, the seed conjoined with the *full*
+    `inv_ack_persist`, and `INVARIANTS` is `inv_ack_persist_dom`, checked on
+    the successors. On the seed family the two conjuncts coincide, because
+    every seed ack has term 1, which is in `DOMAIN leader_log`; so the seed
+    is the same 10,560 states either way, and the export can evaluate it.
+    Only the check on the successor is restricted.
 - **(A1), (A2), (A4), (A6)** are now choices of hole values or exporter
   behaviour, not transliteration: `n` is set by `MCInit`, and commands and
   ack maps take the values in the table above. (A6) is fix 2.
@@ -239,14 +264,27 @@ With the exporter from BasisResearch/verus#53 (a source build runs with
     cd tla/export
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -continue -config RaftExportMC.cfg RaftExportMC.tla
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -continue -config RaftExportMC_deep_lc.cfg RaftExportMC.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -config RaftExportMC_deep_lc_witness.cfg RaftExportMC.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -config RaftExportMC_deep_lc_witness.cfg RaftExportMC.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -config RaftExportMC_deep_reads_witness.cfg RaftExportMC.tla
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 16 -continue -config RaftExportMC_deep_reads.cfg RaftExportMC.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -config RaftExportMC_deep_reads_witness.cfg RaftExportMC.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -config RaftExportMC_deep_reads.cfg RaftExportMC.tla
     JAR=<jar> ./cti.sh                         # the CTI table's export column
+    JAR=<jar> ./oracle.sh a3                   # its Raft_cti.tla column
+    JAR=<jar> ./oracle.sh noa3                 # the "without (A3)" numbers
+
+The witnesses run with one worker, since only then is TLC's search
+breadth-first and the trace a shortest one: with four workers the reads
+witness has come out at 15 states instead of 14. With several workers the
+depth TLC reports is an upper bound on the diameter, not the diameter. The
+16-worker `Raft_deep_reads.cfg` run gives the verdicts (and reports depth
+25). The one-worker run after it gives the diameter, 24; it is much
+slower. The `Raft.cfg` and `Raft_deep_lc.cfg` diameters (18 and 20) are
+also the same with one worker as with four.
 
 Verus empties its `--log-dir`, so `export.sh` exports into a temporary
 directory and copies the three files. The `.cfg`s set
 `CHECK_DEADLOCK FALSE`, which is the exporter's default; `-deadlock` is not
-needed. The oracle columns come from the commands in `README.md`. The
-"without (A3)" columns come from a copy of `Raft.tla` with the four lines
-marked `\* bound, see (A3)` deleted.
+needed. The oracle's state-space and witness numbers come from the commands
+in `README.md`. `oracle.sh` prints the oracle's CTI counts. With `noa3` it
+also prints the state counts with the four lines marked
+`\* bound, see (A3)` deleted, checked without `TypeOK` (see (A3) above).

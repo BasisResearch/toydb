@@ -17,8 +17,12 @@ shifted accordingly (`h.log[b - 1].term` becomes `h.log[b].term`).
 
 `export/` holds what Verus's TLA+ exporter (`verus -V tla-export`) writes
 for the same `safety.rs`, with no hand edits, and `EXPORT.md` compares it
-with this module under TLC: the same distinct states, diameter and verdicts,
-and the same CTI table, with every difference accounted for.
+with this module under TLC. The two agree on distinct states, diameter and
+verdicts. In the CTI probe the same six conjuncts have CTIs, produced by the
+same transitions, but the counts differ (for `inv_msgs`, 162 here against
+432; for `inv_lterms`, 2,904 against 3,672), and the export's
+`inv_ack_persist` probe stops at an off-domain map read. `EXPORT.md` traces
+each difference to this module's (A3) guards or its (A5) total-map reads.
 
 `Raft_cti.tla` is the inductiveness probe: it replaces `INIT` with the
 invariant and takes one step, the question Verus's `step_preserves_inv` is
@@ -264,8 +268,16 @@ to report a violation):
 
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_lc.cfg Raft.tla
     java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 16 -deadlock -config Raft_deep_reads.cfg Raft.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_lc_witness.cfg Raft.tla
-    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 4 -deadlock -config Raft_deep_reads_witness.cfg Raft.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -deadlock -config Raft_deep_lc_witness.cfg Raft.tla
+    java -XX:+UseParallelGC -cp <jar> tlc2.TLC -workers 1 -deadlock -config Raft_deep_reads_witness.cfg Raft.tla
+
+The witnesses run with one worker because only then is TLC's search
+breadth-first, so the trace it returns is a shortest one (13 and 14 states).
+With several workers the trace can be longer: four workers have given a
+15-state reads witness. For the same reason, the depth TLC reports with
+several workers is only an upper bound on the diameter. The 16-worker
+`Raft_deep_reads.cfg` run gives the verdicts; its diameter, 24, comes from
+a one-worker run.
 
 `Raft_cti_small.cfg` names `CtiInit_all`; edit its `INIT` to
 `CtiInit_<conjunct>` and its `INVARIANTS` to that one conjunct to reproduce a
