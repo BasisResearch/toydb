@@ -37,7 +37,9 @@
 (* t_leader_commit's ack maps [Q -> 0..MaxLog], which is past a million   *)
 (* functions at N = 5.  For the same reason t_leader_commit is taken at    *)
 (* its logged witness (Q, q) (LeaderCommitAt), which is t_leader_commit's *)
-(* body with its existentials instantiated.                                *)
+(* body with its existentials instantiated.  Likewise t_recv_append is    *)
+(* taken at the logged Append and ack (RecvAppendAt): its body with the    *)
+(* message pinned, so the ack in net is the one the shell sent.           *)
 (*                                                                         *)
 (* Run with CONSTANT TraceLog = "<log>", N the logged cluster size, and    *)
 (* MaxTerm, MaxLog, MaxRead above anything the log reaches (they are      *)
@@ -132,6 +134,31 @@ LeaderCommitAt(i, ci, q) ==
         /\ unch_elect
         /\ unch_reads
 
+\* t_recv_append(i) at the logged Append (term t, base b, base term bt) and
+\* ack mi: its body, with the message's term, base and base term pinned and
+\* its entries to the ones the ack covers (so it implies t_recv_append(i)).
+\* Without the pin TLC may explain the step by any Append in net, and add
+\* the ack that one implies, not the one the shell sent.
+RecvAppendAt(i, t, b, bt, mi) ==
+    \E m \in net :
+        /\ m.kind = "Append"
+        /\ m.term = t
+        /\ m.base = b
+        /\ m.bterm = bt
+        /\ b + Len(m.entries) = mi
+        /\ LET h == hosts[i]
+               entries == m.entries
+               newlog  == splice(h.log, b, entries)
+               newvote == IF t > h.term THEN Nil ELSE h.vote
+           IN  /\ t >= h.term
+               /\ ~(h.role = "Leader" /\ t = h.term)
+               /\ (IF b = 0 THEN TRUE ELSE (b <= Len(h.log) /\ h.log[b].term = bt))
+               /\ hosts' = [hosts EXCEPT ![i] =
+                      [h EXCEPT !.term = t, !.vote = newvote,
+                                !.role = "Follower", !.log = newlog]]
+               /\ net' = net \cup { MAck(i, t, mi) }
+               /\ unch_ghost
+
 TraceStep(e) ==
     LET P(k) == e.params[k]
         i    == IF e.step = "t_grant" THEN P("v") ELSE P("i")
@@ -152,7 +179,7 @@ TraceStep(e) ==
                                             { MAppend(h.term, P("b"),
                                                       IF P("b") = 0 THEN 0 ELSE h.log[P("b")].term,
                                                       SubSeq(h.log, P("b") + 1, P("e"))) }
-      [] e.step = "t_recv_append"   -> t_recv_append(i) /\ hosts'[i].term = P("term")
+      [] e.step = "t_recv_append"   -> RecvAppendAt(i, P("term"), P("base"), P("bterm"), P("mi"))
       [] e.step = "t_send_ack"      -> /\ t_send_ack(i)
                                        /\ net' = net \cup {MAck(i, h.term, P("mi"))}
       [] e.step = "t_leader_commit" -> LeaderCommitAt(i, P("ci"), DecMap(P("q")))

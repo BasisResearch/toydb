@@ -484,6 +484,7 @@ impl RawNode<Follower> {
                             term: msg.term,
                             base: base_index,
                             bterm: base_term,
+                            mi: match_index,
                         });
                         self.send(
                             msg.from,
