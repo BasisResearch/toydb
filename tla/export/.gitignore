@@ -1,0 +1,4 @@
+# TLC writes a trace module beside the spec on every violation (the witness
+# configurations violate on purpose), and its state directory.
+*_TTrace_*
+states/
