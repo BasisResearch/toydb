@@ -1705,34 +1705,34 @@ mod tests {
 
             self.ids = (1..=nodes).collect();
 
-            for id in self.ids.clone() {
-                let peers = self.ids.iter().copied().filter(|i| i != &id).collect();
-                self.add_node(id, peers, opts.clone())?;
-            }
-
-            // Start the step log: the header names the model and holds the
-            // nodes' observed initial states.
+            // Start the step log before the nodes exist (a one-node cluster
+            // elects itself as it starts): the header names the model and
+            // holds the observed initial state, every host the model's
+            // init_host.
             #[cfg(feature = "tla-trace")]
             if let Some(path) = self.trace.clone() {
                 use tla_trace::Value;
-                let mut hosts = Vec::new();
-                for id in self.ids.clone() {
-                    let node = self.nodes.get_mut(&id).expect("node");
-                    let state = with_rawnode!(ref mut node, |n| n.tla_state(&[]));
-                    let Value::Object(fields) = state else { unreachable!() };
-                    let Some((_, Value::Object(host))) = fields.into_iter().next() else {
-                        unreachable!()
-                    };
-                    hosts.extend(host);
-                }
+                let init_host = Value::object([
+                    ("term", Value::from(0u64)),
+                    ("vote", Value::option(None)),
+                    ("role", Value::tag("Follower")),
+                    ("log", Value::Array(Vec::new())),
+                    ("commit", Value::from(0u64)),
+                ]);
+                let hosts = (0..nodes).map(|r| (r.to_string(), init_host.clone()));
                 let module = std::env::var("TOYDB_TLA_TRACE_MODULE").unwrap_or("Raft".into());
                 let header = Value::object([
                     ("module", Value::from(module)),
                     ("export", Value::from("toydb::raft::safety")),
                     ("nodes", Value::from(nodes)),
-                    ("state", Value::object([("hosts", Value::Object(hosts))])),
+                    ("state", Value::object([("hosts", Value::object(hosts))])),
                 ]);
                 tla_trace::start(&path, header)?;
+            }
+
+            for id in self.ids.clone() {
+                let peers = self.ids.iter().copied().filter(|i| i != &id).collect();
+                self.add_node(id, peers, opts.clone())?;
             }
 
             // Promote leader if requested. Suppress output.
