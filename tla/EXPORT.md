@@ -11,8 +11,9 @@ or a genuine difference between `safety.rs` and the transliteration.
 
 In short: with four exporter fixes (BasisResearch/verus#53), the export
 reproduces the oracle's state space exactly. It reaches 597,764 distinct
-states with diameter 18 at `Raft.cfg`'s bounds, and 390,622 with diameter 20
-at `Raft_deep_lc.cfg`'s. All twelve conjuncts hold in both models, and the
+states with diameter 18 at `Raft.cfg`'s bounds, 390,622 with diameter 20 at
+`Raft_deep_lc.cfg`'s, and 10,849,481 with diameter 24 at
+`Raft_deep_reads.cfg`'s. All twelve conjuncts hold in both models, and the
 same six conjuncts have CTIs, produced by the same transitions. The remaining
 differences come from two deliberate choices in `Raft.tla`: its (A3) action
 guards and its (A5) total-map reads. Removing the (A3) guards from the oracle
@@ -68,7 +69,9 @@ indices are shifted once, as `Raft.tla` does by hand.
 | | conjuncts violated | none | **none** |
 | `Raft_deep_lc_witness.cfg` (expected to fail) | `NoLC` violated, trace length | 13 states | **13 states** |
 | `Raft_deep_reads_witness.cfg` (expected to fail) | `NoR2` violated, trace length | 14 states (see below) | **14 states** |
-| `Raft_deep_reads.cfg` (`N=3, MaxLog=1, MaxMsgs=12`, one command) | distinct states / diameter | 10,849,481 / 24 | (run in progress) |
+| `Raft_deep_reads.cfg` (`N=3, MaxLog=1, MaxMsgs=12`, one command) | distinct states / diameter | 10,849,481 / 24 | **10,849,481 / 24** (one worker; 16 workers report 25, see below) |
+| | states generated | 159,660,571 | 185,460,271 |
+| | conjuncts violated | none | **none** (1 h 10 min on 16 workers, load average above 100) |
 
 The twelve conjuncts are checked separately in both models: `inv_wf`,
 `inv_hosts`, `inv_msgs`, `inv_lterms`, `inv_ack_persist`, `inv_vote_persist`,
@@ -79,6 +82,14 @@ predicts. The witnesses show that two of them hold non-vacuously in the deep
 configurations: `NoLC` for leader completeness and `NoR2` for `inv_reads`'s
 R2 clause. Both witnesses are `Raft.tla`'s definitions restated in
 `RaftExportMC.tla`.
+
+TLC's depth with several workers is an upper bound, not the breadth-first
+depth: a state may first be reached through a longer path. At
+`Raft_deep_reads.cfg`'s bounds the export's 16-worker run reported 25. A
+one-worker run of each model gives 24 for both, with the oracle generating
+159,660,571 states and the export 185,460,271. The export's one-worker run
+steps with `next` rather than `Next == next /\ TypeOK'`, to cut its time,
+and finds the same 10,849,481 states, so `TypeOK'` excludes nothing there.
 
 `README.md` gave the reads witness as a 15-state trace; it now says 14.
 TLC's breadth-first search returns a shortest trace only with one worker. Run
