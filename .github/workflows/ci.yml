@@ -7,7 +7,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
     - uses: actions/checkout@v7
@@ -26,3 +26,46 @@ jobs:
     - run: cargo doc --no-deps 
       env:
         RUSTDOCFLAGS: -D warnings
+    # The tla-trace feature (trace validation, see tla/README.md): the shell's
+    # step logging compiles, lints and passes the tests with it on, and the
+    # tla-trace crate (not a workspace member) runs its own tests.
+    - run: cargo clippy --tests --no-deps --features tla-trace -- -D warnings
+    - run: cargo test --features tla-trace
+    - run: cargo fmt --check --manifest-path tla-trace/Cargo.toml
+    - run: cargo clippy --manifest-path tla-trace/Cargo.toml --target-dir target/tla-trace --tests -- -D warnings
+    - run: cargo test --manifest-path tla-trace/Cargo.toml --target-dir target/tla-trace
+
+  trace:
+    name: Trace validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The BasisResearch/tlaplus fork's jar (it has the Json module), the
+      # build verus-tools-mcp pins.
+      TLC_TAG: basis-11305b4a05
+      TLC_SHA256: 46f5b2249f4832bc2927ea24e0ab8ef3791530270e90200314e05c2e67d191a8
+
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@1.97.1
+      id: toolchain
+    - uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '17'
+    - uses: actions/cache@v6
+      with:
+        path: target
+        key: ${{runner.os}}-trace-${{steps.toolchain.outputs.cachekey}}-${{hashFiles('Cargo.lock')}}
+    - name: Download the pinned tla2tools.jar
+      run: |
+        curl -sSfL --retry 5 -o "$RUNNER_TEMP/tla2tools.jar" \
+          "https://github.com/BasisResearch/tlaplus/releases/download/$TLC_TAG/tla2tools.jar"
+        echo "$TLC_SHA256  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
+        echo "TLA2TOOLS_JAR=$RUNNER_TEMP/tla2tools.jar" >> "$GITHUB_ENV"
+    # The election script's step log conforms to tla/Raft.tla, and the
+    # known-bad fixtures diverge at the step their header names.
+    - run: >-
+        tla/conform.sh election
+        tla/traces/election-bad-quorum.ndjson
+        tla/traces/election-bad-ack.ndjson

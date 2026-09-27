@@ -252,8 +252,9 @@ hosts.
 
 `TraceNext` takes the logged step, Raft.tla's action for the logged node,
 with the other logged parameters pinning what the action binds from the
-network (the Append a leader sends, the ack or read confirmation a node
-adds, the ack map `q` a commit rests on), and compares the observed host.
+network (the Append a leader sends, the Append a follower applies and
+the ack it sends back, the ack or read confirmation a node adds, the ack
+map `q` a commit rests on), and compares the observed host.
 Each arm is a disjunct of `Next`, so the trace spec only narrows the model;
 it does not conjoin `Next` again, which would make TLC enumerate
 `t_leader_commit`'s ack maps at every step. TLC run on it explores exactly
@@ -268,8 +269,15 @@ they are guards (A3).
 
     TLA2TOOLS_JAR=<jar> tla/conform.sh             # every node goldenscript
     TLA2TOOLS_JAR=<jar> tla/conform.sh election    # one
+    TLA2TOOLS_JAR=<jar> tla/conform.sh tla/traces/election-bad-ack.ndjson
 
-(the jar needs the `Json` module; the fork's has it). From an agent,
+(the jar needs the `Json` module; the fork's has it). A path checks that
+log as it is. The logs in `traces/` are known-bad copies of `election`'s,
+each with an `"expect_divergence"` step in its header, which must diverge
+at exactly that step: `election-bad-quorum` logs a commit on a non-quorum
+ack map, `election-bad-ack` a follower acking an index past the Append it
+applied. CI (the Trace validation job) runs `election` and both fixtures
+with the pinned jar. From an agent,
 verus-tools-mcp's `tlc_conform` runs the same check on a `tlc_open` session
 of `Raft.tla` (`constants: ["N = 3", "MaxTerm = 20", "MaxLog = 50",
 "MaxRead = 50", "Command = {c1}"]`), and on a divergence reports the model's
