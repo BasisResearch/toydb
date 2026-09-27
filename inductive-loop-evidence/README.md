@@ -8,8 +8,10 @@ transliteration and the `CtiSeed` family). Nothing under `src/` or `tla/` was
 changed.
 
 `rounds/` holds every call's complete record (`NN-name.json`, the tool's
-artifact) and the preview the agent sees (`NN-name.preview.txt`). The run is
-the test `tests/inductive_loop_raft.rs` of verus-tools-mcp:
+artifact) and the preview the agent sees (`NN-name.preview.txt`). Paths in
+them are relative to this checkout (`src/…`, `tla/…`); `<tmp>` is the test's
+temporary directory and `~` the home directory of the machine that ran it.
+The run is the test `tests/inductive_loop_raft.rs` of verus-tools-mcp:
 
     TOYDB_DIR=<this checkout> INDUCTIVE_LOOP_EVIDENCE=<dir> RAFT_TLC_WORKERS=8 \
     VERUS_MCP_TLC_JAR=~/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar \
@@ -17,7 +19,23 @@ the test `tests/inductive_loop_raft.rs` of verus-tools-mcp:
     cargo test --test inductive_loop_raft -- --nocapture
 
 verus-tools-mcp `d2e54ed`, TLC fork `basis-11305b4a05`, Verus fork `95e162cf`
-(cvc5), 2026-09-27, one 32-core box. Whole run 9 min 41 s.
+(cvc5), 2026-09-27, one 32-core box. Whole run 9 min 41 s. The test's
+assertions below were added in verus-tools-mcp `48983c6` and pass against a
+clean build of Verus `95e162cf` (rerun 2026-09-27, 7 min 28 s). The records
+here come from the `d2e54ed` run, with their paths rewritten afterwards into
+the repo-relative form that `48983c6` writes itself.
+
+What the test asserts, per round: both screens ran to the end over all
+597,764 states. Round `02`: no drop of either kind, one induction search
+from 124 pre-states, and all 24 obligations `valid`. Round `03`:
+`terms_le_1` is the only reachability drop and carries a state;
+`net_within_bound` is the only induction drop, relative to all 13
+conjuncts, with its pre and post state; twelve survive and all 24
+obligations are `valid`. Rounds `04`–`15`: no reachability drop, the six
+conjuncts below drop by induction on the action named in the table
+(`inv_msgs` only on the `t_` prefix), and the other six are `screened`.
+Costs, levels, fingerprints and the exact steps of round `03` are recorded,
+not asserted.
 
 ## Setup
 
@@ -63,14 +81,18 @@ they are checked as a conjunction, which is what the plan expected and what
 ## Step 4: two wrong candidates beside the twelve (`03-round-twelve-plus-wrong`)
 
 - `terms_le_1` (`forall|i| 0 <= i < s.n ==> s.hosts[i].term <= 1`): **dropped
-  by reachability**. False on 546,546 stored states, first at BFS level 11
-  (fingerprint and state in the record, with the behaviour that reaches it).
+  by reachability**. False on 546,546 stored states. The record carries the
+  first violating state in the screen's scan order, at BFS level 11 with a
+  10-action behaviour. It is not the shallowest: `t_bump_term` has no guard,
+  so one step from `Init` already puts a host at term 2. The screen reports
+  a violating state and a behaviour that reaches it (fingerprint, state and
+  actions in the record), not a shortest one.
 - `net_within_bound` (`s.net.len() <= 7`, the model's own `MaxMsgs` bound):
   true on every stored state, since the bound is what kept them stored, but
-  **dropped by induction**: from a `CtiSeed` state with seven messages,
-  `t_campaign(1)` adds an eighth. The drop records the 13-conjunct
-  conjunction it was relative to; a second search over the remaining twelve
-  finds nothing.
+  **dropped by induction**: from a `CtiSeed` state with six messages,
+  `t_campaign(1)` adds two, its `Campaign` message and its self-`Vote`, for
+  eight. The drop records the 13-conjunct conjunction it was relative to; a
+  second search over the remaining twelve finds nothing.
 - Verus proves the other twelve: 24 of 24 obligations `valid`, verdict
   `inductive`.
 
@@ -111,15 +133,22 @@ search of up to 10,560 pre-states and 233,824 steps).
   and Verus refutes.
 - **The model's lemmas are trusted in the scratch session.** It verifies
   only the obligations and uses `init_implies_inv` and `step_preserves_inv`
-  through their `ensures`. That proof verifies in this repository's CI
-  (upstream Verus, z3). Under the Basis fork, which always uses cvc5, it
-  does not verify: `model-proof-under-cvc5.txt` records a standalone run of
-  `safety.rs` with 21 functions verified and 20 errors. Every
-  `*_preserves` lemma, the `recv_append_*` helpers and
+  through their `ensures`. That proof verifies with upstream Verus and z3:
+  the `Upstream Verus gate (z3)` job for this PR's base commit `260c949a`
+  (run on PR #16's merge ref, which carries the same `safety.rs`; upstream
+  Verus `0.2026.08.30.b432e82`, `raft::safety` among the gated modules, job
+  passed;
+  [run 36170503453](https://github.com/BasisResearch/toydb/actions/runs/36170503453/job/108188594069)).
+  `safety.rs` is unchanged between that commit and this PR. Under the Basis
+  fork, which always uses cvc5, it does not verify:
+  `model-proof-under-cvc5.txt` records a standalone run of `safety.rs` with
+  the fork build the rounds used (`95e162cf`), 21 functions verified and 20
+  errors. Every `*_preserves` lemma, the `recv_append_*` helpers and
   `execution_implies_inv` exceed the rlimit. So the rounds' `inductive` is
-  conditional on the z3 proof. `verify_model: true` makes the scratch
-  session verify the model as well, which under the fork would report those
-  twenty failures, not a proof of the candidates.
+  conditional on the z3 proof in CI, not on anything this run checked.
+  `verify_model: true` makes the scratch session verify the model as well,
+  which under the fork would report those twenty failures, not a proof of
+  the candidates.
 - **Nothing is dropped silently.** Every drop carries its state or its step,
   and the conjunction it was relative to. States are TLA+ values here,
   because this session is a `tlc_open` over the hand-written transliteration.

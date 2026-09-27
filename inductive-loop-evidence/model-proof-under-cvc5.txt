@@ -1,5 +1,10 @@
-# safety.rs verified whole by the Basis Verus fork (cvc5), standalone
-# verus safety.rs --crate-type=lib --num-threads 16  (fork main b4c09033; wall 9m58s at 8 threads)
+# safety.rs verified whole by the Basis Verus fork (cvc5), standalone.
+# Rerun 2026-09-27 on this PR's safety.rs (unchanged since base 260c949a) with
+#   verus safety.rs --crate-type=lib --num-threads 16   (wall 8m22s)
+# using a clean build of the fork at 95e162cf (kg/model-tools), the build the
+# rounds used; `verus --version`: 0.2026.09.27.95e162c (cvc5 1.3.5.dev+main@e68dc63).
+# An earlier run with fork main b4c09033 gave the same 21 verified / 20 errors
+# on the same functions.
 verification results:: 21 verified, 20 errors
 rlimit exceeded: proof fn campaign_preserves (safety.rs:1510)
 rlimit exceeded: proof fn grant_preserves (safety.rs:1698)

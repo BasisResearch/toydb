@@ -2,11 +2,11 @@
   "schema_version": 1,
   "tool": "tlc_open",
   "request": {
-    "spec": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft_cti.tla",
-    "config": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft.cfg",
+    "spec": "tla/Raft_cti.tla",
+    "config": "tla/Raft.cfg",
     "workers": 8,
     "coverage": false,
-    "metadir": "/Users/kirancodes/tmp/vtm-il-raft-mO1Bbf/states"
+    "metadir": "<tmp>/states"
   },
   "status": "done",
   "summary": {
@@ -22,9 +22,9 @@
   },
   "data": {
     "session_id": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
-    "spec": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/tla/Raft_cti.tla",
+    "spec": "tla/Raft_cti.tla",
     "root_module": "Raft_cti",
-    "metadir": "/Users/kirancodes/tmp/vtm-il-raft-mO1Bbf/states/26-09-27-01-55-39.949",
+    "metadir": "<tmp>/states/26-09-27-01-55-39.949",
     "workers": 8,
     "check_deadlock": true,
     "coverage": false,

@@ -3,7 +3,7 @@
   "tool": "inductive_loop",
   "request": {
     "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
-    "model_path": "/data/home/kirancodes/Documents/code/verus-research/tasks/inductive-loop/toydb/src/raft/safety.rs",
+    "model_path": "src/raft/safety.rs",
     "state_type": "GState",
     "typing": "CtiSeed",
     "proof": {
