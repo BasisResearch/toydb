@@ -1738,19 +1738,20 @@ mod tests {
             // Promote leader if requested. Suppress output.
             if let Some(id) = leader {
                 let quiet = &mut String::new();
-                let Some(Node::Follower(node)) = self.nodes.remove(&id) else {
+                if !matches!(self.nodes.get(&id), Some(Node::Follower(_))) {
                     return Err(format!("invalid leader {id}").into());
-                };
-                // Record every peer's (implicit) vote, as the real election
-                // path would, so the verified quorum check in into_leader is
-                // satisfied.
-                let mut node = node.into_candidate()?;
-                for peer in node.peers.iter().copied().sorted() {
-                    node.abs.collect_vote(&node.log, peer, node.term());
                 }
-                self.nodes.insert(id, node.into_leader()?.into());
-                self.receive(id, quiet)?;
+                // Elect it through the message path, as a real election
+                // would: it campaigns, every peer grants its vote, and the
+                // responses win it the election. (Recording the peers' votes
+                // directly skips the Vote messages the safety model's
+                // t_collect_vote rests on, so a step log of the script, see
+                // tla/Raft_trace.tla, is no behaviour of the model.)
+                self.campaign(&[id], quiet)?;
                 self.stabilize(&self.ids.clone(), true, quiet)?;
+                if !matches!(self.nodes.get(&id), Some(Node::Leader(_))) {
+                    return Err(format!("{id} did not win the election").into());
+                }
             }
 
             // Drain any initial applied entries.
