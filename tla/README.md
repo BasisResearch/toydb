@@ -235,6 +235,66 @@ The remaining six — `inv_wf`, `inv_hosts`, `inv_commits`,
 this family*. That is not a claim that they are inductive on their own; the
 family is narrow.
 
+## Trace validation
+
+`Raft_trace.tla` checks that a run of the implementation is a behaviour of
+this model. Built with `--features tla-trace`, the Raft shell logs every
+model transition it performs through a verified step function
+(`src/raft/node.rs`, `trace_step!` from the `tla-trace/` crate): one JSON
+line per step, the `t_*` name, its parameters under the model's names, and
+the stepping node's observed host state afterwards (`term`, `vote`, `role`,
+`log`, `commit`, plus `votes` while a candidate and `read_seq` while a
+leader), in the Verus exporter's value encoding. Ghost state (the payloads,
+the network, the ghost maps) is not logged and stays free. The node
+goldenscripts then write one log per script to
+`target/tla-traces/node/<script>.ndjson`, starting from the model's initial
+hosts.
+
+`TraceNext` takes the logged step, Raft.tla's action for the logged node,
+with the other logged parameters pinning what the action binds from the
+network (the Append a leader sends, the Append a follower applies and
+the ack it sends back, the ack or read confirmation a node adds, the ack
+map `q` a commit rests on), and compares the observed host.
+Each arm is a disjunct of `Next`, so the trace spec only narrows the model;
+it does not conjoin `Next` again, which would make TLC enumerate
+`t_leader_commit`'s ack maps at every step. TLC run on it explores exactly
+the model's behaviours that explain the log. The log conforms when the
+search depth is its number of steps plus one; otherwise the depth is the
+first step no such behaviour can take, and `TraceEnabled` /
+`TraceDiagnosis` evaluated there say which steps the model had and why the
+logged one did not fit. `Command = {c1}` in `Raft_trace.cfg`: the log says
+only whether an entry is the noop, and (A2) makes every write the same
+abstract command; the bounds sit above anything a script reaches, since
+they are guards (A3).
+
+    TLA2TOOLS_JAR=<jar> tla/conform.sh             # every node goldenscript
+    TLA2TOOLS_JAR=<jar> tla/conform.sh election    # one
+    TLA2TOOLS_JAR=<jar> tla/conform.sh tla/traces/election-bad-ack.ndjson
+
+(the jar needs the `Json` module; the fork's has it). A path checks that
+log as it is. The logs in `traces/` are known-bad copies of `election`'s,
+each with an `"expect_divergence"` step in its header, which must diverge
+at exactly that step: `election-bad-quorum` logs a commit on a non-quorum
+ack map, `election-bad-ack` a follower acking an index past the Append it
+applied. CI (the Trace validation job) runs, with the pinned jar,
+`tla/conform.sh` over every node goldenscript's log, then
+`tla/conform.sh tla/traces/*.ndjson` over the fixtures. From an agent,
+verus-tools-mcp's `tlc_conform` runs the same check on a `tlc_open` session
+of `Raft.tla` (`constants: ["N = 3", "MaxTerm = 20", "MaxLog = 50",
+"MaxRead = 50", "Command = {c1}"]`), and on a divergence reports the model's
+state there, the path to it and its enabled steps. It runs the exporter's
+generated trace spec the same way once the exported model is faithful.
+
+All 58 node goldenscripts conform, each with exactly one explaining
+behaviour (as many distinct states as steps plus one): 0 to 248 steps on 1
+to 7 nodes, elections, contested and tied elections, appends and probes,
+heartbeats, reads, client requests and restarts. The first run found one
+divergence, in the test harness rather than the shell: `cluster leader=N`
+promoted its leader by recording the peers' votes directly, with no Vote
+message behind them, so every such script left the model at
+`t_become_leader`; the harness now elects through the messages, with every
+script's output unchanged.
+
 ## Running it
 
 With the jar from the fork's build (`tlaplus/tlatools/org.lamport.tlatools/dist/tla2tools.jar`):

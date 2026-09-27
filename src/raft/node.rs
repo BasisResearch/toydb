@@ -14,6 +14,22 @@ use super::{APPLY_BATCH_SIZE, ELECTION_TIMEOUT_RANGE, HEARTBEAT_INTERVAL, MAX_AP
 use crate::errinput;
 use crate::error::{Error, Result};
 
+/// Logs the model step the shell just took through a verified step function,
+/// with this node's observed model state after it, for trace validation (the
+/// `tla-trace` feature; without it, nothing). The step is the `t_*`
+/// transition of `raft::safety`, its parameters the model's names for them.
+/// `omit` leaves fields out of the observed state: a step logged before a
+/// later state change in the same step function.
+macro_rules! trace_step {
+    ($node:expr, $step:literal, { $($k:ident : $v:expr),* $(,)? }) => {
+        trace_step!($node, $step, { $($k: $v),* }, omit: &[])
+    };
+    ($node:expr, $step:literal, { $($k:ident : $v:expr),* $(,)? }, omit: $omit:expr) => {
+        #[cfg(feature = "tla-trace")]
+        tla_trace::trace_step!($step, { $($k: $v),* }, $node.tla_state($omit));
+    };
+}
+
 /// A node ID, unique within a cluster. Assigned manually when started.
 pub type NodeID = u8;
 
@@ -193,6 +209,12 @@ pub struct RawNode<R: Role> {
 }
 
 impl<R: Role> RawNode<R> {
+    /// This node's observed model state (see `refine::tla_view`).
+    #[cfg(feature = "tla-trace")]
+    fn tla_state(&mut self, omit: &[&str]) -> tla_trace::Value {
+        self.abs.tla_state(&mut self.log, omit).expect("tla-trace: reading the log failed")
+    }
+
     /// Helper for role transitions.
     fn into_role<T: Role>(self, role: T) -> RawNode<T> {
         RawNode {
@@ -300,6 +322,13 @@ impl RawNode<Follower> {
         };
         let mut node = Self { id, peers, log, state, tx, opts, abs, role };
         node.role.election_timeout = node.random_election_timeout();
+        // A node recovering a log that has seen a step is restarting: the
+        // model's t_restart (a fresh log is the initial state).
+        #[cfg(feature = "tla-trace")]
+        if node.log.get_term_vote().0 > 0 || node.log.get_last_index().0 > 0 {
+            trace_step!(node, "t_restart",
+                { i: node.abs.tla_rank(), commit: node.log.get_commit_index().0 });
+        }
 
         // Apply any pending entries following restart. State machine writes are
         // not flushed to durable storage, so a tail of writes may be lost if
@@ -355,6 +384,7 @@ impl RawNode<Follower> {
             // it writes the new term with a cleared vote to the log.
             let bumped = self.abs.bump_term(&mut self.log, term)?;
             assert!(bumped, "term regression in into_follower");
+            trace_step!(self, "t_bump_term", { i: self.abs.tla_rank(), term: term });
             self.role = Follower::new(None, self.random_election_timeout());
         }
         Ok(self)
@@ -401,6 +431,26 @@ impl RawNode<Follower> {
                     commit_index,
                     read_seq,
                 )?;
+                // The commit advance comes last: the steps before it are
+                // logged without the commit index.
+                #[cfg(feature = "tla-trace")]
+                {
+                    let before_commit: &[&str] = if plan.committed { &["commit"] } else { &[] };
+                    if plan.match_index != 0 {
+                        trace_step!(self, "t_send_ack",
+                            { i: self.abs.tla_rank(), mi: plan.match_index },
+                            omit: before_commit);
+                    }
+                    if read_seq >= 1 {
+                        trace_step!(self, "t_confirm_read",
+                            { i: self.abs.tla_rank(), term: msg.term, seq: read_seq },
+                            omit: before_commit);
+                    }
+                    if plan.committed {
+                        trace_step!(self, "t_recv_commit",
+                            { i: self.abs.tla_rank(), ci: commit_index, mi: last_index });
+                    }
+                }
                 self.send(
                     msg.from,
                     Message::HeartbeatResponse { match_index: plan.match_index, read_seq },
@@ -430,6 +480,13 @@ impl RawNode<Follower> {
                     entries,
                 )? {
                     refine::AppendPlan::Accept { match_index } => {
+                        trace_step!(self, "t_recv_append", {
+                            i: self.abs.tla_rank(),
+                            term: msg.term,
+                            base: base_index,
+                            bterm: base_term,
+                            mi: match_index,
+                        });
                         self.send(
                             msg.from,
                             Message::AppendResponse { match_index, reject_index: 0 },
@@ -454,6 +511,11 @@ impl RawNode<Follower> {
 
                 // Confirm the read. Verified: the model's t_confirm_read.
                 let seq = self.abs.follower_read(&self.log, msg.term, seq);
+                #[cfg(feature = "tla-trace")]
+                if seq >= 1 {
+                    trace_step!(self, "t_confirm_read",
+                        { i: self.abs.tla_rank(), term: msg.term, seq: seq });
+                }
                 self.send(msg.from, Message::ReadResponse { seq })?;
             }
 
@@ -468,6 +530,11 @@ impl RawNode<Follower> {
             // the model's t_grant transition.
             Message::Campaign { last_index, last_term } => {
                 if self.abs.grant(&mut self.log, msg.from, msg.term, last_index, last_term)? {
+                    trace_step!(self, "t_grant", {
+                        v: self.abs.tla_rank(),
+                        c: self.abs.tla_rank_of(msg.from),
+                        term: msg.term,
+                    });
                     info!("Voting for {} in term {} election", msg.from, msg.term);
                     self.send(msg.from, Message::CampaignResponse { vote: true })?;
                 } else {
@@ -584,6 +651,7 @@ impl RawNode<Candidate> {
             info!("Lost election, following leader {leader} in term {term}");
             // Verified: this step is the model's t_step_down transition.
             self.abs.step_down(&self.log);
+            trace_step!(self, "t_step_down", { i: self.abs.tla_rank() });
             Ok(self.into_role(Follower::new(Some(leader), election_timeout)))
         } else {
             // We found a new term, but we don't necessarily know who the leader
@@ -593,6 +661,7 @@ impl RawNode<Candidate> {
             // Verified: this step is the model's t_bump_term transition.
             let bumped = self.abs.bump_term(&mut self.log, term)?;
             assert!(bumped, "term regression in into_follower");
+            trace_step!(self, "t_bump_term", { i: self.abs.tla_rank(), term: term });
             Ok(self.into_role(Follower::new(None, election_timeout)))
         }
     }
@@ -610,6 +679,7 @@ impl RawNode<Candidate> {
         // transition includes appending the empty entry that disambiguates
         // previous entries in the log (section 5.4.2 in the Raft paper).
         let index = self.abs.become_leader(&mut self.log)?;
+        trace_step!(self, "t_become_leader", { i: self.abs.tla_rank() });
         let mut node = self.into_role(Leader::new());
 
         // Eagerly replicate the noop entry, prior to the heartbeat, to avoid
@@ -642,7 +712,10 @@ impl RawNode<Candidate> {
             // ghost network evidence; the quorum check is verified in
             // become_leader.
             Message::CampaignResponse { vote: true } => {
-                if self.abs.collect_vote(&self.log, msg.from, msg.term) {
+                let won = self.abs.collect_vote(&self.log, msg.from, msg.term);
+                trace_step!(self, "t_collect_vote",
+                    { i: self.abs.tla_rank(), v: self.abs.tla_rank_of(msg.from) });
+                if won {
                     return Ok(self.into_leader()?.into());
                 }
             }
@@ -692,6 +765,7 @@ impl RawNode<Candidate> {
     /// the ghost Campaign message carrying our log view.
     fn campaign(&mut self) -> Result<()> {
         let plan = self.abs.campaign(&mut self.log)?;
+        trace_step!(self, "t_campaign", { i: self.abs.tla_rank() });
         info!("Starting new election for term {term}", term = plan.term);
         self.role = Candidate::new(self.random_election_timeout());
         self.broadcast(Message::Campaign { last_index: plan.last_index, last_term: plan.last_term })
@@ -767,6 +841,7 @@ impl RawNode<Leader> {
         // Verified: this step is the model's t_bump_term transition.
         let bumped = self.abs.bump_term(&mut self.log, term)?;
         assert!(bumped, "term regression in into_follower");
+        trace_step!(self, "t_bump_term", { i: self.abs.tla_rank(), term: term });
         let election_timeout = self.random_election_timeout();
         Ok(self.into_role(Follower::new(None, election_timeout)))
     }
@@ -879,6 +954,7 @@ impl RawNode<Leader> {
             // and our own confirmation in the ghost history.
             Message::ClientRequest { id, request: Request::Read(command) } => {
                 let seq = self.abs.submit_read(&self.log);
+                trace_step!(self, "t_submit_read", { i: self.abs.tla_rank() });
                 let read = Read { seq, from: msg.from, id, command };
                 self.role.reads.push_back(read);
                 self.broadcast(Message::Read { seq })?;
@@ -928,6 +1004,10 @@ impl RawNode<Leader> {
     /// ghost commit witness.
     fn heartbeat(&mut self) -> Result<()> {
         let hb = self.abs.leader_heartbeat(&self.log);
+        #[cfg(feature = "tla-trace")]
+        if hb.commit_index >= 1 {
+            trace_step!(self, "t_send_commit", { i: self.abs.tla_rank(), ci: hb.commit_index });
+        }
         self.role.since_heartbeat = 0;
         self.broadcast(Message::Heartbeat {
             last_index: hb.last_index,
@@ -942,6 +1022,7 @@ impl RawNode<Leader> {
     /// transition.
     fn propose(&mut self, command: Option<Vec<u8>>) -> Result<Index> {
         let index = self.abs.propose(&mut self.log, command)?;
+        trace_step!(self, "t_propose", { i: self.abs.tla_rank() });
         self.replicate_appended(index)?;
         Ok(index)
     }
@@ -973,6 +1054,14 @@ impl RawNode<Leader> {
             // 0), or its entry is not from our own term. Nothing to do.
             return Ok(old_index);
         };
+        // The leader acks its own last index, then commits.
+        trace_step!(self, "t_send_ack",
+            { i: self.abs.tla_rank(), mi: self.log.get_last_index().0 }, omit: &["commit"]);
+        trace_step!(self, "t_leader_commit", {
+            i: self.abs.tla_rank(),
+            ci: commit_index,
+            q: self.abs.tla_commit_quorum(&self.log, commit_index),
+        });
 
         // Apply entries and respond to clients. The verified read_committed
         // pins each batch to the committed prefix of the log's verified view,
@@ -1071,6 +1160,11 @@ impl RawNode<Leader> {
         else {
             return Ok(());
         };
+        trace_step!(self, "t_send_append", {
+            i: self.abs.tla_rank(),
+            b: msg.base_index,
+            e: msg.base_index + msg.entries.len() as Index,
+        });
         debug!(
             "Replicating {count} entries with base {base} to {peer}",
             count = msg.entries.len(),
@@ -1128,7 +1222,25 @@ mod tests {
     test_each_path! { in "src/raft/testscripts/node" as scripts => test_goldenscript }
 
     fn test_goldenscript(path: &Path) {
-        goldenscript::run(&mut TestRunner::new(), path).expect("goldenscript failed")
+        let mut runner = TestRunner::new();
+        // With the tla-trace feature, every script logs its model steps to
+        // target/tla-traces/node/<script>.ndjson (or $TOYDB_TLA_TRACE_DIR),
+        // for trace validation against tla/Raft.tla: the log starts once the
+        // script creates its cluster, and ends with the script.
+        #[cfg(feature = "tla-trace")]
+        {
+            let dir = std::env::var_os("TOYDB_TLA_TRACE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tla-traces/node")
+                });
+            let name = path.file_name().expect("script name").to_string_lossy();
+            runner.trace = Some(dir.join(format!("{name}.ndjson")));
+        }
+        let result = goldenscript::run(&mut runner, path);
+        #[cfg(feature = "tla-trace")]
+        tla_trace::finish();
+        result.expect("goldenscript failed")
     }
 
     /// Tests RawNode.quorum_size() and cluster_size().
@@ -1254,6 +1366,9 @@ mod tests {
         next_request_id: u64,
         /// Temporary directory (deleted when dropped).
         tempdir: TempDir,
+        /// Where the model steps are logged (the tla-trace feature).
+        #[cfg(feature = "tla-trace")]
+        trace: Option<std::path::PathBuf>,
     }
 
     /// Commands accepted by the TestRunner.
@@ -1513,6 +1628,8 @@ mod tests {
                 requests: HashMap::new(),
                 next_request_id: 1,
                 tempdir: TempDir::with_prefix("toydb").expect("tempdir failed"),
+                #[cfg(feature = "tla-trace")]
+                trace: None,
             }
         }
 
@@ -1590,6 +1707,31 @@ mod tests {
 
             self.ids = (1..=nodes).collect();
 
+            // Start the step log before the nodes exist (a one-node cluster
+            // elects itself as it starts): the header names the model and
+            // holds the observed initial state, every host the model's
+            // init_host.
+            #[cfg(feature = "tla-trace")]
+            if let Some(path) = self.trace.clone() {
+                use tla_trace::Value;
+                let init_host = Value::object([
+                    ("term", Value::from(0u64)),
+                    ("vote", Value::option(None)),
+                    ("role", Value::tag("Follower")),
+                    ("log", Value::Array(Vec::new())),
+                    ("commit", Value::from(0u64)),
+                ]);
+                let hosts = (0..nodes).map(|r| (r.to_string(), init_host.clone()));
+                let module = std::env::var("TOYDB_TLA_TRACE_MODULE").unwrap_or("Raft".into());
+                let header = Value::object([
+                    ("module", Value::from(module)),
+                    ("export", Value::from("toydb::raft::safety")),
+                    ("nodes", Value::from(nodes)),
+                    ("state", Value::object([("hosts", Value::object(hosts))])),
+                ]);
+                tla_trace::start(&path, header)?;
+            }
+
             for id in self.ids.clone() {
                 let peers = self.ids.iter().copied().filter(|i| i != &id).collect();
                 self.add_node(id, peers, opts.clone())?;
@@ -1598,19 +1740,20 @@ mod tests {
             // Promote leader if requested. Suppress output.
             if let Some(id) = leader {
                 let quiet = &mut String::new();
-                let Some(Node::Follower(node)) = self.nodes.remove(&id) else {
+                if !matches!(self.nodes.get(&id), Some(Node::Follower(_))) {
                     return Err(format!("invalid leader {id}").into());
-                };
-                // Record every peer's (implicit) vote, as the real election
-                // path would, so the verified quorum check in into_leader is
-                // satisfied.
-                let mut node = node.into_candidate()?;
-                for peer in node.peers.iter().copied().sorted() {
-                    node.abs.collect_vote(&node.log, peer, node.term());
                 }
-                self.nodes.insert(id, node.into_leader()?.into());
-                self.receive(id, quiet)?;
+                // Elect it through the message path, as a real election
+                // would: it campaigns, every peer grants its vote, and the
+                // responses win it the election. (Recording the peers' votes
+                // directly skips the Vote messages the safety model's
+                // t_collect_vote rests on, so a step log of the script, see
+                // tla/Raft_trace.tla, is no behaviour of the model.)
+                self.campaign(&[id], quiet)?;
                 self.stabilize(&self.ids.clone(), true, quiet)?;
+                if !matches!(self.nodes.get(&id), Some(Node::Leader(_))) {
+                    return Err(format!("{id} did not win the election").into());
+                }
             }
 
             // Drain any initial applied entries.
