@@ -63,9 +63,8 @@ jobs:
           "https://github.com/BasisResearch/tlaplus/releases/download/$TLC_TAG/tla2tools.jar"
         echo "$TLC_SHA256  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
         echo "TLA2TOOLS_JAR=$RUNNER_TEMP/tla2tools.jar" >> "$GITHUB_ENV"
-    # The election script's step log conforms to tla/Raft.tla, and the
-    # known-bad fixtures diverge at the step their header names.
-    - run: >-
-        tla/conform.sh election
-        tla/traces/election-bad-quorum.ndjson
-        tla/traces/election-bad-ack.ndjson
+    # Every node goldenscript's step log conforms to tla/Raft.tla (conform.sh
+    # with no arguments runs the tests and checks each log), and the known-bad
+    # fixtures diverge at the step their header names.
+    - run: tla/conform.sh
+    - run: tla/conform.sh tla/traces/*.ndjson

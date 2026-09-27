@@ -276,8 +276,9 @@ log as it is. The logs in `traces/` are known-bad copies of `election`'s,
 each with an `"expect_divergence"` step in its header, which must diverge
 at exactly that step: `election-bad-quorum` logs a commit on a non-quorum
 ack map, `election-bad-ack` a follower acking an index past the Append it
-applied. CI (the Trace validation job) runs `election` and both fixtures
-with the pinned jar. From an agent,
+applied. CI (the Trace validation job) runs, with the pinned jar,
+`tla/conform.sh` over every node goldenscript's log, then
+`tla/conform.sh tla/traces/*.ndjson` over the fixtures. From an agent,
 verus-tools-mcp's `tlc_conform` runs the same check on a `tlc_open` session
 of `Raft.tla` (`constants: ["N = 3", "MaxTerm = 20", "MaxLog = 50",
 "MaxRead = 50", "Command = {c1}"]`), and on a divergence reports the model's

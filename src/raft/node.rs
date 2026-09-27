@@ -437,7 +437,8 @@ impl RawNode<Follower> {
                 {
                     let before_commit: &[&str] = if plan.committed { &["commit"] } else { &[] };
                     if plan.match_index != 0 {
-                        trace_step!(self, "t_send_ack", { i: self.abs.tla_rank(), mi: last_index },
+                        trace_step!(self, "t_send_ack",
+                            { i: self.abs.tla_rank(), mi: plan.match_index },
                             omit: before_commit);
                     }
                     if read_seq >= 1 {
