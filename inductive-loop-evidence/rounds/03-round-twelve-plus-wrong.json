@@ -1,0 +1,1052 @@
+{
+  "schema_version": 1,
+  "tool": "inductive_loop",
+  "request": {
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_path": "src/raft/safety.rs",
+    "state_type": "GState",
+    "typing": "CtiSeed",
+    "proof": {
+      "init": "init_implies_inv(s);",
+      "step": "let step = choose|step: TStep| next_step(pre, post, step);\nstep_preserves_inv(pre, post, step);"
+    },
+    "budget": {
+      "screen_ms": 1800000,
+      "cti_ms": 600000,
+      "verus_check_secs": 300
+    },
+    "candidates": [
+      {
+        "name": "inv_wf"
+      },
+      {
+        "name": "inv_hosts"
+      },
+      {
+        "name": "inv_msgs"
+      },
+      {
+        "name": "inv_lterms"
+      },
+      {
+        "name": "inv_ack_persist"
+      },
+      {
+        "name": "inv_vote_persist"
+      },
+      {
+        "name": "inv_commits"
+      },
+      {
+        "name": "inv_leader_completeness"
+      },
+      {
+        "name": "inv_commit_msgs"
+      },
+      {
+        "name": "inv_host_commits"
+      },
+      {
+        "name": "inv_commit_leaders"
+      },
+      {
+        "name": "inv_reads"
+      },
+      {
+        "name": "terms_le_1",
+        "verus": "forall|i: int| 0 <= i < s.n ==> s.hosts[i].term <= 1",
+        "tla": "\\A i \\in node_ids : hosts[i].term <= 1"
+      },
+      {
+        "name": "net_within_bound",
+        "verus": "s.net.len() <= 7",
+        "tla": "Cardinality(net) <= 7"
+      }
+    ]
+  },
+  "status": "done",
+  "summary": {
+    "success": true,
+    "crate_name": null,
+    "scope": null,
+    "verified": null,
+    "errors": 0,
+    "warnings": null,
+    "total": 14,
+    "shown": 0,
+    "duration_ms": 68220
+  },
+  "data": {
+    "round_id": "f3b66aebbdfd",
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_backend": "tlc",
+    "candidates": [
+      {
+        "name": "inv_wf",
+        "verus": "inv_wf(s)",
+        "tla": "inv_wf"
+      },
+      {
+        "name": "inv_hosts",
+        "verus": "inv_hosts(s)",
+        "tla": "inv_hosts"
+      },
+      {
+        "name": "inv_msgs",
+        "verus": "inv_msgs(s)",
+        "tla": "inv_msgs"
+      },
+      {
+        "name": "inv_lterms",
+        "verus": "inv_lterms(s)",
+        "tla": "inv_lterms"
+      },
+      {
+        "name": "inv_ack_persist",
+        "verus": "inv_ack_persist(s)",
+        "tla": "inv_ack_persist"
+      },
+      {
+        "name": "inv_vote_persist",
+        "verus": "inv_vote_persist(s)",
+        "tla": "inv_vote_persist"
+      },
+      {
+        "name": "inv_commits",
+        "verus": "inv_commits(s)",
+        "tla": "inv_commits"
+      },
+      {
+        "name": "inv_leader_completeness",
+        "verus": "inv_leader_completeness(s)",
+        "tla": "inv_leader_completeness"
+      },
+      {
+        "name": "inv_commit_msgs",
+        "verus": "inv_commit_msgs(s)",
+        "tla": "inv_commit_msgs"
+      },
+      {
+        "name": "inv_host_commits",
+        "verus": "inv_host_commits(s)",
+        "tla": "inv_host_commits"
+      },
+      {
+        "name": "inv_commit_leaders",
+        "verus": "inv_commit_leaders(s)",
+        "tla": "inv_commit_leaders"
+      },
+      {
+        "name": "inv_reads",
+        "verus": "inv_reads(s)",
+        "tla": "inv_reads"
+      },
+      {
+        "name": "terms_le_1",
+        "verus": "forall|i: int| 0 <= i < s.n ==> s.hosts[i].term <= 1",
+        "tla": "\\A i \\in node_ids : hosts[i].term <= 1"
+      },
+      {
+        "name": "net_within_bound",
+        "verus": "s.net.len() <= 7",
+        "tla": "Cardinality(net) <= 7"
+      }
+    ],
+    "typing": "CtiSeed",
+    "dropped_by_reachability": [
+      {
+        "name": "terms_le_1",
+        "violations": 546546,
+        "fp": "-4912696935369779748",
+        "level": 11,
+        "state": {
+          "elect_votes": [
+            {
+              "0": [],
+              "2": []
+            }
+          ],
+          "voters": [
+            [
+              0,
+              2
+            ]
+          ],
+          "leader_of": [
+            0
+          ],
+          "hosts": {
+            "0": {
+              "term": 1,
+              "vote": 0,
+              "role": "Leader",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                },
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 0,
+              "votes": [
+                0,
+                2
+              ],
+              "vote_logs": {
+                "0": [],
+                "2": []
+              },
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "1": {
+              "term": 2,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "2": {
+              "term": 2,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            }
+          },
+          "leader_log": [
+            [
+              {
+                "term": 1,
+                "cmd": "Nil"
+              },
+              {
+                "term": 1,
+                "cmd": "Nil"
+              }
+            ]
+          ],
+          "elect_log": [
+            []
+          ],
+          "reads": [],
+          "commits": [],
+          "read_hwm": [],
+          "net": [
+            {
+              "term": 1,
+              "c": 0,
+              "clog": [],
+              "kind": "Campaign"
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 0,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 2,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "base": 0,
+              "entries": [],
+              "kind": "Append",
+              "bterm": 0
+            },
+            {
+              "term": 1,
+              "base": 1,
+              "entries": [],
+              "kind": "Append",
+              "bterm": 1
+            },
+            {
+              "term": 1,
+              "base": 1,
+              "entries": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "kind": "Append",
+              "bterm": 1
+            }
+          ]
+        },
+        "path": [
+          "t_campaign",
+          "t_grant",
+          "t_collect_vote",
+          "t_become_leader",
+          "t_propose",
+          "t_send_append",
+          "t_send_append",
+          "t_send_append",
+          "t_bump_term",
+          "t_bump_term"
+        ]
+      }
+    ],
+    "reachability_complete": true,
+    "unscreened": [],
+    "dropped_by_induction": [
+      {
+        "name": "net_within_bound",
+        "relative_to": [
+          "inv_wf",
+          "inv_hosts",
+          "inv_msgs",
+          "inv_lterms",
+          "inv_ack_persist",
+          "inv_vote_persist",
+          "inv_commits",
+          "inv_leader_completeness",
+          "inv_commit_msgs",
+          "inv_host_commits",
+          "inv_commit_leaders",
+          "inv_reads",
+          "net_within_bound"
+        ],
+        "action": "<t_campaign(1) line 219, col 9 to line 225, col 21 of module Raft>",
+        "changed": [
+          "hosts",
+          "net"
+        ],
+        "pre": {
+          "elect_votes": [
+            {
+              "0": [],
+              "1": []
+            }
+          ],
+          "voters": [
+            [
+              0,
+              1
+            ]
+          ],
+          "leader_of": [
+            0
+          ],
+          "hosts": {
+            "0": {
+              "term": 1,
+              "vote": 0,
+              "role": "Leader",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 1,
+              "votes": [
+                0,
+                1
+              ],
+              "vote_logs": {
+                "0": [],
+                "1": []
+              },
+              "crec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              },
+              "read_seq": 0
+            },
+            "1": {
+              "term": 1,
+              "vote": 0,
+              "role": "Follower",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "2": {
+              "term": 0,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            }
+          },
+          "leader_log": [
+            [
+              {
+                "term": 1,
+                "cmd": "Nil"
+              }
+            ]
+          ],
+          "elect_log": [
+            []
+          ],
+          "reads": [],
+          "commits": [
+            {
+              "term": 1,
+              "ci": 1,
+              "q": {
+                "0": 1,
+                "1": 1
+              }
+            }
+          ],
+          "read_hwm": [],
+          "net": [
+            {
+              "term": 1,
+              "c": 0,
+              "clog": [],
+              "kind": "Campaign"
+            },
+            {
+              "term": 1,
+              "ci": 1,
+              "kind": "Commit",
+              "rec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              }
+            },
+            {
+              "term": 1,
+              "v": 0,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "v": 1,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 0,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 1,
+              "kind": "Vote",
+              "vlog": []
+            }
+          ]
+        },
+        "post": {
+          "elect_votes": [
+            {
+              "0": [],
+              "1": []
+            }
+          ],
+          "voters": [
+            [
+              0,
+              1
+            ]
+          ],
+          "leader_of": [
+            0
+          ],
+          "hosts": {
+            "0": {
+              "term": 1,
+              "vote": 0,
+              "role": "Leader",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 1,
+              "votes": [
+                0,
+                1
+              ],
+              "vote_logs": {
+                "0": [],
+                "1": []
+              },
+              "crec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              },
+              "read_seq": 0
+            },
+            "1": {
+              "term": 2,
+              "vote": 1,
+              "role": "Candidate",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 0,
+              "votes": [
+                1
+              ],
+              "vote_logs": [
+                [
+                  {
+                    "term": 1,
+                    "cmd": "Nil"
+                  }
+                ]
+              ],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "2": {
+              "term": 0,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            }
+          },
+          "leader_log": [
+            [
+              {
+                "term": 1,
+                "cmd": "Nil"
+              }
+            ]
+          ],
+          "elect_log": [
+            []
+          ],
+          "reads": [],
+          "commits": [
+            {
+              "term": 1,
+              "ci": 1,
+              "q": {
+                "0": 1,
+                "1": 1
+              }
+            }
+          ],
+          "read_hwm": [],
+          "net": [
+            {
+              "term": 1,
+              "c": 0,
+              "clog": [],
+              "kind": "Campaign"
+            },
+            {
+              "term": 2,
+              "c": 1,
+              "clog": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "kind": "Campaign"
+            },
+            {
+              "term": 1,
+              "ci": 1,
+              "kind": "Commit",
+              "rec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              }
+            },
+            {
+              "term": 1,
+              "v": 0,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "v": 1,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 0,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 1,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 2,
+              "c": 1,
+              "v": 1,
+              "kind": "Vote",
+              "vlog": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ]
+            }
+          ]
+        },
+        "counterexamples": 100
+      }
+    ],
+    "cti_runs": [
+      {
+        "conjunction": [
+          "inv_wf",
+          "inv_hosts",
+          "inv_msgs",
+          "inv_lterms",
+          "inv_ack_persist",
+          "inv_vote_persist",
+          "inv_commits",
+          "inv_leader_completeness",
+          "inv_commit_msgs",
+          "inv_host_commits",
+          "inv_commit_leaders",
+          "inv_reads",
+          "net_within_bound"
+        ],
+        "finished": true,
+        "verdict": "invariant_violated",
+        "init_states": 76,
+        "steps": 1458,
+        "dropped": [
+          "net_within_bound"
+        ],
+        "error": null,
+        "messages": null,
+        "ms": 4929
+      },
+      {
+        "conjunction": [
+          "inv_wf",
+          "inv_hosts",
+          "inv_msgs",
+          "inv_lterms",
+          "inv_ack_persist",
+          "inv_vote_persist",
+          "inv_commits",
+          "inv_leader_completeness",
+          "inv_commit_msgs",
+          "inv_host_commits",
+          "inv_commit_leaders",
+          "inv_reads"
+        ],
+        "finished": true,
+        "verdict": "ok",
+        "init_states": 124,
+        "steps": 2436,
+        "dropped": [],
+        "error": null,
+        "messages": null,
+        "ms": 4669
+      }
+    ],
+    "induction_screen_complete": true,
+    "survivors": [
+      "inv_wf",
+      "inv_hosts",
+      "inv_msgs",
+      "inv_lterms",
+      "inv_ack_persist",
+      "inv_vote_persist",
+      "inv_commits",
+      "inv_leader_completeness",
+      "inv_commit_msgs",
+      "inv_host_commits",
+      "inv_commit_leaders",
+      "inv_reads"
+    ],
+    "verus": {
+      "verdict": "inductive",
+      "scratch_path": "~/.verus-trace/data/inductive-loop/f3b66aebbdfd/candidate.rs",
+      "scratch_text": "// Written by verus-tools-mcp inductive_loop, round f3b66aebbdfd.\n// The model is included read-only: `il_model.rs` beside this file links to\n// src/raft/safety.rs.\n// The obligations below are the round's.\nuse vstd::prelude::*;\n\n#[allow(dead_code, unused_imports)]\nmod il_model;\n\n#[allow(unused_imports)]\nmod il_candidate {\nuse super::il_model::*;\nuse vstd::prelude::*;\n\nverus! {\n\n/// Candidate `inv_wf`.\npub open spec fn il_cand_0(s: GState) -> bool {\n    inv_wf(s)\n}\n\n/// Candidate `inv_hosts`.\npub open spec fn il_cand_1(s: GState) -> bool {\n    inv_hosts(s)\n}\n\n/// Candidate `inv_msgs`.\npub open spec fn il_cand_2(s: GState) -> bool {\n    inv_msgs(s)\n}\n\n/// Candidate `inv_lterms`.\npub open spec fn il_cand_3(s: GState) -> bool {\n    inv_lterms(s)\n}\n\n/// Candidate `inv_ack_persist`.\npub open spec fn il_cand_4(s: GState) -> bool {\n    inv_ack_persist(s)\n}\n\n/// Candidate `inv_vote_persist`.\npub open spec fn il_cand_5(s: GState) -> bool {\n    inv_vote_persist(s)\n}\n\n/// Candidate `inv_commits`.\npub open spec fn il_cand_6(s: GState) -> bool {\n    inv_commits(s)\n}\n\n/// Candidate `inv_leader_completeness`.\npub open spec fn il_cand_7(s: GState) -> bool {\n    inv_leader_completeness(s)\n}\n\n/// Candidate `inv_commit_msgs`.\npub open spec fn il_cand_8(s: GState) -> bool {\n    inv_commit_msgs(s)\n}\n\n/// Candidate `inv_host_commits`.\npub open spec fn il_cand_9(s: GState) -> bool {\n    inv_host_commits(s)\n}\n\n/// Candidate `inv_commit_leaders`.\npub open spec fn il_cand_10(s: GState) -> bool {\n    inv_commit_leaders(s)\n}\n\n/// Candidate `inv_reads`.\npub open spec fn il_cand_11(s: GState) -> bool {\n    inv_reads(s)\n}\n\n/// The conjunction of the round's survivors.\npub open spec fn il_candidate_inv(s: GState) -> bool {\n    &&& il_cand_0(s)\n    &&& il_cand_1(s)\n    &&& il_cand_2(s)\n    &&& il_cand_3(s)\n    &&& il_cand_4(s)\n    &&& il_cand_5(s)\n    &&& il_cand_6(s)\n    &&& il_cand_7(s)\n    &&& il_cand_8(s)\n    &&& il_cand_9(s)\n    &&& il_cand_10(s)\n    &&& il_cand_11(s)\n}\n\n/// `inv_wf` holds initially.\npub proof fn il_init_0(s: GState)\n    requires init(s),\n    ensures il_cand_0(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_wf` is preserved by every step from the conjunction.\npub proof fn il_step_0(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_0(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_hosts` holds initially.\npub proof fn il_init_1(s: GState)\n    requires init(s),\n    ensures il_cand_1(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_hosts` is preserved by every step from the conjunction.\npub proof fn il_step_1(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_1(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_msgs` holds initially.\npub proof fn il_init_2(s: GState)\n    requires init(s),\n    ensures il_cand_2(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_msgs` is preserved by every step from the conjunction.\npub proof fn il_step_2(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_2(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_lterms` holds initially.\npub proof fn il_init_3(s: GState)\n    requires init(s),\n    ensures il_cand_3(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_lterms` is preserved by every step from the conjunction.\npub proof fn il_step_3(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_3(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_ack_persist` holds initially.\npub proof fn il_init_4(s: GState)\n    requires init(s),\n    ensures il_cand_4(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_ack_persist` is preserved by every step from the conjunction.\npub proof fn il_step_4(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_4(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_vote_persist` holds initially.\npub proof fn il_init_5(s: GState)\n    requires init(s),\n    ensures il_cand_5(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_vote_persist` is preserved by every step from the conjunction.\npub proof fn il_step_5(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_5(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_commits` holds initially.\npub proof fn il_init_6(s: GState)\n    requires init(s),\n    ensures il_cand_6(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_commits` is preserved by every step from the conjunction.\npub proof fn il_step_6(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_6(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_leader_completeness` holds initially.\npub proof fn il_init_7(s: GState)\n    requires init(s),\n    ensures il_cand_7(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_leader_completeness` is preserved by every step from the conjunction.\npub proof fn il_step_7(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_7(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_commit_msgs` holds initially.\npub proof fn il_init_8(s: GState)\n    requires init(s),\n    ensures il_cand_8(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_commit_msgs` is preserved by every step from the conjunction.\npub proof fn il_step_8(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_8(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_host_commits` holds initially.\npub proof fn il_init_9(s: GState)\n    requires init(s),\n    ensures il_cand_9(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_host_commits` is preserved by every step from the conjunction.\npub proof fn il_step_9(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_9(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_commit_leaders` holds initially.\npub proof fn il_init_10(s: GState)\n    requires init(s),\n    ensures il_cand_10(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_commit_leaders` is preserved by every step from the conjunction.\npub proof fn il_step_10(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_10(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n/// `inv_reads` holds initially.\npub proof fn il_init_11(s: GState)\n    requires init(s),\n    ensures il_cand_11(s),\n{\n    init_implies_inv(s);\n}\n\n/// `inv_reads` is preserved by every step from the conjunction.\npub proof fn il_step_11(pre: GState, post: GState)\n    requires\n        il_candidate_inv(pre),\n        next(pre, post),\n    ensures il_cand_11(post),\n{\n    let step = choose|step: TStep| next_step(pre, post, step);\n    step_preserves_inv(pre, post, step);\n}\n\n} // verus!\n} // mod\n",
+      "session_id": "6b4c7c16-cdbe-44d8-aa65-3ec02cdb0334",
+      "snapshot_id": "4a43c0826b9362828c5784e52b7e552413ac8b4d274c520a1857f805b74451d0",
+      "session_open": false,
+      "model_trusted": true,
+      "model_session_verified": null,
+      "obligations": [
+        {
+          "kind": "init",
+          "conjunct": "inv_wf",
+          "function": "il_init_0",
+          "bucket": 0,
+          "query": 0,
+          "result": "valid",
+          "elapsed_ms": 49,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_wf",
+          "function": "il_step_0",
+          "bucket": 0,
+          "query": 1,
+          "result": "valid",
+          "elapsed_ms": 82,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_hosts",
+          "function": "il_init_1",
+          "bucket": 0,
+          "query": 2,
+          "result": "valid",
+          "elapsed_ms": 53,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_hosts",
+          "function": "il_step_1",
+          "bucket": 0,
+          "query": 3,
+          "result": "valid",
+          "elapsed_ms": 86,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_msgs",
+          "function": "il_init_2",
+          "bucket": 0,
+          "query": 4,
+          "result": "valid",
+          "elapsed_ms": 47,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_msgs",
+          "function": "il_step_2",
+          "bucket": 0,
+          "query": 5,
+          "result": "valid",
+          "elapsed_ms": 88,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_lterms",
+          "function": "il_init_3",
+          "bucket": 0,
+          "query": 6,
+          "result": "valid",
+          "elapsed_ms": 54,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_lterms",
+          "function": "il_step_3",
+          "bucket": 0,
+          "query": 7,
+          "result": "valid",
+          "elapsed_ms": 92,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_ack_persist",
+          "function": "il_init_4",
+          "bucket": 0,
+          "query": 8,
+          "result": "valid",
+          "elapsed_ms": 55,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_ack_persist",
+          "function": "il_step_4",
+          "bucket": 0,
+          "query": 9,
+          "result": "valid",
+          "elapsed_ms": 91,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_vote_persist",
+          "function": "il_init_5",
+          "bucket": 0,
+          "query": 10,
+          "result": "valid",
+          "elapsed_ms": 65,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_vote_persist",
+          "function": "il_step_5",
+          "bucket": 0,
+          "query": 11,
+          "result": "valid",
+          "elapsed_ms": 98,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_commits",
+          "function": "il_init_6",
+          "bucket": 0,
+          "query": 12,
+          "result": "valid",
+          "elapsed_ms": 58,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_commits",
+          "function": "il_step_6",
+          "bucket": 0,
+          "query": 13,
+          "result": "valid",
+          "elapsed_ms": 95,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_leader_completeness",
+          "function": "il_init_7",
+          "bucket": 0,
+          "query": 14,
+          "result": "valid",
+          "elapsed_ms": 57,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_leader_completeness",
+          "function": "il_step_7",
+          "bucket": 0,
+          "query": 15,
+          "result": "valid",
+          "elapsed_ms": 103,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_commit_msgs",
+          "function": "il_init_8",
+          "bucket": 0,
+          "query": 16,
+          "result": "valid",
+          "elapsed_ms": 60,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_commit_msgs",
+          "function": "il_step_8",
+          "bucket": 0,
+          "query": 17,
+          "result": "valid",
+          "elapsed_ms": 106,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_host_commits",
+          "function": "il_init_9",
+          "bucket": 0,
+          "query": 18,
+          "result": "valid",
+          "elapsed_ms": 64,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_host_commits",
+          "function": "il_step_9",
+          "bucket": 0,
+          "query": 19,
+          "result": "valid",
+          "elapsed_ms": 125,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_commit_leaders",
+          "function": "il_init_10",
+          "bucket": 0,
+          "query": 20,
+          "result": "valid",
+          "elapsed_ms": 59,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_commit_leaders",
+          "function": "il_step_10",
+          "bucket": 0,
+          "query": 21,
+          "result": "valid",
+          "elapsed_ms": 108,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "init",
+          "conjunct": "inv_reads",
+          "function": "il_init_11",
+          "bucket": 0,
+          "query": 22,
+          "result": "valid",
+          "elapsed_ms": 63,
+          "diagnostics": [],
+          "unknown_reason": null
+        },
+        {
+          "kind": "step",
+          "conjunct": "inv_reads",
+          "function": "il_step_11",
+          "bucket": 0,
+          "query": 23,
+          "result": "valid",
+          "elapsed_ms": 109,
+          "diagnostics": [],
+          "unknown_reason": null
+        }
+      ],
+      "failing": [],
+      "error": null,
+      "diagnostics_tail": "note: verifying module il_candidate\n\n"
+    },
+    "verdict": "inductive",
+    "cost": {
+      "screen_ms": 48562,
+      "trace_ms": 12,
+      "stored_states": 597764,
+      "scanned_states": 597764,
+      "cti_ms": 9598,
+      "cti_runs": 2,
+      "cti_init_states": 200,
+      "cti_steps": 3894,
+      "verus_open_ms": 7653,
+      "verus_checks": 24,
+      "verus_check_ms": 2123,
+      "verus_solver_ms": 1867,
+      "total_ms": 68220
+    },
+    "notes": []
+  }
+}
