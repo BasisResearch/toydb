@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "tool": "inductive_loop",
+  "request": {
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_path": "src/raft/safety.rs",
+    "state_type": "GState",
+    "typing": "CtiSeed",
+    "proof": {
+      "init": "init_implies_inv(s);",
+      "step": "let step = choose|step: TStep| next_step(pre, post, step);\nstep_preserves_inv(pre, post, step);"
+    },
+    "budget": {
+      "screen_ms": 1800000,
+      "cti_ms": 600000,
+      "verus_check_secs": 300
+    },
+    "candidates": [
+      {
+        "name": "inv_ack_persist"
+      }
+    ],
+    "screen_only": true
+  },
+  "status": "done",
+  "summary": {
+    "success": null,
+    "crate_name": null,
+    "scope": null,
+    "verified": null,
+    "errors": 0,
+    "warnings": null,
+    "total": 1,
+    "shown": 0,
+    "duration_ms": 19278
+  },
+  "data": {
+    "round_id": "f64a114efd25",
+    "model_session": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "model_backend": "tlc",
+    "candidates": [
+      {
+        "name": "inv_ack_persist",
+        "verus": "inv_ack_persist(s)",
+        "tla": "inv_ack_persist"
+      }
+    ],
+    "typing": "CtiSeed",
+    "dropped_by_reachability": [],
+    "reachability_complete": true,
+    "unscreened": [],
+    "dropped_by_induction": [
+      {
+        "name": "inv_ack_persist",
+        "relative_to": [
+          "inv_ack_persist"
+        ],
+        "action": "<t_send_ack(2) line 336, col 9 to line 340, col 21 of module Raft>",
+        "changed": [
+          "net"
+        ],
+        "pre": {
+          "elect_votes": [
+            {
+              "0": [],
+              "1": []
+            }
+          ],
+          "voters": [
+            [
+              0,
+              1
+            ]
+          ],
+          "leader_of": [
+            0
+          ],
+          "hosts": {
+            "0": {
+              "term": 1,
+              "vote": 0,
+              "role": "Leader",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 1,
+              "votes": [
+                0,
+                1
+              ],
+              "vote_logs": {
+                "0": [],
+                "1": []
+              },
+              "crec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              },
+              "read_seq": 0
+            },
+            "1": {
+              "term": 1,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "2": {
+              "term": 1,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "c1"
+                }
+              ],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            }
+          },
+          "leader_log": [
+            [
+              {
+                "term": 1,
+                "cmd": "Nil"
+              }
+            ]
+          ],
+          "elect_log": [
+            []
+          ],
+          "reads": [],
+          "commits": [
+            {
+              "term": 1,
+              "ci": 1,
+              "q": {
+                "0": 1,
+                "1": 1
+              }
+            }
+          ],
+          "read_hwm": [],
+          "net": [
+            {
+              "term": 1,
+              "c": 0,
+              "clog": [],
+              "kind": "Campaign"
+            },
+            {
+              "term": 1,
+              "ci": 1,
+              "kind": "Commit",
+              "rec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              }
+            },
+            {
+              "term": 1,
+              "v": 0,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "v": 1,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 0,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 1,
+              "kind": "Vote",
+              "vlog": []
+            }
+          ]
+        },
+        "post": {
+          "elect_votes": [
+            {
+              "0": [],
+              "1": []
+            }
+          ],
+          "voters": [
+            [
+              0,
+              1
+            ]
+          ],
+          "leader_of": [
+            0
+          ],
+          "hosts": {
+            "0": {
+              "term": 1,
+              "vote": 0,
+              "role": "Leader",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 1,
+              "votes": [
+                0,
+                1
+              ],
+              "vote_logs": {
+                "0": [],
+                "1": []
+              },
+              "crec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              },
+              "read_seq": 0
+            },
+            "1": {
+              "term": 1,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "Nil"
+                }
+              ],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            },
+            "2": {
+              "term": 1,
+              "vote": "Nil",
+              "role": "Follower",
+              "log": [
+                {
+                  "term": 1,
+                  "cmd": "c1"
+                }
+              ],
+              "commit": 0,
+              "votes": [],
+              "vote_logs": [],
+              "crec": {
+                "term": 0,
+                "ci": 0,
+                "q": []
+              },
+              "read_seq": 0
+            }
+          },
+          "leader_log": [
+            [
+              {
+                "term": 1,
+                "cmd": "Nil"
+              }
+            ]
+          ],
+          "elect_log": [
+            []
+          ],
+          "reads": [],
+          "commits": [
+            {
+              "term": 1,
+              "ci": 1,
+              "q": {
+                "0": 1,
+                "1": 1
+              }
+            }
+          ],
+          "read_hwm": [],
+          "net": [
+            {
+              "term": 1,
+              "c": 0,
+              "clog": [],
+              "kind": "Campaign"
+            },
+            {
+              "term": 1,
+              "ci": 1,
+              "kind": "Commit",
+              "rec": {
+                "term": 1,
+                "ci": 1,
+                "q": {
+                  "0": 1,
+                  "1": 1
+                }
+              }
+            },
+            {
+              "term": 1,
+              "v": 0,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "v": 1,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "v": 2,
+              "kind": "Ack",
+              "mi": 1
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 0,
+              "kind": "Vote",
+              "vlog": []
+            },
+            {
+              "term": 1,
+              "c": 0,
+              "v": 1,
+              "kind": "Vote",
+              "vlog": []
+            }
+          ]
+        },
+        "counterexamples": 100
+      }
+    ],
+    "cti_runs": [
+      {
+        "conjunction": [
+          "inv_ack_persist"
+        ],
+        "finished": true,
+        "verdict": "invariant_violated",
+        "init_states": 10560,
+        "steps": 233824,
+        "dropped": [
+          "inv_ack_persist"
+        ],
+        "error": null,
+        "messages": null,
+        "ms": 11983
+      }
+    ],
+    "induction_screen_complete": true,
+    "survivors": [],
+    "verus": {
+      "verdict": "not_run",
+      "scratch_path": null,
+      "scratch_text": null,
+      "session_id": null,
+      "snapshot_id": null,
+      "session_open": false,
+      "model_trusted": true,
+      "model_session_verified": null,
+      "obligations": [],
+      "failing": [],
+      "error": null,
+      "diagnostics_tail": null
+    },
+    "verdict": "no_survivors",
+    "cost": {
+      "screen_ms": 7292,
+      "trace_ms": 0,
+      "stored_states": 597764,
+      "scanned_states": 597764,
+      "cti_ms": 11983,
+      "cti_runs": 1,
+      "cti_init_states": 10560,
+      "cti_steps": 233824,
+      "verus_open_ms": 0,
+      "verus_checks": 0,
+      "verus_check_ms": 0,
+      "verus_solver_ms": 0,
+      "total_ms": 19278
+    },
+    "notes": []
+  }
+}

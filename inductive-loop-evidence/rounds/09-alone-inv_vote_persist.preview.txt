@@ -1,0 +1,4 @@
+round e1d6051719a6: 1 candidates, 0 dropped by reachability, 1 by induction, 0 survive; verdict no_survivors
+  induction: inv_vote_persist broken by <t_send_ack(2) line 336, col 9 to line 340, col 21 of module Raft> changing net (relative to 1 conjuncts): {"elect_votes":[{"0":[],"1":[]}],"voters":[[0,1]],"leader_of":[0],"hosts":{"0":{"term":1,"vote":0,"role":"Leader","log":[{"term":1,"cmd":"Nil"}],"commit":1,"votes":[0,1],"vote_logs":{"0":[],"1":[]},"c… -> {"elect_votes":[{"0":[],"1":[]}],"voters":[[0,1]],"leader_of":[0],"hosts":{"0":{"term":1,"vote":0,"role":"Leader","log":[{"term":1,"cmd":"Nil"}],"commit":1,"votes":[0,1],"vote_logs":{"0":[],"1":[]},"c…
+  verus: not_run (0 of 0 obligations valid)
+  cost: total 21469 ms; screen 8326 ms over 597764 states; 1 CTI searches 13139 ms (10560 initial states, 233824 steps); verus open 0 ms, 0 checks 0 ms (solver 0 ms)

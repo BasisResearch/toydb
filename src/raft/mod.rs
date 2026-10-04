@@ -239,10 +239,23 @@
 //!   entries one by one until a match is found. The replication protocol could
 //!   instead be extended with rejection hints (Raft paper section 5.3).
 
-mod log;
 mod message;
 mod node;
+// The Verus distributed-safety model and proof for the protocol implemented
+// by `node`. Spec/proof only: it erases under a normal build (the types it
+// declares are ghost bookkeeping, hence the dead_code allowance).
+#[allow(dead_code)]
+mod safety;
 mod state;
+// The verified core: the durable log (`verified::log`) and the node-local
+// refinement layer (`verified::refine`) — the verified node state (member
+// ranks, candidate votes, leader progress) and one verified step function
+// per protocol input, each proving that the step implements the safety
+// model's transitions. `node` is the I/O shell around it. The shared parent
+// module scopes the log's mutators to verified code (see `verified.rs`).
+mod verified;
+
+use verified::{log, refine};
 
 use std::ops::Range;
 use std::time::Duration;
@@ -264,3 +277,8 @@ const ELECTION_TIMEOUT_RANGE: Range<Ticks> = 10..20;
 
 /// The maximum number of log entries to send in a single append message.
 const MAX_APPEND_ENTRIES: usize = 100;
+
+/// The maximum number of committed entries to read into memory per batch when
+/// applying them to the state machine (via the verified
+/// `Log::read_committed`).
+const APPLY_BATCH_SIZE: usize = 1024;

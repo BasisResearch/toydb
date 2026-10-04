@@ -1,0 +1,318 @@
+{
+  "schema_version": 1,
+  "tool": "tlc_check",
+  "request": {
+    "session_id": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "budget_ms": 600000,
+    "continue": true
+  },
+  "status": "done",
+  "summary": {
+    "success": true,
+    "crate_name": null,
+    "scope": null,
+    "verified": null,
+    "errors": 0,
+    "warnings": null,
+    "total": 0,
+    "shown": 0,
+    "duration_ms": 212975
+  },
+  "data": {
+    "session_id": "076e7db3-b9aa-42d0-8080-bcb836b20a58",
+    "finished": true,
+    "budget_exhausted": false,
+    "verdict": "ok",
+    "violated": null,
+    "invariants": [
+      {
+        "name": "TypeOK",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_wf",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_hosts",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_msgs",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_lterms",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_ack_persist",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_vote_persist",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_commits",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_leader_completeness",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_commit_msgs",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_host_commits",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_commit_leaders",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      },
+      {
+        "name": "inv_reads",
+        "verdict": "no_violation_found",
+        "level": null,
+        "action": null,
+        "reports": null
+      }
+    ],
+    "trace": null,
+    "traces": [],
+    "continuation": true,
+    "stats": {
+      "generated": 7324630,
+      "distinct": 597764,
+      "queue": 0,
+      "initial": 1,
+      "diameter": 18,
+      "exploring_ms": 212975,
+      "since_open_ms": 214785,
+      "running": false,
+      "finished": true,
+      "store": {
+        "states": 597764,
+        "initial": 1,
+        "edges": 4708059,
+        "unsatisfied": 85998729,
+        "excluded": 2616570,
+        "excluded_states": 1502631,
+        "bytes": 2765816249
+      }
+    },
+    "error": null,
+    "reply": {
+      "ok": true,
+      "finished": true,
+      "budget_exhausted": false,
+      "result_code": 0,
+      "verdict": "ok",
+      "traces": [],
+      "untraced_reports": {},
+      "invariants": [
+        {
+          "name": "TypeOK",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_wf",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_hosts",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_msgs",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_lterms",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_ack_persist",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_vote_persist",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_commits",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_leader_completeness",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_commit_msgs",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_host_commits",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_commit_leaders",
+          "verdict": "no_violation_found"
+        },
+        {
+          "name": "inv_reads",
+          "verdict": "no_violation_found"
+        }
+      ],
+      "continuation": true,
+      "stats": {
+        "generated": 7324630,
+        "distinct": 597764,
+        "queue": 0,
+        "initial": 1,
+        "diameter": 18,
+        "exploring_ms": 212975,
+        "since_open_ms": 214785,
+        "running": false,
+        "finished": true,
+        "store": {
+          "states": 597764,
+          "initial": 1,
+          "edges": 4708059,
+          "unsatisfied": 85998729,
+          "excluded": 2616570,
+          "excluded_states": 1502631,
+          "bytes": 2765816249
+        }
+      },
+      "messages": [
+        {
+          "code": 2189,
+          "params": []
+        },
+        {
+          "code": 2190,
+          "params": [
+            "1",
+            ""
+          ]
+        },
+        {
+          "code": 2200,
+          "params": [
+            "9",
+            "52,863",
+            "10,960",
+            "6,123",
+            "52,863",
+            "10,960"
+          ]
+        },
+        {
+          "code": 2200,
+          "params": [
+            "12",
+            "1,994,626",
+            "280,702",
+            "142,839",
+            "1,941,763",
+            "269,742"
+          ]
+        },
+        {
+          "code": 2200,
+          "params": [
+            "13",
+            "4,386,518",
+            "468,361",
+            "147,480",
+            "2,391,892",
+            "187,659"
+          ]
+        },
+        {
+          "code": 2200,
+          "params": [
+            "14",
+            "6,395,795",
+            "565,923",
+            "59,704",
+            "2,009,277",
+            "97,562"
+          ]
+        },
+        {
+          "code": 2193,
+          "params": [
+            "val = 2.2E-7",
+            "val = 5.6E-8"
+          ]
+        },
+        {
+          "code": 2199,
+          "params": [
+            "7324630",
+            "597764",
+            "0"
+          ]
+        },
+        {
+          "code": 2194,
+          "params": [
+            "18"
+          ]
+        },
+        {
+          "code": 2268,
+          "params": [
+            "0",
+            "1",
+            "4",
+            "19"
+          ]
+        }
+      ],
+      "id": 2,
+      "command": "check"
+    }
+  }
+}

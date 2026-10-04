@@ -1,0 +1,4 @@
+round 8c797465815f: 1 candidates, 0 dropped by reachability, 1 by induction, 0 survive; verdict no_survivors
+  induction: inv_leader_completeness broken by <t_become_leader(2) line 264, col 9 to line 276, col 21 of module Raft> changing elect_votes, voters, leader_of, hosts, leader_log, elect_log (relative to 1 conjuncts): {"elect_votes":[{"0":[],"1":[]}],"voters":[[0,1]],"leader_of":[0],"hosts":{"0":{"term":1,"vote":0,"role":"Leader","log":[{"term":1,"cmd":"Nil"}],"commit":1,"votes":[0,1],"vote_logs":{"0":[],"1":[]},"c… -> {"elect_votes":[{"0":[],"1":[]},{"0":[{"term":1,"cmd":"Nil"}],"1":[{"term":1,"cmd":"Nil"}]}],"voters":[[0,1],[0,1]],"leader_of":[0,2],"hosts":{"0":{"term":1,"vote":0,"role":"Leader","log":[{"term":1,"…
+  verus: not_run (0 of 0 obligations valid)
+  cost: total 14529 ms; screen 4872 ms over 597764 states; 1 CTI searches 9654 ms (10560 initial states, 233824 steps); verus open 0 ms, 0 checks 0 ms (solver 0 ms)

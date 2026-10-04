@@ -1,0 +1,3 @@
+round 5fe75d7043b2: 1 candidates, 0 dropped by reachability, 0 by induction, 1 survive; verdict screened
+  verus: not_run (0 of 0 obligations valid)
+  cost: total 17718 ms; screen 12546 ms over 597764 states; 1 CTI searches 5171 ms (1608 initial states, 34918 steps); verus open 0 ms, 0 checks 0 ms (solver 0 ms)

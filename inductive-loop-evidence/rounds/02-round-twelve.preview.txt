@@ -1,0 +1,3 @@
+round 28819e351f53: 12 candidates, 0 dropped by reachability, 0 by induction, 12 survive; verdict inductive
+  verus: inductive (24 of 24 obligations valid), scratch session 4fec5360-9be4-4cf7-9ab9-14968d76cb63 (closed)
+  cost: total 61611 ms; screen 47643 ms over 597764 states; 1 CTI searches 3746 ms (124 initial states, 2436 steps); verus open 7946 ms, 24 checks 1999 ms (solver 1775 ms)

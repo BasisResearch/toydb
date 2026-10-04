@@ -1,0 +1,14 @@
+session 076e7db3-b9aa-42d0-8080-bcb836b20a58: Raft_cti opened (54 actions, 13 invariants, 0 temporal properties, 10 variables; workers 8, coverage off, deadlock checked)
+  action t_campaign <t_campaign(0) line 219, col 9 to line 225, col 21 of module Raft>
+  action t_campaign <t_campaign(1) line 219, col 9 to line 225, col 21 of module Raft>
+  action t_campaign <t_campaign(2) line 219, col 9 to line 225, col 21 of module Raft>
+  action t_grant <t_grant(0) line 230, col 5 to line 243, col 28 of module Raft>
+  action t_grant <t_grant(1) line 230, col 5 to line 243, col 28 of module Raft>
+  action t_grant <t_grant(2) line 230, col 5 to line 243, col 28 of module Raft>
+  action t_collect_vote <t_collect_vote(0) line 249, col 9 to line 258, col 21 of module Raft>
+  action t_collect_vote <t_collect_vote(1) line 249, col 9 to line 258, col 21 of module Raft>
+  action t_collect_vote <t_collect_vote(2) line 249, col 9 to line 258, col 21 of module Raft>
+  action t_become_leader <t_become_leader(0) line 264, col 9 to line 276, col 21 of module Raft>
+  invariants: TypeOK, inv_wf, inv_hosts, inv_msgs, inv_lterms, inv_ack_persist, inv_vote_persist, inv_commits, inv_leader_completeness, inv_commit_msgs, inv_host_commits, inv_commit_leaders, inv_reads
+  variables: reads, leader_log, leader_of, read_hwm, net, hosts, elect_votes, voters, elect_log, commits
+… and 44 more (the whole result is in `file`)
