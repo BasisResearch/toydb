@@ -3566,3 +3566,99 @@ pub struct AppendMsg {
 }
 
 } // verus!
+
+/// Trace validation (the `tla-trace` feature): this node's observable part of
+/// the model state, read from the verified state, for the shell to log with
+/// each model step a step function performs (`node.rs`, `trace_step!`). The
+/// log is checked against the model by TLC (`tla/Raft_trace.tla`, or the
+/// exporter's trace spec, run by verus-tools-mcp's `tlc_conform`).
+///
+/// It is the host `hosts[rank]` in the exporter's value encoding: `term`,
+/// `vote` (the voted-for node's rank, an `Option`), `role`, `log` (each
+/// entry's term and whether its command is a noop) and `commit`; `votes`
+/// while a candidate and `read_seq` while a leader, where the node tracks
+/// them. Everything else in the model (the ghost payloads, the network, the
+/// ghost maps) is left out, so it is free in the model.
+#[cfg(feature = "tla-trace")]
+mod tla_view {
+    use tla_trace::Value;
+
+    use super::{Abs, AbsRole};
+    use crate::error::Result;
+    use crate::raft::NodeID;
+    use crate::raft::log::Log;
+
+    impl Abs {
+        /// This node's model host index.
+        pub(crate) fn tla_rank(&self) -> u64 {
+            self.rank as u64
+        }
+
+        /// A member's model host index.
+        pub(crate) fn tla_rank_of(&self, id: NodeID) -> u64 {
+            self.members.rank(id).expect("tla-trace: not a member") as u64
+        }
+
+        /// The ack map a leader's commit of `ci` rests on (the model's
+        /// `t_leader_commit` parameter `q`, a `Map<int, nat>` as `[rank,
+        /// index]` pairs): every member whose match value reaches `ci`, the
+        /// leader's own last index at its rank, as `leader_try_commit`
+        /// counts them.
+        pub(crate) fn tla_commit_quorum(&self, log: &Log, ci: u64) -> Value {
+            let (last, _) = log.get_last_index();
+            let pairs = (0..self.n as usize)
+                .map(|k| (k, self.member_match(k, last)))
+                .filter(|(_, m)| *m >= ci)
+                .map(|(k, m)| Value::Array(vec![Value::from(k), Value::from(m)]))
+                .collect();
+            Value::Array(pairs)
+        }
+
+        /// The observed model state: `{"hosts": {"<rank>": host}}`, fields
+        /// named in `omit` left out (a step logged before the state change
+        /// that follows it in the same step function).
+        pub(crate) fn tla_state(&self, log: &mut Log, omit: &[&str]) -> Result<Value> {
+            let (term, vote) = log.get_term_vote();
+            let (commit, _) = log.get_commit_index();
+            let (last, _) = log.get_last_index();
+            let mut entries = Vec::new();
+            for index in 1..=last {
+                let entry = log.get(index)?.expect("tla-trace: a log entry below the last index");
+                let cmd = entry.command.map(Value::from);
+                entries.push(Value::object([
+                    ("term", Value::from(entry.term)),
+                    ("cmd", Value::option(cmd)),
+                ]));
+            }
+            let (role, extra) = match &self.role {
+                AbsRole::Follower => ("Follower", None),
+                AbsRole::Candidate { votes } => {
+                    let set: Vec<Value> = votes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| **v)
+                        .map(|(r, _)| Value::from(r))
+                        .collect();
+                    ("Candidate", Some(("votes", Value::Array(set))))
+                }
+                AbsRole::Leader { progress } => (
+                    "Leader",
+                    Some(("read_seq", Value::from(progress[self.rank as usize].read_seq))),
+                ),
+            };
+            let mut host = vec![
+                ("term", Value::from(term)),
+                ("vote", Value::option(vote.map(|v| Value::from(self.tla_rank_of(v))))),
+                ("role", Value::tag(role)),
+                ("log", Value::Array(entries)),
+                ("commit", Value::from(commit)),
+            ];
+            host.extend(extra);
+            host.retain(|(k, _)| !omit.contains(k));
+            Ok(Value::object([(
+                "hosts",
+                Value::object([(self.rank.to_string(), Value::object(host))]),
+            )]))
+        }
+    }
+}

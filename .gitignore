@@ -13,3 +13,7 @@
 # Verus build byproducts dropped in the working tree
 /*.rlib
 *.long-type-*.txt
+
+# The tla-trace crate built on its own
+/tla-trace/target
+/tla-trace/Cargo.lock
