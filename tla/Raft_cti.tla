@@ -143,4 +143,15 @@ CtiInit_reads               == CtiSeed /\ inv_reads
 \* because `inv` is inductive (safety.rs `step_preserves_inv`).
 CtiInit_all == CtiSeed /\ Inv
 
+\* inv_ack_persist on the acks whose term has a leader log (ack_msg_ok's own
+\* domain clause).  Off that domain inv_ack_persist compares with LL(t) =
+\* << >>, a value (A5) picks for what Verus leaves unspecified; this part of
+\* the conjunct does not depend on it.  Probed from CtiInit_ack_persist, the
+\* same seed as inv_ack_persist: every seed ack has term 1, which is in
+\* DOMAIN leader_log, so on CtiSeed the two agree.  export/RaftExportCti.tla
+\* restates it for the export (see EXPORT.md).
+inv_ack_persist_dom ==
+    \A m \in net : (m.kind = "Ack" /\ m.term \in DOMAIN leader_log)
+                    => ack_persist_ok(m.v, m.term, m.mi)
+
 =============================================================================

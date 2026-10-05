@@ -1,0 +1,222 @@
+{
+  "module": "safety",
+  "shape": "hand-rolled",
+  "state_type": "safety::GState",
+  "variables": [
+    "n",
+    "hosts",
+    "net",
+    "leader_log",
+    "leader_of",
+    "voters",
+    "elect_log",
+    "elect_votes",
+    "commits",
+    "reads",
+    "read_hwm"
+  ],
+  "typed_variables": [
+    "n",
+    "hosts",
+    "net",
+    "leader_log",
+    "leader_of",
+    "voters",
+    "elect_log",
+    "elect_votes",
+    "commits",
+    "reads",
+    "read_hwm"
+  ],
+  "init": "init",
+  "next": "next",
+  "init_unassigned": [
+    "hosts"
+  ],
+  "invariants": [
+    "inv_wf",
+    "inv_hosts",
+    "inv_msgs",
+    "inv_lterms",
+    "inv_ack_persist",
+    "inv_vote_persist",
+    "inv_commits",
+    "inv_leader_completeness",
+    "inv_commit_msgs",
+    "inv_host_commits",
+    "inv_commit_leaders",
+    "inv_reads"
+  ],
+  "transitions": [
+    {
+      "operator": "t_become_leader",
+      "unassigned": []
+    },
+    {
+      "operator": "t_bump_term",
+      "unassigned": []
+    },
+    {
+      "operator": "t_campaign",
+      "unassigned": []
+    },
+    {
+      "operator": "t_collect_vote",
+      "unassigned": []
+    },
+    {
+      "operator": "t_confirm_read",
+      "unassigned": []
+    },
+    {
+      "operator": "t_grant",
+      "unassigned": []
+    },
+    {
+      "operator": "t_leader_commit",
+      "unassigned": []
+    },
+    {
+      "operator": "t_propose",
+      "unassigned": []
+    },
+    {
+      "operator": "t_recv_append",
+      "unassigned": []
+    },
+    {
+      "operator": "t_recv_commit",
+      "unassigned": []
+    },
+    {
+      "operator": "t_restart",
+      "unassigned": []
+    },
+    {
+      "operator": "t_send_ack",
+      "unassigned": []
+    },
+    {
+      "operator": "t_send_append",
+      "unassigned": []
+    },
+    {
+      "operator": "t_send_commit",
+      "unassigned": []
+    },
+    {
+      "operator": "t_step_down",
+      "unassigned": []
+    },
+    {
+      "operator": "t_submit_read",
+      "unassigned": []
+    }
+  ],
+  "skipped_invariants": [],
+  "candidates": [
+    {
+      "function": "safety::inv_wf",
+      "operator": "inv_wf",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_hosts",
+      "operator": "inv_hosts",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_msgs",
+      "operator": "inv_msgs",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_lterms",
+      "operator": "inv_lterms",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_ack_persist",
+      "operator": "inv_ack_persist",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_vote_persist",
+      "operator": "inv_vote_persist",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_commits",
+      "operator": "inv_commits",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_leader_completeness",
+      "operator": "inv_leader_completeness",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_commit_msgs",
+      "operator": "inv_commit_msgs",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_host_commits",
+      "operator": "inv_host_commits",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_commit_leaders",
+      "operator": "inv_commit_leaders",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv_reads",
+      "operator": "inv_reads",
+      "included": true,
+      "reason": "named on the command line"
+    },
+    {
+      "function": "safety::inv",
+      "operator": null,
+      "included": false,
+      "reason": "not named on the command line"
+    }
+  ],
+  "operators": 67,
+  "holes": [
+    {
+      "variable": "Some.v0",
+      "typ": "Seq_u8",
+      "constant": "Dom_Option_Seq_u8_Some_v0",
+      "location": "src/raft/safety.rs:874:5: 874:51 (#0)",
+      "in_function": "safety::next"
+    },
+    {
+      "variable": "LeaderCommit.q",
+      "typ": "Map_int_nat",
+      "constant": "Dom_TStep_LeaderCommit_q",
+      "location": "src/raft/safety.rs:874:5: 874:51 (#0)",
+      "in_function": "safety::next"
+    },
+    {
+      "variable": "BumpTerm.term",
+      "typ": "nat",
+      "constant": "Dom_TStep_BumpTerm_term",
+      "location": "src/raft/safety.rs:874:5: 874:51 (#0)",
+      "in_function": "safety::next"
+    }
+  ],
+  "refusals": []
+}
