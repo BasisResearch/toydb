@@ -17,3 +17,6 @@
 # The tla-trace crate built on its own
 /tla-trace/target
 /tla-trace/Cargo.lock
+
+/tla-trace/macros/target
+/tla-trace/macros/Cargo.lock

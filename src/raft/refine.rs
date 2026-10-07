@@ -3569,7 +3569,7 @@ pub struct AppendMsg {
 
 /// Trace validation (the `tla-trace` feature): this node's observable part of
 /// the model state, read from the verified state, for the shell to log with
-/// each model step a step function performs (`node.rs`, `trace_step!`). The
+/// each model step a step function performs (`node_steps.rs`, `#[trace_step]`). The
 /// log is checked against the model by TLC (`tla/Raft_trace.tla`, or the
 /// exporter's trace spec, run by verus-tools-mcp's `tlc_conform`).
 ///

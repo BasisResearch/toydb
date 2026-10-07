@@ -1477,6 +1477,18 @@ dependencies = [
 [[package]]
 name = "tla-trace"
 version = "0.1.0"
+dependencies = [
+ "tla-trace-macros",
+]
+
+[[package]]
+name = "tla-trace-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "toml"
