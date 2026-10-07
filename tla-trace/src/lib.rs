@@ -1,36 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Basis Research.
 
-//! Log an implementation's protocol steps for trace validation against its
-//! TLA+ model (`verus -V tla-export` writes the model and a trace spec that
-//! reads this log; the `tlc_conform` tool of verus-tools-mcp runs it).
-//!
-//! The log is newline-delimited JSON: a header line naming the TLA+ module
-//! and the export the trace is for, optionally with the observed initial
-//! state, then one line per step:
-//!
-//! ```text
-//! {"module": "Raft", "export": "toydb::raft::safety", "nodes": 3}
-//! {"step": "t_campaign", "params": {"i": 0}, "state": {"hosts": {"0": {"term": 1}}}}
-//! ```
-//!
-//! `step` is the name of the model's transition (the `t_*` spec fn),
-//! `params` its parameters other than the pre and post states, by their
-//! Rust names, and `state` the fields of the model state the implementation
-//! can observe after the step, in the exporter's value encoding: a struct or
-//! enum value is an object (an enum's with its `"tag"`, `Option` as
-//! `{"tag": "Some", "v0": ...}`), a `Seq` an array, or an object keyed by
-//! index for a partial view. An object is partial: a field left out (a ghost
-//! one) is free in the model.
-//!
-//! A log belongs to one thread: [`start`] opens it for the calling thread,
-//! [`trace_step!`] (or [`emit`]) appends to it, [`finish`] closes it. A
-//! thread with no log open emits nothing, so steps run outside a traced test
-//! cost one thread-local lookup.
+#![doc = include_str!("../README.md")]
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::Path;
 
 /// A JSON value in the exporter's encoding.
@@ -164,50 +138,42 @@ impl<T: Into<Value>> From<Option<T>> for Value {
     }
 }
 
-thread_local! {
-    static LOG: RefCell<Option<std::fs::File>> = const { RefCell::new(None) };
+mod object;
+mod observe;
+pub use object::{Event, StepGuard, Trace};
+pub use observe::{Context, Observe};
+pub use tla_trace_macros::Observe;
+/// Attributes have their own path because Rust shares the macro namespace
+/// between attributes and function-like macros.
+pub mod instrument {
+    pub use tla_trace_macros::trace_step;
+    // Distinguish an impl's pending fallback from a user's method annotation,
+    // even when the latter is imported under an alias.
+    #[doc(hidden)]
+    pub use tla_trace_macros::trace_step as __trace_step_default;
 }
 
-/// Open a log at `path` for the calling thread (replacing any open one)
-/// and write its header line.
+thread_local! {
+    static LOG: RefCell<Trace> = RefCell::new(Trace::default());
+}
+/// Open a compatibility log for this thread, with a v2 header.
 pub fn start(path: &Path, header: Value) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut file = std::fs::File::create(path)?;
-    writeln!(file, "{}", header.to_json())?;
-    LOG.with(|l| *l.borrow_mut() = Some(file));
+    let trace = Trace::at(path, header)?;
+    LOG.with(|l| *l.borrow_mut() = trace);
     Ok(())
 }
-
-/// Whether the calling thread has a log open.
+/// Obtain the current thread's handle (disabled when no log is open).
+pub fn thread_log() -> Trace {
+    LOG.with(|l| l.borrow().clone())
+}
 pub fn active() -> bool {
-    LOG.with(|l| l.borrow().is_some())
+    LOG.with(|l| l.borrow().active())
 }
-
-/// Append one step to the calling thread's log; nothing when none is open.
-/// A write that fails panics: a trace with a step missing would be wrong,
-/// not short.
 pub fn emit(step: &str, params: Value, state: Value) {
-    LOG.with(|l| {
-        if let Some(file) = l.borrow_mut().as_mut() {
-            let line = Value::object([
-                ("step", Value::Str(step.into())),
-                ("params", params),
-                ("state", state),
-            ]);
-            writeln!(file, "{}", line.to_json()).expect("tla-trace: writing the log failed");
-        }
-    })
+    thread_log().emit(Event::new(step, params, state));
 }
-
-/// Close the calling thread's log.
 pub fn finish() {
-    LOG.with(|l| {
-        if let Some(mut file) = l.borrow_mut().take() {
-            let _ = file.flush();
-        }
-    })
+    LOG.with(|l| *l.borrow_mut() = Trace::default());
 }
 
 /// Log one step: `trace_step!("t_grant", {v: 1, c: 0, term: 2}, state)`,
@@ -263,7 +229,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             text,
-            "{\"module\": \"M\"}\n\
+            "{\"module\": \"M\", \"format\": \"tla-trace-v2\", \"state\": {}}\n\
              {\"step\": \"t_a\", \"params\": {\"i\": 0, \"term\": 2}, \"state\": {\"x\": 1}}\n\
              {\"step\": \"t_b\", \"params\": {}, \"state\": {}}\n"
         );

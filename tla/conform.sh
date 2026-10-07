@@ -51,13 +51,17 @@ for f in "${files[@]}"; do
     echo "$s: no log at $f"; failed=1; continue
   fi
   log="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+  if ! python3 tla-trace/normalize.py "$log" "$work/$s.ndjson"; then
+    echo "$s: incomplete or invalid trace"; failed=1; continue
+  fi
+  log="$work/$s.ndjson"
   steps=$(($(grep -c '' "$log") - 1))
   header=$(head -1 "$log")
   nodes=$(sed -E 's/.*"nodes": ([0-9]+).*/\1/' <<<"$header")
   expect=$(sed -nE 's/.*"expect_divergence": ([0-9]+).*/\1/p' <<<"$header")
   sed -e "s/N = 3/N = $nodes/" -e "s#TraceLog = .*#TraceLog = \"$log\"#" \
     tla/Raft_trace.cfg >"tla/Raft_trace_run_$$.cfg"
-  out=$(cd tla && java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers 1 \
+  out=$(cd tla && timeout "${TLC_TIMEOUT:-120}s" java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers 1 \
     -metadir "$work/$s" -config "Raft_trace_run_$$.cfg" Raft_trace.tla 2>&1 || true)
   depth=$(sed -nE 's/.*depth of the complete state graph search is ([0-9]+).*/\1/p' <<<"$out")
   if grep -q '^Error' <<<"$out"; then

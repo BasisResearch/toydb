@@ -31,6 +31,9 @@ jobs:
     # tla-trace crate (not a workspace member) runs its own tests.
     - run: cargo clippy --tests --no-deps --features tla-trace -- -D warnings
     - run: cargo test --features tla-trace
+    - run: python3 -m unittest discover -s tla-trace -p 'test_*.py'
+    - run: cargo fmt --check --manifest-path tla-trace/macros/Cargo.toml
+    - run: cargo clippy --manifest-path tla-trace/macros/Cargo.toml --target-dir target/tla-trace -- -D warnings
     - run: cargo fmt --check --manifest-path tla-trace/Cargo.toml
     - run: cargo clippy --manifest-path tla-trace/Cargo.toml --target-dir target/tla-trace --tests -- -D warnings
     - run: cargo test --manifest-path tla-trace/Cargo.toml --target-dir target/tla-trace
@@ -68,3 +71,4 @@ jobs:
     # fixtures diverge at the step their header names.
     - run: tla/conform.sh
     - run: tla/conform.sh tla/traces/*.ndjson
+    - run: cargo test --manifest-path tla-trace/Cargo.toml --test exporter -- --ignored
