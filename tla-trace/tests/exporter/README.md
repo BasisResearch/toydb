@@ -16,8 +16,11 @@ an enum containing a field named `tag`. The Rust integration test emits full
 and diff logs, checks acceptance, and checks rejection of incorrect record and
 enum fields. The method and model both declare the raw parameter `r#type`;
 the emitted key `r_type` must match the generated checker, and changing its
-value alone must diverge. It also compares direct and normalized legacy logs with
-optional fields omitted. Run it with the pinned Basis TLC jar, Java, Python and `timeout`:
+value alone must diverge. The Rust method uses the raw spelling `r#set`: its
+begin and transition names must both be `t_set`, so a mismatched argument cannot
+pass via the checker's unknown-step fallback. It also compares direct and
+normalized legacy logs with optional fields omitted. Run it with the pinned
+Basis TLC jar, Java, Python and `timeout`:
 
 ```sh
 TLA2TOOLS_JAR=/absolute/path/to/tla2tools.jar \

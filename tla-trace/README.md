@@ -65,7 +65,8 @@ attributes and doc comments are preserved. Attributes on methods work without
 an impl attribute. Defaults are:
 
 - Handle: `self.trace.clone()`.
-- Transition name: `t_<method name>`.
+- Transition name: `t_<method name>`, without a raw identifier's `r#` prefix
+  (`r#set` emits `t_set`). Explicit `step` names are used unchanged.
 - Parameters: named arguments, observed **before** the body.
 - State: `Observe::observe(self, cx)` **after** the body.
 

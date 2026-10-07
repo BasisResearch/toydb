@@ -15,21 +15,24 @@ Baseline: `c23eebe8` on `yl/raft-safety-refine`. Implementation branch:
 - The 305 library tests pass both with and without `tla-trace`. The complete
   `cargo test` suites pass with and without the feature, including five integration
   tests in each run.
-- The emitter has **15 unit/integration tests**, **7 doctests** (including five
+- The emitter has **16 unit/integration tests**, **7 doctests** (including five
   compile-fail cases), and **7 Python reader tests**. Coverage includes nested
   calls, early returns, disabled tracing, moved and concurrent objects, caught
   panics, automatic IDs and collisions, generic equality interning, collections,
   enum encoding, field removal, cfg preservation (including inactive unsupported
   signatures), impl-member overrides (direct, conditional, and aliased, including
   log-handle replacement), explicit constructor opt-outs, and equality-preserving
-  generic interning with explicit default and custom collection hashers.
+  generic interning with explicit default and custom collection hashers, and
+  raw method names in both method and impl annotations with explicit overrides.
 - An additional **exporter-backed integration test** runs in the trace CI job
   with Java and the pinned jar. Full and diff logs containing reserved field
   names and nested unit tuples conform; incorrect record and enum field values
   diverge. Legacy logs with omitted `state`, `params`, or both have identical
   direct and normalized TLC verdicts. The real export checks the raw parameter
   `r#type` under its exported name `r_type`; changing only that parameter makes
-  the trace diverge. The fixture and regeneration instructions
+  the trace diverge. The Rust method is spelled `r#set`; begin and transition
+  records must name `t_set`, ensuring the parameter mismatch cannot pass through
+  the checker's unknown-step fallback. The fixture and regeneration instructions
   are in [tests/exporter/README.md](tests/exporter/README.md).
 - Formatting and warnings-as-errors Clippy pass for the root with tracing, the
   emitter, and the proc-macro crate. CI includes the reader and macro checks.

@@ -22,7 +22,7 @@ struct State {
 }
 impl State {
     #[trace_step]
-    fn set(&mut self, r#type: u64) {
+    fn r#set(&mut self, r#type: u64) {
         self.record.tag = r#type;
         self.choice = Choice::A { tag: r#type };
     }
@@ -108,6 +108,14 @@ fn emitted_and_legacy_logs_conform_to_the_exported_model() {
         state.set(2);
         drop(state);
         let input = work.join(format!("{id}.ndjson"));
+        let emitted: Vec<serde_json::Value> = std::fs::read_to_string(&input)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for index in [1, 2, 4, 5] {
+            assert_eq!(emitted[index]["step"], "t_set");
+        }
         let normalized = work.join("normalized.ndjson");
         assert!(
             Command::new("python3")
@@ -126,8 +134,9 @@ fn emitted_and_legacy_logs_conform_to_the_exported_model() {
             .collect();
         assert_eq!(rows[1]["params"], serde_json::json!({"r_type": 1}));
         assert_eq!(rows[2]["params"], serde_json::json!({"r_type": 2}));
-        // Check that the real export consumes this parameter, rather than
-        // accepting the state via an unknown-step/state-only fallback.
+        // The raw method must dispatch to t_set, so the real export consumes
+        // this parameter. The old t_r#set name took the unknown-step fallback
+        // and falsely accepted this mismatched argument and state.
         let mut bad_param = rows.clone();
         bad_param[1]["params"]["r_type"] = serde_json::json!(2);
         write_rows(&input, &bad_param);

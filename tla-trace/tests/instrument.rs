@@ -365,6 +365,47 @@ fn impl_keeps_cfg_and_method_override() {
 }
 
 #[test]
+fn raw_method_names_use_unraw_defaults_and_preserve_explicit_names() {
+    #[derive(Observe)]
+    struct Raw {
+        x: u64,
+        #[observe(skip)]
+        trace: Trace,
+    }
+    impl Raw {
+        #[trace_step]
+        fn r#set(&mut self) {
+            self.x = 1;
+        }
+    }
+    #[trace_step]
+    impl Raw {
+        fn r#type(&mut self) {
+            self.x = 2;
+        }
+        #[trace_step(step = "custom::t_match")]
+        fn r#match(&mut self) {
+            self.x = 3;
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = Raw { x: 0, trace: Trace::default() };
+    raw.trace = Trace::object(dir.path(), Some("raw"), Value::object::<&str>([]), false, |cx| {
+        raw.observe(cx)
+    })
+    .unwrap();
+    raw.set();
+    raw.r#type();
+    raw.r#match();
+    let rows = lines(&dir.path().join("raw.ndjson"));
+    assert_eq!(rows.len(), 10);
+    for (chunk, name) in rows[1..].chunks(3).zip(["t_set", "t_type", "custom::t_match"]) {
+        assert_eq!(chunk[0]["step"], name);
+        assert_eq!(chunk[1]["step"], name);
+    }
+}
+
+#[test]
 fn diff_removes_fields_that_become_unobserved() {
     let dir = tempfile::tempdir().unwrap();
     let trace = Trace::object(dir.path(), Some("remove"), Value::object::<&str>([]), true, |_| {

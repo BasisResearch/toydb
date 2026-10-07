@@ -170,7 +170,7 @@ fn wrap(method: &mut ImplItemFn, o: &Options) -> Result<()> {
             "a returned borrow cannot be observed after the call; use an owned-result wrapper or #[trace_skip]",
         ));
     }
-    let name = format!("t_{}", sig.ident);
+    let name = format!("t_{}", sig.ident.unraw());
     let step = o.step.clone().unwrap_or_else(|| parse_quote!(#name));
     let log = o.log.clone().unwrap_or_else(|| parse_quote!(self.trace.clone()));
     let params = if let Some(p) = &o.params {
