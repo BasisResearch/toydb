@@ -122,7 +122,7 @@ TraceObservedNext(j) == \A k \in DOMAIN j : TraceObservedKeyNext(k, j[k])
 
 TraceStep(e) ==
     CASE e.step \in {"t_set", "encoding::t_set"} ->
-           Next /\ TraceParamsDeclared(e, {"n"}) /\ \E a1_ \in TraceParam(e, "n", TraceDec_nat, (IF (1) > 0 THEN (1) ELSE 0)..2) : t_set(a1_)
+           Next /\ TraceParamsDeclared(e, {"r_type"}) /\ \E a1_ \in TraceParam(e, "r_type", TraceDec_nat, (IF (1) > 0 THEN (1) ELSE 0)..2) : t_set(a1_)
       [] OTHER -> Next
 
 TraceInit ==
@@ -152,8 +152,8 @@ TraceStepAt == Trace[trace_i]
 \* The model's steps enabled in the current state, with their parameters
 \* (a step whose parameter has no finite domain is not enumerated).
 TraceEnabled ==
-    {r \in {[step |-> "t_set", params |-> [n |-> a1_]] : a1_ \in (IF (1) > 0 THEN (1) ELSE 0)..2} :
-        ENABLED (Next /\ t_set(r.params.n))}
+    {r \in {[step |-> "t_set", params |-> [r_type |-> a1_]] : a1_ \in (IF (1) > 0 THEN (1) ELSE 0)..2} :
+        ENABLED (Next /\ t_set(r.params.r_type))}
 \* At a state where the log's next step cannot be taken: whether the logged
 \* step is enabled at all, and which observed fields no successor by it matches.
 TraceDiagnosis ==
@@ -163,4 +163,4 @@ TraceDiagnosis ==
                         ~ENABLED (Next /\ TraceStep(e) /\ TraceObservedKeyNext(k, TraceStateOf(e)[k]))} ]
 ===================================
 
-\* VERUS_TRACE_POLICY {"module":"State_tla_trace","index_variable":"trace_i","observables":["record","choice"],"steps":[{"step":"t_set","function":"encoding::t_set","operator":"t_set","short_name_shared":false,"params":[{"name":"n","typ":"nat","domain":"(IF (1) > 0 THEN (1) ELSE 0)..2"}],"enumerated":true}],"general_relation_steps":["t_set"],"unknown_step":"Next (state-only conformance; logged name and parameters are not checked)"}
+\* VERUS_TRACE_POLICY {"module":"State_tla_trace","index_variable":"trace_i","observables":["record","choice"],"steps":[{"step":"t_set","function":"encoding::t_set","operator":"t_set","short_name_shared":false,"params":[{"name":"r_type","typ":"nat","domain":"(IF (1) > 0 THEN (1) ELSE 0)..2"}],"enumerated":true}],"general_relation_steps":["t_set"],"unknown_step":"Next (state-only conformance; logged name and parameters are not checked)"}

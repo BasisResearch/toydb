@@ -18,9 +18,9 @@ pub open spec fn init(s: State) -> bool {
     s.record == Record { tag: 0, tag_: 7, unit: () }
     && s.choice == Choice::A { tag: 0 }
 }
-pub open spec fn t_set(pre: State, post: State, n: nat) -> bool {
-    post.record == Record { tag: n, tag_: pre.record.tag_, unit: () }
-    && post.choice == Choice::A { tag: n }
+pub open spec fn t_set(pre: State, post: State, r#type: nat) -> bool {
+    post.record == Record { tag: r#type, tag_: pre.record.tag_, unit: () }
+    && post.choice == Choice::A { tag: r#type }
 }
 pub open spec fn next(pre: State, post: State) -> bool {
     exists|n: nat| 1 <= n && n <= 2 && t_set(pre, post, n)

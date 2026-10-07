@@ -38,6 +38,104 @@ fn options(tokens: proc_macro2::TokenStream) -> Result<Options> {
     }
     Ok(o)
 }
+
+// Match vir::tla::ident_name for the exporter's logged parameter names.
+// In particular, Verus retains the raw prefix before sanitizing r#type to r_type.
+fn parameter_name(id: &Ident) -> String {
+    let mut name: String = id
+        .to_string()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    const RESERVED: &[&str] = &[
+        "ACTION",
+        "BY",
+        "COROLLARY",
+        "DEF",
+        "DEFINE",
+        "DEFS",
+        "HAVE",
+        "HIDE",
+        "LEMMA",
+        "NEW",
+        "OBVIOUS",
+        "OMITTED",
+        "ONLY",
+        "PICK",
+        "PROOF",
+        "PROPOSITION",
+        "PROVE",
+        "QED",
+        "STATE",
+        "SUFFICES",
+        "TAKE",
+        "TEMPORAL",
+        "USE",
+        "WITNESS",
+        "ASSUME",
+        "ELSE",
+        "LOCAL",
+        "UNION",
+        "ASSUMPTION",
+        "ENABLED",
+        "MODULE",
+        "VARIABLE",
+        "AXIOM",
+        "EXCEPT",
+        "OTHER",
+        "VARIABLES",
+        "CASE",
+        "EXTENDS",
+        "SF_",
+        "WF_",
+        "CHOOSE",
+        "IF",
+        "SUBSET",
+        "WITH",
+        "CONSTANT",
+        "IN",
+        "THEN",
+        "CONSTANTS",
+        "INSTANCE",
+        "THEOREM",
+        "DOMAIN",
+        "LET",
+        "UNCHANGED",
+        "STRING",
+        "BOOLEAN",
+        "TRUE",
+        "FALSE",
+        "LAMBDA",
+        "RECURSIVE",
+        "Nat",
+        "Int",
+        "Seq",
+        "Len",
+        "Append",
+        "Head",
+        "Tail",
+        "SubSeq",
+        "SelectSeq",
+        "Cardinality",
+        "IsFiniteSet",
+        "Assert",
+        "Print",
+        "PrintT",
+        "ToString",
+        "JavaTime",
+        "TLCGet",
+        "TLCSet",
+        "Permutations",
+        "SortSeq",
+        "RandomElement",
+        "Any",
+        "TLCEval",
+    ];
+    if RESERVED.contains(&name.as_str()) {
+        name.push('_');
+    }
+    name
+}
 fn wrap(method: &mut ImplItemFn, o: &Options) -> Result<()> {
     let sig = &method.sig;
     if sig.constness.is_some() || sig.asyncness.is_some() || sig.unsafety.is_some() {
@@ -81,13 +179,20 @@ fn wrap(method: &mut ImplItemFn, o: &Options) -> Result<()> {
         quote!(::tla_trace::Value::object::<&str>([]))
     } else {
         let mut args = Vec::new();
+        let mut keys = std::collections::BTreeSet::new();
         for arg in &sig.inputs {
             if let FnArg::Typed(a) = arg {
                 let Pat::Ident(p) = a.pat.as_ref() else {
                     return Err(Error::new(a.span(), "use named parameters or explicit params"));
                 };
                 let id = &p.ident;
-                let key = id.to_string();
+                let key = parameter_name(id);
+                if !keys.insert(key.clone()) {
+                    return Err(Error::new(
+                        id.span(),
+                        format!("duplicate exported parameter name `{key}`; use explicit params"),
+                    ));
+                }
                 args.push(quote!((#key, ::tla_trace::Observe::observe(&#id, cx))));
             }
         }
@@ -125,20 +230,28 @@ pub fn trace_step(args: TokenStream, item: TokenStream) -> TokenStream {
                 if let ImplItem::Fn(m) = item {
                     let skip = m.attrs.iter().any(|a| a.path().is_ident("trace_skip"));
                     m.attrs.retain(|a| !a.path().is_ident("trace_skip"));
-                    if !skip
-                        && !m.attrs.iter().any(|a| {
-                            a.path().segments.last().is_some_and(|s| s.ident == "trace_step")
-                        })
-                    {
+                    if !skip {
                         // Let Rust remove cfg-disabled members before validating
                         // their signatures. Keep impl defaults on active members.
-                        m.attrs.push(parse_quote!(#[::tla_trace::instrument::trace_step(#args)]));
+                        // An explicit annotation (including an alias or one
+                        // expanded by cfg_attr) removes this fallback before
+                        // wrapping, so it overrides every impl option exactly once.
+                        m.attrs.push(
+                            parse_quote!(#[::tla_trace::instrument::__trace_step_default(#args)]),
+                        );
                     }
                 }
             }
             Ok(quote!(#block))
         } else {
             let mut m: ImplItemFn = syn::parse2(tokens)?;
+            m.attrs.retain(|a| {
+                !a.path().segments.iter().map(|s| s.ident.to_string()).eq([
+                    "tla_trace",
+                    "instrument",
+                    "__trace_step_default",
+                ])
+            });
             wrap(&mut m, &o)?;
             Ok(quote!(#m))
         }
@@ -180,7 +293,9 @@ pub fn derive_observe(item: TokenStream) -> TokenStream {
                                 if let GenericArgument::Type(t) = a { Some(t) } else { None }
                             })
                             .collect();
-                    if ts.len() == 1
+                    // Only elements, keys and values are observed. Additional
+                    // collection arguments select a hasher or allocator.
+                    if !ts.is_empty()
                         && ["Vec", "VecDeque", "HashSet", "BTreeSet", "Option"]
                             .iter()
                             .any(|n| s.ident == *n)
@@ -192,7 +307,7 @@ pub fn derive_observe(item: TokenStream) -> TokenStream {
                             quote!(::tla_trace::Value::Array((#access).iter().map(|v| #inner).collect()))
                         };
                     }
-                    if ts.len() == 2 && (s.ident == "HashMap" || s.ident == "BTreeMap") {
+                    if ts.len() >= 2 && (s.ident == "HashMap" || s.ident == "BTreeMap") {
                         let k = encode(ts[0], quote!(k), names);
                         let v = encode(ts[1], quote!(v), names);
                         return quote!(::tla_trace::Value::Array((#access).iter().map(|(k,v)| ::tla_trace::Value::Array(vec![#k, #v])).collect()));

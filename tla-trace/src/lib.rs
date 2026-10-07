@@ -147,6 +147,10 @@ pub use tla_trace_macros::Observe;
 /// between attributes and function-like macros.
 pub mod instrument {
     pub use tla_trace_macros::trace_step;
+    // Distinguish an impl's pending fallback from a user's method annotation,
+    // even when the latter is imported under an alias.
+    #[doc(hidden)]
+    pub use tla_trace_macros::trace_step as __trace_step_default;
 }
 
 thread_local! {

@@ -203,6 +203,114 @@ fn collection_encoding() {
 }
 
 #[test]
+fn explicit_hashers_preserve_generic_element_identity() {
+    use std::collections::{HashMap, HashSet, hash_map::RandomState};
+    use std::hash::{BuildHasherDefault, DefaultHasher};
+
+    #[derive(Observe)]
+    struct Collections<T> {
+        implicit_set: HashSet<T>,
+        explicit_set: HashSet<T, RandomState>,
+        other_set: HashSet<T, BuildHasherDefault<DefaultHasher>>,
+        implicit_map: HashMap<T, T>,
+        explicit_map: HashMap<T, T, RandomState>,
+        other_map: HashMap<T, T, BuildHasherDefault<DefaultHasher>>,
+    }
+    let equal = Collections {
+        implicit_set: HashSet::from([42u64]),
+        explicit_set: HashSet::from([42]),
+        other_set: [42].into_iter().collect(),
+        implicit_map: HashMap::from([(42, 1)]),
+        explicit_map: HashMap::from([(42, 1)]),
+        other_map: [(42, 1)].into_iter().collect(),
+    };
+    let mut cx = Context::default();
+    let value: serde_json::Value = serde_json::from_str(&equal.observe(&mut cx).to_json()).unwrap();
+    assert_eq!(value["implicit_set"], value["explicit_set"]);
+    assert_eq!(value["implicit_set"], value["other_set"]);
+    assert_eq!(value["implicit_map"], value["explicit_map"]);
+    assert_eq!(value["implicit_map"], value["other_map"]);
+    assert_eq!(value["implicit_map"], serde_json::json!([[1, 2]]));
+
+    let unequal = Collections {
+        explicit_set: HashSet::from([1]),
+        explicit_map: HashMap::from([(1, 42)]),
+        ..equal
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&unequal.observe(&mut cx).to_json()).unwrap();
+    assert_ne!(value["implicit_set"], value["explicit_set"]);
+    assert_ne!(value["implicit_map"], value["explicit_map"]);
+    assert_eq!(value["explicit_map"], serde_json::json!([[2, 1]]));
+
+    // The optional hasher must not introduce an Observe requirement on T.
+    let opaque = Collections {
+        implicit_set: HashSet::new(),
+        explicit_set: HashSet::<Opaque, RandomState>::new(),
+        other_set: HashSet::default(),
+        implicit_map: HashMap::new(),
+        explicit_map: HashMap::<Opaque, Opaque, RandomState>::new(),
+        other_map: HashMap::default(),
+    };
+    opaque.observe(&mut Context::default());
+}
+
+#[test]
+fn conditional_and_aliased_method_annotations_override_impl_defaults() {
+    use tla_trace::instrument::trace_step as alias;
+
+    #[derive(Observe)]
+    struct Configured {
+        n: u64,
+        #[observe(skip)]
+        trace: Trace,
+        #[observe(skip)]
+        fallback: Trace,
+    }
+    #[trace_step(step = "t_default", log = self.fallback.clone())]
+    impl Configured {
+        #[cfg_attr(all(), trace_step(step = "t_conditional"))]
+        fn conditional(&mut self) {
+            self.n += 1;
+        }
+        #[alias(step = "t_alias")]
+        fn aliased(&mut self) {
+            self.n += 1;
+        }
+        #[cfg_attr(all(), cfg_attr(all(), alias(step = "t_nested")))]
+        fn nested(&mut self) {
+            self.n += 1;
+        }
+        #[cfg_attr(any(), trace_step(step = "t_inactive"))]
+        fn default(&mut self) {
+            self.n += 1;
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = Configured {
+        n: 0,
+        trace: counter(dir.path(), Some("override"), false).trace,
+        fallback: counter(dir.path(), Some("fallback"), false).trace,
+    };
+    c.conditional();
+    c.aliased();
+    c.nested();
+    c.default();
+    let rows = lines(&dir.path().join("override.ndjson"));
+    assert_eq!(rows.len(), 10);
+    for (chunk, name) in rows[1..].chunks(3).zip(["t_conditional", "t_alias", "t_nested"]) {
+        assert_eq!(chunk[0]["step"], name);
+        assert_eq!(chunk[1]["step"], name);
+    }
+    // An override replaces the default handle too; there must be no nested
+    // default wrappers quietly recording the same call into a second file.
+    let fallback = lines(&dir.path().join("fallback.ndjson"));
+    assert_eq!(fallback.len(), 4);
+    assert_eq!(fallback[1]["step"], "t_default");
+    assert_eq!(fallback[2]["state"]["n"], 4);
+}
+
+#[test]
 fn impl_keeps_cfg_and_method_override() {
     #[derive(Observe)]
     struct Configured {

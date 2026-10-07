@@ -20,9 +20,9 @@ vars == <<record, choice>>
 init ==
     ((record = [tag_ |-> 0, tag__ |-> 7, unit |-> <<>>]) /\ (choice = [tag |-> "A", tag_ |-> 0]))
 
-\* encoding::t_set, tla-trace/tests/exporter/encoding.rs:21:1: 21:64 (#0)
-t_set(n) ==
-    ((record' = [tag_ |-> n, tag__ |-> record.tag__, unit |-> <<>>]) /\ (choice' = [tag |-> "A", tag_ |-> n]))
+\* encoding::t_set, tla-trace/tests/exporter/encoding.rs:21:1: 21:69 (#0)
+t_set(r_type) ==
+    ((record' = [tag_ |-> r_type, tag__ |-> record.tag__, unit |-> <<>>]) /\ (choice' = [tag |-> "A", tag_ |-> r_type]))
 
 \* encoding::next, tla-trace/tests/exporter/encoding.rs:25:1: 25:55 (#0)
 next ==

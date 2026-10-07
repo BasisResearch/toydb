@@ -22,9 +22,9 @@ struct State {
 }
 impl State {
     #[trace_step]
-    fn set(&mut self, n: u64) {
-        self.record.tag = n;
-        self.choice = Choice::A { tag: n };
+    fn set(&mut self, r#type: u64) {
+        self.record.tag = r#type;
+        self.choice = Choice::A { tag: r#type };
     }
 }
 
@@ -124,6 +124,14 @@ fn emitted_and_legacy_logs_conform_to_the_exported_model() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        assert_eq!(rows[1]["params"], serde_json::json!({"r_type": 1}));
+        assert_eq!(rows[2]["params"], serde_json::json!({"r_type": 2}));
+        // Check that the real export consumes this parameter, rather than
+        // accepting the state via an unknown-step/state-only fallback.
+        let mut bad_param = rows.clone();
+        bad_param[1]["params"]["r_type"] = serde_json::json!(2);
+        write_rows(&input, &bad_param);
+        check_depth(work, &input, 1);
         // Incorrect reserved-name fields must cause divergence, not disappear
         // from the observer as they did when encoded as the reserved "tag".
         for field in ["record", "choice"] {

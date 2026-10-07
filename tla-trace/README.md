@@ -69,6 +69,22 @@ an impl attribute. Defaults are:
 - Parameters: named arguments, observed **before** the body.
 - State: `Observe::observe(self, cx)` **after** the body.
 
+Method overrides also work through `cfg_attr` and imported attribute aliases;
+they replace all impl options, including the log handle. Parameter keys follow
+the exporter's naming rules: `r#type` becomes `r_type`, and TLA-reserved names
+such as `Len` become `Len_`. Use explicit `params` for a different model mapping.
+Names that collide after this conversion are rejected:
+
+```compile_fail
+use tla_trace::{Observe, Trace, instrument::trace_step};
+#[derive(Observe)]
+struct Counter { x: u64, #[observe(skip)] trace: Trace }
+impl Counter {
+    #[trace_step]
+    fn add(&mut self, r#type: u64, r_type: u64) { self.x += r#type + r_type; }
+}
+```
+
 Override any of these with expressions:
 
 ```rust
@@ -180,6 +196,10 @@ log's lifetime and currently uses linear lookup. For generic method parameters,
 use `params = ... cx.intern(&argument) ...` to share that same encoding; ordinary
 parameters use `Observe`, not automatic interning. A model must interpret interned
 IDs as opaque identities, not as the element's numeric value.
+
+Explicit collection hasher or allocator arguments do not change element
+encoding: `HashSet<T>` and `HashSet<T, RandomState>` share the same interning
+table, as do map keys and values with or without an explicit hasher.
 
 Object observations are partial, as in the exporter. JSON arrays are whole
 collections; the exporter's *partial sequence object keys* use Verus's zero-based
