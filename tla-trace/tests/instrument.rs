@@ -210,8 +210,12 @@ fn impl_keeps_cfg_and_method_override() {
         #[observe(skip)]
         trace: Trace,
     }
-    #[trace_step]
+    #[trace_step(step = "t_default")]
     impl Configured {
+        #[trace_skip]
+        fn new() -> Self {
+            Self { n: 0, trace: Trace::default() }
+        }
         /// The active definition keeps this doc comment.
         #[cfg(not(any()))]
         fn go(&mut self) {
@@ -221,13 +225,25 @@ fn impl_keeps_cfg_and_method_override() {
         fn go(&mut self) {
             compile_error!("inactive method compiled");
         }
+        #[cfg(any())]
+        async fn inactive_async(&mut self) {}
+        #[cfg(any())]
+        const fn inactive_const(&self) -> u64 {
+            0
+        }
+        #[cfg(any())]
+        fn inactive_consuming(self) {}
+        #[cfg_attr(not(any()), cfg(any()))]
+        fn inactive_borrow(&mut self) -> &mut u64 {
+            &mut self.n
+        }
         #[trace_step(step = "t_custom")]
         fn custom(&mut self) {
             self.n += 2;
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut c = Configured { n: 0, trace: Trace::default() };
+    let mut c = Configured::new();
     c.trace = Trace::object(dir.path(), Some("cfg"), Value::object::<&str>([]), false, |cx| {
         c.observe(cx)
     })
@@ -236,6 +252,7 @@ fn impl_keeps_cfg_and_method_override() {
     c.custom();
     let rows = lines(&dir.path().join("cfg.ndjson"));
     assert_eq!(rows.len(), 7);
+    assert_eq!(rows[1]["step"], "t_default");
     assert_eq!(rows[4]["step"], "t_custom");
 }
 

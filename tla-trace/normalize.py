@@ -59,10 +59,12 @@ def normalize(lines):
                 state.update(row['diff'])
                 row = {"step": row['step'], "params": row['params'], "state": state}
             else:
-                if set(row) != {"step", "params", "state"}:
+                if "step" not in row or not set(row) <= {"step", "params", "state"}:
                     raise ValueError(f"line {line}: invalid step fields")
-                state = row['state']
-            if not isinstance(row['step'], str) or not isinstance(row['params'], dict):
+                # An omitted state observes nothing; it does not carry the
+                # previous observation forward as a diff would.
+                state = row.get('state', {})
+            if not isinstance(row['step'], str) or not isinstance(row.get('params', {}), dict):
                 raise ValueError(f"line {line}: invalid step or params")
             output.append(row)
     if pending is not None:

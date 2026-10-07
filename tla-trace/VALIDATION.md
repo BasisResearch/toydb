@@ -15,14 +15,21 @@ Baseline: `c23eebe8` on `yl/raft-safety-refine`. Implementation branch:
 - The 305 library tests pass both with and without `tla-trace`. The complete
   `cargo test` suites pass with and without the feature, including five integration
   tests in each run.
-- The emitter has **12 unit/integration tests**, **4 doctests** (including two
-  compile-fail cases), and **5 Python reader tests**. Coverage includes nested
+- The emitter has **13 unit/integration tests**, **6 doctests** (including four
+  compile-fail cases), and **7 Python reader tests**. Coverage includes nested
   calls, early returns, disabled tracing, moved and concurrent objects, caught
   panics, automatic IDs and collisions, generic equality interning, collections,
-  enum encoding, field removal, cfg preservation, and impl-member overrides.
+  enum encoding, field removal, cfg preservation (including inactive unsupported
+  signatures), impl-member overrides, and explicit constructor opt-outs.
+- An additional **exporter-backed integration test** runs in the trace CI job
+  with Java and the pinned jar. Full and diff logs containing reserved field
+  names and nested unit tuples conform; incorrect record and enum field values
+  diverge. Legacy logs with omitted `state`, `params`, or both have identical
+  direct and normalized TLC verdicts. The fixture and regeneration instructions
+  are in [tests/exporter/README.md](tests/exporter/README.md).
 - Formatting and warnings-as-errors Clippy pass for the root with tracing, the
   emitter, and the proc-macro crate. CI includes the reader and macro checks.
-- Each TLC invocation uses a 120-second timeout; the full runner was additionally
+- Each goldenscript TLC invocation uses a 120-second timeout; the full runner was additionally
   bounded to 1,800 seconds. No Verus proof bodies changed or were reverified.
 
 ## Instrumentation size

@@ -16,6 +16,18 @@ class Normalization(unittest.TestCase):
         self.assertEqual(result[1], STEP)
         self.assertEqual(read(*result), result)
 
+    def test_optional_legacy_fields_are_preserved(self):
+        header = {'module': 'M'}
+        for row in ({'step': 't_add'}, {'step': 't_add', 'params': {}},
+                    {'step': 't_add', 'state': {'x': 1}}):
+            with self.subTest(row=row):
+                self.assertEqual(read(header, row), [header, row])
+
+    def test_omitted_state_clears_diff_base(self):
+        result = read(HEADER, {'step': 't_hide'},
+            {'step': 't_add', 'params': {}, 'diff': {'x': 2}, 'remove': []})
+        self.assertEqual(result[-1]['state'], {'x': 2})
+
     def test_diff_reconstructs_unchanged_fields_and_removals(self):
         result = read(HEADER, BEGIN,
             {'step': 't_add', 'params': {}, 'diff': {'x': 1}, 'remove': []},
@@ -39,6 +51,9 @@ class Normalization(unittest.TestCase):
             [HEADER, BEGIN, {'end': True}],
             [HEADER, BEGIN, {'end': 1}, BEGIN],
             [HEADER, dict(STEP, typo={})],
+            [HEADER, {'params': {}, 'state': {}}],
+            [HEADER, {'step': 't_add', 'params': None}],
+            [HEADER, {'step': 't_add', 'prams': {}}],
             [dict(HEADER, format='future')],
             [HEADER, {'step': 't_add', 'params': {}, 'diff': {}, 'remove': ['absent']}],
         ]

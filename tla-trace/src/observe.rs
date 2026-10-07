@@ -117,6 +117,6 @@ impl<A: Observe, B: Observe> Observe for (A, B) {
 }
 impl Observe for () {
     fn observe(&self, _: &mut Context) -> Value {
-        Value::object::<&str>([])
+        Value::Array(vec![])
     }
 }

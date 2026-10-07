@@ -18,6 +18,8 @@ struct Counter {
 
 #[trace_step]
 impl Counter {
+    #[trace_skip]
+    fn new() -> Self { Self { x: 0, trace: Trace::default() } }
     fn add(&mut self, amount: u64) {
         self.increment(amount);
     }
@@ -27,7 +29,7 @@ impl Counter {
 }
 
 # let dir = tempfile::tempdir().unwrap();
-let mut counter = Counter { x: 0, trace: Trace::default() };
+let mut counter = Counter::new();
 counter.trace = Trace::object(
     dir.path(), Some("counter-a"),
     Value::object([("module", Value::from("Counter")),
@@ -102,8 +104,9 @@ borrowed iterators. Use an owned-result wrapper or `#[trace_skip]`. Never use
 unsafe pointer reads to work around a returned mutable borrow: writes through it
 happen *after* the method returned and need their own modeled operation. Type
 aliases may cause the borrow checker to reject an unsupported return type instead
-of the macro's diagnostic. Constructors are skipped and the header captures
-initialization. Panics before `Trace::object` opens a log cannot be detected.
+of the macro's diagnostic. Constructors and other associated functions require
+`#[trace_skip]` inside an attributed impl (as in the example above); the header
+captures initialization. Panics before `Trace::object` opens a log cannot be detected.
 
 ```compile_fail
 use tla_trace::{Trace, instrument::trace_step};
@@ -129,6 +132,29 @@ derived for structs, tuple structs, and enums. Field annotations are
 `#[observe(intern)]`, and `#[observe(with = path_to_encoder)]` (a function taking
 `&FieldType, &mut Context`). Skipped fields stay unobserved, not zero-valued.
 
+Default field names follow the exporter: `tag` becomes `tag_`, `tag_` becomes
+`tag__`, and so on. `rename` specifies the final encoded model name. Duplicate
+encoded names and a field renamed to the reserved `tag` are compile errors.
+
+```compile_fail
+use tla_trace::Observe;
+#[derive(Observe)]
+struct Duplicate {
+    tag: u64, // encodes as tag_
+    #[observe(rename = "tag_")]
+    other: u64,
+}
+```
+
+```compile_fail
+use tla_trace::Observe;
+#[derive(Observe)]
+enum Reserved {
+    A { #[observe(rename = "tag")] value: u64 },
+    B,
+}
+```
+
 | Rust/model value | JSON value |
 | --- | --- |
 | integers, bool, string, char | number, boolean, string, one-character string |
@@ -138,6 +164,8 @@ derived for structs, tuple structs, and enums. Field annotations are
 | sequence / array / tuple | array, interpreted by TLA at positions **1..Len** |
 | set | array of elements |
 | map | array of `[key,value]` pairs |
+
+The unit tuple `()` is `[]`; an empty struct is `{}`.
 
 `Observe` supports slices, arrays, Vec/VecDeque, BTreeSet/HashSet,
 BTreeMap/HashMap, Option, Box, references, and pairs. Set/map iteration order is
@@ -195,8 +223,10 @@ python3 tla-trace/normalize.py input.ndjson normalized.ndjson
 # Pass normalized.ndjson to tlc_conform, only if normalization succeeded.
 ```
 
-The adapter accepts legacy logs too. It validates framing, rejects unknown
-record fields, reconstructs full observations from diffs, and strips only v2
+The adapter accepts legacy logs too, including omitted `params` and `state`
+fields (the model supplies parameter domains; omitted state observes nothing).
+It validates framing, rejects unknown record fields, reconstructs full
+observations from diffs, and strips only v2
 metadata. An unmatched begin reports the affected model step and Rust operation,
 returns nonzero, and writes no new output. It never treats the completed prefix
 of a panicking call as a passing trace. Older tools cannot read v2 directly;
@@ -221,6 +251,7 @@ recovery itself still occurs before that adapter and is not panic-framed.
 cargo test --manifest-path tla-trace/Cargo.toml
 python3 -m unittest discover -s tla-trace -p 'test_*.py'
 cargo test --lib
+TLA2TOOLS_JAR=/path/to/tla2tools.jar cargo test --manifest-path tla-trace/Cargo.toml --test exporter -- --ignored
 TLA2TOOLS_JAR=/path/to/tla2tools.jar bash tla/conform.sh
 TLA2TOOLS_JAR=/path/to/tla2tools.jar bash tla/conform.sh tla/traces/*.ndjson
 ```

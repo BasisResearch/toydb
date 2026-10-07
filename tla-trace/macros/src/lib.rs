@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse::Parser, parse_quote, spanned::Spanned, *};
+use syn::{ext::IdentExt, parse::Parser, parse_quote, spanned::Spanned, *};
 
 #[derive(Default)]
 struct Options {
@@ -117,7 +117,8 @@ fn wrap(method: &mut ImplItemFn, o: &Options) -> Result<()> {
 #[proc_macro_attribute]
 pub fn trace_step(args: TokenStream, item: TokenStream) -> TokenStream {
     let output = (|| {
-        let o = options(args.into())?;
+        let args: proc_macro2::TokenStream = args.into();
+        let o = options(args.clone())?;
         let tokens: proc_macro2::TokenStream = item.into();
         if let Ok(mut block) = syn::parse2::<ItemImpl>(tokens.clone()) {
             for item in &mut block.items {
@@ -129,7 +130,9 @@ pub fn trace_step(args: TokenStream, item: TokenStream) -> TokenStream {
                             a.path().segments.last().is_some_and(|s| s.ident == "trace_step")
                         })
                     {
-                        wrap(m, &o)?;
+                        // Let Rust remove cfg-disabled members before validating
+                        // their signatures. Keep impl defaults on active members.
+                        m.attrs.push(parse_quote!(#[::tla_trace::instrument::trace_step(#args)]));
                     }
                 }
             }
@@ -204,6 +207,7 @@ pub fn derive_observe(item: TokenStream) -> TokenStream {
              -> Result<(Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>)> {
                 let mut binds = Vec::new();
                 let mut entries = Vec::new();
+                let mut keys = std::collections::BTreeSet::new();
                 for (i, f) in fs.iter().enumerate() {
                     let member = f
                         .ident
@@ -211,8 +215,16 @@ pub fn derive_observe(item: TokenStream) -> TokenStream {
                         .map(Member::Named)
                         .unwrap_or(Member::Unnamed(Index::from(i)));
                     let binding = format_ident!("__field_{i}");
-                    let mut key =
-                        f.ident.as_ref().map(ToString::to_string).unwrap_or(format!("v{i}"));
+                    let mut key = f
+                        .ident
+                        .as_ref()
+                        .map(|id| id.unraw().to_string())
+                        .unwrap_or(format!("v{i}"));
+                    // Match the exporter's field_name: tag is reserved for
+                    // variant identity, and escaping must remain injective.
+                    if key.strip_prefix("tag").is_some_and(|s| s.chars().all(|c| c == '_')) {
+                        key.push('_');
+                    }
                     let mut skip = false;
                     let mut intern = false;
                     let mut with: Option<Expr> = None;
@@ -237,6 +249,18 @@ pub fn derive_observe(item: TokenStream) -> TokenStream {
                     binds.push(quote!(#member: #binding));
                     if skip {
                         continue;
+                    }
+                    if key == "tag" {
+                        return Err(Error::new(
+                            f.span(),
+                            "observe field name `tag` is reserved; use the model's escaped name `tag_`",
+                        ));
+                    }
+                    if !keys.insert(key.clone()) {
+                        return Err(Error::new(
+                            f.span(),
+                            format!("duplicate observe field name `{key}`"),
+                        ));
                     }
                     let access = if enum_mode { quote!(#binding) } else { quote!(&self.#member) };
                     let value = if let Some(with) = with {

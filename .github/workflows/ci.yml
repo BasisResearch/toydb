@@ -71,3 +71,4 @@ jobs:
     # fixtures diverge at the step their header names.
     - run: tla/conform.sh
     - run: tla/conform.sh tla/traces/*.ndjson
+    - run: cargo test --manifest-path tla-trace/Cargo.toml --test exporter -- --ignored
