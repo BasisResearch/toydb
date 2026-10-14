@@ -139,8 +139,10 @@ VERUS_DYNCOV_OUT="$repo_root/$out/profiles" "$lib_tests"
 
 # The integration tests (tests/tests.rs): goldenscripts against real clusters
 # of the instrumented `toydb` binary (TOYDB_BIN, see tests/testcluster.rs).
-# The servers inherit VERUS_DYNCOV_OUT and flush their profiles every two
-# seconds; they are killed at the end of each script.
+# The servers inherit VERUS_DYNCOV_OUT and flush their profiles every
+# second (VERUS_DYNCOV_FLUSH_SECS) and on SIGTERM, which testcluster.rs
+# sends first; their profiles are copied into the pool, so the "all
+# workloads" summary and HTML include this run.
 integration=""
 for exe in "$target_dir"/debug/deps/tests-*; do
   [[ -x "$exe" && ! "$exe" == *.d ]] || continue
