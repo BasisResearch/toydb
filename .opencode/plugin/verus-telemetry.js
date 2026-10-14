@@ -33,7 +33,6 @@ const REPO_ROOT = join(HERE, "..", "..");
 const PKG_DIR = join(REPO_ROOT, ".claude", "hooks");
 const RUNNER = join(REPO_ROOT, ".opencode", "plugin", "verus_runner.py");
 const BRANCH_GUARD = join(PKG_DIR, "branch_guard.py");
-const SOLVER_GUARD = join(PKG_DIR, "solver_guard.py");
 
 // session.idle fires after every turn, so a synchronous capture would block the
 // event loop on each one while the ingest endpoint responds. Coalesce bursts
@@ -95,18 +94,16 @@ function scheduleCapture(sessionId, directory) {
 
 export const VerusTelemetry = async ({ project, directory }) => {
   return {
-    // ---- Branch-discipline + solver guards on bash commands --------------
-    // Same policies and same guard scripts as the Claude Code / Codex
-    // PreToolUse hooks. The solver guard blocks manual verus/z3/cvc5 runs
-    // (they must go through the Verus MCP server's pinned binaries); the
-    // branch guard enforces branch discipline. Exit 2 => violation (throw
-    // blocks the call, message reaches the agent); anything else fails open
-    // so the guards never brick the bash tool.
+    // ---- Branch-discipline guard on bash commands -------------------------
+    // Same policy and same guard script as the Claude Code / Codex
+    // PreToolUse hooks. Exit 2 => violation (throw blocks the call, message
+    // reaches the agent); anything else fails open so the guard never
+    // bricks the bash tool.
     "tool.execute.before": async (input, output) => {
       if (!input || input.tool !== "bash") return;
       const cmd = output && output.args && output.args.command;
       if (!cmd) return;
-      for (const guard of [SOLVER_GUARD, BRANCH_GUARD]) {
+      for (const guard of [BRANCH_GUARD]) {
         if (!existsSync(guard)) continue;
         const res = spawnSync(
           "python3",

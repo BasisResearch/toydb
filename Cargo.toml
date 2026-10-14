@@ -73,12 +73,3 @@ serde_json = "1.0"
 tempfile = "3.25"
 test-case = "3.3"
 test_each_file = "0.3"
-
-# Dynamic verified coverage experiment: use the local BasisResearch/verus
-# checkout's vstd (same version as the pin) so that its `verus!` macro can
-# instrument contracts (`verus --dyncov`).
-[patch.crates-io]
-vstd = { path = "../verus-basis/source/vstd" }
-verus_builtin = { path = "../verus-basis/source/builtin" }
-verus_builtin_macros = { path = "../verus-basis/source/builtin_macros" }
-verus_state_machines_macros = { path = "../verus-basis/source/state_machines_macros" }

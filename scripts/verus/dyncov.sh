@@ -26,9 +26,14 @@
 #
 # Usage: scripts/verus/dyncov.sh [--out DIR] [--fail-under PCT]
 #
-# Requires `cargo-verus`, `verus` and `verus-reach` on PATH, built from the
-# BasisResearch/verus checkout that Cargo.toml's [patch.crates-io] points at
-# (the instrumentation lives in that checkout's vstd and verus! macro).
+# Requires `cargo-verus`, `verus` and `verus-reach` on PATH, built from a
+# BasisResearch/verus commit with `--dyncov`. The instrumentation lives in
+# that commit's `verus!` macro and vstd (`vstd::dyncov`), so the build
+# replaces the crates.io vstd pin with the fork's through cargo `--config`
+# patches, leaving Cargo.toml alone (Cargo.lock is restored afterwards):
+#   VERUS_SRC=<checkout>   path patches into that checkout (default: the
+#                          checkout the `verus` on PATH was built in);
+#   VERUS_REV=<sha>        otherwise, git patches at that fork commit.
 
 set -euo pipefail
 
@@ -46,12 +51,43 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-for tool in cargo-verus verus-reach; do
+for tool in cargo-verus verus verus-reach; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: $tool not found on PATH (see the header of this script)." >&2
     exit 127
   fi
 done
+
+# The fork's vstd and `verus!` macro in place of the crates.io pin, for this
+# build only. (vstd re-exports the dyncov run-time, so nothing else is
+# needed.)
+verus_src="${VERUS_SRC:-}"
+if [[ -z "$verus_src" && -z "${VERUS_REV:-}" ]]; then
+  # vargo installs `verus` at <checkout>/source/target-verus/<profile>/verus
+  candidate="$(cd "$(dirname "$(command -v verus)")/../../.." 2>/dev/null && pwd || true)"
+  if [[ -n "$candidate" && -f "$candidate/source/vstd/Cargo.toml" ]]; then
+    verus_src="$candidate"
+  fi
+fi
+patch_config=()
+for crate in vstd:vstd verus_builtin:builtin verus_builtin_macros:builtin_macros \
+             verus_state_machines_macros:state_machines_macros; do
+  name="${crate%%:*}"; dir="${crate##*:}"
+  if [[ -n "$verus_src" ]]; then
+    patch_config+=(--config "patch.crates-io.${name}.path=\"${verus_src}/source/${dir}\"")
+  elif [[ -n "${VERUS_REV:-}" ]]; then
+    patch_config+=(--config "patch.crates-io.${name}.git=\"https://github.com/BasisResearch/verus\"")
+    patch_config+=(--config "patch.crates-io.${name}.rev=\"${VERUS_REV}\"")
+  else
+    echo "error: set VERUS_SRC to a BasisResearch/verus checkout or VERUS_REV to a commit (see the header of this script)." >&2
+    exit 2
+  fi
+done
+echo "verus: vstd and verus! from ${verus_src:-BasisResearch/verus@$VERUS_REV}" >&2
+# The patches re-resolve the lock file; put it back when done
+lock_backup="$(mktemp)"
+cp Cargo.lock "$lock_backup"
+trap 'cp "$lock_backup" Cargo.lock; rm -f "$lock_backup"' EXIT
 
 # Browsable pages (verus-reach --html): the files with verified code and
 # their sources, where a verified exec function counts as reachable only
@@ -75,12 +111,12 @@ export LLVM_PROFILE_FILE="$repo_root/$out/llvm/%p-%m.profraw"
 # own artifacts; dependencies stay cached.
 cargo clean --quiet --package toydb --target-dir "$target_dir"
 echo "verus: building instrumented binaries into $target_dir" >&2
-cargo verus build --fwd-verus-args-to roots --target-dir "$target_dir" --lib --bins \
+cargo verus build --fwd-verus-args-to roots "${patch_config[@]}" --target-dir "$target_dir" --lib --bins \
   -- --reach "$repo_root/$reach_dir" --dyncov --no-verify
 # The test crates get reports too (`<crate>.test-<root stem>.json`), so that
 # the static graph is rooted at the tests as well as the binaries: the
 # workload below is the unit tests, and D ⊆ S should hold for it.
-cargo verus build --fwd-verus-args-to roots --target-dir "$target_dir" --tests \
+cargo verus build --fwd-verus-args-to roots "${patch_config[@]}" --target-dir "$target_dir" --tests \
   -- --reach "$repo_root/$reach_dir" --dyncov --no-verify
 
 # The library's unit-test binary: the one test executable named after the
